@@ -1,0 +1,234 @@
+name: Release
+
+# Cutting a release is `git tag v0.2.0 && git push --tags`. Everything below
+# follows from that, in an order chosen so the irreversible step happens last:
+# crates.io cannot be un-published, a GitHub release can be deleted, and a failed
+# build costs nothing.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  # A manual run builds, packages and smoke-tests everything and publishes
+  # nothing: the two publishing jobs are gated on the trigger being a tag. That
+  # is the dry run, and it needs no flag anybody could forget to set.
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  # Never cancel: a half-finished publish is worse than a queued one.
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ── 1. The tag says what it is, and the tree passes the same gate main does ──
+  #
+  # A tag can be pushed at any commit, including one that never went through the
+  # pull-request lane. Re-running the whole gate here costs a few minutes and is
+  # the only thing standing between "somebody tagged the wrong SHA" and a
+  # published crate.
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches the workspace version
+        id: version
+        run: |
+          set -euo pipefail
+          manifest="$(sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml \
+            | sed -n 's/^version *= *"\(.*\)"/\1/p' | head -1)"
+          echo "version=$manifest" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$manifest" ]; then
+              echo "::error::tag v$tag does not match [workspace.package] version $manifest"
+              exit 1
+            fi
+          fi
+          echo "releasing $manifest"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # fmt · clippy · purity · tests · workspace guards · licences · docs.
+      - run: just ci
+
+  # ── 2. The daemon, for the boxes it runs on ─────────────────────────────────
+  #
+  # Linux only, and on purpose: `hemsd` is an edge daemon for a gateway box, not
+  # a desktop application. Both architectures are built **natively** rather than
+  # cross-compiled, because the planner links HiGHS — a C++ library built from
+  # source by cmake — and a native runner is simpler and more honest than a
+  # cross-toolchain that has to be trusted to produce the same numbers.
+  #
+  # There is deliberately no musl target yet: HiGHS on musl is an open question
+  # (static C++ runtime, binary size), and shipping a build nobody has run on a
+  # real box would be a claim rather than an artefact.
+  binaries:
+    name: hemsd (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake
+
+      # `cargo-auditable` embeds the exact dependency tree in the binary, so the
+      # SBOM can be recovered from an artefact found in the field rather than
+      # trusted from a file shipped beside it. That is what a CRA vulnerability
+      # process needs when somebody asks "which boxes have this crate on them?"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-auditable
+
+      - run: cargo auditable build --release --locked -p hemsd
+
+      # The binary is exercised before it is shipped. A release that has never
+      # run a day through its own control stack is a file, not a build.
+      - name: Smoke test
+        run: |
+          ./target/release/hemsd simulate --day winter
+          ./target/release/hemsd simulate --day shared --json > /dev/null
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="hemsd-${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/hemsd "dist/$name/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hemsd-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # ── 3. What is in it ────────────────────────────────────────────────────────
+  #
+  # A CycloneDX bill of materials for the daemon. The CRA asks for one and so does
+  # every customer with a procurement department; producing it in the same run
+  # that produces the binaries is what keeps the two describing the same thing.
+  sbom:
+    name: SBOM
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install --locked cargo-cyclonedx
+      # For `hemsd` alone rather than `--all`: the daemon is the artefact that
+      # ships, its tree transitively contains every domain crate, and one file is
+      # a bill of materials where twelve are a directory listing.
+      - run: cargo cyclonedx -p hemsd --format json --all-features
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './target/*' \
+            -exec cp {} "sbom/hemsd-${{ needs.verify.outputs.version }}.cdx.json" \;
+          ls -l sbom
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom/*.json
+          if-no-files-found: error
+
+  # ── 4. The GitHub release ───────────────────────────────────────────────────
+  release:
+    name: GitHub release
+    needs: [verify, binaries, sbom]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Build provenance: a signed statement, in a public transparency log, that
+      # these artefacts came out of this workflow at this commit. It is what lets
+      # somebody who downloaded a tarball check that it is the one we built.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum ./*.tar.gz ./*.json > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: artifacts/*.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: hems ${{ needs.verify.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.json
+            artifacts/SHA256SUMS
+
+  # ── 5. crates.io, last, because it cannot be undone ─────────────────────────
+  #
+  # `cargo publish --workspace` resolves the order of the ten publishable crates
+  # itself and skips the two that are `publish = false` (`hemsd`, `xtask`), which
+  # is why there is no hand-maintained list here to drift out of date.
+  #
+  # Authentication is **trusted publishing**: GitHub's OIDC identity is exchanged
+  # for a token that lives for the length of this job. There is no long-lived
+  # `CARGO_REGISTRY_TOKEN` in the repository secrets to leak, and the exchange
+  # only succeeds for this workflow on this repository.
+  crates-io:
+    name: Publish to crates.io
+    needs: [verify, binaries]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Named so crates.io's trusted publishing can be scoped to it, and so a
+    # required reviewer can be added later without touching this file.
+    environment: crates-io
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish --workspace --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

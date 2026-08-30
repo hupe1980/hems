@@ -1,0 +1,42 @@
+[package]
+name        = "hemsd"
+description = "The hems edge daemon — the guard, arbiter and planner of one household, with a simulated site to run them against"
+publish     = false
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[[bin]]
+name = "hemsd"
+path = "src/main.rs"
+
+[lib]
+name = "hemsd"
+path = "src/lib.rs"
+
+[dependencies]
+hems-core      = { workspace = true }
+hems-events    = { workspace = true }
+hems-flex      = { workspace = true }
+hems-forecast  = { workspace = true }
+hems-grid      = { workspace = true }
+# The daemon is built with HiGHS: a gateway box solves a 192-slot horizon
+# every five minutes, and the pure-Rust fallback is for library consumers who
+# would rather not have a C++ toolchain than for the thing doing the solving.
+hems-optimizer = { workspace = true, features = ["highs"] }
+hems-realtime  = { workspace = true }
+hems-sim       = { workspace = true }
+hems-tariff    = { workspace = true }
+metering       = { workspace = true }
+
+anyhow       = { workspace = true }
+clap         = { version = "4", features = ["derive", "env"] }
+rust_decimal = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+time         = { workspace = true }
+tracing      = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

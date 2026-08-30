@@ -1,0 +1,44 @@
+[package]
+name        = "hems-optimizer"
+description = "The planner of a home energy system — a receding-horizon mixed-integer linear program over quarter-hour slots that prices battery wear instead of hiding it, respects § 14a and § 9 EEG limits as hard constraints, and returns a plan the one-second arbiter can follow"
+keywords    = ["energy", "optimization", "milp", "battery", "smart-grid"]
+categories  = ["science", "mathematics"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+# `clarabel` is always on and is not a solver choice: it is the *dual* pass.
+# The mixed-integer solve is done by whichever backend the features select, and
+# the shadow prices come from re-solving the same model with the binaries pinned,
+# which is a pure linear program. Clarabel is pure Rust, so this costs no C++
+# toolchain and — the point — leaves no backend split: a box built with `microlp`
+# and one built with `highs` both get per-asset marginal values.
+good_lp       = { workspace = true, features = ["clarabel"] }
+hems-core     = { workspace = true }
+hems-forecast = { workspace = true }
+hems-tariff   = { workspace = true }
+serde         = { workspace = true, optional = true }
+thiserror     = { workspace = true }
+time          = { workspace = true }
+
+[features]
+## The pure-Rust solver. Default, so `cargo test` needs no C++ toolchain and the
+## crate cross-compiles to a gateway box without a build environment on it.
+default = ["microlp", "serde"]
+## Pure-Rust linear and mixed-integer solver.
+microlp = ["good_lp/microlp"]
+## HiGHS — markedly faster on larger models, but needs cmake and a C++ compiler.
+## What a production box should be built with, and what wins when both solver
+## features are enabled.
+highs = ["good_lp/highs"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde"]
+
+[dev-dependencies]
+hems-grid    = { workspace = true }
+rust_decimal = { workspace = true }

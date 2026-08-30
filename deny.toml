@@ -1,0 +1,50 @@
+# cargo-deny — licences and advisories.
+#
+# Run with `just deny` or `cargo deny check`. CI runs it on every
+# change; a scheduled job re-runs the advisory half against the unchanged main
+# branch, because an advisory filed on a Wednesday concerns a dependency that
+# was clean on merge day.
+
+[graph]
+all-features = true
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },  # the gateway box
+    { triple = "aarch64-unknown-linux-musl" }, # the static build
+    { triple = "aarch64-apple-darwin" },
+    { triple = "x86_64-apple-darwin" },
+]
+
+[licenses]
+# Permissive only. A copyleft dependency in a crate an operator links into their
+# own product is a decision for them to take deliberately, not one to inherit.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MIT-0",
+    "CC0-1.0",
+    "0BSD",
+]
+confidence-threshold = 0.9
+
+[bans]
+# A second major version of a serialisation or numeric crate is how two halves of
+# the workspace come to disagree about what a number is. Any new duplicate needs
+# an entry here with a reason.
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

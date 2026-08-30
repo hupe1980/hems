@@ -1,0 +1,34 @@
+[package]
+name        = "hems-grid"
+description = "The German grid rules for a home energy system, executable and cited — § 14a EnWG netzorientierte Steuerung, the EEBUS LPC/LPP limitation state machine, § 9 EEG feed-in limits, § 14a Modul 3 time windows, and the evidence record an operator has to keep"
+keywords    = ["energy", "smart-grid", "enwg", "eebus", "compliance"]
+categories  = ["science", "simulation"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core    = { workspace = true }
+metering     = { workspace = true }
+rust_decimal = { workspace = true }
+serde        = { workspace = true, optional = true }
+thiserror    = { workspace = true }
+time         = { workspace = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = [
+  "dep:serde",
+  "hems-core/serde",
+  "metering/serde",
+  "rust_decimal/serde-with-str",
+  "time/serde-well-known",
+]
+
+[dev-dependencies]
+serde_json = { workspace = true }

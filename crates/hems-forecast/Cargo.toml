@@ -1,0 +1,23 @@
+[package]
+name        = "hems-forecast"
+description = "Quantile forecasts for a home energy system — a physical photovoltaic model from solar geometry and the online residual corrector that turns it into a forecast, load profiles by day type, electric-vehicle session statistics, RC identification of the building from its own record, naive fallbacks, and the calibration metrics that say whether any of it can be trusted"
+keywords    = ["energy", "forecasting", "photovoltaic", "solar", "quantile"]
+categories  = ["science", "simulation"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core = { workspace = true }
+metering  = { workspace = true }
+serde     = { workspace = true, optional = true }
+time      = { workspace = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde"]

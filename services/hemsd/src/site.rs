@@ -1,0 +1,341 @@
+//! Building the household the daemon manages.
+
+use hems_core::asset::{
+    AssetMeta, Battery, Capabilities, Chemistry, DhwTank, Evse, FlexibleLoad, HeatPump,
+    HeatPumpControl, LoadKind, PvArray,
+};
+use hems_core::prelude::*;
+use hems_optimizer::solve::AssetNames;
+use hems_tariff::levies::Levies;
+use hems_tariff::tariff::{EnergyPrice, FeedIn, NetworkCharge, Tariff};
+use rust_decimal::Decimal;
+use std::collections::BTreeMap;
+
+/// How the house is put together.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HouseholdConfig {
+    /// Installed photovoltaic power.
+    pub pv_kwp: Power,
+    /// The inverter's alternating-current limit.
+    pub pv_ac_nominal: Power,
+    /// Battery capacity.
+    pub battery_kwh: Energy,
+    /// Battery power, both directions.
+    pub battery_power: Power,
+    /// Energy held back for a power cut.
+    pub reserve_soc: Soc,
+    /// What a kilowatt-hour of battery throughput costs in wear, €/kWh.
+    pub battery_wear_eur_per_kwh: f64,
+    /// The main fuse.
+    pub fuse: Current,
+    /// Where the house is.
+    pub location: GeoPoint,
+    /// Electrical power of the heat pump at full output.
+    pub heat_pump_power: Power,
+    /// The bottom of the comfort band, °C.
+    pub comfort_min_c: f64,
+    /// The top of the comfort band, °C.
+    pub comfort_max_c: f64,
+    /// Whether the heat pump modulates rather than switching on and off.
+    pub heat_pump_modulating: bool,
+    /// Volume of the hot-water tank, litres. Zero leaves the house without one.
+    pub dhw_litres: f64,
+    /// Electrical power of the hot-water heat pump.
+    pub dhw_heater: Power,
+    /// What, if anything, has lifted the § 9 Abs. 2 EEG 60 % feed-in cap.
+    ///
+    /// [`CapRelief::None`] is the default and the realistic one: most systems
+    /// commissioned since 25.02.2025 are still waiting for an intelligent
+    /// metering system with a control device, and until it is **in operation**
+    /// they may feed in 60 % of their installed direct-current power and no
+    /// more.
+    pub cap_relief: CapRelief,
+    /// Whether the charge point can drop to a single conductor.
+    ///
+    /// Almost every wallbox sold in Germany since about 2022 can, and it is what
+    /// decides whether 2 kW of surplus charges a car or is exported: three-phase
+    /// charging cannot start below 4,14 kW, single-phase below 1,38 kW.
+    pub evse_switchable: bool,
+}
+
+impl Default for HouseholdConfig {
+    /// A common German single-family house in 2026: 9,8 kWp on the roof, a
+    /// 10 kWh battery, an 11 kW wallbox and an 8 kW heat pump.
+    fn default() -> Self {
+        Self {
+            pv_kwp: Power::from_kw(9.8),
+            pv_ac_nominal: Power::from_kw(8.0),
+            battery_kwh: Energy::from_kwh(10.0),
+            battery_power: Power::from_kw(5.0),
+            reserve_soc: Soc::new(0.1).unwrap_or(Soc::EMPTY),
+            // A €4 000 pack warranted for 2,4 MWh per kWh of capacity works out
+            // near 8 ct per kilowatt-hour of throughput. Leaving it at zero is
+            // what makes a plan cycle a battery for a two-cent spread.
+            battery_wear_eur_per_kwh: 0.08,
+            fuse: Current::new(35.0),
+            heat_pump_power: Power::from_kw(5.0),
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            heat_pump_modulating: true,
+            // Three hundred litres on a hot-water heat pump — the standard
+            // German fitting, and about five kilowatt-hours of heat between 45
+            // and 60 °C for under two kilowatt-hours of electricity.
+            dhw_litres: 300.0,
+            dhw_heater: Power::from_kw(0.5),
+            cap_relief: CapRelief::None,
+            evse_switchable: true,
+            location: GeoPoint {
+                latitude: 52.52,
+                longitude: 13.40,
+                altitude_m: 34.0,
+            },
+        }
+    }
+}
+
+/// The site, plus the names the planner uses for its parts.
+#[derive(Debug, Clone)]
+pub struct Household {
+    /// The site itself.
+    pub site: Site,
+    /// The photovoltaic array.
+    pub pv: AssetId,
+    /// The battery.
+    pub battery: AssetId,
+    /// The charge point.
+    pub evse: AssetId,
+    /// The heat pump.
+    pub heat_pump: AssetId,
+    /// The uncontrollable household load.
+    pub load: AssetId,
+    /// The hot-water tank.
+    pub dhw: AssetId,
+    /// The names, as the optimiser wants them.
+    pub names: AssetNames,
+}
+
+impl Household {
+    /// Build a site from a configuration.
+    ///
+    /// # Errors
+    /// When the identifiers or the circuit tree do not validate — which can only
+    /// happen if this function is edited badly, and is worth failing on rather
+    /// than unwrapping.
+    pub fn build(config: &HouseholdConfig) -> anyhow::Result<Self> {
+        let main = CircuitId::new("main")?;
+        let garage = CircuitId::new("garage")?;
+
+        let pv = AssetId::new("pv")?;
+        let battery = AssetId::new("battery")?;
+        let evse = AssetId::new("wallbox")?;
+        let heat_pump = AssetId::new("waermepumpe")?;
+        let load = AssetId::new("haushalt")?;
+        let dhw = AssetId::new("warmwasser")?;
+
+        let assets = assets_of(config, &main, &garage)?;
+        let site = Site::new(
+            SiteId::new(),
+            config.location,
+            GridConnection::new(config.fuse),
+            Circuits::new(vec![
+                Circuit::new(main.clone(), None, config.fuse),
+                Circuit::new(garage.clone(), Some(main.clone()), Current::new(20.0)),
+            ])?,
+            assets,
+        )?;
+
+        Ok(Self {
+            names: AssetNames {
+                battery: Some(battery.clone()),
+                evse: Some(evse.clone()),
+                pv: Some(pv.clone()),
+                heat_pump: Some(heat_pump.clone()),
+                dhw: Some(dhw.clone()),
+            },
+            site,
+            pv,
+            battery,
+            evse,
+            heat_pump,
+            load,
+            dhw,
+        })
+    }
+}
+
+/// The assets the reference household is made of.
+///
+/// Split out from [`Household::build`] because the list is the interesting part
+/// and the plumbing around it is not.
+fn assets_of(
+    config: &HouseholdConfig,
+    main: &CircuitId,
+    garage: &CircuitId,
+) -> anyhow::Result<Vec<Asset>> {
+    // What each device can actually be told, rather than one bitset for
+    // everything. The distinction earns its keep in the arbiter: an asset the
+    // manager can only *limit* has controls of its own and an absent instruction
+    // means "no limit", while an asset the manager *drives* does nothing until
+    // it is asked to.
+    let meta = |id: &str,
+                kw: f64,
+                circuit: &CircuitId,
+                capabilities: Capabilities|
+     -> anyhow::Result<AssetMeta> {
+        Ok(AssetMeta::new(
+            AssetId::new(id)?,
+            circuit.clone(),
+            PhaseConnection::Three,
+            Power::from_kw(kw),
+        )
+        .with_capabilities(Capabilities::MEASURE | capabilities)
+        .commissioned(time::macros::date!(2025 - 03 - 01)))
+    };
+    let driven = Capabilities::LIMIT_CONSUMPTION | Capabilities::SET_POWER;
+    Ok(vec![
+        Asset::Pv(PvArray {
+            meta: meta(
+                "pv",
+                config.pv_kwp.kw(),
+                main,
+                Capabilities::LIMIT_PRODUCTION,
+            )?,
+            kwp_dc: config.pv_kwp,
+            ac_nominal: config.pv_ac_nominal,
+            tilt_deg: 35.0,
+            azimuth_deg: 180.0,
+            cap_relief: config.cap_relief,
+        }),
+        Asset::Battery(Battery {
+            meta: meta("battery", config.battery_power.kw(), main, driven)?,
+            capacity: config.battery_kwh,
+            max_charge: config.battery_power,
+            max_discharge: config.battery_power,
+            efficiency_charge: 0.95,
+            efficiency_discharge: 0.95,
+            soc_min: Soc::new(0.05)?,
+            soc_max: Soc::FULL,
+            reserve_soc: config.reserve_soc,
+            chemistry: Chemistry::Lfp,
+            grid_charging_allowed: true,
+        }),
+        Asset::Evse(Evse {
+            meta: {
+                let mut m = meta("wallbox", 11.0, garage, driven)?;
+                if config.evse_switchable {
+                    m.phases = PhaseConnection::Switchable { phase: Phase::L1 };
+                }
+                m
+            },
+            min_current: Current::new(6.0),
+            max_current: Current::new(16.0),
+            bidirectional: false,
+            public: false,
+        }),
+        Asset::HeatPump(HeatPump {
+            meta: meta(
+                "waermepumpe",
+                config.heat_pump_power.kw() + 3.0,
+                main,
+                Capabilities::LIMIT_CONSUMPTION,
+            )?,
+            electrical_nominal: config.heat_pump_power,
+            heating_rod: Some(Power::from_kw(3.0)),
+            control: HeatPumpControl::PowerCeiling,
+            modulating: true,
+        }),
+        Asset::Dhw(DhwTank {
+            meta: meta(
+                "warmwasser",
+                config.dhw_heater.kw(),
+                main,
+                Capabilities::LIMIT_CONSUMPTION,
+            )?,
+            volume_l: config.dhw_litres,
+            heater: config.dhw_heater,
+            cop: 3.0,
+            standing_loss: Power::new(45.0),
+            t_min_c: 45.0,
+            t_set_c: 55.0,
+            t_max_c: 60.0,
+        }),
+        Asset::Load(FlexibleLoad {
+            // No control capability: this is the part of the house
+            // nobody manages, and the arbiter must leave it alone.
+            meta: AssetMeta::new(
+                AssetId::new("haushalt")?,
+                main.clone(),
+                PhaseConnection::Three,
+                Power::from_kw(3.0),
+            ),
+            nominal: Power::from_kw(0.5),
+            kind: LoadKind::Fixed,
+        }),
+    ])
+}
+
+/// The § 14a network-charge modules this household could choose between.
+///
+/// The first is the reference — what it is on today — and the rest are what
+/// [`hems_tariff::compare_moduls`] prices against it. Modul 3 is deliberately
+/// absent: it needs the network operator's own Zählzeitdefinition, and this
+/// workspace refuses to invent one (P5). A curated calendar per operator is
+/// `tariffd`'s job.
+#[must_use]
+pub fn modul_choices(current: &Tariff) -> Vec<hems_tariff::ModulChoice> {
+    let arbeitspreis = Decimal::new(1000, 2);
+    vec![
+        hems_tariff::ModulChoice {
+            label: "Modul 1".into(),
+            tariff: current.clone(),
+        },
+        hems_tariff::ModulChoice {
+            label: "Modul 2".into(),
+            tariff: Tariff {
+                network: NetworkCharge::Modul2 {
+                    arbeitspreis,
+                    // 60 % off the working price, at a Marktlokation of its own.
+                    remaining_share: Decimal::new(4, 1),
+                    metering_eur_per_year: Decimal::new(25, 0),
+                },
+                ..current.clone()
+            },
+        },
+        hems_tariff::ModulChoice {
+            label: "no module".into(),
+            tariff: Tariff {
+                network: NetworkCharge::None { arbeitspreis },
+                ..current.clone()
+            },
+        },
+    ]
+}
+
+/// A dynamic tariff with the given day-ahead prices, in ct/kWh per slot.
+#[must_use]
+pub fn tariff_for(prices_ct: &[i64], horizon: Horizon) -> Tariff {
+    let spot: BTreeMap<Slot, Decimal> = horizon
+        .slots()
+        .enumerate()
+        .map(|(i, s)| (s, Decimal::new(prices_ct[i % prices_ct.len()], 0)))
+        .collect();
+    Tariff {
+        energy: EnergyPrice::Dynamic {
+            spot,
+            markup_ct_per_kwh: Decimal::new(3, 0),
+            fallback_ct_per_kwh: Decimal::new(20, 0),
+        },
+        network: NetworkCharge::Modul1 {
+            arbeitspreis: Decimal::new(1000, 2),
+            reduction_eur_per_year: Decimal::new(120, 0),
+        },
+        levies: Levies::household_2026(),
+        // 7,86 ct/kWh, and nothing at all in a quarter hour with a negative
+        // day-ahead price — § 51 EEG since 25.02.2025.
+        feed_in: FeedIn::Eeg {
+            ct_per_kwh: Decimal::new(786, 2),
+            negative_price_rule: true,
+        },
+        standing_charge_eur_per_year: Decimal::new(120, 0),
+    }
+}

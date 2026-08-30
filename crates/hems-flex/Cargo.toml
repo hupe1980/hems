@@ -1,0 +1,27 @@
+[package]
+name        = "hems-flex"
+description = "Expressing a household's flexibility in S2 (EN 50491-12-2) — which control type each asset belongs to, the descriptions a Customer Energy Manager exchanges, and the translation of an S2 instruction back into a command"
+keywords    = ["energy", "s2", "flexibility", "hems", "en50491"]
+categories  = ["science", "api-bindings"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core = { workspace = true }
+# The reference S2 types, generated from the official schema by the standard's
+# own authors (TNO / Flexiblepower). Writing our own would be a second opinion
+# about a wire format, which is the one thing a standard exists to prevent.
+s2energy  = { version = "0.3", default-features = false }
+hems-device = { workspace = true }
+chrono      = { version = "0.4", default-features = false, features = ["std"] }
+time        = { workspace = true }
+uuid        = { version = "1", default-features = false, features = ["v5"] }
+thiserror   = { workspace = true }
+
+[dev-dependencies]
+time = { workspace = true, features = ["macros"] }

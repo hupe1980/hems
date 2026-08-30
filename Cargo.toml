@@ -1,0 +1,71 @@
+[workspace]
+resolver = "3"
+members = ["crates/hems-core", "crates/hems-device", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-sim", "services/hemsd", "xtask"]
+
+[workspace.package]
+version      = "0.1.0"
+authors      = ["hupe1980"]
+edition      = "2024"
+license      = "MIT OR Apache-2.0"
+repository   = "https://github.com/hupe1980/hems"
+rust-version = "1.94"
+
+[workspace.dependencies]
+# ── External ────────────────────────────────────────────────────────────────
+thiserror    = "2"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+time         = { version = "0.3", features = ["std", "macros", "parsing", "formatting", "serde-well-known"] }
+rust_decimal = { version = "1", features = ["macros"] }
+uuid         = { version = "1", features = ["v4", "v7", "serde"] }
+tracing      = "0.1"
+anyhow       = "1"
+toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+
+# Reading somebody else's price list. Both are pure parsers — a `&str` in, a
+# structure out — so `hems-tariff` stays a domain crate that does no I/O: the
+# fetching lives in `tariffd`, and every source is tested against a captured
+# response rather than against the internet.
+# ≥ 0.41: RUSTSEC-2026-… caps the namespace resolver's per-element
+# allocation. hems uses the plain `Reader` rather than `NsReader` and is not
+# affected, but a workspace that pins a version an advisory names has to argue
+# the point on every audit run, and upgrading is cheaper than arguing.
+quick-xml    = { version = "0.42", default-features = false }
+
+# The German metering domain: DST-correct Europe/Berlin calendar, OBIS codes,
+# quality flags, §14a Modul 3 Zählzeit registers, virtual meters (§42b), §42c
+# eligibility. hems computes *control*; `metering` owns *quantities*, and the
+# two must never disagree about what a quarter-hour is.
+metering     = { version = "0.21", features = ["serde"] }
+
+# Linear/mixed-integer programming façade. `microlp` is the pure-Rust default so
+# a plain `cargo test` needs no C++ toolchain; production boxes enable `highs`.
+good_lp      = { version = "1.15", default-features = false }
+
+# ── Internal (path + version so the domain crates can be published) ─────────
+hems-core      = { path = "crates/hems-core",      version = "0.1" }
+hems-device    = { path = "crates/hems-device",    version = "0.1" }
+hems-flex      = { path = "crates/hems-flex",      version = "0.1" }
+hems-grid      = { path = "crates/hems-grid",      version = "0.1" }
+hems-tariff    = { path = "crates/hems-tariff",    version = "0.1" }
+hems-forecast  = { path = "crates/hems-forecast",  version = "0.1" }
+hems-optimizer = { path = "crates/hems-optimizer", version = "0.1" }
+hems-realtime  = { path = "crates/hems-realtime",  version = "0.1" }
+hems-events    = { path = "crates/hems-events",    version = "0.1" }
+hems-sim       = { path = "crates/hems-sim",       version = "0.1" }
+
+# Dependencies are optimised even in a debug build.
+#
+# `cargo test` builds unoptimised, and the numerical libraries in this workspace
+# are the kind of code that is thirty times slower that way: the interior-point
+# solver behind the shadow prices took a simulated day from four seconds to
+# sixty, which is not a statement about the algorithm. Our own crates stay
+# unoptimised so a panic still points at a line.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = "debuginfo"

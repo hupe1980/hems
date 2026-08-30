@@ -1,0 +1,20 @@
+name: Security audit
+
+# The push and pull-request lane already runs cargo-deny on every change. This
+# schedule exists to catch advisories filed *after* the last push — a dependency
+# that was clean on merge day and had a RUSTSEC entry raised on Wednesday.
+
+on:
+  schedule:
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: Advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories

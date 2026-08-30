@@ -1,0 +1,28 @@
+[package]
+name        = "hems-core"
+description = "Domain model of a home energy system — sign-consistent power/energy units, three-phase vectors, the 15-minute Europe/Berlin slot grid, assets, circuits, measurements, and setpoints that must name their reason"
+keywords    = ["energy", "hems", "photovoltaic", "smart-grid", "battery"]
+categories  = ["science", "simulation"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+metering     = { workspace = true }
+rust_decimal = { workspace = true }
+serde        = { workspace = true, optional = true }
+thiserror    = { workspace = true }
+time         = { workspace = true }
+uuid         = { workspace = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "metering/serde", "uuid/serde", "time/serde-well-known", "rust_decimal/serde"]
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -1,0 +1,22 @@
+[package]
+name        = "hems-device"
+description = "How a decision becomes a command a device will actually accept — amperes for a charge point, an SG Ready contact pair for a heat pump, a ceiling for an inverter — plus the capability model the arbiter dispatches on"
+keywords    = ["energy", "hems", "sg-ready", "device", "control"]
+categories  = ["science", "hardware-support"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core = { workspace = true }
+serde     = { workspace = true, optional = true }
+thiserror = { workspace = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde"]

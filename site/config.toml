@@ -1,0 +1,19 @@
+base_url = "https://hupe1980.github.io/hems"
+title = "hems"
+description = "The open-source home energy management platform for the German market: § 14a EnWG, § 9 EEG, MiSpeL and Modul 3 as executable, cited rules; a guard the optimiser cannot argue with; EEBUS and S2 native; written in Rust."
+default_language = "en"
+compile_sass = false
+build_search_index = false
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+[markdown]
+smart_punctuation = true
+# Deep links to every heading: a documentation page whose sections cannot be
+# linked to is one nobody links to.
+insert_anchor_links = "heading"
+
+[extra]
+repository = "https://github.com/hupe1980/hems"
+tagline    = "open-source home energy management for the German grid"
+keywords   = "HEMS, home energy management, § 14a EnWG, EEBUS, S2, EN 50491-12-2, Rust, model predictive control, § 9 EEG, Solarspitzengesetz, MiSpeL, dynamic tariff, § 41a EnWG"

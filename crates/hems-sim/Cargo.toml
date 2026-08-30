@@ -1,0 +1,25 @@
+[package]
+name        = "hems-sim"
+description = "Deterministic simulators for a home energy system — photovoltaics, battery, electric vehicle, heat pump and building, household load, a Steuerbox that speaks the EEBUS limitation use case, and a seeded weather realisation so the day that happens is not the day that was forecast — all on virtual time, so a whole day is a unit test"
+keywords    = ["energy", "simulation", "hems", "testing"]
+categories  = ["simulation", "development-tools::testing"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core     = { workspace = true }
+hems-forecast = { workspace = true }
+hems-grid     = { workspace = true }
+metering      = { workspace = true }
+serde         = { workspace = true, optional = true }
+time          = { workspace = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde"]

@@ -1,0 +1,14 @@
+[package]
+name        = "hems-events"
+description = "The compile-time catalogue of every CloudEvents type the hems workspace emits — one list, checked by a workspace guard, so an event nobody consumes and a consumer of an event nobody emits are both build failures"
+keywords    = ["energy", "cloudevents", "hems", "events"]
+categories  = ["science"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]

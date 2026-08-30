@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block content %}
+{{ section.content | safe }}
+<div class="cards">
+{% for page in section.pages %}
+  <div class="card">
+    <h3><a href="{{ page.permalink }}">{{ page.title }}</a></h3>
+    <p>{{ page.description | default(value="") }}</p>
+  </div>
+{% endfor %}
+</div>
+{% endblock %}

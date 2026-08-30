@@ -1,0 +1,11 @@
+[toolchain]
+# Pinned to the declared MSRV so every developer and every CI lane compiles on
+# exactly the same toolchain. Bumping the MSRV means changing this value and the
+# `msrv` job in .github/workflows/ci.yml in the same commit.
+#
+# 1.94 is the floor because:
+#   - edition 2024 needs 1.85
+#   - `let_chains` (used across the guard and arbiter) stabilised in 1.88
+#   - `metering` 0.19 declares rust-version = "1.94"
+channel    = "1.94"
+components = ["rustfmt", "clippy"]

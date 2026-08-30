@@ -1,0 +1,25 @@
+[package]
+name        = "hems-realtime"
+description = "The one-second control loop of a home energy system — a guard plane that grid limits can never be argued out of, fair allocation of a limited budget across devices, and an arbiter that turns a plan plus live measurements into setpoints. Sans-I/O."
+keywords    = ["energy", "hems", "control", "smart-grid", "load-management"]
+categories  = ["science", "simulation"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core   = { workspace = true }
+hems-device = { workspace = true }
+hems-grid   = { workspace = true }
+serde     = { workspace = true, optional = true }
+thiserror = { workspace = true }
+time      = { workspace = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde", "hems-device/serde", "hems-grid/serde"]

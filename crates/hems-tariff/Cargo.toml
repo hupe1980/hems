@@ -1,0 +1,30 @@
+[package]
+name        = "hems-tariff"
+description = "What a kilowatt-hour costs a German household in a given quarter hour — dynamic energy prices, § 14a Modul 1/2/3 network charges, levies and taxes, feed-in remuneration with the § 51 EEG negative-price rule, parsers for what ENTSO-E, SMARD, aWATTar, Tibber and Energy-Charts publish, and an advisor that compares the module choices against a household's own history"
+keywords    = ["energy", "tariff", "enwg", "epex", "smart-grid"]
+categories  = ["science", "finance"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core    = { workspace = true }
+hems-grid    = { workspace = true }
+quick-xml    = { workspace = true }
+rust_decimal = { workspace = true }
+serde_json   = { workspace = true }
+serde        = { workspace = true, optional = true }
+thiserror    = { workspace = true }
+time         = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = "1"
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde", "hems-grid/serde", "rust_decimal/serde"]
