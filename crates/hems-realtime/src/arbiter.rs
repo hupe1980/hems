@@ -659,6 +659,18 @@ impl Arbiter {
                 Some(soc) if soc >= b.soc_max => Power::ZERO,
                 _ => ceiling,
             },
+            // …and neither is a car that already has what it was asked for. A
+            // surplus tracker with no notion of *enough* pushes production past
+            // the Ladelimit in preference to exporting it, which earns money.
+            // The planner has an energy target and a departure instead; this
+            // fallback has neither, and it is what runs when the cloud is gone.
+            Asset::Evse(e) => match (
+                e.charge_limit,
+                tick.state.soc_of(asset.id(), tick.now, max_age),
+            ) {
+                (Some(limit), Some(soc)) if soc >= limit => Power::ZERO,
+                _ => ceiling,
+            },
             _ => ceiling,
         }
     }
@@ -848,6 +860,7 @@ mod tests {
                     max_current: Current::new(16.0),
                     bidirectional: false,
                     public: false,
+                    charge_limit: None,
                 }),
                 Asset::Battery(Battery {
                     meta: meta("battery", 5.0),

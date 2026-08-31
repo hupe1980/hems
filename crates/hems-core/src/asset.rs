@@ -378,6 +378,21 @@ pub struct Evse {
     /// Whether it is publicly accessible in the sense of § 2 Nr. 5 LSV.
     #[cfg_attr(feature = "serde", serde(default))]
     pub public: bool,
+    /// The state of charge the household asked the car to reach — evcc's and
+    /// openWB's *Ladelimit*.
+    ///
+    /// The **planner** does not read it: it is given an energy target and a
+    /// departure, which say the same thing more precisely. The real-time
+    /// fallback does, because it has neither — and a surplus tracker with no
+    /// notion of *enough* pushes production into a car that already has what it
+    /// was asked for, in preference to exporting it for money.
+    ///
+    /// `None` means "fill it". Read against
+    /// [`crate::measurement::Measurement::soc`] on the charge point, which is
+    /// where a vehicle's charge reaches the box (EEBUS `EVSOC`, ISO 15118 or an
+    /// OEM API, in that order of trust).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub charge_limit: Option<Soc>,
 }
 
 /// A heat pump, with whatever auxiliary heater is bound to it.
@@ -819,6 +834,7 @@ mod tests {
                 max_current: Current::new(16.0),
                 bidirectional: false,
                 public,
+                charge_limit: None,
             })
         };
         assert_eq!(mk(false).fallgruppe(), Some(Fallgruppe::Ladepunkt));
@@ -845,6 +861,7 @@ mod tests {
             max_current: Current::new(16.0),
             bidirectional: false,
             public: false,
+            charge_limit: None,
         });
         // A one-way charge point cannot export whatever the nameplate says.
         assert_eq!(wallbox.ratings().floor, Power::ZERO);
@@ -902,6 +919,7 @@ mod tests {
             max_current: Current::new(16.0),
             bidirectional: false,
             public: false,
+            charge_limit: None,
         };
         // 6 A × 230 V × 3 = 4,14 kW three-phase; a third of it on one conductor.
         assert!((e.min_power(PhaseMode::Three).kw() - 4.14).abs() < 1e-9);

@@ -65,10 +65,9 @@ const RATIO_BOUNDS: (f64, f64) = (0.1, 3.0);
 /// Mean absolute deviation to a 10-90 half-width, for a normal.
 ///
 /// `sigma = 1,2533 x MAD` and the 10-90 half-width is `1,2816 x sigma`, so the
-/// two together are 1,606. They used to be applied separately as 1,25 and 1,6,
-/// which is 2,0 — a quarter too wide, and the reason the first scored day
-/// reported a production band the outcome fell inside 98 % of the time against
-/// the 80 % it promises.
+/// two together are 1,606. Applying them separately as 1,25 and 1,6 gives 2,0 —
+/// a quarter too wide, which produces a band the outcome falls inside 98 % of
+/// the time against the 80 % it promises.
 const MAD_TO_HALF_WIDTH: f64 = 1.606;
 
 /// One bucket's running estimate of the ratio and its dispersion.

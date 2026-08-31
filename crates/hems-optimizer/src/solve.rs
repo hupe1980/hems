@@ -526,8 +526,17 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
         v.dhw.push(vars.add(variable().min(0.0).max(dhw_max)));
         v.dhw_e
             .push(vars.add(variable().min(0.0).max(dhw_capacity)));
+        // The shortfall covers the standing loss as well as the draw. `dhw_e ≥ 0`
+        // is the lowest temperature the household accepts, not the ambient one,
+        // so a tank on that floor is still losing heat — and an equality that can
+        // only be closed by heating forces the heater to `loss/cop` for ever, and
+        // is infeasible wherever a heater cannot out-run its own cylinder.
+        let dhw_deficit = problem
+            .dhw
+            .map_or(0.0, |d| d.standing_loss.get() * DT_HOURS)
+            + problem.dhw_draw_at(k);
         v.dhw_short
-            .push(vars.add(variable().min(0.0).max(problem.dhw_draw_at(k))));
+            .push(vars.add(variable().min(0.0).max(dhw_deficit)));
 
         match problem.thermal {
             Some(t) => {
@@ -812,8 +821,7 @@ fn balance<M: SolverModel>(
     // Without it the model is *unbounded* wherever export earns more than import
     // costs, and it will happily invent an infinite round trip through a meter.
     //
-    // # There used to be a second one, and removing it is what made the duals
-    // # mean anything
+    // # Its mirror is implied, and stating it destroys every shadow price
     //
     // The mirror statement — `g_in ≤ load + b_ch + ev + hp + dhw`, imported power
     // has to go into the house or a store — reads like the other half of the
@@ -894,10 +902,6 @@ fn charging<M: SolverModel>(
     // pessimistic about hardware the household owns: under a limit that leaves
     // it 3 kW it refuses to charge, while the arbiter would have switched and
     // charged.
-    // A charge point is semi-continuous: off, or between the 6 A of IEC 61851
-    // and its maximum. Without this the cheapest way to meet a modest target is
-    // to trickle a few hundred watts across many hours — which delivers nothing
-    // at all, and the model has no way to find that out.
     if e.min_charge > Power::ZERO {
         model = model.with(constraint!(
             vars.ev[k] <= vars.ev_on[k] * e.max_charge.get()
@@ -1109,81 +1113,58 @@ fn building<M: SolverModel>(
 /// A baseline that priced a household simply consuming its own load, with no car
 /// and no heating at all, produces a saving figure flattering enough to be
 /// useless: it credits the optimiser for energy it never had to buy.
+///
+/// # It faces the same law, and pays for the same failures
+///
+/// The baseline lives under the **same grid rules**. A household with no energy
+/// manager cannot be addressed as one `[A1 4.4.b]`, so its Steuerbox turns each
+/// device down on its own `[A1 4.4.a]` — that is
+/// [`PlanningLimits::direct_control_ceiling`] — and its roof is capped by § 9 EEG
+/// exactly like the managed one, curtailing what it cannot export. Measuring a
+/// saving against a household that ignored the network operator prices a
+/// counterfactual nobody is allowed to buy.
+///
+/// And it pays for **service it fails to deliver**, on the same terms the plan
+/// does. A car plugged in an hour before it leaves is short whatever anybody
+/// does; a tank that starts the day cold cannot fill a bath at seven. Charging
+/// the plan for that and not the baseline would be the same asymmetry pointing
+/// the other way.
+///
+/// [`PlanningLimits::direct_control_ceiling`]: crate::model::PlanningLimits::direct_control_ceiling
 fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
     let mut cost = hems_core::prelude::CostBreakdown::default();
-    let mut car_remaining = problem.ev.map_or(0.0, |e| {
-        (e.energy_target.get() - e.energy_now.get()).max(0.0)
-    });
-    let mut thermostat_on = false;
-    let mut dhw_stored = problem.dhw.map_or(0.0, |d| d.stored_now.get());
-    let mut thermal_state = problem
-        .thermal
-        .map_or(hems_core::prelude::ThermalState::default(), |t| t.state);
-    let thermal_step = problem.thermal_step();
+    let mut house = Unmanaged::new(problem);
 
     for k in 0..problem.horizon.len {
         let (pv, load) = problem.forecasts_at(k);
-
-        // An unmanaged charge point runs flat out from the moment the cable
-        // goes in until the car is full.
         let slot_k = problem.horizon.get(k);
-        let ev = match problem.ev {
-            Some(e) if car_remaining > 0.0 && slot_k.is_some_and(|s| e.present_in(s)) => {
-                let p = e.max_charge.get();
-                car_remaining = (car_remaining - p * e.efficiency * DT_HOURS).max(0.0);
-                p
-            }
-            _ => 0.0,
-        };
 
-        // An ordinary thermostat with half a kelvin of hysteresis. It knows
-        // nothing about the price or the weather, which is the whole of the
-        // difference being measured.
-        let hp = match problem.thermal {
-            Some(t) => {
-                if thermal_state.indoor_c < t.comfort_min_c {
-                    thermostat_on = true;
-                } else if thermal_state.indoor_c > t.comfort_min_c + 0.5 {
-                    thermostat_on = false;
-                }
-                let p = if thermostat_on {
-                    t.heat_pump.max_electrical.get()
-                } else {
-                    0.0
-                };
-                let outdoor = problem.outdoor_at(k);
-                thermal_state = thermal_step.step(
-                    thermal_state,
-                    p * t.heat_pump.cop(outdoor) / 1000.0,
-                    outdoor,
-                );
-                p
-            }
-            None => 0.0,
-        };
+        // The ceiling one device faces while a reduction is in force. The plan
+        // is given the sum for everything behind it; a household with no energy
+        // manager is not, so each of its devices is turned down on its own.
+        let device_ceiling = slot_k
+            .and_then(|s| problem.limits.steuve_at(s))
+            .and(problem.limits.direct_control_ceiling)
+            .map_or(f64::INFINITY, Power::get);
 
-        // An unmanaged tank reheats the moment it drops below its set point and
-        // stops when it is full. It knows nothing about the price or the roof,
-        // which is the whole of the difference being measured.
-        let dhw = match problem.dhw {
-            Some(d) => {
-                let draw = problem.dhw_draw_at(k) + d.standing_loss.get() * DT_HOURS;
-                dhw_stored = (dhw_stored - draw).max(0.0);
-                let missing = d.capacity.get() * DHW_THERMOSTAT_SET - dhw_stored;
-                let p = if missing > 0.0 {
-                    d.heater
-                        .get()
-                        .min(missing / (d.cop * DT_HOURS).max(f64::EPSILON))
-                } else {
-                    0.0
-                };
-                dhw_stored = (dhw_stored + p * d.cop * DT_HOURS).min(d.capacity.get());
-                p
-            }
-            None => 0.0,
-        };
+        let ev = house.charge_point(problem, k, device_ceiling, &mut cost);
+        let hp = house.heat_pump(problem, k, device_ceiling);
+        let dhw = house.hot_water(problem, k, &mut cost);
 
-        let net = load + ev + hp + dhw - pv;
+        // § 9 EEG and an LPP session bound what leaves the connection point, and
+        // they do not ask whether there is an energy manager behind it. What the
+        // baseline cannot export it throws away, at the same price the plan pays
+        // for doing so.
+        let mut net = load + ev + hp + dhw - pv;
+        if net < 0.0
+            && let Some(ceiling) = slot_k.and_then(|s| problem.limits.feed_in_at(s))
+        {
+            let curtailed = (-net - ceiling.get()).max(0.0);
+            net += curtailed;
+            cost.curtailment_eur +=
+                curtailed * problem.curtailment_penalty_eur_per_kwh * SLOT_KWH_PER_W;
+        }
+
         let price = problem.prices.slots.get(k);
         cost.energy_eur += if net >= 0.0 {
             net * price.map_or(
@@ -1202,36 +1183,162 @@ fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
         // never catches up. Leaving that out of the baseline would credit the
         // planner with comfort it did not actually have to buy.
         if let Some(t) = problem.thermal {
-            let outside = (t.comfort_min_c - thermal_state.indoor_c)
-                .max(thermal_state.indoor_c - t.comfort_max_c)
+            let outside = (t.comfort_min_c - house.thermal_state.indoor_c)
+                .max(house.thermal_state.indoor_c - t.comfort_max_c)
                 .max(0.0);
             cost.discomfort_eur += outside * t.discomfort_eur_per_kelvin_hour * DT_HOURS;
         }
     }
+    // A departure outside the horizon is not a missed deadline, so the baseline
+    // is held to exactly what the plan is held to out there: the pro-rata floor
+    // of `charging_target`. Charging it the whole outstanding balance instead
+    // would invent a failure on a car that has not left yet — the same
+    // asymmetry, pointing the other way.
+    if let Some(e) = problem.ev
+        && problem.horizon.index_of(e.deadline()).is_none()
+    {
+        let owed = (0..problem.horizon.len)
+            .filter_map(|k| charging_target(problem, e, k))
+            .fold(0.0_f64, f64::max);
+        let in_car = e.energy_target.get() - house.car_remaining;
+        cost.unserved_eur += (owed - in_car).max(0.0) * (problem.unmet_charge_eur_per_kwh / 1000.0);
+    }
     cost
+}
+
+/// The state an unmanaged household carries from slot to slot.
+///
+/// Split out of [`baseline_cost`] so each appliance's "what would it do with no
+/// energy manager" rule reads on its own — they are three independent claims and
+/// each is a place the comparison can be made unfair.
+struct Unmanaged {
+    car_remaining: f64,
+    thermostat_on: bool,
+    dhw_stored: f64,
+    thermal_state: hems_core::prelude::ThermalState,
+    thermal_step: hems_core::prelude::Rc2Discrete,
+}
+
+impl Unmanaged {
+    fn new(problem: &Problem<'_>) -> Self {
+        Self {
+            car_remaining: problem.ev.map_or(0.0, |e| {
+                (e.energy_target.get() - e.energy_now.get()).max(0.0)
+            }),
+            thermostat_on: false,
+            dhw_stored: problem.dhw.map_or(0.0, |d| d.stored_now.get()),
+            thermal_state: problem
+                .thermal
+                .map_or(hems_core::prelude::ThermalState::default(), |t| t.state),
+            thermal_step: problem.thermal_step(),
+        }
+    }
+
+    /// An unmanaged charge point runs flat out from the moment the cable goes in
+    /// until the car is full, and pays for whatever it could not deliver by the
+    /// departure.
+    fn charge_point(
+        &mut self,
+        problem: &Problem<'_>,
+        k: usize,
+        device_ceiling: f64,
+        cost: &mut hems_core::prelude::CostBreakdown,
+    ) -> f64 {
+        let slot_k = problem.horizon.get(k);
+        let ev = match problem.ev {
+            Some(e) if self.car_remaining > 0.0 && slot_k.is_some_and(|s| e.present_in(s)) => {
+                let p = e.max_charge.get().min(device_ceiling);
+                self.car_remaining = (self.car_remaining - p * e.efficiency * DT_HOURS).max(0.0);
+                p
+            }
+            _ => 0.0,
+        };
+        if let Some(e) = problem.ev
+            && slot_k == Some(e.deadline())
+        {
+            cost.unserved_eur += self.car_remaining * (problem.unmet_charge_eur_per_kwh / 1000.0);
+            self.car_remaining = 0.0;
+        }
+        ev
+    }
+
+    /// An ordinary thermostat with half a kelvin of hysteresis. It knows nothing
+    /// about the price or the weather, which is the whole of the difference
+    /// being measured.
+    fn heat_pump(&mut self, problem: &Problem<'_>, k: usize, device_ceiling: f64) -> f64 {
+        let Some(t) = problem.thermal else {
+            return 0.0;
+        };
+        if self.thermal_state.indoor_c < t.comfort_min_c {
+            self.thermostat_on = true;
+        } else if self.thermal_state.indoor_c > t.comfort_min_c + 0.5 {
+            self.thermostat_on = false;
+        }
+        let p = if self.thermostat_on {
+            t.heat_pump.max_electrical.get().min(device_ceiling)
+        } else {
+            0.0
+        };
+        let outdoor = problem.outdoor_at(k);
+        self.thermal_state = self.thermal_step.step(
+            self.thermal_state,
+            p * t.heat_pump.cop(outdoor) / 1000.0,
+            outdoor,
+        );
+        p
+    }
+
+    /// An unmanaged tank reheats the moment it drops below its set point and
+    /// stops when it is full — and is not immune to a cold shower either: it
+    /// starts each morning where the evening left it.
+    fn hot_water(
+        &mut self,
+        problem: &Problem<'_>,
+        k: usize,
+        cost: &mut hems_core::prelude::CostBreakdown,
+    ) -> f64 {
+        let Some(d) = problem.dhw else {
+            return 0.0;
+        };
+        let draw = problem.dhw_draw_at(k) + d.standing_loss.get() * DT_HOURS;
+        cost.unserved_eur += (draw - self.dhw_stored).max(0.0) * (d.shortfall_eur_per_kwh / 1000.0);
+        self.dhw_stored = (self.dhw_stored - draw).max(0.0);
+        let missing = d.capacity.get() * DHW_THERMOSTAT_SET - self.dhw_stored;
+        let p = if missing > 0.0 {
+            d.heater
+                .get()
+                .min(missing / (d.cop * DT_HOURS).max(f64::EPSILON))
+        } else {
+            0.0
+        };
+        self.dhw_stored = (self.dhw_stored + p * d.cop * DT_HOURS).min(d.capacity.get());
+        p
+    }
 }
 
 /// How much has to be in the car by the end of slot `k`, if anything.
 ///
 /// Three cases, and the middle one is the one an implementation forgets:
 ///
-/// * the departure is **inside** the horizon — the full target applies in that
-///   slot, and nothing before it;
+/// * the deadline — the slot before the departure — is **inside** the horizon:
+///   the full target applies in that slot, and nothing before it;
 /// * the departure is **beyond** the horizon — no deadline falls inside it, so
 ///   an unconstrained model would simply not charge, wait for the next re-plan,
 ///   and repeat that until the deadline finally came into view and the car could
 ///   no longer be filled in time. A pro-rata floor at the end of the horizon
 ///   keeps the plan moving at the constant rate that would just make it;
-/// * the departure is **behind** the horizon — the car should already be full,
-///   so the target applies from the first slot and the solve is infeasible if it
-///   cannot be met, which is the honest answer.
+/// * the deadline is **behind** the horizon — the car should already be full,
+///   so the target applies from the first slot and the shortfall says how far
+///   off it is.
 fn charging_target(problem: &Problem<'_>, ev: EvSession, k: usize) -> Option<f64> {
     let last = problem.horizon.len.saturating_sub(1);
     let first = problem.horizon.first;
-    if problem.horizon.index_of(ev.departure).is_some() {
-        return (problem.horizon.get(k) == Some(ev.departure)).then(|| ev.energy_target.get());
+    // The last slot the car can charge in is the one *before* it leaves.
+    let deadline = ev.deadline();
+    if problem.horizon.index_of(deadline).is_some() {
+        return (problem.horizon.get(k) == Some(deadline)).then(|| ev.energy_target.get());
     }
-    if ev.departure < first {
+    if deadline < first {
         return (k == 0).then(|| ev.energy_target.get());
     }
     if k != last {
@@ -1458,6 +1565,15 @@ fn read_back(
             .map(|k| solution.value(vars.dhw_short[k]).max(0.0))
             .sum::<f64>(),
     );
+
+    // The two soft terms of the objective, reported. Uncharged, they let the
+    // saving treat a service the household did not get as one it did not have to
+    // pay for.
+    cost.unserved_eur = unmet_charge.get() * (problem.unmet_charge_eur_per_kwh / 1000.0)
+        + unmet_hot_water.get()
+            * problem
+                .dhw
+                .map_or(0.0, |d| d.shortfall_eur_per_kwh / 1000.0);
 
     Solved {
         plan: Plan {

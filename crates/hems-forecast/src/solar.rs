@@ -153,9 +153,18 @@ impl ArrayModel {
         if ghi <= 0.0 || !sun.is_up() {
             return 0.0;
         }
-        // Erbs' correlation splits global into direct and diffuse via the
-        // clearness index; at the clear-sky reference the ratio is stable
-        // enough to take a fixed split.
+        // A fixed diffuse fraction, deliberately, and it is not Erbs.
+        //
+        // Erbs and the other correlations split global into direct and diffuse
+        // through the **clearness index**, which needs an extraterrestrial
+        // reference and a measured global value. Here the global value *is* the
+        // clear-sky model, so the clearness index is one by construction and
+        // every correlation collapses to its clear-sky end. A quarter is that
+        // end for middle latitudes, and the honest thing is to write the number
+        // rather than the name of a correlation that is not being evaluated.
+        //
+        // The error this leaves is far below the cloud forecast's, and the
+        // residual corrector learns whatever of it is systematic for this roof.
         let diffuse_fraction = 0.25;
         let dhi = ghi * diffuse_fraction;
         let bhi = ghi - dhi;

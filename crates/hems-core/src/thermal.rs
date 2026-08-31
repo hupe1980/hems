@@ -355,7 +355,7 @@ fn expm4(m: &[[f64; 4]; 4], t: f64) -> [[f64; 4]; 4] {
     } else {
         0
     };
-    let shrink = f64::from(2.0_f32).powi(-(squarings as i32));
+    let shrink = 2.0_f64.powi(-(squarings as i32));
     for row in &mut scaled {
         for v in row.iter_mut() {
             *v *= shrink;

@@ -146,6 +146,7 @@ mod tests {
             max_current: Current::new(16.0),
             bidirectional,
             public: false,
+            charge_limit: None,
         })
     }
 

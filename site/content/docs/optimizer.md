@@ -152,9 +152,11 @@ limit too tight for three conductors. That is a real case, and the answer to it
 is the soft charging deadline above rather than making every solve four times
 slower.
 
-Measured on a June day with the planner off: a switchable charge point puts
-**2,5 kWh** into the car that a fixed three-phase one exports, for **three**
-contactor operations.
+Measured on a September day with the planner off — the shoulder season, where the
+surplus sits in the 1,4 – 4,1 kW band for hours: a switchable charge point puts
+**6,0 kWh** into the car against **0,2** for a fixed three-phase one, for one
+contactor operation. Midsummer measures nothing, because the roof spends the
+middle of the day above the 4,14 kW three conductors need.
 
 ### Hot water is a store, and a cold shower has a price
 
@@ -278,9 +280,11 @@ right conditioning: the arbiter is not going to re-open them either.
 The last one answers a different question from the rest — not what a household
 *holds* but what a *limit costs it* — and it is the number this market does not
 have. €3,93/kWh on a household with no store whose car will otherwise leave
-short; €0,16 on the same household with a battery, because the store lends the
-controllable devices the headroom `[A1 2.3]` allows. Aggregators price both at
-"30 % of nominal", because nobody publishes the alternative.
+short; **nothing at all** on the same household with a battery, because the store
+lends the controllable devices all the headroom `[A1 2.3]` allows and the ceiling
+stops binding. A limit that costs a household nothing is a limit nobody should be
+compensated for. Aggregators price both at "30 % of nominal", because nobody
+publishes the alternative.
 
 The dual pass always runs on [Clarabel](https://clarabel.org), whichever backend
 solved the mixed-integer problem. Clarabel is pure Rust, so this costs no C++
@@ -321,12 +325,13 @@ The plan also reports what it expects to cost *and* what the same horizon would
 cost without any of it, so a saving is a subtraction rather than a claim.
 
 It reports that cost **term by term** — energy, battery life, curtailed
-production, comfort given up — for the plan *and* for the baseline. Comparing
-energy bills alone puts the saving back exactly where the wear term exists to
-stop it being: a number that credits the optimiser for a cycle it has already
-paid for in cell life and for a degree of cold it decided to accept. On the
-reference winter day the difference is €3,42 of bill against €2,23 of actual
-saving. The larger number is the one every other system quotes.
+production, comfort given up, and the service it decided not to deliver — for the
+plan *and* for the baseline. The invariant is that **every term of the objective
+is a term of the report**: comparing energy bills alone credits the optimiser for
+a cycle it has already paid for in cell life, for a degree of cold it accepted,
+and for a charging session it abandoned. On the reference winter day the
+difference is €3,39 of bill against €2,21 of actual saving. The larger number is
+the one every other system quotes.
 
 The ledger is closed on the stores as well. A period that ends with an emptier
 battery than it began with has spent something it started with, and that is
@@ -343,3 +348,10 @@ the moment the car is plugged in, and a heat pump and a hot-water tank on
 ordinary thermostats, stepped through the same two-mass building model the plan
 is solved against. A baseline that priced a household with no car and no heating
 at all would credit the optimiser for energy it never had to buy.
+
+It also lives under the **same law**: a house with no energy management system
+cannot be addressed as one `[A1 4.4.b]`, so during a reduction its Steuerbox
+turns each device down on its own `[A1 4.4.a]` and may take none of them below
+`[A1 4.5.1]`, and its roof is capped by § 9 EEG like any other. And it pays for
+the service it fails to deliver, on the same terms — an unmanaged wallbox on a car
+plugged in an hour before it leaves falls short too.

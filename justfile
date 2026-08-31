@@ -84,14 +84,15 @@ demo-all:
     @just demo deadline
     @just demo shared
     @just demo offline
+    @just demo autumn
     @just demo capped
     @echo "  ── the same winter day with the future known in advance ──"
     @echo "  ── (what every saving figure in this project was, before v1.2) ──"
     cargo run -q -p hemsd -- simulate --day winter --perfect-foresight
     @echo "  ── the same winter day with battery wear priced at zero ──"
     cargo run -q -p hemsd -- simulate --day winter --wear-eur-per-kwh 0
-    @echo "  ── the same June day, planner off, with a fixed three-phase wallbox ──"
-    cargo run -q -p hemsd -- simulate --day offline --no-phase-switching
+    @echo "  ── the same September day with a fixed three-phase wallbox ──"
+    cargo run -q -p hemsd -- simulate --day autumn --no-phase-switching
     @echo "  ── the same capped day with an intelligent meter, which lifts § 9 EEG ──"
     cargo run -q -p hemsd -- simulate --day capped --imsys
     @echo "  ── the shared reduction with every asset weighted the same ──"

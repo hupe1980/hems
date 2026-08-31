@@ -50,6 +50,14 @@ pub struct HouseholdConfig {
     /// they may feed in 60 % of their installed direct-current power and no
     /// more.
     pub cap_relief: CapRelief,
+    /// The state of charge the household asked its car to reach.
+    ///
+    /// `None` means "fill it". It is only ever read by the real-time fallback —
+    /// the planner is given an energy target and a departure, which say the same
+    /// thing more precisely — but that is the mode G3 is about, and a surplus
+    /// tracker with no notion of *enough* charges past the limit in preference to
+    /// exporting.
+    pub ev_charge_limit: Option<Soc>,
     /// Whether the charge point can drop to a single conductor.
     ///
     /// Almost every wallbox sold in Germany since about 2022 can, and it is what
@@ -83,6 +91,10 @@ impl Default for HouseholdConfig {
             dhw_litres: 300.0,
             dhw_heater: Power::from_kw(0.5),
             cap_relief: CapRelief::None,
+            // Three quarters, the figure most owners of a car they drive daily
+            // set: it is where lithium ageing turns and where a charging session
+            // stops being worth waiting for.
+            ev_charge_limit: Soc::new(0.75).ok(),
             evse_switchable: true,
             location: GeoPoint {
                 latitude: 52.52,
@@ -231,6 +243,12 @@ fn assets_of(
             max_current: Current::new(16.0),
             bidirectional: false,
             public: false,
+            // The household's Ladelimit, as a fraction of the vehicle's own
+            // capacity. The planner works from an energy target and a departure
+            // and never reads this; the real-time fallback has neither, and
+            // without it a box with no plan pushes surplus into a car that
+            // already has what it was asked for rather than exporting it.
+            charge_limit: config.ev_charge_limit,
         }),
         Asset::HeatPump(HeatPump {
             meta: meta(

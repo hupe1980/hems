@@ -1423,6 +1423,7 @@ mod tests {
                     max_current: Current::new(16.0),
                     bidirectional: false,
                     public: false,
+                    charge_limit: None,
                 }),
                 Asset::Battery(Battery {
                     meta: meta("battery", 5.0),
@@ -1860,6 +1861,7 @@ mod tests {
                 max_current: Current::new(16.0),
                 bidirectional: false,
                 public: false,
+                charge_limit: None,
             }));
         }
         let site = Site::new(
@@ -2003,6 +2005,7 @@ mod tests {
                 max_current: Current::new(20.0),
                 bidirectional: false,
                 public: false,
+                charge_limit: None,
             }));
         }
         Site::new(

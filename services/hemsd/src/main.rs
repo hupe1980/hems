@@ -65,6 +65,9 @@ enum Day {
     Shared,
     /// The June day with the planner switched off — the box on its own.
     Offline,
+    /// A September day with the planner off and broken cloud, where the surplus
+    /// spends its time in the band only one conductor can use.
+    Autumn,
     /// The June day with nobody home: the § 9 EEG 60 % cap against a roof the
     /// house cannot use.
     Capped,
@@ -102,6 +105,7 @@ fn main() -> anyhow::Result<()> {
                 Day::Deadline => Scenario::winter_evening_deadline(config),
                 Day::Shared => Scenario::winter_evening_no_store(&config),
                 Day::Offline => Scenario::summer_without_a_planner(config),
+                Day::Autumn => Scenario::autumn_without_a_planner(config),
                 Day::Capped => Scenario::summer_capped(&config),
             };
             if perfect_foresight {
@@ -216,6 +220,18 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         "comfort given up",
         format!("{:.2} €", r.cost.discomfort_eur),
     );
+    if r.cost.curtailment_eur > 0.005 {
+        row(
+            "production thrown away",
+            format!("{:.2} €", r.cost.curtailment_eur),
+        );
+    }
+    if r.cost.unserved_eur > 0.005 {
+        row(
+            "service not delivered",
+            format!("{:.2} €", r.cost.unserved_eur),
+        );
+    }
     if r.cost.stored_eur > 0.005 {
         row(
             "borrowed from the stores",
@@ -234,6 +250,24 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
     );
     println!();
     row("§ 14a limit in force", format!("{} min", r.limited_minutes));
+    if r.limited_minutes > 0 {
+        row(
+            "…against a minimum of",
+            format!("{:.1} kW", r.minimum_power_kw),
+        );
+    }
+    if r.commanded_below_minimum {
+        row(
+            "commanded below that minimum",
+            "YES — unlawful, and recorded".to_string(),
+        );
+    }
+    if r.failsafe_below_minimum {
+        row(
+            "own failsafe below that minimum",
+            "YES — a configuration fault".to_string(),
+        );
+    }
     if r.lent_kwh > 0.005 {
         row("…covered by the store", format!("{:.1} kWh", r.lent_kwh));
     }
@@ -258,6 +292,11 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         row(
             "car left short by",
             format!("{:.1} kWh", r.unmet_charge_kwh),
+        );
+    } else if r.planned_charge_shortfall_kwh > 0.01 {
+        row(
+            "a plan feared falling short by",
+            format!("{:.1} kWh, and did not", r.planned_charge_shortfall_kwh),
         );
     }
     row(

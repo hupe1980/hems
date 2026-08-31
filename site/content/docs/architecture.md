@@ -117,11 +117,14 @@ A literal setpoint survives none of them.
 **And when there is no plan at all, it keeps the house running anyway.** A cold
 start, a stale plan, a solver that timed out — the fallback is what every home
 battery has always done: cover the house from the roof and the store rather than
-from the grid, in both directions. Absorbing surplus and stopping there was the
-earlier behaviour, and it meant an offline box bought the evening peak at the
-retail price with a full battery sitting behind the meter. `just demo offline`
-runs a whole June day that way: 100 % self-sufficiency, 3,0 kWh imported, no
-planner at all.
+from the grid, in both directions. Absorbing surplus and stopping there leaves an
+offline box buying the evening peak at the retail price with a full battery
+sitting behind the meter. `just demo offline` runs a whole June day that way:
+100 % self-sufficiency, 2,7 kWh imported, no planner at all.
+
+It also knows the word *enough*: the charge point carries the household's own
+Ladelimit and the fallback stops there, rather than pushing production into a car
+that already has what it was asked for in preference to exporting it.
 
 **And "no plan" does not mean "zero" for every device.** An inverter, a heat pump
 and a hot-water tank all answer a request for *less*; an energy manager only ever
@@ -177,10 +180,14 @@ handed over. What the conductor **policy** reads uses the lowest minimum the
 wiring can reach, so a session shed for failing a three-phase minimum can still
 argue its way down to one conductor.
 
-Measured: with a 10 kWh battery and a working planner it is worth a cent or two a
-day, because a planner can duty-cycle a quarter hour and reach the same average.
-With the planner off it puts **2,5 kWh a day into the car** that would otherwise
-have been exported, for **three** contactor operations.
+Measured, and the season decides it. With a working planner it is worth a cent or
+two a day, because a planner can duty-cycle a quarter hour and reach the same
+average. In midsummer it is worth nothing even with the planner off: the roof
+spends the middle of the day above the 4,14 kW three conductors need, so the car
+fills either way. The German shoulder season is the other nine months — on the
+September reference day the surplus sits in the 1,4 – 4,1 kW band all afternoon,
+and a switchable wallbox puts **6,0 kWh** into the car against **0,2**, for one
+contactor operation.
 
 ### The planner
 

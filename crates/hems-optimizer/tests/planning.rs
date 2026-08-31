@@ -223,7 +223,8 @@ fn a_car_reaches_its_target_before_it_leaves() {
         max_charge: Power::from_kw(11.0),
         min_charge: Power::from_kw(4.14),
         efficiency: 0.92,
-        departure: h.get(11).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(11).unwrap().next(),
     };
     let solved = solve(&Problem::new(h, &p, &pv, &load).with_ev(ev), &names(), T0).unwrap();
 
@@ -680,7 +681,8 @@ fn a_charge_point_is_never_asked_for_a_current_it_cannot_deliver() {
         max_charge: Power::from_kw(11.0),
         min_charge: Power::from_kw(4.14),
         efficiency: 0.92,
-        departure: h.get(23).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(23).unwrap().next(),
     };
     let solved = solve(&Problem::new(h, &p, &pv, &load).with_ev(ev), &names(), T0).unwrap();
     for (k, f) in solved.flows.iter().enumerate() {
@@ -752,7 +754,8 @@ fn the_baseline_delivers_the_same_service_as_the_plan() {
         max_charge: Power::from_kw(11.0),
         min_charge: Power::from_kw(4.14),
         efficiency: 0.92,
-        departure: h.get(23).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(23).unwrap().next(),
     };
     let solved = solve(&Problem::new(h, &p, &pv, &load).with_ev(ev), &names(), T0).unwrap();
     let baseline = solved.plan.baseline_cost.unwrap().total();
@@ -842,7 +845,8 @@ fn a_deadline_that_cannot_be_met_returns_the_best_plan_and_says_how_short_it_is(
         max_charge: Power::from_kw(11.0),
         min_charge: Power::from_kw(4.14),
         efficiency: 0.92,
-        departure: h.get(3).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(3).unwrap().next(),
     };
     let solved = solve(&Problem::new(h, &p, &pv, &load).with_ev(ev), &names(), T0)
         .expect("an impossible deadline is still a plan");
@@ -880,7 +884,8 @@ fn a_deadline_that_can_be_met_is_met_and_reports_no_shortfall() {
         max_charge: Power::from_kw(11.0),
         min_charge: Power::from_kw(4.14),
         efficiency: 0.92,
-        departure: h.get(23).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(23).unwrap().next(),
     };
     let solved = solve(&Problem::new(h, &p, &pv, &load).with_ev(ev), &names(), T0).unwrap();
     assert!(
@@ -1003,7 +1008,8 @@ fn a_binding_ceiling_prices_the_relief_the_operator_did_not_give() {
         min_charge: Power::ZERO,
         efficiency: 0.95,
         arrival: None,
-        departure: h.get(7).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(7).unwrap().next(),
     };
     let free = solve(&Problem::new(h, &p, &pv, &load).with_ev(ev), &names(), T0).unwrap();
     let squeezed = solve(
@@ -1062,7 +1068,8 @@ fn a_car_that_will_be_short_outbids_a_tank_that_will_not() {
         min_charge: Power::ZERO,
         efficiency: 0.95,
         arrival: None,
-        departure: h.get(11).unwrap(),
+        // The first slot the car is gone.
+        departure: h.get(11).unwrap().next(),
     };
     let dhw = DhwModel::tank(Energy::from_kwh(5.0), Power::from_kw(2.0));
     let solved = solve(

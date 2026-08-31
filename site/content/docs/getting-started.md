@@ -27,25 +27,26 @@ build — the same list, in the same order, that CI runs.
 $ just demo-all
 ```
 
-Six days and five comparisons:
+Seven days and five comparisons:
 
-| Day | What it shows |
-|---|---|
-| `winter` | a network operator reduction from 17:00 to 18:30, and a car that must be full by seven |
-| `summer` | more production than the house can use, and four quarter hours of negative prices |
-| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 12 kWh under a 4,2 kW ceiling it shares with a heat pump |
-| `shared` | the same evening on a household with **no store**, and a reduction that arrives at 17:07 rather than on the re-planning grid |
-| `offline` | **the planner switched off** — what the box does on its own |
-| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,00 of 12,00 kW |
+| Day | What it shows | Saved |
+|---|---|---|
+| `winter` | a network operator reduction from 17:00 to 18:30, and a car that must be full by seven | €2,21 |
+| `summer` | more production than the house can use, and four quarter hours of negative prices | €8,78 |
+| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 12 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,56 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,41 |
+| `offline` | **the planner switched off** — what the box does on its own | €7,85 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €1,51 |
+| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,00 of 12,00 kW | €1,22 |
 
 …plus five comparisons:
 
 | Flag | What it isolates |
 |---|---|
-| `--perfect-foresight` | the January day with the future known in advance: €5,52 against the €2,23 an honest forecast earns |
-| `--wear-eur-per-kwh 0` | what a cost-only optimiser does to a battery — 18,5 kWh of throughput instead of 15,4 |
-| `--no-phase-switching` | a wallbox wired to three fixed conductors exports 5,5 kWh where a switchable one puts 31,0 kWh into the car instead of 28,5 |
-| `--imsys` | what an intelligent metering system with a control device is worth to a roof that has not been given one |
+| `--perfect-foresight` | the January day with the future known in advance: €5,49 against the €2,21 an honest forecast earns |
+| `--wear-eur-per-kwh 0` | what a cost-only optimiser does to a battery — 18,5 kWh of throughput instead of 15,9 |
+| `--no-phase-switching` | on the autumn day: 0,2 kWh into the car against 6,0, and a car 4,8 kWh short of where it had to be |
+| `--imsys` | the § 9 EEG cap lifted on both households — one cent to the managed one, twelve to the unmanaged one |
 | `--uniform-weights` | every asset given the same allocation weight, which is what a single marginal value per slot amounts to |
 
 ## Use one crate

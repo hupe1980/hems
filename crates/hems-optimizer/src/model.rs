@@ -123,7 +123,20 @@ pub struct EvSession {
     /// again in whatever hours are left, which are the expensive ones.
     #[cfg_attr(feature = "serde", serde(default))]
     pub arrival: Option<Slot>,
-    /// The slot the car leaves in. The target must be met by then.
+    /// The first slot the car is **gone**.
+    ///
+    /// Half-open, like [`TimedLimit::until`], and that is not a presentation
+    /// choice. Read the other way — "the last slot it can charge in" — a car
+    /// leaving at eight is planned as though it could still be charging at
+    /// 08:14, and a plan with a loose enough ceiling to defer will happily put
+    /// the last quarter hour of a session into a slot the cable is out for. At
+    /// 11 kW that is 2,75 kWh the car never receives, and it is invisible
+    /// wherever a limit was tight enough to force the charging earlier: the
+    /// reference evening lost **more** of its charge with no reduction at all
+    /// than under one.
+    ///
+    /// The target must therefore be met by the end of the slot **before** this
+    /// one, which is [`EvSession::deadline`].
     pub departure: Slot,
 }
 
@@ -131,7 +144,13 @@ impl EvSession {
     /// Whether the car is plugged in during `slot`.
     #[must_use]
     pub fn present_in(&self, slot: Slot) -> bool {
-        self.arrival.is_none_or(|a| slot >= a) && slot <= self.departure
+        self.arrival.is_none_or(|a| slot >= a) && slot < self.departure
+    }
+
+    /// The last slot the car can charge in — the one before it leaves.
+    #[must_use]
+    pub fn deadline(&self) -> Slot {
+        self.departure.prev()
     }
 }
 
@@ -436,6 +455,24 @@ pub struct PlanningLimits {
     /// The largest import the connection allows. A fuse has no schedule.
     #[cfg_attr(feature = "serde", serde(default))]
     pub import_ceiling: Option<Power>,
+    /// The ceiling **one** controllable device faces while a `steuve` limit is
+    /// in force, under direct control `[A1 4.4.a]`.
+    ///
+    /// This is not a constraint on the plan — the plan is addressed as an energy
+    /// management system `[A1 4.4.b]` and gets one number for everything behind
+    /// it. It is what the **baseline** lives under. Leaving it out measures the
+    /// saving against a household that ignored the network operator, which is
+    /// not a lawful household and not one anybody can buy: a house with no
+    /// energy manager cannot be addressed as one, so its Steuerbox turns each
+    /// device down on its own and may not go below the minimum of
+    /// `[A1 4.5.1]`.
+    ///
+    /// `None` leaves the baseline unlimited, which is right only where no
+    /// § 14a limit applies at all. `hems-grid` owns the number
+    /// (`para14a::MINDESTLEISTUNG`); this crate does not restate a regulation it
+    /// does not depend on.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub direct_control_ceiling: Option<Power>,
 }
 
 impl PlanningLimits {
@@ -457,6 +494,14 @@ impl PlanningLimits {
     #[must_use]
     pub const fn with_import_ceiling(mut self, ceiling: Power) -> Self {
         self.import_ceiling = Some(ceiling);
+        self
+    }
+
+    /// Set the per-device ceiling the baseline household faces under direct
+    /// control `[A1 4.4.a]`.
+    #[must_use]
+    pub const fn with_direct_control_ceiling(mut self, ceiling: Power) -> Self {
+        self.direct_control_ceiling = Some(ceiling);
         self
     }
 

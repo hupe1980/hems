@@ -98,10 +98,10 @@ $ cargo run -p hemsd -- simulate --day winter --perfect-foresight
 
 | Day | Saved | Saved, knowing the future | The premium |
 |---|---|---|---|
-| January, § 14a reduction, 20 kWh of charging to place | **€2,23** | €5,52 | 60 % |
-| January evening, car arrives *as* the reduction starts | **€3,06** | €7,09 | 57 % |
-| June, more sun than the house can use | **€8,80** | €9,07 | 3 % |
-| May, § 9 EEG cap, no car | **€1,11** | €1,10 | — |
+| January, § 14a reduction, 20 kWh of charging to place | **€2,21** | €5,49 | 60 % |
+| January evening, car arrives *as* the reduction starts | **€2,56** | €5,74 | 55 % |
+| June, more sun than the house can use | **€8,78** | €9,00 | 2 % |
+| May, § 9 EEG cap, no car | **€1,22** | €1,35 | 10 % |
 
 The shape of that table is a result rather than noise. Where the surplus lasts
 all day the plan has slack and being wrong costs nothing. Where a large charging

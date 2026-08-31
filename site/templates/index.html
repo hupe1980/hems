@@ -1,2 +1,30 @@
 {% extends "base.html" %}
+
+{% block prelude %}
+<section class="hero">
+  <div class="hero-inner">
+    <p class="hero-eyebrow">Open source · Rust · § 14a EnWG · § 9 EEG · EEBUS · S2 / EN 50491-12-2</p>
+    <h1 class="hero-title">The house is a power station now.</h1>
+    <p class="hero-sub">hems is the open-source home energy management platform for
+      the German prosumer household: every grid obligation modelled as executable,
+      cited, auditable code — and a guard plane the optimiser cannot argue with.</p>
+    <div class="hero-cta">
+      <a class="btn btn-primary" href="{{ get_url(path='@/docs/getting-started.md') | safe }}">Get started</a>
+      <a class="btn btn-ghost" href="{{ get_url(path='@/docs/_index.md') | safe }}">Read the docs</a>
+      <a class="btn btn-ghost" href="{{ config.extra.repository }}" rel="noopener">GitHub ↗</a>
+    </div>
+  </div>
+</section>
+
+<section class="stats">
+  <div class="stats-inner">
+    <div><strong>{{ config.extra.stat_rules }}</strong><span>citations checked by the build</span></div>
+    <div><strong>{{ config.extra.stat_tests }}</strong><span>tests, sans-I/O</span></div>
+    <div><strong>{{ config.extra.stat_crates }}</strong><span>domain crates with no I/O</span></div>
+    <div><strong>{{ config.extra.stat_days }}</strong><span>reference days in CI</span></div>
+    <div><strong>{{ config.extra.stat_horizon }}</strong><span>quarter-hour MPC horizon</span></div>
+  </div>
+</section>
+{% endblock prelude %}
+
 {% block content %}{{ section.content | safe }}{% endblock %}

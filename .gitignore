@@ -20,8 +20,7 @@ target
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Internal-only documents (not published)
-CONCEPT.md
+# Internal-only documents (not published) — the architecture notes and the backlog
 concepts/
 # Third-party specifications, laws, standards and papers (copyrighted; indexed
 # with retrieval URLs in specs/README.md so the folder can be rebuilt).

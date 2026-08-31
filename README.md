@@ -85,8 +85,15 @@ CO₂ while leaving wear in euros would be minimising a sum of two currencies.
 The same terms come back out in the **reported** saving, for the plan and for the
 baseline alike. Comparing electricity bills alone puts the saving back exactly
 where the wear term exists to stop it being: on the reference winter day that is
-€3,42 of bill against €2,23 of actual saving. The larger number is the one every
+€3,39 of bill against €2,21 of actual saving. The larger number is the one every
 other system quotes.
+
+The invariant is one line: **every term of the objective is a term of the
+report.** The charging deadline and the morning shower are priced *soft*, so a day
+nobody could have got through returns the best achievable schedule rather than
+none — and a soft cost that is spent but not charged is a discount the optimiser
+helps itself to. A plan that gives up two kilowatt-hours of charge buys two
+kilowatt-hours less electricity: energy nobody used is energy nobody bought.
 
 The ledger is closed on the stores too. A day that ends with an emptier battery
 than it began with has spent something it started with, and that is charged — the
@@ -103,7 +110,7 @@ bound no box in a real house can reach.
 
 So the simulator runs a seeded **realisation** — a cloud that passes at 12:19, an
 afternoon three kelvin milder than modelled, a shower that ran long, a roof
-delivering 92 % of its datasheet — and the planner gets only what a box could
+delivering 90 % of its datasheet — and the planner gets only what a box could
 have known: the geometric model corrected by what *this* roof has been
 delivering, this household's own load profile by day type, its own charging
 sessions by weekday. The day still replays to the last cent; the planner has to
@@ -113,10 +120,10 @@ What that costs is the most useful number the simulator produces:
 
 | Day | Saved | Saved, knowing the future | Premium |
 |---|---|---|---|
-| January, § 14a reduction, car to charge | **€2,23** | €5,52 | 60 % |
-| January evening, car arrives *as* the reduction starts | **€3,06** | €7,09 | 57 % |
-| June, more sun than the house can use | **€8,80** | €9,07 | 3 % |
-| May, § 9 EEG cap | **€1,11** | €1,10 | — |
+| January, § 14a reduction, car to charge | **€2,21** | €5,49 | 60 % |
+| January evening, car arrives *as* the reduction starts | **€2,56** | €5,74 | 55 % |
+| June, more sun than the house can use | **€8,78** | €9,00 | 2 % |
+| May, § 9 EEG cap | **€1,22** | €1,35 | 10 % |
 
 ```console
 $ cargo run -p hemsd -- simulate --day winter --perfect-foresight
@@ -154,15 +161,17 @@ The same pass prices the § 14a ceiling itself:
 
 What a kilowatt-hour of relief from a network operator's limit is worth to *this*
 household, from its own plan. €3,93/kWh in a house with no store whose car will
-otherwise leave short; €0,16 on the same evening with a battery, because the
-store lends the controllable devices the headroom `[A1 2.3]` allows. Aggregators
-price both at "30 % of nominal". It is what a § 41e offer or an OpenADR bid
-should be built from.
+otherwise leave short; **nothing at all** on the same evening with a battery,
+because the store lends the controllable devices all the headroom `[A1 2.3]`
+allows and the operator's ceiling costs the household nothing. Aggregators price
+both at "30 % of nominal". A limit that costs nothing is a limit nobody should be
+compensated for, and saying so is half of what the number is for; it is what a
+§ 41e offer or an OpenADR bid should be built from.
 
 One limitation, measured rather than assumed: on the reference household the
 weights change no day's outcome, because the planner has usually already solved
-the split, the charge point's indivisible 6 A minimum eats most of a 4,2 kW
-budget, and the hardware quantises the rest. `--uniform-weights` is the
+the split, the charge point's indivisible 6 A minimum eats most of the budget,
+and the hardware quantises the rest. `--uniform-weights` is the
 comparison and it prints the same numbers.
 
 ### 5. It runs the house when the cloud is gone
@@ -176,7 +185,14 @@ And when there is no plan at all — a cold start, a stale plan, a solver that
 timed out — the arbiter does what every home battery has always done: covers the
 house from the roof and the store rather than from the grid, in both directions.
 `just demo offline` runs a whole June day that way: **100 % self-sufficiency,
-3,0 kWh imported, no planner at all.**
+2,7 kWh imported, no planner at all.**
+
+It also knows the word *enough*. The charge point carries the household's own
+Ladelimit, and the fallback stops there — a surplus tracker without one keeps
+pushing production into a car that has already had what it was asked for, in
+preference to exporting it for money. That is 4,6 kWh and 39 cents on the June
+day, and it is the preference every competing surplus-charger has and this one
+did not.
 
 Which is not the same as holding everything at zero. A device an energy manager
 can only *limit* — an inverter, a heat pump, a hot-water tank — has controls of
@@ -227,16 +243,24 @@ the difference is a type rather than a comment.
 because the cap is a fraction of *direct-current* power and what a roof delivers
 against it is decided by cell temperature — and prints the quarter-hour feed-in
 peak against the ceiling. The cap binds, for four quarter hours around solar
-noon, and what it costs is **0,4 kWh**.
+noon, and what it costs is **0,2 kWh** of export.
 
 That is far less than "60 %" sounds, and the arithmetic is worth stating plainly
 because nobody else does: a German roof's clear-day peak is only about two thirds
 of its direct-current rating once system losses, soiling and a 50 °C cell are
 taken off, so a 60 % line clips the top tenth of the peak on the clearest days of
 the year — and a household with a store, a tank and a heat pump **absorbs** most
-of that rather than throwing it away. The earlier figure of 3,0 kWh in this
-README came from a June day, a planner with perfect foresight and a roof that had
-never been told it was dirty. All three flattered it.
+of that rather than throwing it away. Three things inflate the figure
+several-fold if any of them is wrong: a June day rather than a May one, a planner
+shown the weather in advance, and a roof modelled at its datasheet rather than at
+what a three-year-old one delivers.
+
+Which household it costs is the number worth having, and it needs a baseline that
+is **also** capped — because § 9 EEG does not ask whether there is an energy
+manager behind the meter. `--imsys` lifts the cap on both: the managed
+household's own cost moves by **one cent**, the unmanaged one's by **twelve**.
+That ratio is the case for owning an energy manager under the Solarspitzengesetz,
+and it is invisible to anyone whose baseline ignores the law.
 
 ## 🏠 One day, end to end
 
@@ -248,34 +272,34 @@ $ cargo run -p hemsd -- simulate --day winter
   produced                                  8.4 kWh
   household consumption                    11.0 kWh
   charged into the car                     21.7 kWh
-  heat pump                                26.2 kWh
+  heat pump                                26.0 kWh
   hot water                                 3.1 kWh
-  battery throughput                       15.4 kWh
-  imported                                 54.4 kWh
+  battery throughput                       15.9 kWh
+  imported                                 54.8 kWh
   exported                                  0.3 kWh
   curtailed                                 0.0 kWh
-  peak feed-in, per quarter hour      0.12 of 5.88 kW
+  peak feed-in, per quarter hour     0.12 of 5.88 kW
   self-sufficiency                             13 %
   wallbox on one conductor           0 min (0 switches)
 
   indoor temperature                 19.9 – 23.1 °C
-  outside the comfort band                 0.15 K·h
-  hot-water tank, emptiest                21 % full
+  outside the comfort band                 0.13 K·h
+  hot-water tank, emptiest                24 % full
 
   roof, as the box learned it        90 % of the model
   production forecast, CRPS          65 W (93 % covered)
   load forecast, CRPS                18 W (85 % covered)
 
-  electricity bill                          20.47 €
-  battery life spent                         0.63 €
-  comfort given up                           0.22 €
-  borrowed from the stores                   0.19 €
+  electricity bill                          20.67 €
+  battery life spent                         0.64 €
+  comfort given up                           0.20 €
   cost of the day                           21.51 €
-  without optimisation                      23.74 €
-  saved                                      2.23 €
-  …of it on the bill                         3.42 €
+  without optimisation                      23.72 €
+  saved                                      2.21 €
+  …of it on the bill                         3.39 €
 
   § 14a limit in force                       90 min
+  …against a minimum of                     10.5 kW
   …covered by the store                     1.5 kWh
   control events recorded            1 (93 samples)
   self-restraint records                          1
@@ -286,17 +310,27 @@ $ cargo run -p hemsd -- simulate --day winter
 
   described in S2                       5 resources
   dearest asset vs cheapest                      2×
-  relief from § 14a was worth            0.16 €/kWh
+  relief from § 14a was worth            0.00 €/kWh
   Modul 2 pays above                     2417 kWh/a
-  …on this day it would have         -3.90 € on the energy
+  …on this day it would have         -3.91 € on the energy
 ```
 
 The baseline is the same day delivering the **same service** — the car still
 reaches its target, the house is still warm and the shower is still hot — with no
 battery, a wallbox that starts on plug-in, and a heat pump and a tank on ordinary
-thermostats. It also faces the **same weather**, down to the cloud at 12:19: a
-baseline run against a different realisation prices two different Tuesdays and
-calls the difference a saving.
+thermostats. It also faces the **same weather**, down to the cloud at 12:19, and
+the **same law**: its Steuerbox turns each device down on its own `[A1 4.4.a]`
+while the reduction lasts, and its roof is capped by § 9 EEG. A baseline run
+against a different realisation prices two different Tuesdays and calls the
+difference a saving; a baseline free of the grid rules prices a household nobody
+is allowed to be.
+
+"…against a minimum of" is what `[A1 4.5.2]` owes *this* household:
+`4,2 kW + (n − 1) · GZF(n) · 4,2 kW`, so 10,5 kW once there is a wallbox, a heat
+pump and a battery behind the energy manager. The flat 4,2 kW is the **base** of
+that formula, not the whole of it — every reference day in this project used to
+command it, which is an instruction no operator may lawfully send, and the field
+that said so was written to the evidence record and printed nowhere.
 
 "…covered by the store" is `[A1 2.3]` in one number: the kilowatt-hours the
 battery lent the controllable devices during the reduction, which never crossed
@@ -325,25 +359,26 @@ the arbiter drops a plan older than its tolerance, so a planner that re-solves
 more slowly than that leaves the house on the fallback for part of every cycle,
 silently.
 
-`just demo-all` runs six days and five comparisons:
+`just demo-all` runs seven days and five comparisons:
 
-| `just demo …` | What it shows |
-|---|---|
-| `winter` | a § 14a reduction at teatime and a car that must be full by seven |
-| `summer` | more production than the house can use, and four negative quarter hours |
-| `deadline` | a car that arrives **as the reduction starts** and takes 12 kWh under a 4,2 kW ceiling it shares with a heat pump — the store lends it 6,6 kWh |
-| `shared` | the same evening on a household with **no store**, with the reduction arriving at **17:07** rather than on the re-planning grid — the only case where the guard, not the planner, decides who gets it |
-| `offline` | **the planner switched off** — the box on its own, and the only day a switchable wallbox pays for itself |
-| `capped` | a clear May day on a 20 kWp roof against the § 9 EEG 60 % cap |
+| `just demo …` | What it shows | Saved |
+|---|---|---|
+| `winter` | a § 14a reduction at teatime and a car that must be full by seven | €2,21 |
+| `summer` | more production than the house can use, and four negative quarter hours | €8,78 |
+| `deadline` | a car that arrives **as the reduction starts** and takes 12 kWh under the household's own 10,5 kW minimum, shared with a heat pump — the store lends it 5,4 kWh | €2,56 |
+| `shared` | the same evening on a household with **no store** — owed 7,56 kW rather than 10,5, because two controllable devices are not three — with the reduction arriving at **17:07** rather than on the re-planning grid. The only case where the guard, not the planner, decides who gets it | €1,41 |
+| `offline` | **the planner switched off** — the box on its own | €7,85 |
+| `autumn` | a September day, planner off, the surplus in the 1,4 – 4,1 kW band all afternoon: the day a switchable wallbox is the whole session | €1,51 |
+| `capped` | a clear May day on a 20 kWp roof against the § 9 EEG 60 % cap | €1,22 |
 
 and beside them, five comparisons that each isolate one mechanism:
 
 | Flag | What it isolates |
 |---|---|
-| `--perfect-foresight` | the winter day with the future known in advance: €5,52 against €2,23 — what a saving quoted without a forecast measures |
-| `--wear-eur-per-kwh 0` | 18,5 kWh of battery throughput instead of 15,4, for €0,37 more saving on paper and none in the cell |
-| `--no-phase-switching` | a fixed three-phase wallbox exports 5,5 kWh where a switchable one puts 31,0 kWh into the car instead of 28,5 |
-| `--imsys` | what a Steuerbox is worth to a roof that has not been given one |
+| `--perfect-foresight` | the winter day with the future known in advance: €5,49 against €2,21 — what a saving quoted without a forecast measures |
+| `--wear-eur-per-kwh 0` | 18,5 kWh of battery throughput instead of 15,9, for €0,37 more saving on paper and none in the cell |
+| `--no-phase-switching` | on the **autumn** day: 0,2 kWh into the car against 6,0, and a car 4,8 kWh short of where it had to be. Not the June day — midsummer fills the car three-phase either way |
+| `--imsys` | the § 9 EEG cap lifted on both households: one cent to the managed one, twelve to the unmanaged one |
 | `--uniform-weights` | every asset weighted the same, which is what one marginal value per slot amounts to |
 
 ## 🧱 Architecture
@@ -421,7 +456,7 @@ without a citation does not compile.
 ```console
 $ git clone https://github.com/hupe1980/hems && cd hems
 $ just ci          # fmt, clippy, purity, tests, guards, licences, docs
-$ just demo-all    # six days end to end, and five comparisons worth seeing
+$ just demo-all    # seven days end to end, and five comparisons worth seeing
 ```
 
 Released builds of the daemon are on the
@@ -471,6 +506,7 @@ assert!((minimum_power(&devices, ControlMode::Ems).kw() - 7.56).abs() < 1e-9);
 | **M3.11** the § 14a, Modul 3, Schieflast and allocation arithmetic delegated to `metering` 0.21; a Modul 3 calendar that knows a Sunday; the Verursachungsregel and the Aufteilungsschlüssel as choices rather than assumptions | ✅ done |
 | **M3.12** the end of perfect foresight — a seeded weather realisation, forecasts the box has to *learn*, the price-source parsers, § 42c and the S2 model given callers, and every day scored against what it actually predicted | ✅ done |
 | **M3.13** per-asset shadow prices from a pinned-binary dual pass on Clarabel, the § 14a ceiling priced as flexibility, and a reduction that arrives off the re-planning grid | ✅ done |
+| **M3.14** every term of the objective reported, a baseline that obeys the same grid rules, reductions derived from the household's own § 14a minimum, and a charge limit the real-time fallback honours | ✅ done |
 | **M4** a driver trait and the first real driver: Modbus/SunSpec | ⏳ next |
 | **M5** EEBUS (SHIP/SPINE, LPC/LPP/MPC/MGCP), OCPP, SG Ready, SMGW | ⏳ blocked on the [`eebus`](https://github.com/hupe1980/eebus) crate |
 | **M6** fleet services, market bridge to `mako` | 📋 planned |
@@ -480,9 +516,9 @@ the drivers are M4/M5. What is real is the control stack and the rules, and they
 are real all the way down — the simulated days run the same guard, arbiter and
 planner a box would.
 
-442 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+447 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (244 citations across five document
+clock, the whole suite, the workspace guards (279 citations across five document
 families, each resolving to a document the index carries), `cargo-deny` and the
 docs.
 

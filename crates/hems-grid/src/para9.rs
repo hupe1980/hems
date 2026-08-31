@@ -143,8 +143,8 @@ impl FeedInLimits {
     /// conversations: an LPP session is the network operator reducing this
     /// house right now, the `MGCP` factor is the § 9 EEG limitation announced
     /// over the wire, and the statutory cap is the law applying by itself. An
-    /// earlier version reported the factor as an LPP session, which told the
-    /// household the operator had intervened when it had not.
+    /// reporting the factor as an LPP session would tell the household the
+    /// operator had intervened when it had not.
     #[must_use]
     pub fn binding_rule(
         &self,

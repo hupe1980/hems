@@ -141,16 +141,23 @@ impl SlotPlan {
 /// What following a plan costs, term by term.
 ///
 /// The objective the planner minimises prices battery wear, curtailed
-/// production and time outside the comfort band alongside the energy bill, all
-/// in euros, so that the terms can honestly be added up. Reporting only the
-/// energy bill would put the saving back exactly where § 9.2 of the concept says
-/// it must not be: a number that credits the optimiser for a cycle it paid for
-/// in battery life.
+/// production, time outside the comfort band and **service it decided not to
+/// deliver** alongside the energy bill, all in euros, so that the terms can
+/// honestly be added up. Reporting only the energy bill would put the saving
+/// back exactly where § 9.2 of the concept says it must not be: a number that
+/// credits the optimiser for a cycle it paid for in battery life.
 ///
-/// So the same four terms are reported for the plan **and** for the baseline it
-/// is measured against. A baseline with no battery pays no wear, which is
+/// So the same terms are reported for the plan **and** for the baseline it is
+/// measured against. A baseline with no battery pays no wear, which is
 /// precisely the point — the comparison is only fair once both sides carry
 /// every cost they incur.
+///
+/// # Every term of the objective is a term of the report
+///
+/// The invariant this type exists to hold. A term the plan may *spend* and is
+/// not *charged* for is a discount the optimiser helps itself to: leave the car
+/// two kilowatt-hours short, let the tank run cold before the morning shower,
+/// and the electricity bill falls while nothing else on the report moves.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CostBreakdown {
@@ -181,6 +188,22 @@ pub struct CostBreakdown {
     /// state, which is what a week or a month does, it is zero either way.
     #[cfg_attr(feature = "serde", serde(default))]
     pub stored_eur: f64,
+    /// Service the household asked for and did not get, at its own price: the
+    /// kilowatt-hours the car was promised and did not receive by its
+    /// departure, and the hot water drawn from a tank that had none left.
+    ///
+    /// The objective prices both — that is what makes the charging deadline and
+    /// the morning shower *soft* rather than infeasible — so a report that left
+    /// them out would reward giving up: a plan abandoning the last two
+    /// kilowatt-hours of a charging session buys two kilowatt-hours less
+    /// electricity. Energy nobody used is energy nobody bought.
+    ///
+    /// It is charged on **both** sides. A thermostat and an unmanaged wallbox
+    /// can fall short too — a car plugged in an hour before it leaves is short
+    /// whatever anybody does — and a baseline that never pays this while the
+    /// plan does would be the same mistake pointing the other way.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unserved_eur: f64,
 }
 
 impl CostBreakdown {
@@ -202,6 +225,7 @@ impl CostBreakdown {
             + self.curtailment_eur
             + self.discomfort_eur
             + self.stored_eur
+            + self.unserved_eur
     }
 
     /// Everything except the terms that are preferences rather than bills.

@@ -369,9 +369,24 @@ fn the_sixty_percent_cap_costs_a_roof_what_an_intelligent_meter_would_have_saved
         cost < 5.0,
         "…and it is a small something, on a well-managed house: {cost:.2} kWh"
     );
+    // And now the number worth having, which the saving figure cannot carry:
+    // the § 9 EEG cap applies to a household **whether or not** it owns an
+    // energy manager, so both sides of the comparison move and the *difference*
+    // between them says nothing about the law. What the law costs is the change
+    // in each household's own bill.
+    let managed = capped.cost.total() - relieved.cost.total();
+    let unmanaged = capped.baseline.total() - relieved.baseline.total();
     assert!(
-        relieved.saving_eur() > capped.saving_eur(),
-        "which is what the Solarspitzengesetz costs this household"
+        unmanaged > 0.0,
+        "the cap has to cost an unmanaged household something: {unmanaged:.2} €"
+    );
+    assert!(
+        unmanaged > managed,
+        "and it has to cost the managed one less — that is the whole case for          owning an energy manager under the Solarspitzengesetz: {managed:.2} €          against {unmanaged:.2} €"
+    );
+    assert!(
+        capped.baseline.curtailment_eur > relieved.baseline.curtailment_eur,
+        "the baseline is capped too: a household with no energy manager does not          get to ignore § 9 EEG"
     );
 }
 
@@ -433,12 +448,14 @@ fn without_a_planner_the_house_still_runs_off_its_own_roof() {
 }
 
 #[test]
-fn a_switchable_charge_point_absorbs_surplus_a_fixed_one_exports() {
-    // The one situation in which switching conductors pays, and the measurement
-    // that says so. Surplus arrives as an instantaneous quantity: below 4,14 kW
-    // three conductors can do nothing with it, and one conductor charges. A
-    // planner can duty-cycle a quarter hour and reach the same average, which is
-    // why this shows up with the planner off and nowhere else.
+fn midsummer_is_the_wrong_day_to_measure_a_contactor_on() {
+    // On midsummer a 9,8 kWp roof spends the middle of the day well above the
+    // 4,14 kW a three-phase session needs to start, so the car reaches the
+    // household's Ladelimit either way and a contactor is worth nothing. Any
+    // difference a June day shows is the fallback charging past that limit rather
+    // than the contactor earning its keep — which is why the day is pinned at
+    // *no* difference, and why the shoulder season is where the capability is
+    // measured (`a_switchable_charge_point_is_the_whole_session_in_the_shoulder_season`).
     let switchable = run(&Scenario::summer_without_a_planner(HouseholdConfig {
         evse_switchable: true,
         ..HouseholdConfig::default()
@@ -451,21 +468,14 @@ fn a_switchable_charge_point_absorbs_surplus_a_fixed_one_exports() {
     .unwrap();
 
     assert!(
-        switchable.ev_charged_kwh > fixed.ev_charged_kwh + 2.0,
-        "switching should put several more kilowatt-hours into the car: {:.1} vs {:.1}",
+        (switchable.ev_charged_kwh - fixed.ev_charged_kwh).abs() < 0.5,
+        "on midsummer the car fills either way: {:.1} vs {:.1} kWh",
         switchable.ev_charged_kwh,
         fixed.ev_charged_kwh
     );
     assert!(
-        switchable.exported_kwh < fixed.exported_kwh - 2.0,
-        "and take them out of the export: {:.1} vs {:.1}",
-        switchable.exported_kwh,
-        fixed.exported_kwh
-    );
-    assert!(
-        switchable.phase_switches > 0 && switchable.phase_switches < 40,
-        "a summer day should switch a few dozen times at most, not {}",
-        switchable.phase_switches
+        switchable.unmet_charge_kwh < 0.05 && fixed.unmet_charge_kwh < 0.05,
+        "and both deliver the whole session"
     );
     assert_eq!(
         fixed.phase_switches, 0,
@@ -794,5 +804,210 @@ fn a_household_with_a_store_is_barely_touched_by_the_same_reduction() {
         "and relief should therefore be worth far less to it: {:.2} against {:.2} €/kWh",
         with.relief_eur_per_kwh,
         without.relief_eur_per_kwh
+    );
+}
+
+#[test]
+fn a_reduction_no_reference_day_may_command_is_one_no_reference_day_commands() {
+    // § 14a Ziff. 4.5.2: under an energy management system the minimum is one
+    // number for everything behind it and it **grows with the number of
+    // controllable devices** — `4,2 kW + (n − 1) · GZF(n) · 4,2 kW`. The flat
+    // 4,2 kW is the *base* of that formula, and reading it as the whole of it is
+    // the easiest mistake in the Festlegung to make: every reference day in this
+    // workspace commanded 4,2 kW to a household owed 10,5, and the figure that
+    // says so was computed, stored on the evidence record and printed nowhere.
+    //
+    // Two faults, and they are different faults. An operator commanding below
+    // the minimum is unlawful; the box holding *itself* below it on a lost
+    // heartbeat is a configuration error of our own.
+    for scenario in [
+        Scenario::winter_with_grid_event(HouseholdConfig::default()),
+        Scenario::winter_evening_deadline(HouseholdConfig::default()),
+        Scenario::winter_evening_no_store(&HouseholdConfig::default()),
+    ] {
+        let label = scenario.date;
+        let r = run(&scenario).unwrap();
+        assert!(
+            r.minimum_power_kw > 4.2,
+            "{label}: a household with three controllable devices is owed more \
+             than the base of the formula, got {:.2} kW",
+            r.minimum_power_kw
+        );
+        assert!(
+            !r.commanded_below_minimum,
+            "{label}: the reference reduction is below the § 14a minimum of \
+             {:.2} kW — an instruction no operator may send",
+            r.minimum_power_kw
+        );
+        assert!(
+            !r.failsafe_below_minimum,
+            "{label}: the box's own failsafe restrains the household further \
+             than any operator may, on nothing more than a lost heartbeat"
+        );
+    }
+}
+
+#[test]
+fn a_car_is_not_planned_to_charge_after_it_has_gone() {
+    // The deadline is half-open, and it has to be. Read as "the last slot it can
+    // charge in", a car leaving at eight is planned as though it could still be
+    // charging at 08:14 — and a plan with room to defer will put the last
+    // quarter hour of the session there. At 11 kW that is 2,75 kWh the car never
+    // receives.
+    //
+    // The failure hides wherever a limit was tight enough to force the charging
+    // earlier, which is why it survived every § 14a day: the *loosest* ceiling
+    // was the one that lost the most charge. So the test sweeps the ceiling and
+    // asserts the car arrives full under all of them, which is the shape the bug
+    // had rather than the value it took.
+    let base = HouseholdConfig::default();
+    for ceiling_kw in [4.2_f64, 7.56, 20.0] {
+        let mut scenario = Scenario::winter_evening_no_store(&base);
+        if let Some((from, until, _)) = scenario.grid_event {
+            scenario.grid_event = Some((from, until, Power::from_kw(ceiling_kw)));
+        }
+        let r = run(&scenario).unwrap();
+        assert!(
+            r.unmet_charge_kwh < 0.05,
+            "under a {ceiling_kw:.2} kW ceiling the car left {:.2} kWh short",
+            r.unmet_charge_kwh
+        );
+    }
+}
+
+#[test]
+fn the_saving_is_charged_for_the_service_the_plan_did_not_deliver() {
+    // Every term of the objective is a term of the report. A plan is allowed to
+    // leave the car short and to let the tank run cold — that is what makes both
+    // soft rather than infeasible — and if it is not *charged* for doing so, the
+    // saving figure treats a service the household did not get as a service it
+    // did not have to pay for.
+    //
+    // The proof is a household whose car cannot possibly be filled: it arrives
+    // at seven in the evening needing 40 kWh and leaves at nine.
+    let base = HouseholdConfig::default();
+    let mut scenario = Scenario::winter_evening_deadline(base);
+    scenario.ev = Some(hemsd::EvPlan {
+        energy_now: Energy::from_kwh(10.0),
+        energy_target: Energy::from_kwh(50.0),
+        arrival: Duration::hours(19),
+        departure: Duration::hours(21),
+    });
+    let r = run(&scenario).unwrap();
+
+    assert!(
+        r.unmet_charge_kwh > 5.0,
+        "40 kWh in two hours through an 11 kW wallbox cannot be done: {:.1} kWh short",
+        r.unmet_charge_kwh
+    );
+    assert!(
+        r.cost.unserved_eur > 5.0,
+        "and the day has to be charged for it: {:.2} €",
+        r.cost.unserved_eur
+    );
+    assert!(
+        r.cost.total() > r.cost.energy_eur,
+        "so the cost of the day is more than the electricity bill"
+    );
+    // The baseline is short too — it has the same two hours — so the comparison
+    // stays a comparison rather than becoming a penalty on the side that admits
+    // to it.
+    assert!(
+        r.baseline.unserved_eur > 5.0,
+        "an unmanaged wallbox cannot do it either: {:.2} €",
+        r.baseline.unserved_eur
+    );
+}
+
+#[test]
+fn a_switchable_charge_point_is_the_whole_session_in_the_shoulder_season() {
+    // Midsummer is the wrong test for a contactor. A 9,8 kWp roof under high
+    // pressure spends the middle of the day above the 4,14 kW a three-phase
+    // session needs to start, so the car fills either way — which is why the
+    // June day measured this at nothing once the fallback stopped charging past
+    // the household's own Ladelimit.
+    //
+    // The German shoulder season is the other nine months. Under a September sun
+    // the surplus sits in the 1,4 – 4,1 kW band for hours, where three conductors
+    // can do nothing with it and one can take all of it.
+    let switchable = run(&Scenario::autumn_without_a_planner(
+        HouseholdConfig::default(),
+    ))
+    .unwrap();
+    let fixed = run(&Scenario::autumn_without_a_planner(HouseholdConfig {
+        evse_switchable: false,
+        ..HouseholdConfig::default()
+    }))
+    .unwrap();
+
+    assert!(
+        switchable.phase_switches > 0 && switchable.single_phase_minutes > 60,
+        "the surplus spends the day in the single-conductor band: {} switches, {} min",
+        switchable.phase_switches,
+        switchable.single_phase_minutes
+    );
+    assert!(
+        switchable.ev_charged_kwh > 10.0 * fixed.ev_charged_kwh,
+        "a fixed three-phase wallbox can hardly start at all: {:.1} kWh against {:.1}",
+        fixed.ev_charged_kwh,
+        switchable.ev_charged_kwh
+    );
+    assert!(
+        switchable.unmet_charge_kwh < 0.05,
+        "and the switchable one finishes the session: {:.1} kWh short",
+        switchable.unmet_charge_kwh
+    );
+    assert!(
+        fixed.unmet_charge_kwh > 3.0,
+        "while the fixed one does not: {:.1} kWh short",
+        fixed.unmet_charge_kwh
+    );
+    assert!(
+        switchable.saving_eur() > fixed.saving_eur(),
+        "which is what the contactor is worth: {:.2} € against {:.2} €",
+        switchable.saving_eur(),
+        fixed.saving_eur()
+    );
+}
+
+#[test]
+fn the_fallback_stops_at_the_charge_limit_the_household_set() {
+    // A surplus tracker with no notion of *enough* pushes production into a car
+    // that already has what it was asked for, in preference to exporting it —
+    // which earns money. The planner never needs the limit; it is given an energy
+    // target and a departure. The fallback has neither, and the fallback is what
+    // runs when the cloud is gone.
+    let limited = run(&Scenario::summer_without_a_planner(
+        HouseholdConfig::default(),
+    ))
+    .unwrap();
+    let unlimited = run(&Scenario::summer_without_a_planner(HouseholdConfig {
+        ev_charge_limit: None,
+        ..HouseholdConfig::default()
+    }))
+    .unwrap();
+
+    assert!(
+        unlimited.ev_charged_kwh > limited.ev_charged_kwh + 3.0,
+        "without a limit the box keeps filling the car: {:.1} kWh against {:.1}",
+        unlimited.ev_charged_kwh,
+        limited.ev_charged_kwh
+    );
+    assert!(
+        limited.exported_kwh > unlimited.exported_kwh + 3.0,
+        "and what it stops putting into the car it exports instead: {:.1} kWh against {:.1}",
+        limited.exported_kwh,
+        unlimited.exported_kwh
+    );
+    assert!(
+        limited.unmet_charge_kwh < 0.05,
+        "the car still gets what it was promised: {:.1} kWh short",
+        limited.unmet_charge_kwh
+    );
+    assert!(
+        limited.saving_eur() > unlimited.saving_eur(),
+        "so respecting the limit is worth money: {:.2} € against {:.2} €",
+        limited.saving_eur(),
+        unlimited.saving_eur()
     );
 }

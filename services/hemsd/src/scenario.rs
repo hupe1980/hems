@@ -46,6 +46,29 @@ pub const HOT_WATER_SHORTFALL_EUR_PER_KWH: f64 = 3.0;
 /// and by the baseline — three places that would otherwise drift apart.
 pub const DISCOMFORT_EUR_PER_KELVIN_HOUR: f64 = 1.5;
 
+/// What a kilowatt-hour the car was promised and did not get is worth avoiding.
+///
+/// Far above any electricity price, so the deadline is lexicographic in
+/// practice — and finite, so a session that cannot be finished returns the best
+/// achievable schedule rather than no schedule at all.
+///
+/// It is a **price**, not only a weight, and that is the point: the same number
+/// prices the shortfall in the objective and charges it on the report, for the
+/// plan and for the baseline alike. A term the plan may spend and is not charged
+/// for is a discount it can help itself to.
+pub const UNMET_CHARGE_EUR_PER_KWH: f64 = 5.0;
+
+/// What throwing away a kilowatt-hour the roof produced is worth avoiding.
+///
+/// Not zero even where feeding in earns nothing: energy that could have heated
+/// water is a real loss, and a plan indifferent to it curtails whenever that is
+/// a rounding error cheaper. Used by the planner, by the day and by the
+/// baseline, which is capped by § 9 EEG exactly as the managed house is.
+pub const CURTAILMENT_EUR_PER_KWH: f64 = 0.01;
+
+/// What reaches the battery when charging on three conductors.
+const THREE_PHASE_EFFICIENCY: f64 = 0.92;
+
 /// How often the control loop runs in a simulated day.
 ///
 /// A real box ticks once a second; a day at that rate is 86 400 solves of the
@@ -151,13 +174,37 @@ impl EvPlan {
     }
 }
 
+/// The tightest ceiling a network operator may lawfully command this household,
+/// `[A1 4.5.2]`.
+///
+/// Under an energy management system the minimum is **one number for everything
+/// behind it**, and it grows with the number of controllable devices:
+/// `4,2 kW + (n − 1) · GZF(n) · 4,2 kW`. A household with a wallbox, a heat pump
+/// and a battery is owed **10,5 kW**; with no battery, 7,56 kW.
+///
+/// A flat 4,2 kW is the *base* of that formula rather than the whole of it, so
+/// commanding it is an instruction no operator may send. Deriving the ceiling
+/// keeps a reduction lawful when the household changes — and an operator asking
+/// for the most relief the Festlegung allows commands exactly this, which is
+/// also the sharpest honest test of the household's response.
+fn lawful_minimum(config: &HouseholdConfig, date: time::Date) -> Power {
+    Household::build(config).map_or(hems_grid::para14a::MINDESTLEISTUNG, |h| {
+        hems_grid::para14a::minimum_power(
+            &hems_grid::classify_on(&h.site.assets, date),
+            hems_grid::para14a::ControlMode::Ems,
+        )
+    })
+}
+
 impl Scenario {
     /// A January day with a teatime reduction — the case § 14a exists for.
     #[must_use]
     pub fn winter_with_grid_event(config: HouseholdConfig) -> Self {
+        let date = time::macros::date!(2026 - 01 - 15);
+        let ceiling = lawful_minimum(&config, date);
         Self {
             config,
-            date: time::macros::date!(2026 - 01 - 15),
+            date,
             outdoor_c: 2.0,
             cloudiness: 0.55,
             // A January day in Germany: broken cloud, and a forecast that is
@@ -166,7 +213,7 @@ impl Scenario {
             grid_event: Some((
                 Duration::hours(17),
                 Duration::minutes(18 * 60 + 30),
-                Power::from_kw(4.2),
+                ceiling,
             )),
             steuerbox_outage: None,
             planner: true,
@@ -198,6 +245,42 @@ impl Scenario {
         }
     }
 
+    /// A **September** day with the planner off and broken cloud — the day a
+    /// switchable charge point is the whole difference.
+    ///
+    /// Midsummer is the wrong test for it. A 9,8 kWp roof under high pressure
+    /// spends the middle of the day above the 4,14 kW a three-phase session needs
+    /// to start, so the car fills either way and the contactor earns nothing. The
+    /// German shoulder season is the other nine months: under broken cloud the
+    /// surplus sits in the **1,4 – 4,1 kW band** for hours, where three
+    /// conductors can do nothing with it at all and one can take all of it.
+    ///
+    /// Measured: **6,0 kWh** into the car against **0,2** with the wallbox wired
+    /// to three fixed conductors, for **one** contactor operation and 180 minutes
+    /// on a single conductor — and, because the car has somewhere to be at eight,
+    /// the difference between a household that got what it asked for and one
+    /// that is 4,8 kWh short and €24 out of pocket for it.
+    ///
+    /// The car's target is deliberately inside what the day can give: a box with
+    /// no planner surplus-charges and never imports for a deadline (D20), so a
+    /// target beyond the roof measures the absence of a planner rather than the
+    /// presence of a contactor.
+    #[must_use]
+    pub fn autumn_without_a_planner(config: HouseholdConfig) -> Self {
+        Self {
+            date: time::macros::date!(2026 - 09 - 20),
+            outdoor_c: 14.0,
+            cloudiness: 0.5,
+            weather: WeatherSpec::settled(0x_2009_2026),
+            ev: Some(EvPlan::overnight(
+                Energy::from_kwh(20.0),
+                Energy::from_kwh(25.0),
+                Duration::hours(20),
+            )),
+            ..Self::summer_without_a_planner(config)
+        }
+    }
+
     /// A January evening with a § 14a reduction and a car that cannot wait for
     /// the cheap hours.
     ///
@@ -207,26 +290,22 @@ impl Scenario {
     /// after the heat pump and the household take their share the wallbox is left
     /// with something between one and three kilowatts.
     ///
-    /// What it actually demonstrates is the **store lending its discharge** to
-    /// the § 14a budget (`[A1 2.3]`, D26): 4,6 kWh of headroom the connection
-    /// point never saw, and a car 0,6 kWh short of a 12 kWh target instead of far
-    /// further.
+    /// What it demonstrates is the **store lending its discharge** to the § 14a
+    /// budget (`[A1 2.3]`, D26): 5,4 kWh of headroom the connection point never
+    /// saw, and a car that leaves full.
     ///
-    /// This doc comment used to say it was "the case phase switching exists for,
-    /// and the only one in which it pays". It is not, and the day's own KPI says
-    /// so — **zero switches**. A planner duty-cycles a quarter hour and reaches
-    /// the same average, which is exactly the measurement behind D22; switching
-    /// pays where there is no planner, which is the `offline` day (178 minutes on
-    /// one conductor, three switches, 2,5 kWh). A claim in a comment that the
-    /// scenario's own output contradicts is the cheapest kind of wrong to leave
-    /// lying around, and this workspace has now found several.
+    /// It is *not* a phase-switching day, and the KPI says so — **zero
+    /// switches**. A planner duty-cycles a quarter hour and reaches the same
+    /// average, which is the measurement behind D22; a contactor pays where
+    /// there is no planner, which is the `autumn` day.
     #[must_use]
     pub fn winter_evening_deadline(config: HouseholdConfig) -> Self {
+        let ceiling = lawful_minimum(&config, time::macros::date!(2026 - 01 - 15));
         Self {
             grid_event: Some((
                 Duration::hours(17),
                 Duration::minutes(19 * 60 + 30),
-                Power::from_kw(4.2),
+                ceiling,
             )),
             // Home as the reduction starts, gone at eight, and 12 kWh short.
             // The arrival is what makes this scenario the one it says it is:
@@ -259,6 +338,17 @@ impl Scenario {
     /// ceiling of 4,2.
     #[must_use]
     pub fn winter_evening_no_store(config: &HouseholdConfig) -> Self {
+        let household = HouseholdConfig {
+            // Not quite zero: a household with no battery at all has no asset to
+            // model, and what is being tested is the *sharing*, not the absence.
+            // Below the 4,2 kW of `[A1 2.4.1]` it is not a steuerbare
+            // Verbrauchseinrichtung either, so the household is owed the
+            // two-device minimum of 7,56 kW rather than the three-device 10,5.
+            battery_kwh: Energy::from_kwh(1.0),
+            battery_power: Power::from_kw(0.5),
+            ..config.clone()
+        };
+        let ceiling = lawful_minimum(&household, time::macros::date!(2026 - 01 - 15));
         Self {
             // **Seven minutes past the hour**, and that is the whole scenario.
             //
@@ -278,15 +368,9 @@ impl Scenario {
             grid_event: Some((
                 Duration::minutes(17 * 60 + 7),
                 Duration::minutes(19 * 60 + 30),
-                Power::from_kw(4.2),
+                ceiling,
             )),
-            ..Self::winter_evening_deadline(HouseholdConfig {
-                // Not quite zero: a household with no battery at all has no asset to
-                // model, and what is being tested is the *sharing*, not the absence.
-                battery_kwh: Energy::from_kwh(1.0),
-                battery_power: Power::from_kw(0.5),
-                ..config.clone()
-            })
+            ..Self::winter_evening_deadline(household)
         }
     }
 
@@ -404,7 +488,15 @@ fn planning_limits(
     ends_at: Option<OffsetDateTime>,
     site: &Site,
 ) -> PlanningLimits {
-    let mut planning = PlanningLimits::default().with_import_ceiling(site.grid.import_ceiling());
+    let mut planning = PlanningLimits::default()
+        .with_import_ceiling(site.grid.import_ceiling())
+        // What the *baseline* household lives under while the same reduction is
+        // in force. It has no energy manager, so it cannot be addressed as one
+        // `[A1 4.4.b]`: its Steuerbox turns each device down on its own
+        // `[A1 4.4.a]`, and may not take any of them below the minimum of
+        // `[A1 4.5.1]`. The plan is unaffected — this bounds the comparison, not
+        // the optimisation.
+        .with_direct_control_ceiling(hems_grid::para14a::MINDESTLEISTUNG);
     if let Some(ceiling) = limits.steuve_ceiling {
         planning = planning.with_steuve(match ends_at {
             Some(end) => TimedLimit::until(ceiling, Slot::containing(end)),
@@ -501,6 +593,31 @@ pub struct DayResult {
     pub indoor_max_c: f64,
     /// Kelvin-hours spent outside the comfort band.
     pub discomfort_kelvin_hours: f64,
+    /// The lowest netzwirksamer Leistungsbezug the operator may reduce this
+    /// household to, `[A1 4.5]` — in the mode the site is actually in.
+    ///
+    /// Under an energy management system `[A1 4.4.b]` it is one number for
+    /// everything behind it and it **grows with the number of controllable
+    /// devices**: `4,2 kW + (n − 1) · GZF(n) · 4,2 kW`. A household with a
+    /// wallbox, a heat pump and a battery is owed 10,5 kW, not 4,2 — the flat
+    /// figure is the *base* of the formula, and reading it as the whole of it is
+    /// the easiest mistake in the Festlegung to make.
+    pub minimum_power_kw: f64,
+    /// Whether the box's **own** failsafe value sits below that minimum.
+    ///
+    /// A different fault from [`DayResult::commanded_below_minimum`] and worth
+    /// telling apart: this one is the household's own configuration restraining
+    /// it further than any operator may, on nothing more than a lost heartbeat.
+    pub failsafe_below_minimum: bool,
+    /// Whether a ceiling the operator commanded was **below** that minimum.
+    ///
+    /// An unlawful instruction, `[A1 4.5]`. The box carries it out anyway — a
+    /// guard cannot refuse a grid limit — and records it, because the record of
+    /// `[A1 7.2]` is what a customer takes to the operator. It is printed
+    /// because a field that is written and never read is the failure mode R20
+    /// names: nothing else would say that a reference day was running under an
+    /// instruction no operator may send.
+    pub commanded_below_minimum: bool,
     /// How long a network operator's § 14a limit was in force, minutes.
     pub limited_minutes: i64,
     /// Whether the netzwirksamer Leistungsbezug stayed inside the ceiling the
@@ -541,13 +658,24 @@ pub struct DayResult {
     /// number is a cost as well as a capability: a controller that chases every
     /// cloud spends the afternoon switching instead of charging.
     pub phase_switches: usize,
-    /// The largest shortfall any plan of the day admitted to on the charging
-    /// deadline, kWh.
+    /// What the car was **actually** short of its target when it left, kWh.
     ///
-    /// Zero on an ordinary day. Above zero it is what the household has to be
-    /// told before the morning rather than after it: the schedule was the best
-    /// achievable and it could not deliver everything the car was promised.
+    /// Measured on the car at its departure, not read off a plan. The two are
+    /// different facts and only one of them is a failure: a plan that admits to
+    /// a shortfall at nine in the morning and then makes it up by seven left
+    /// nobody short, and a plan that promised everything and delivered less did.
+    /// Reporting the plan's own confession as the outcome credits the optimiser
+    /// for its pessimism and hides its optimism, which is the wrong way round.
+    ///
+    /// It is also what [`CostBreakdown::unserved_eur`] charges the day for.
     pub unmet_charge_kwh: f64,
+    /// The largest shortfall any *plan* of the day admitted to, kWh.
+    ///
+    /// The forward-looking half of the same fact: what the household could have
+    /// been told before the morning rather than after it. Above zero with
+    /// [`DayResult::unmet_charge_kwh`] at zero is a plan that was pessimistic
+    /// and recovered — worth knowing, and not a failure.
+    pub planned_charge_shortfall_kwh: f64,
     /// Minutes in which the arbiter had no plan it was willing to follow.
     ///
     /// Should be zero for a box whose planner is running: a plan older than
@@ -750,9 +878,21 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     if let Some((from, until)) = scenario.steuerbox_outage {
         steuerbox = steuerbox.with_outage(start + from, start + until);
     }
+    // The value the box holds itself at when it cannot hear an Energy Guard
+    // (`[LPC-022]`, `[LPC-901]`). It is the household's own § 14a minimum and
+    // not a flat 4,2 kW: a failsafe is a *substitute* for an instruction, and
+    // restraining the house below what the operator itself may lawfully command
+    // — on nothing more than a lost heartbeat — is a configuration fault dressed
+    // up as caution. `[A1 4.5.2]`'s minimum grows with the number of
+    // controllable devices, and this household is owed 10,5 kW.
+    let failsafe_limit = hems_grid::para14a::minimum_power(
+        &hems_grid::classify_at(&site.assets, start),
+        hems_grid::para14a::ControlMode::Ems,
+    )
+    .max(hems_grid::para14a::MINDESTLEISTUNG);
     let mut lpc = LpcMachine::new(
         LpcConfig {
-            failsafe_limit: Power::from_kw(4.2),
+            failsafe_limit,
             ..LpcConfig::default()
         },
         start,
@@ -1007,7 +1147,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 } else {
                     needed > Energy::ZERO
                 };
-                if departure >= Slot::containing(now) && worth_planning {
+                if departure > Slot::containing(now) && worth_planning {
                     problem = problem.with_ev(hems_optimizer::model::EvSession {
                         energy_now,
                         energy_target,
@@ -1049,8 +1189,9 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 Ok(solved) => {
                     // A shortfall is not an error and not a silence: the plan
                     // that came back is the best achievable, and it is short.
-                    result.unmet_charge_kwh =
-                        result.unmet_charge_kwh.max(solved.unmet_charge.kwh());
+                    result.planned_charge_shortfall_kwh = result
+                        .planned_charge_shortfall_kwh
+                        .max(solved.unmet_charge.kwh());
                     // What a kilowatt-hour of relief from the § 14a ceiling
                     // would have been worth to this household — the shadow price
                     // of the ceiling itself, from the plan that is living under
@@ -1138,6 +1279,15 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // not be told to discharge, and both happen between re-plans.
         if let Some(m) = state.assets.get_mut(&household.battery) {
             m.soc = Some(battery.soc());
+        }
+        // And the *car's*, on the charge point, which is where a vehicle's charge
+        // reaches a real box. Without it the surplus fallback cannot know the car
+        // has had what it was asked for.
+        if let Some(m) = state.assets.get_mut(&household.evse)
+            && let Some(v) = evse.vehicle.as_ref()
+            && v.capacity > Energy::ZERO
+        {
+            m.soc = Soc::new(v.stored.kwh() / v.capacity.kwh()).ok();
         }
         state.assets.insert(
             household.dhw.clone(),
@@ -1256,7 +1406,22 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         previous.insert(household.dhw.clone(), dhw_actual);
         result.dhw_kwh += dhw_actual.kw() * step.as_seconds_f64() / 3600.0;
         result.cold_water_kwh += dhw_short.kwh();
+        result.cost.unserved_eur += dhw_short.kwh() * HOT_WATER_SHORTFALL_EUR_PER_KWH;
         result.tank_min_fill = result.tank_min_fill.min(tank.fill());
+        result.minimum_power_kw = result
+            .minimum_power_kw
+            .max(decision.verdict.minimum_power.kw());
+        // The car's own deadline, measured on the car rather than on a plan. A
+        // plan that admitted to a shortfall and then made it up is not a
+        // shortfall; a plan that promised everything and delivered less is one,
+        // and only this side of the loop can tell them apart.
+        if let Some((ev, vehicle)) = scenario.ev.zip(evse.vehicle.as_ref())
+            && now < start + ev.departure
+            && now + step >= start + ev.departure
+        {
+            result.unmet_charge_kwh = (ev.energy_target - vehicle.stored).max(Energy::ZERO).kwh();
+            result.cost.unserved_eur += result.unmet_charge_kwh * UNMET_CHARGE_EUR_PER_KWH;
+        }
         // The inverter's ceiling for the next tick. Kept with the other
         // commanded values so a stale one behaves the way a stale command to any
         // other device does.
@@ -1272,8 +1437,12 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // weather and the meter instead would count the inverter's own settling
         // time as a decision, and print a curtailment figure every sunrise on a
         // day when nothing was curtailed at all.
-        result.curtailed_kwh +=
+        let curtailed_now =
             (available - pv_allowed).max(Power::ZERO).kw() * step.as_seconds_f64() / 3600.0;
+        result.curtailed_kwh += curtailed_now;
+        // Priced, because the objective prices it: production thrown away is a
+        // real loss whatever feeding it in would have earned.
+        result.cost.curtailment_eur += curtailed_now * CURTAILMENT_EUR_PER_KWH;
         for (id, power) in [
             (&household.battery, battery_actual),
             (&household.evse, evse_actual),
@@ -1429,6 +1598,21 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     // separate running check — one source, and it is the one an operator would
     // be asked to produce.
     result.grid_event_respected = evidence.fully_compliant();
+    // Only a *network operator's* instruction can be unlawful under `[A1 4.5]`.
+    // The same shape arrived at from `init` or `failsafe` is the box restraining
+    // itself, which is a configuration fault rather than an operator's, and
+    // conflating them would tell a household the operator broke the law on a day
+    // nobody sent anything.
+    result.commanded_below_minimum = evidence
+        .closed()
+        .iter()
+        .filter(|e| e.rule == GuardRule::Lpc)
+        .any(hems_grid::ControlEvent::below_minimum);
+    result.failsafe_below_minimum = evidence
+        .closed()
+        .iter()
+        .filter(|e| e.rule != GuardRule::Lpc)
+        .any(hems_grid::ControlEvent::below_minimum);
     result.worst_overshoot_w = evidence
         .closed()
         .iter()
@@ -1448,7 +1632,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         / prices.slots.len().max(1) as f64;
     result.cost.stored_eur =
         ((stores_open - stored_at_start(&battery, &tank)) * mean_import).max(0.0);
-    result.baseline = baseline_cost(scenario, &weather, &array, &prices, site.location);
+    result.baseline = baseline_cost(scenario, &weather, &array, &prices, site, site.location);
 
     result.quarter_hours = registers.into_values().collect();
     // The § 9 EEG quantity, at the resolution § 9 EEG measures it: the largest
@@ -1542,14 +1726,50 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
 /// moment the car is plugged in, and a heat pump on an ordinary thermostat.
 /// Anything else flatters the optimiser, and a saving figure nobody can
 /// reproduce is worse than no figure at all.
+///
+/// # Same day, same law, same failures
+///
+/// Three things make it a comparison rather than an advertisement.
+///
+/// It faces the **same realisation** — down to the cloud at 12:19. A baseline
+/// run against a different draw prices two different Tuesdays.
+///
+/// It faces the **same law**. A household with no energy manager cannot be
+/// addressed as one `[A1 4.4.b]`, so during a § 14a reduction its Steuerbox
+/// turns each device down on its own `[A1 4.4.a]`, no further than the minimum
+/// of `[A1 4.5.1]`; and its roof is capped by § 9 EEG exactly like the managed
+/// one, throwing away what it cannot export. Ignoring either would measure the
+/// optimiser against a household nobody is allowed to be.
+///
+/// And it pays for the **service it fails to deliver**. A wallbox limited to
+/// 4,2 kW through teatime may not fill a car by seven; a thermostat that starts
+/// the day with a cold tank cannot fill a bath at six. The plan is charged for
+/// exactly that ([`CostBreakdown::unserved_eur`]), so the baseline has to be.
+/// The charge point the unmanaged household has — the same one, three-phase,
+/// because it is the same house.
+fn unmanaged_wallbox_power(site: &Site) -> Power {
+    site.assets
+        .iter()
+        .find_map(|a| match a {
+            Asset::Evse(e) => Some(e.max_power(PhaseMode::Three)),
+            _ => None,
+        })
+        .unwrap_or(Power::from_kw(11.0))
+}
+
 fn baseline_cost(
     scenario: &Scenario,
     weather: &Weather,
     array: &ArrayModel,
     prices: &PriceStack,
+    site: &Site,
     location: GeoPoint,
 ) -> CostBreakdown {
     let start = scenario.start();
+    // The same § 9 EEG ceiling the managed house lives under. It is a property
+    // of the installation, not of who is controlling it.
+    let feed_in_ceiling = hems_grid::para9::site_feed_in_ceiling(site, None, None).map(|(p, _)| p);
+    let evse_power = unmanaged_wallbox_power(site);
     let step = CONTROL_PERIOD;
     let hours = step.as_seconds_f64() / 3600.0;
     let mut car_remaining = scenario.ev.map_or(Energy::ZERO, |e| {
@@ -1581,6 +1801,17 @@ fn baseline_cost(
         let pv = -weather.production_at(array, location, now);
         let load = weather.load_at(now, household_load(slot));
 
+        // The ceiling **one** device faces while the reduction is in force. The
+        // managed house is given one number for everything behind it
+        // `[A1 4.4.b]`; a house with no energy manager is not, so its Steuerbox
+        // addresses each device on its own `[A1 4.4.a]` and may not take any of
+        // them below the minimum of `[A1 4.5.1]`.
+        let device_ceiling = scenario
+            .grid_event
+            .filter(|(from, until, _)| now >= start + *from && now < start + *until)
+            .map(|_| hems_grid::para14a::MINDESTLEISTUNG);
+        let bounded = |p: Power| device_ceiling.map_or(p, |c| p.min(c));
+
         // An unmanaged wallbox starts as soon as the car is plugged in and runs
         // until the car is full — which means it cannot start before the cable
         // goes in either. A baseline that charged a car that was not there
@@ -1590,13 +1821,22 @@ fn baseline_cost(
             .ev
             .is_none_or(|e| now >= start + e.arrival && now < start + e.departure);
         let ev = if car_remaining > Energy::ZERO && plugged_in {
-            let p = Power::from_kw(11.0);
-            let delivered = Energy::new(p.get() * hours * 0.92);
+            let p = bounded(evse_power);
+            let delivered = Energy::new(p.get() * hours * THREE_PHASE_EFFICIENCY);
             car_remaining = (car_remaining - delivered).max(Energy::ZERO);
             p
         } else {
             Power::ZERO
         };
+        // The car left short at its departure, at the household's own price for
+        // it — the same price the plan is charged.
+        if let Some(e) = scenario.ev
+            && now < start + e.departure
+            && now + step >= start + e.departure
+        {
+            cost.unserved_eur += car_remaining.kwh() * UNMET_CHARGE_EUR_PER_KWH;
+            car_remaining = Energy::ZERO;
+        }
 
         // An ordinary thermostat with a half-kelvin hysteresis: on at the
         // bottom of the comfort band, off half a degree above it. It knows
@@ -1610,7 +1850,7 @@ fn baseline_cost(
         }
         let hp = building.step(
             if thermostat_on {
-                scenario.config.heat_pump_power
+                bounded(scenario.config.heat_pump_power)
             } else {
                 Power::ZERO
             },
@@ -1620,14 +1860,24 @@ fn baseline_cost(
 
         // An unmanaged tank reheats whenever it is not full and stops when it
         // is. It never uses the store as a store, which is the whole of the
-        // difference being measured.
-        let (dhw, _) = tank.step(
+        // difference being measured — and it is not immune to a cold shower
+        // either: it starts each morning where the evening left it.
+        let (dhw, dhw_short) = tank.step(
             scenario.config.dhw_heater,
             weather.draw_in(slot, hot_water_draw(slot)) * (step / SLOT),
             step,
         );
+        cost.unserved_eur += dhw_short.kwh() * HOT_WATER_SHORTFALL_EUR_PER_KWH;
 
-        let grid = load + ev + hp + dhw + pv;
+        // § 9 EEG bounds what leaves the connection point whether or not there
+        // is an energy manager behind it, so what the baseline cannot export it
+        // throws away — at the same price the plan pays for doing so.
+        let mut grid = load + ev + hp + dhw + pv;
+        if let Some(ceiling) = feed_in_ceiling {
+            let curtailed = (grid.outflow() - ceiling).max(Power::ZERO);
+            grid += curtailed;
+            cost.curtailment_eur += curtailed.kw() * hours * CURTAILMENT_EUR_PER_KWH;
+        }
         if let Some(price) = prices.at(slot) {
             cost.energy_eur += grid.inflow().kw() * hours * price.import_f64()
                 - grid.outflow().kw() * hours * price.export_f64();

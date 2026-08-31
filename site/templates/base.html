@@ -92,6 +92,22 @@ footer nav{padding:0 0 .8rem;max-width:none}
 .toc strong{display:block;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
 .toc ul{margin:0;padding-left:1.1rem}
 .toc li{margin:.2rem 0}
+.hero{border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--soft),var(--bg))}
+.hero-inner{max-width:56rem;margin:0 auto;padding:4rem 1.25rem 3.2rem}
+.hero-eyebrow{margin:0 0 .9rem;font-size:.78rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
+.hero-title{font-size:2.7rem;line-height:1.1;letter-spacing:-.025em;margin:0 0 .9rem;max-width:20ch}
+.hero-sub{font-size:1.15rem;line-height:1.6;color:var(--muted);margin:0 0 1.8rem;max-width:60ch}
+.hero-cta{display:flex;gap:.7rem;flex-wrap:wrap}
+.btn{display:inline-block;padding:.6rem 1.15rem;border-radius:6px;font-weight:600;font-size:.95rem;border:1px solid var(--accent)}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-ghost{background:transparent;color:var(--accent)}
+.btn:hover{text-decoration:none;filter:brightness(1.08)}
+.stats{border-bottom:1px solid var(--line);background:var(--bg)}
+.stats-inner{max-width:56rem;margin:0 auto;padding:1.4rem 1.25rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(8rem,1fr))}
+.stats-inner div{display:flex;flex-direction:column;gap:.15rem}
+.stats-inner strong{font-size:1.5rem;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.stats-inner span{font-size:.82rem;color:var(--muted);line-height:1.35}
+@media(max-width:34rem){.hero-title{font-size:2.05rem}.hero-inner{padding:2.6rem 1.25rem 2.2rem}}
 .cta{margin:1.6rem 0 .5rem}
 .cta p{display:flex;gap:.7rem;flex-wrap:wrap;margin:0}
 .cta a{display:inline-block;padding:.55rem 1.1rem;border-radius:6px;background:var(--accent);color:#fff;font-weight:600;font-size:.95rem;border:1px solid var(--accent)}
@@ -110,6 +126,7 @@ h2:hover .zola-anchor,h3:hover .zola-anchor,.zola-anchor:focus{opacity:.55}
   <span class="spacer"></span>
   <a href="{{ config.extra.repository }}" rel="noopener">GitHub</a>
 </nav></header>
+{% block prelude %}{% endblock %}
 <main id="content">{% block content %}{% endblock %}</main>
 <footer>
   <nav>

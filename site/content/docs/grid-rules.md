@@ -109,7 +109,7 @@ reverse it. So the guard lends only what survives three tests — it is
 in exchange. The battery may go on discharging or it may stop; what it may not
 do is turn into a load while the others spend the headroom it created.
 
-On the reference January evening that is 4,6 kWh of headroom, and the difference
+On the reference January evening that is 5,4 kWh of headroom, and the difference
 between a car that leaves full and one that does not.
 
 Two further readings go the conservative way, and both are places where the
@@ -233,7 +233,7 @@ May, not June, because the cap is a fraction of *direct-current* power and how
 close a roof gets to that fraction is decided by cell temperature — and prints
 the quarter-hour feed-in peak against the ceiling. The cap binds, at 12,00 of
 12,00 kW for four quarter hours around solar noon, and the household loses
-**0,4 kWh** of export.
+**0,2 kWh** of export.
 
 That is far less than "60 %" sounds, and the arithmetic is worth stating: a
 German roof's clear-day peak is only about two thirds of its direct-current
@@ -241,6 +241,10 @@ rating once system losses, soiling and a 50 °C cell are taken off, so the 60 %
 line clips the top tenth of the peak on the clearest days of the year — and a
 household with a store, a tank and a heat pump *absorbs* most of that rather than
 throwing it away.
+
+What it *costs* needs a baseline that is capped too, because § 9 EEG does not ask
+whether there is an energy manager behind the meter: lifting the cap moves the
+managed household's own cost by a cent and the unmanaged one's by twelve.
 
 The three things that decide the figure are worth naming, because getting any of
 them wrong inflates it several-fold: the month (a 50 °C cell in June keeps a roof
@@ -305,9 +309,10 @@ computed from its own plan rather than assumed.
 ```
 
 That is a house with no store whose car will otherwise leave short. The *same*
-reduction on the same household with a 10 kWh battery is worth **€0,16/kWh**,
-because the store lends the controllable devices the headroom `[A1 2.3]` allows
-and the ceiling stops binding. It is `[A1 2.3]` measured in money, and it is what
+reduction on the same household with a 10 kWh battery is worth **nothing at
+all**, because the store lends the controllable devices the headroom `[A1 2.3]`
+allows and the ceiling stops binding — and a limit that costs a household nothing
+is a limit nobody should be compensated for. It is `[A1 2.3]` measured in money, and it is what
 a § 41e Aggregatorvertrag offer or an OpenADR bid should be priced from —
 aggregators currently price both households at "30 % of nominal".
 
