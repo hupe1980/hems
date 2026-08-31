@@ -1405,7 +1405,15 @@ fn a_plan_over_three_futures_commits_between_what_the_pessimist_and_the_optimist
     let h = horizon(16);
     let ct = [30_i64; 16];
     let p = prices(h, &ct);
-    let pv = uncertain(h, 6000.0, 0.9, &(0..10).collect::<Vec<_>>());
+    //
+    // The sun is uncertain in the **first slot only**, and that is what makes
+    // the measurement possible rather than merely plausible. With a flat tariff
+    // and no wear, *when* a surplus is stored is undetermined — charging now and
+    // charging in an hour cost the same — so two backends can return different,
+    // equally optimal plans and the first slot would say nothing about risk. A
+    // surplus that exists only now must be taken now or exported at the feed-in
+    // tariff, which pins the first slot to the optimum on any backend.
+    let pv = uncertain(h, 6000.0, 0.9, &[0]);
     let load = flat(h, 500.0);
 
     let first_slot = |risk| -> f64 {
@@ -1449,7 +1457,9 @@ fn the_tail_pulls_the_commitment_towards_the_pessimist() {
     let h = horizon(16);
     let ct = [30_i64; 16];
     let p = prices(h, &ct);
-    let pv = uncertain(h, 6000.0, 0.9, &(0..10).collect::<Vec<_>>());
+    // Surplus in the first slot only, for the reason the previous test gives:
+    // with a flat tariff the *timing* of storing it is otherwise undetermined.
+    let pv = uncertain(h, 6000.0, 0.9, &[0]);
     let load = flat(h, 500.0);
 
     let first_slot = |risk| -> f64 {
@@ -1472,6 +1482,14 @@ fn the_tail_pulls_the_commitment_towards_the_pessimist() {
         hedged <= neutral + 1e-6,
         "weight on the tail cannot make the plan *more* optimistic about the sun: \
          {hedged:.3} against {neutral:.3} kW"
+    );
+    // …and it has to move something. Without this the test passes on a plan
+    // where both are zero, which is exactly the knob-that-does-nothing it exists
+    // to rule out.
+    assert!(
+        neutral > 0.1,
+        "the risk-neutral plan should be storing the surplus it can see: \
+         {neutral:.3} kW"
     );
 }
 
