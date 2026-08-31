@@ -17,5 +17,5 @@
 pub mod command;
 pub mod sg_ready;
 
-pub use command::{Decision, commands_for, realisable};
+pub use command::{Decision, commands_for, realisable, single_speed};
 pub use sg_ready::{SgReadyState, expected_power, recommended_limited_power, state_for};

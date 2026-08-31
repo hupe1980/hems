@@ -5,7 +5,7 @@ use hems_grid::modul3::Preisstufe;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
-use crate::tariff::{FeedIn, Tariff};
+use crate::tariff::{Remuneration, Tariff};
 
 /// Everything a kilowatt-hour costs, or earns, in one quarter hour.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -14,14 +14,19 @@ pub struct SlotPrice {
     /// The quarter hour.
     pub slot: Slot,
     /// The energy component, net, ct/kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub energy_ct: Decimal,
     /// The network working price, net, ct/kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub network_ct: Decimal,
     /// Levies and taxes before value added tax, ct/kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub levies_ct: Decimal,
     /// What the household pays for a kilowatt-hour drawn here, gross, ct/kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub import_ct: Decimal,
     /// What it earns for a kilowatt-hour fed in here, ct/kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub export_ct: Decimal,
     /// The § 14a Modul 3 level, where the customer is on Modul 3.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -141,27 +146,39 @@ pub fn price_at(tariff: &Tariff, slot: Slot) -> SlotPrice {
 
     let market_price = tariff.energy.spot_at(slot);
     let negative = market_price.is_some_and(|p| p < Decimal::ZERO);
+    // § 51 Abs. 1 EEG reduces the **anzulegender Wert** to zero in a negative
+    // quarter hour, and the anzulegender Wert is what both remuneration schemes
+    // are computed from — § 53 Abs. 1 for the Einspeisevergütung, Anlage 1 zu
+    // § 23a Nr. 1 for the Marktprämie. So it zeroes the tariff *and* the
+    // premium, and whether it reaches this plant at all is a date rather than a
+    // preference (§ 51 Abs. 2).
+    let aw_is_zero = negative && tariff.feed_in.para51_applies_on(slot.local_date());
 
-    let export_ct = match &tariff.feed_in {
-        FeedIn::None => Decimal::ZERO,
-        FeedIn::Eeg {
-            ct_per_kwh,
-            negative_price_rule,
-        } => {
-            if *negative_price_rule && negative {
+    let export_ct = match &tariff.feed_in.scheme {
+        Remuneration::None => Decimal::ZERO,
+        Remuneration::Eeg { ct_per_kwh } => {
+            if aw_is_zero {
                 Decimal::ZERO
             } else {
                 *ct_per_kwh
             }
         }
-        FeedIn::Direktvermarktung {
+        Remuneration::Direktvermarktung {
             marktwert_ct_per_kwh,
             praemie_ct_per_kwh,
         } => {
-            // Under Direktvermarktung the seller is exposed to the price
-            // itself, so a negative hour is a cost, not merely a missing
-            // payment. The spot price is the honest signal to plan against.
-            market_price.unwrap_or(*marktwert_ct_per_kwh) + *praemie_ct_per_kwh
+            // Under Direktvermarktung the seller is exposed to the price itself,
+            // so a negative hour is a *cost* and not merely a missing payment —
+            // the spot price is the honest signal to plan against. The premium
+            // is what § 51 takes away on top of that, and leaving it in was the
+            // household being told it still earns it in exactly the hours the
+            // statute is paying it to stop.
+            let premium = if aw_is_zero {
+                Decimal::ZERO
+            } else {
+                *praemie_ct_per_kwh
+            };
+            market_price.unwrap_or(*marktwert_ct_per_kwh) + premium
         }
     };
 
@@ -183,7 +200,7 @@ pub fn price_at(tariff: &Tariff, slot: Slot) -> SlotPrice {
 mod tests {
     use super::*;
     use crate::levies::Levies;
-    use crate::tariff::{EnergyPrice, NetworkCharge};
+    use crate::tariff::{EnergyPrice, FeedIn, NetworkCharge};
     use std::collections::BTreeMap;
     use time::macros::datetime;
 
@@ -202,10 +219,8 @@ mod tests {
                 arbeitspreis: Decimal::new(10, 0),
             },
             levies: Levies::household_2026(),
-            feed_in: FeedIn::Eeg {
-                ct_per_kwh: Decimal::new(786, 2),
-                negative_price_rule: true,
-            },
+            feed_in: FeedIn::eeg(Decimal::new(786, 2))
+                .under_para51_from(Some(time::macros::date!(2026 - 01 - 01))),
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }
@@ -232,10 +247,7 @@ mod tests {
     #[test]
     fn a_system_outside_the_rule_keeps_being_paid() {
         let mut t = dynamic_tariff(&[(datetime!(2026-06-15 11:00:00 UTC), -3)]);
-        t.feed_in = FeedIn::Eeg {
-            ct_per_kwh: Decimal::new(786, 2),
-            negative_price_rule: false,
-        };
+        t.feed_in = FeedIn::eeg(Decimal::new(786, 2));
         let p = price_at(&t, Slot::containing(datetime!(2026-06-15 11:00:00 UTC)));
         assert!(p.negative_price_hour, "the hour is still negative");
         assert_eq!(
@@ -248,12 +260,58 @@ mod tests {
     #[test]
     fn direktvermarktung_follows_the_price_into_negative_territory() {
         let mut t = dynamic_tariff(&[(datetime!(2026-06-15 11:00:00 UTC), -3)]);
-        t.feed_in = FeedIn::Direktvermarktung {
-            marktwert_ct_per_kwh: Decimal::new(5, 0),
-            praemie_ct_per_kwh: Decimal::new(2, 0),
-        };
+        t.feed_in = FeedIn::direktvermarktung(Decimal::new(5, 0), Decimal::new(2, 0));
         let p = price_at(&t, Slot::containing(datetime!(2026-06-15 11:00:00 UTC)));
         assert_eq!(p.export_ct, Decimal::new(-1, 0), "−3 spot + 2 premium");
+    }
+
+    #[test]
+    fn paragraph_51_takes_the_premium_away_and_leaves_the_seller_the_price() {
+        // The defect this closes. § 51 Abs. 1 zeroes the **anzulegender Wert**,
+        // and the Marktprämie is computed from it (Anlage 1 zu § 23a Nr. 1), so
+        // a plant the rule reaches earns the negative spot price and nothing on
+        // top. Carrying the rule inside the `Eeg` variant left a
+        // Direktvermarktung household being told it still earned the premium in
+        // exactly the hours the statute is paying it to stop.
+        let mut t = dynamic_tariff(&[(datetime!(2026-06-15 11:00:00 UTC), -3)]);
+        t.feed_in = FeedIn::direktvermarktung(Decimal::new(5, 0), Decimal::new(2, 0))
+            .under_para51_from(Some(time::macros::date!(2026 - 01 - 01)));
+        let p = price_at(&t, Slot::containing(datetime!(2026-06-15 11:00:00 UTC)));
+        assert_eq!(
+            p.export_ct,
+            Decimal::new(-3, 0),
+            "the spot price alone: the premium goes with the anzulegender Wert"
+        );
+
+        // …and a positive hour is untouched, because § 51 is about negative
+        // prices and nothing else.
+        let t = dynamic_tariff(&[(datetime!(2026-06-15 12:00:00 UTC), 4)]);
+        let mut t = t;
+        t.feed_in = FeedIn::direktvermarktung(Decimal::new(5, 0), Decimal::new(2, 0))
+            .under_para51_from(Some(time::macros::date!(2026 - 01 - 01)));
+        let p = price_at(&t, Slot::containing(datetime!(2026-06-15 12:00:00 UTC)));
+        assert_eq!(p.export_ct, Decimal::new(6, 0), "4 spot + 2 premium");
+    }
+
+    #[test]
+    fn the_rule_starts_on_a_day_rather_than_being_a_preference() {
+        // § 51 Abs. 2 Nr. 1: a plant below 100 kW is exempt for every period
+        // *before the end of the calendar year* it is fitted with an intelligent
+        // metering system — so a meter fitted in March keeps the remuneration
+        // for the negative hours of that whole year.
+        let mut t = dynamic_tariff(&[(datetime!(2026-06-15 11:00:00 UTC), -3)]);
+        t.feed_in = FeedIn::eeg(Decimal::new(786, 2))
+            .under_para51_from(Some(time::macros::date!(2027 - 01 - 01)));
+        let june_2026 = price_at(&t, Slot::containing(datetime!(2026-06-15 11:00:00 UTC)));
+        assert_eq!(
+            june_2026.export_ct,
+            Decimal::new(786, 2),
+            "the year the meter went in is still paid"
+        );
+        assert!(
+            june_2026.negative_price_hour,
+            "and the hour is still flagged"
+        );
     }
 
     #[test]

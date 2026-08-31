@@ -22,24 +22,121 @@
 //! price fact, so it lives in `hems-tariff`; what belongs here is only the
 //! observation that it makes *self-consumption or curtailment* the rational
 //! choice, not feeding in.
+//!
+//! # The scope of the statutory cap is three conditions, and two of them are not
+//! sizes
+//!
+//! It is tempting to read § 9 Abs. 2 as *"between 2 and 100 kWp, from
+//! 25.02.2025"* and be done. Every part of that is slightly wrong, and the
+//! errors point in both directions:
+//!
+//! * There is **no lower bound**. § 9 Abs. 2 S. 1 Nr. 3 reaches every system
+//!   below 25 kW that is zugeordnet der Einspeisevergütung; the 2 kW in the
+//!   statute belongs to S. 4, which exempts **Steckersolargeräte** — and only
+//!   those, and only with at most 800 VA of inverter, and only behind a
+//!   Letztverbraucher's Entnahmestelle. Read as a size class it exempts every
+//!   small roof array from a cap the statute puts on it, which is a household
+//!   feeding in above a statutory limit and nothing noticing.
+//! * The **upper bound is exclusive**: Nr. 2 is *"ab 25 Kilowatt und von weniger
+//!   als 100 Kilowatt"*, and Nr. 1 — from 100 kW up — carries no percentage at
+//!   all. Between 25 and 100 kW the percentage is the same 60 %, so the two
+//!   Nummern collapse into one range here.
+//! * The **date is a window, not a threshold**. § 100 Abs. 3b disapplies both
+//!   Nummern to systems commissioned between 01.01.2023 and 24.02.2025, so
+//!   "before the Solarspitzengesetz" does not mean "uncapped": a system from
+//!   2019 still carries the obligation of the EEG version applicable to it,
+//!   which it met either with equipment the network operator can reduce it with
+//!   or by limiting itself to **70 %** (§ 100 Abs. 3 S. 2 Nr. 2). Which of the
+//!   two is a fact about the installation and is declared, not guessed
+//!   ([`Para9Status::legacy_70_percent`]).
+//!
+//! [`StatutoryLimit`] is the answer to all three at once, and
+//! [`GenerationProfile::statutory_limit`] is where the decision tree lives.
 
 use hems_core::asset::{Asset, PvArray};
 use hems_core::prelude::{Power, Site};
 use time::Date;
 
-pub use hems_core::asset::CapRelief;
+pub use hems_core::asset::{CapRelief, Para9Status};
 
 /// The day the Solarspitzengesetz took effect.
+///
+/// § 100 Abs. 3b EEG disapplies § 9 Abs. 2 S. 1 Nr. 2 lit. b and Nr. 3 to
+/// systems commissioned between 01.01.2023 and this day, so a system newer than
+/// this is in the 60 % regime and one from the window in between is in none.
 pub const SOLARSPITZEN_START: Date = time::macros::date!(2025 - 02 - 25);
 
-/// The share of installed capacity a capped system may feed in.
+/// The first day of the window § 100 Abs. 3b EEG exempts.
+///
+/// A system commissioned **before** this carries the obligation of the EEG
+/// version applicable to it — see [`Para9Status::legacy_70_percent`].
+pub const EXEMPT_WINDOW_START: Date = time::macros::date!(2023 - 01 - 01);
+
+/// The share of installed capacity a capped system may feed in,
+/// § 9 Abs. 2 S. 1 Nr. 2 lit. b and Nr. 3 EEG.
 pub const CAP_FRACTION: f64 = 0.60;
 
-/// The lower bound of the capped size class, in installed DC power.
-pub const CAP_MIN_SIZE: Power = Power::new_const(2_000.0);
+/// The share a pre-2023 system that chose the Einspeisebegrenzung instead of
+/// remote-control equipment holds itself to, § 100 Abs. 3 S. 2 Nr. 2 EEG.
+pub const LEGACY_CAP_FRACTION: f64 = 0.70;
 
-/// The upper bound of the capped size class.
-pub const CAP_MAX_SIZE: Power = Power::new_const(100_000.0);
+/// The size at which § 9 Abs. 2 S. 1 Nr. 1 EEG takes over, **exclusive**.
+///
+/// Nr. 2 is *"ab 25 Kilowatt und von **weniger als** 100 Kilowatt"* and Nr. 1 —
+/// everything from 100 kW up — carries no percentage cap at all, only the duty
+/// to be remotely reducible. So a system of exactly 100 kW is not capped, and
+/// the comparison has to be strict. The same care as
+/// [`crate::para14a::FALLGRUPPE_THRESHOLD`]'s *"mehr als 4,2 kW"*.
+///
+/// There is deliberately **no lower bound**. The 2 kW that used to be one here
+/// belongs to the Steckersolargerät exemption of § 9 Abs. 2 S. 4 (see
+/// [`STECKERSOLAR_MAX_DC`]), which is a statement about a kind of installation
+/// and not a size class — and reading it as a floor exempted every small roof
+/// array from a cap the statute puts on it.
+pub const CAP_MAX_SIZE_EXCLUSIVE: Power = Power::new_const(100_000.0);
+
+/// The installed power a Steckersolargerät may have and stay outside
+/// § 9 Abs. 2 S. 1 Nr. 3, § 9 Abs. 2 S. 4 EEG.
+pub const STECKERSOLAR_MAX_DC: Power = Power::new_const(2_000.0);
+
+/// The inverter power the same exemption allows, § 9 Abs. 2 S. 4 EEG.
+///
+/// The statute says 800 **Voltampere**. A household micro-inverter is rated at
+/// unity power factor, so its nameplate watts and its voltamperes are the same
+/// number, and [`GenerationProfile::installed_ac_nominal`] is compared against
+/// it directly. An installation where they differ is one where the declaration
+/// on [`Para9Status::steckersolargeraet`] is the thing to get right.
+pub const STECKERSOLAR_MAX_AC: Power = Power::new_const(800.0);
+
+/// Which statutory limitation a system's own feed-in is under.
+///
+/// Not a boolean, because there are two of them and they are different
+/// percentages of the same reference — which is exactly the sort of thing a
+/// `bool` named `capped` loses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum StatutoryLimit {
+    /// § 9 Abs. 2 S. 1 Nr. 2 lit. b / Nr. 3 EEG — 60 % of the installed power,
+    /// for a system commissioned from 25.02.2025 and below 100 kW, until an
+    /// intelligent metering system with a control device is in operation.
+    Cap60,
+    /// § 100 Abs. 3 S. 2 Nr. 2 EEG — the 70 % Einspeisebegrenzung a system
+    /// commissioned before 2023 chose instead of equipment the network operator
+    /// could reduce it with.
+    Cap70Legacy,
+}
+
+impl StatutoryLimit {
+    /// The share of the installed power this limitation allows.
+    #[must_use]
+    pub const fn fraction(self) -> f64 {
+        match self {
+            StatutoryLimit::Cap60 => CAP_FRACTION,
+            StatutoryLimit::Cap70Legacy => LEGACY_CAP_FRACTION,
+        }
+    }
+}
 
 /// What the site's generation looks like to § 9 EEG.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,38 +148,80 @@ pub struct GenerationProfile {
     /// EEBUS `MGCP` feed-in factor.
     pub installed_ac_nominal: Power,
     /// When the system went into operation.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "hems_core::wire::iso_date::option")
+    )]
     pub commissioned_at: Option<Date>,
-    /// What, if anything, has lifted the 60 % cap for this system.
+    /// The § 9 EEG facts the installer declared about this system.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub relief: CapRelief,
+    pub para9: Para9Status,
 }
 
 impl GenerationProfile {
-    /// Whether the 60 % cap applies.
+    /// Whether this is a Steckersolargerät the statute leaves alone.
     ///
-    /// It applies to systems commissioned from 25.02.2025 with an installed
-    /// capacity between 2 and 100 kWp, until a [`CapRelief`] lifts it.
-    ///
-    /// An **unknown** commissioning date leaves the cap off, because the cap only
-    /// ever applied to systems commissioned after 25.02.2025 and applying it to
-    /// an unknown one would curtail a system the statute never reached. That is
-    /// the opposite default from § 14a participation, and for the opposite
-    /// reason: there, silence risks exceeding a network operator's limit; here it
-    /// only risks throwing away a household's own energy.
+    /// All three conditions of § 9 Abs. 2 S. 4 EEG, and the declaration is the
+    /// one that carries the weight: *"Steckersolargeräte mit einer installierten
+    /// Leistung von insgesamt bis zu 2 Kilowatt und mit einer
+    /// Wechselrichterleistung von insgesamt bis zu 800 Voltampere, die hinter
+    /// der Entnahmestelle eines Letztverbrauchers betrieben werden"*. The two
+    /// numbers bound a Steckersolargerät; they do not turn a small roof array
+    /// into one.
     #[must_use]
-    pub fn cap_applies(&self) -> bool {
-        let in_size_class = self.installed_dc >= CAP_MIN_SIZE && self.installed_dc <= CAP_MAX_SIZE;
-        let new_enough = self
-            .commissioned_at
-            .is_some_and(|d| d >= SOLARSPITZEN_START);
-        in_size_class && new_enough && !self.relief.lifts_cap()
+    pub fn is_exempt_steckersolargeraet(&self) -> bool {
+        self.para9.steckersolargeraet
+            && self.installed_dc <= STECKERSOLAR_MAX_DC
+            && self.installed_ac_nominal <= STECKERSOLAR_MAX_AC
     }
 
-    /// The ceiling the 60 % cap puts on feed-in, if it applies.
+    /// Which statutory limitation this system's feed-in is under, if any.
+    ///
+    /// The decision tree of § 9 Abs. 2 S. 1 EEG together with the transitional
+    /// rules of § 100 Abs. 3 and 3b, read in the order the statute is written:
+    ///
+    /// 1. an intelligent metering system with a control device in operation, or
+    ///    a market contract with a working control path, lifts the cap
+    ///    ([`CapRelief`]);
+    /// 2. a Steckersolargerät within its two size tests is outside Nr. 3
+    ///    altogether (§ 9 Abs. 2 S. 4);
+    /// 3. commissioned from **25.02.2025** and below 100 kW → 60 % (Nr. 2 lit. b
+    ///    for 25 kW and up, Nr. 3 below it — the same percentage either way);
+    /// 4. commissioned in the window **01.01.2023 – 24.02.2025** → nothing, by
+    ///    § 100 Abs. 3b;
+    /// 5. commissioned **before 2023** → 70 % if, and only if, that is the way
+    ///    the system met its obligation ([`Para9Status::legacy_70_percent`]);
+    ///    otherwise the network operator holds a Rundsteuerempfänger and there
+    ///    is no static ceiling to apply.
+    ///
+    /// An **unknown** commissioning date leaves the feed-in unlimited, because
+    /// every limitation above is tied to one and applying a cap to a system the
+    /// statute may never have reached would curtail a household for nothing.
+    /// That is the opposite default from § 14a participation, and for the
+    /// opposite reason: there, silence risks exceeding a network operator's
+    /// limit; here it only risks throwing away a household's own energy.
+    #[must_use]
+    pub fn statutory_limit(&self) -> Option<StatutoryLimit> {
+        if self.para9.relief.lifts_cap() || self.is_exempt_steckersolargeraet() {
+            return None;
+        }
+        match self.commissioned_at? {
+            d if d >= SOLARSPITZEN_START => {
+                (self.installed_dc < CAP_MAX_SIZE_EXCLUSIVE).then_some(StatutoryLimit::Cap60)
+            }
+            d if d >= EXEMPT_WINDOW_START => None,
+            _ => self
+                .para9
+                .legacy_70_percent
+                .then_some(StatutoryLimit::Cap70Legacy),
+        }
+    }
+
+    /// The ceiling the statutory limitation puts on feed-in, if one applies.
     #[must_use]
     pub fn statutory_cap(&self) -> Option<Power> {
-        self.cap_applies().then(|| self.installed_dc * CAP_FRACTION)
+        self.statutory_limit()
+            .map(|limit| self.installed_dc * limit.fraction())
     }
 }
 
@@ -142,8 +281,8 @@ impl FeedInLimits {
     /// The three sources are named separately because they are three different
     /// conversations: an LPP session is the network operator reducing this
     /// house right now, the `MGCP` factor is the § 9 EEG limitation announced
-    /// over the wire, and the statutory cap is the law applying by itself. An
-    /// reporting the factor as an LPP session would tell the household the
+    /// over the wire, and the statutory cap is the law applying by itself.
+    /// Reporting the factor as an LPP session would tell the household the
     /// operator had intervened when it had not.
     #[must_use]
     pub fn binding_rule(
@@ -174,7 +313,7 @@ impl GenerationProfile {
             installed_dc: pv.kwp_dc,
             installed_ac_nominal: pv.ac_nominal,
             commissioned_at: pv.meta.commissioned_at,
-            relief: pv.cap_relief,
+            para9: pv.para9,
         }
     }
 
@@ -184,13 +323,21 @@ impl GenerationProfile {
     /// for the cap to apply to, and returning a zero-sized profile would answer
     /// "capped at 0 kW", which is the wrong kind of wrong.
     ///
-    /// Two readings are deliberate. The **capacities add up**, because § 9 Abs. 1
-    /// applies to the installierte Leistung at one connection point and a
-    /// household that splits a roof across two inverters has not thereby left the
-    /// size class. And the relief is taken as lifted only when it is lifted for
-    /// **every** array: an intelligent metering system with a control device that
-    /// reaches one of two inverters does not lift the cap on the other, and the
-    /// cap is measured at the connection point where both of them feed.
+    /// Four readings are deliberate, and every one of them is about the fact
+    /// that all three limitations are measured at the **Verknüpfungspunkt**
+    /// rather than at an inverter.
+    ///
+    /// The **capacities add up**, because § 9 Abs. 3 measures the installierte
+    /// Leistung at one connection point and a household that splits a roof
+    /// across two inverters has not thereby left the size class. The **relief**
+    /// counts as lifted only when it is lifted for *every* array: an intelligent
+    /// metering system with a control device reaching one of two inverters does
+    /// not lift the cap on the other. A **Steckersolargerät stops being one**
+    /// the moment it shares a connection point with a second array — § 9 Abs. 2
+    /// S. 4 exempts a device operated behind a Letztverbraucher's Entnahmestelle,
+    /// not one inverter of a roof installation. And **one legacy array on the
+    /// 70 % limitation holds the whole point to it**, because that is where
+    /// § 100 Abs. 3 S. 2 Nr. 2 asks the question.
     #[must_use]
     pub fn of_site(site: &Site) -> Option<Self> {
         let mut profile: Option<Self> = None;
@@ -209,10 +356,28 @@ impl GenerationProfile {
                         (Some(a), Some(b)) => Some(a.min(b)),
                         (a, b) => a.or(b),
                     },
-                    relief: if acc.relief.lifts_cap() && next.relief.lifts_cap() {
-                        acc.relief
-                    } else {
-                        CapRelief::None
+                    // The relief is lifted only where it is lifted for
+                    // **every** array; a Steckersolargerät stops being one the
+                    // moment a second array shares its connection point; and
+                    // one legacy array on the 70 % limitation holds the whole
+                    // Verknüpfungspunkt to it, because that is where § 100
+                    // Abs. 3 S. 2 Nr. 2 measures.
+                    para9: Para9Status {
+                        relief: if acc.para9.relief.lifts_cap() && next.para9.relief.lifts_cap() {
+                            acc.para9.relief
+                        } else {
+                            CapRelief::None
+                        },
+                        // The earlier fitting, because § 51 Abs. 2 Nr. 1 asks
+                        // when *the plant* got an intelligent metering system
+                        // and a Verknüpfungspunkt has one meter.
+                        imsys_since: match (acc.para9.imsys_since, next.para9.imsys_since) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        },
+                        steckersolargeraet: false,
+                        legacy_70_percent: acc.para9.legacy_70_percent
+                            || next.para9.legacy_70_percent,
                     },
                 },
             });
@@ -220,6 +385,62 @@ impl GenerationProfile {
         profile
     }
 }
+
+/// The day § 51 EEG starts to reduce this plant's anzulegender Wert to zero in a
+/// quarter hour with a negative spot price, if it ever does.
+///
+/// `None` is "not yet, and possibly never" — and for a German household roof
+/// that is the ordinary answer, which is why the rule is worth stating carefully
+/// rather than as a boolean somebody sets by hand.
+///
+/// § 51 Abs. 1 zeroes the anzulegender Wert whenever the spot price is negative,
+/// and § 51 Abs. 2 then takes most household systems back out of it:
+///
+/// * **Nr. 1** — a plant below 100 kW is exempt for every period *before the end
+///   of the calendar year in which it is fitted with an intelligent metering
+///   system*. So the trigger is not the day the meter went in: it is the first
+///   of January after it, and a household that gets an iMSys in March keeps the
+///   remuneration for the negative hours of that whole year. It asks about the
+///   **fitting** and nothing about the Ansteuerbarkeit test § 9 Abs. 2 wants,
+///   which is why [`Para9Status::imsys_since`] is a separate fact from
+///   [`CapRelief::ImsysWithControl`].
+/// * **Nr. 2** — a plant below 2 kW is exempt until the end of the year the
+///   Bundesnetzagentur makes its § 85 Abs. 2 Nr. 12 Festlegung in. It has not,
+///   so such a plant is exempt indefinitely and this returns `None` for it
+///   whatever else is true. The day the Festlegung lands, that is one constant
+///   here.
+///
+/// At 100 kW and above neither exemption applies and the rule has always been in
+/// force, so the answer is the plant's own commissioning date.
+///
+/// The value goes on [`hems_tariff::FeedIn::para51_from`], where it reaches both
+/// remuneration schemes — because § 51 reduces the *anzulegender Wert*, which is
+/// what the Einspeisevergütung (§ 53 Abs. 1) and the Marktprämie (Anlage 1 zu
+/// § 23a Nr. 1) are both computed from.
+///
+/// [`hems_tariff::FeedIn::para51_from`]: https://docs.rs/hems-tariff
+#[must_use]
+pub fn para51_applies_from(profile: &GenerationProfile) -> Option<Date> {
+    if profile.installed_dc < PARA51_FESTLEGUNG_SIZE {
+        return None;
+    }
+    if profile.installed_dc >= PARA51_IMSYS_SIZE {
+        return profile.commissioned_at;
+    }
+    let since = profile.para9.imsys_since?;
+    // "vor dem Ablauf des Kalenderjahres, in dem die Anlage mit einem
+    // intelligenten Messsystem ausgestattet wird" — so the first period the rule
+    // reaches is the first of January following.
+    Date::from_calendar_date(since.year() + 1, time::Month::January, 1).ok()
+}
+
+/// The size at or above which § 51 Abs. 2 Nr. 1 EEG's iMSys exemption stops
+/// applying.
+pub const PARA51_IMSYS_SIZE: Power = Power::new_const(100_000.0);
+
+/// The size below which § 51 Abs. 2 Nr. 2 EEG exempts a plant until the
+/// Bundesnetzagentur's § 85 Abs. 2 Nr. 12 Festlegung, which has not been made.
+pub const PARA51_FESTLEGUNG_SIZE: Power = Power::new_const(2_000.0);
 
 /// The ceiling § 9 EEG, the EEBUS `MGCP` factor and an LPP session together put
 /// on this site's feed-in, and which of them set it.
@@ -250,22 +471,32 @@ mod tests {
             installed_dc: Power::from_kw(kwp),
             installed_ac_nominal: Power::from_kw(kwp * 0.8),
             commissioned_at: commissioned,
-            relief: CapRelief::None,
+            para9: Para9Status::default(),
         }
     }
 
     #[test]
     fn a_new_small_system_without_a_control_device_is_capped_at_sixty_percent() {
         let p = profile(9.8, Some(time::macros::date!(2025 - 06 - 01)));
-        assert!(p.cap_applies());
+        assert_eq!(p.statutory_limit(), Some(StatutoryLimit::Cap60));
         assert!((p.statutory_cap().unwrap().kw() - 5.88).abs() < 1e-9);
     }
 
     #[test]
-    fn a_system_commissioned_before_the_law_is_not_capped() {
-        assert!(!profile(9.8, Some(time::macros::date!(2025 - 02 - 24))).cap_applies());
-        assert!(
-            profile(9.8, Some(SOLARSPITZEN_START)).cap_applies(),
+    fn the_window_paragraph_100_exempts_carries_no_cap_and_the_day_the_law_starts_does() {
+        // § 100 Abs. 3b: nothing applies to a system from the window between
+        // the EEG 2023 and the Solarspitzengesetz.
+        assert_eq!(
+            profile(9.8, Some(time::macros::date!(2025 - 02 - 24))).statutory_limit(),
+            None
+        );
+        assert_eq!(
+            profile(9.8, Some(EXEMPT_WINDOW_START)).statutory_limit(),
+            None
+        );
+        assert_eq!(
+            profile(9.8, Some(SOLARSPITZEN_START)).statutory_limit(),
+            Some(StatutoryLimit::Cap60),
             "the day itself counts"
         );
     }
@@ -277,17 +508,86 @@ mod tests {
             CapRelief::DirektvermarktungFernsteuerbar,
         ] {
             let mut p = profile(9.8, Some(time::macros::date!(2025 - 06 - 01)));
-            p.relief = relief;
-            assert!(!p.cap_applies(), "{relief:?} should lift the cap");
+            p.para9.relief = relief;
+            assert_eq!(p.statutory_limit(), None, "{relief:?} should lift the cap");
         }
         // And the default is that nothing has.
-        assert!(profile(9.8, Some(time::macros::date!(2025 - 06 - 01))).cap_applies());
+        assert_eq!(
+            profile(9.8, Some(time::macros::date!(2025 - 06 - 01))).statutory_limit(),
+            Some(StatutoryLimit::Cap60)
+        );
     }
 
     #[test]
-    fn a_balcony_system_and_a_large_roof_are_both_outside_the_size_class() {
-        assert!(!profile(0.8, Some(time::macros::date!(2025 - 06 - 01))).cap_applies());
-        assert!(!profile(150.0, Some(time::macros::date!(2025 - 06 - 01))).cap_applies());
+    fn a_small_roof_array_is_capped_and_only_a_declared_steckersolargeraet_is_not() {
+        // The defect this closes. § 9 Abs. 2 S. 4 exempts *Steckersolargeräte*
+        // within two size tests; it does not put a 2 kW floor under the cap. A
+        // 1,5 kWp roof array read as "below the size class" fed in above its
+        // statutory limit all summer and nothing said so.
+        let roof = profile(1.5, Some(time::macros::date!(2025 - 06 - 01)));
+        assert_eq!(
+            roof.statutory_limit(),
+            Some(StatutoryLimit::Cap60),
+            "a small roof array is not a balcony device"
+        );
+        assert!((roof.statutory_cap().unwrap().kw() - 0.9).abs() < 1e-9);
+
+        // Declared, and inside both tests: outside Nr. 3 altogether.
+        let balcony = GenerationProfile {
+            installed_dc: Power::from_kw(2.0),
+            installed_ac_nominal: Power::new(800.0),
+            para9: Para9Status::steckersolargeraet(),
+            ..roof
+        };
+        assert_eq!(balcony.statutory_limit(), None);
+
+        // …and the size tests are conditions on the exemption, not on the cap:
+        // an 1 000 VA inverter is a Steckersolargerät the statute does not
+        // exempt.
+        let oversized = GenerationProfile {
+            installed_ac_nominal: Power::new(1_000.0),
+            ..balcony
+        };
+        assert_eq!(oversized.statutory_limit(), Some(StatutoryLimit::Cap60));
+    }
+
+    #[test]
+    fn a_hundred_kilowatt_system_is_paragraph_9_nummer_1s_and_carries_no_percentage() {
+        // *"weniger als 100 Kilowatt"*: exactly 100 kW is Nr. 1's, and Nr. 1
+        // demands remote reducibility rather than a percentage.
+        let commissioned = Some(time::macros::date!(2025 - 06 - 01));
+        assert_eq!(
+            profile(99.999, commissioned).statutory_limit(),
+            Some(StatutoryLimit::Cap60)
+        );
+        assert_eq!(profile(100.0, commissioned).statutory_limit(), None);
+        assert_eq!(profile(150.0, commissioned).statutory_limit(), None);
+    }
+
+    #[test]
+    fn a_legacy_system_on_the_old_limitation_is_held_to_seventy_percent() {
+        // § 100 Abs. 3 S. 2 Nr. 2: a system from before 2023 met its obligation
+        // either with equipment the operator can reduce it with — no static
+        // ceiling — or by limiting itself to 70 %. Which one is a fact about
+        // the installation, so it is declared rather than guessed.
+        let old = Some(time::macros::date!(2019 - 05 - 20));
+        assert_eq!(
+            profile(9.8, old).statutory_limit(),
+            None,
+            "a Rundsteuerempfänger leaves no static ceiling"
+        );
+
+        let limited = GenerationProfile {
+            para9: Para9Status::legacy_70_percent(),
+            ..profile(9.8, old)
+        };
+        assert_eq!(limited.statutory_limit(), Some(StatutoryLimit::Cap70Legacy));
+        assert!((limited.statutory_cap().unwrap().kw() - 6.86).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_unknown_commissioning_date_leaves_the_feed_in_alone() {
+        assert_eq!(profile(9.8, None).statutory_limit(), None);
     }
 
     #[test]

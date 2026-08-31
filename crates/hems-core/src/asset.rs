@@ -117,7 +117,17 @@ pub enum CapRelief {
     #[default]
     None,
     /// An intelligent metering system with a control device is **in operation**
-    /// — the lift § 9 Abs. 2 EEG names.
+    /// and the network operator's first Ansteuerbarkeit test has succeeded —
+    /// which is what § 9 Abs. 2 EEG actually asks for: the cap runs *"bis zum
+    /// Einbau von intelligenten Messsystemen und Steuerungseinrichtungen … **und
+    /// zur erstmaligen erfolgreichen Testung** der Anlage … auf
+    /// Ansteuerbarkeit"*.
+    ///
+    /// Both halves, and the second is why this is not the same fact as
+    /// [`Para9Status::imsys_since`]. A meter can be sitting in the cupboard for
+    /// a year before the operator gets round to testing it, and in that year the
+    /// household is under the 60 % cap *and* has lost § 51's exemption. Reading
+    /// one fact for both questions makes that year impossible to describe.
     ImsysWithControl,
     /// The output is sold on the market and the Fernsteuerbarkeit § 10b EEG
     /// demands is working. The commercial arrangement alone is not enough.
@@ -129,6 +139,129 @@ impl CapRelief {
     #[must_use]
     pub const fn lifts_cap(self) -> bool {
         !matches!(self, CapRelief::None)
+    }
+}
+
+/// Everything § 9 EEG needs to know about a photovoltaic system that is not its
+/// size or its commissioning date.
+///
+/// Three declared facts rather than three inferences, and the reason is that
+/// **none of them can be read off a datasheet**. Whether an installation is a
+/// Steckersolargerät behind a Letztverbraucher's Entnahmestelle, whether a
+/// system from 2019 met its obligation by limiting itself to 70 % or by
+/// accepting a Rundsteuerempfänger, and whether an intelligent metering system
+/// with a control device is actually *in operation* are all statements an
+/// installer makes about a particular house. Guessing any of them either
+/// curtails a household that need not be curtailed or feeds in above a
+/// statutory limit, and principle P5 says which way to fail: the two fields
+/// that would *loosen* a limit default to off, and the one that would tighten
+/// one is off too, because it is a legacy regime a modern system is not in.
+///
+/// `hems_grid::para9::GenerationProfile` turns these into a ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Para9Status {
+    /// What, if anything, has lifted the 60 % cap.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub relief: CapRelief,
+    /// The day an intelligent metering system was **fitted** to this plant.
+    ///
+    /// A different fact from [`CapRelief::ImsysWithControl`], and the statute is
+    /// what separates them. § 9 Abs. 2 EEG lifts the feed-in cap only once the
+    /// system is in operation **and** the operator's first Ansteuerbarkeit test
+    /// has succeeded; § 51 Abs. 2 Nr. 1 EEG stops exempting the plant from the
+    /// negative-price rule at the end of the calendar year it was *fitted* in,
+    /// and asks nothing about a test.
+    ///
+    /// So the ordinary German household of 2026 is exactly the case one field
+    /// could not express: an intelligent metering system has been in for years
+    /// — every § 14a household has one, because the Steuerungseinrichtung comes
+    /// with it — the negative hours therefore earn nothing, and the 60 % cap is
+    /// still on because nobody has run the test. Collapsing the two makes that
+    /// household undescribable and quietly changes what every negative quarter
+    /// hour is worth.
+    ///
+    /// `hems_grid::para9::para51_applies_from` is what reads it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "crate::wire::iso_date::option")
+    )]
+    pub imsys_since: Option<Date>,
+    /// Declared: this is a **Steckersolargerät** with at most 2 kW of modules
+    /// and at most 800 VA of inverter, operated behind the Entnahmestelle of a
+    /// Letztverbraucher — the exemption of § 9 Abs. 2 S. 4 EEG.
+    ///
+    /// The statute exempts a *kind of installation*, not a size class, and the
+    /// two size tests are conditions **on top of** it. A 1,5 kWp roof array is
+    /// not a Steckersolargerät and is not exempt; treating the 2 kW figure as a
+    /// lower bound on the cap's scope is how such a system ends up feeding in
+    /// above its statutory limit.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub steckersolargeraet: bool,
+    /// Declared: a system commissioned **before 2023** that met its obligation
+    /// under the EEG version applicable to it by limiting the maximum active
+    /// power at the Verknüpfungspunkt to 70 % of the installed power, rather
+    /// than by fitting equipment the network operator can reduce it with
+    /// (§ 100 Abs. 3 S. 2 Nr. 2 EEG).
+    ///
+    /// Off by default, and that is a decision. Most legacy systems took the
+    /// Rundsteuerempfänger instead, for which there is no static ceiling at all
+    /// — the operator commands — and § 100 Abs. 3a let a Solaranlage of at most
+    /// 7 kW drop the limitation from 1 January 2023 provided it told the
+    /// operator first (§ 8 EEG). None of that is derivable from a commissioning
+    /// date, so it is asked rather than assumed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub legacy_70_percent: bool,
+}
+
+impl Para9Status {
+    /// A system whose cap has been lifted by `relief` and which is otherwise
+    /// ordinary.
+    #[must_use]
+    pub const fn relieved(relief: CapRelief) -> Self {
+        Self {
+            relief,
+            imsys_since: None,
+            steckersolargeraet: false,
+            legacy_70_percent: false,
+        }
+    }
+
+    /// Say when an intelligent metering system was fitted — § 51's clock.
+    #[must_use]
+    pub const fn with_imsys_since(mut self, day: Date) -> Self {
+        self.imsys_since = Some(day);
+        self
+    }
+
+    /// Say what has lifted the § 9 Abs. 2 cap — the other clock.
+    #[must_use]
+    pub const fn with_relief(mut self, relief: CapRelief) -> Self {
+        self.relief = relief;
+        self
+    }
+
+    /// A Steckersolargerät — see [`Para9Status::steckersolargeraet`]. The size
+    /// tests are `hems_grid::para9`'s, because they are the statute's.
+    #[must_use]
+    pub const fn steckersolargeraet() -> Self {
+        Self {
+            relief: CapRelief::None,
+            imsys_since: None,
+            steckersolargeraet: true,
+            legacy_70_percent: false,
+        }
+    }
+
+    /// A pre-2023 system still holding itself to 70 %.
+    #[must_use]
+    pub const fn legacy_70_percent() -> Self {
+        Self {
+            relief: CapRelief::None,
+            imsys_since: None,
+            steckersolargeraet: false,
+            legacy_70_percent: true,
+        }
     }
 }
 
@@ -180,7 +313,10 @@ pub struct AssetMeta {
     /// group is how a site exceeds a network operator's limit, and it also
     /// lowers the minimum power the customer is owed. See
     /// `hems_grid::para14a::participation`.
-    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "crate::wire::iso_date::option")
+    )]
     pub commissioned_at: Option<Date>,
     /// Why this asset does not participate, if it does not.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -305,13 +441,13 @@ pub struct PvArray {
     /// Module azimuth, degrees east of north (180 = due south).
     #[cfg_attr(feature = "serde", serde(default))]
     pub azimuth_deg: f64,
-    /// What, if anything, has lifted the § 9 Abs. 2 EEG 60 % feed-in cap for
-    /// this system.
+    /// The § 9 EEG facts an installer declares about this system.
     ///
-    /// Together with [`AssetMeta::commissioned_at`] and [`PvArray::kwp_dc`] this
-    /// is everything `hems_grid::para9` needs to decide whether the cap applies.
+    /// Together with [`AssetMeta::commissioned_at`], [`PvArray::kwp_dc`] and
+    /// [`PvArray::ac_nominal`] this is everything `hems_grid::para9` needs to
+    /// decide which statutory feed-in limitation, if any, applies.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub cap_relief: CapRelief,
+    pub para9: Para9Status,
 }
 
 /// Battery chemistry, because degradation behaves differently.
@@ -587,18 +723,120 @@ impl DhwTank {
     }
 }
 
-/// How much freedom a load gives the planner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// The fixed sequence of powers an appliance draws once it has been started.
+///
+/// A washing machine is not a load that can be turned down; it is a *shape* that
+/// can be started later. Heat the water, tumble, heat again, spin — a
+/// two-kilowatt peak for one quarter hour and two hundred watts for the next
+/// five. Modelling it as an average would let a planner run it under a ceiling
+/// its peak breaks, and modelling it as its peak would refuse to run it at all.
+///
+/// This is S2's `PPBC.PowerSequence` at the resolution the planner works in
+/// ([`SLOT`](crate::slot::SLOT)), and it is the reason
+/// [`LoadKind::Shiftable`] carries one: an appliance that says "I am shiftable"
+/// and cannot say *what* it would run has told the planner nothing it can act
+/// on.
+///
+/// # Steps, not a duration and a power
+///
+/// A duration and a power is the same thing only for an appliance that draws a
+/// constant current, and the appliances a household actually wants shifted are
+/// precisely the ones that do not. Carrying the shape costs one `Vec<Power>`
+/// and buys a plan that can put the heating quarter hour into the sunny one.
+#[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "serde", serde(transparent))]
+pub struct Programme {
+    /// The average power drawn in each consecutive quarter hour of the run.
+    pub steps: Vec<Power>,
+}
+
+impl Programme {
+    /// A programme drawing `power` for `slots` consecutive quarter hours.
+    #[must_use]
+    pub fn uniform(power: Power, slots: usize) -> Self {
+        Self {
+            steps: vec![power.max(Power::ZERO); slots],
+        }
+    }
+
+    /// A programme from its quarter-hourly shape.
+    #[must_use]
+    pub fn from_steps(steps: impl IntoIterator<Item = Power>) -> Self {
+        Self {
+            steps: steps.into_iter().map(|p| p.max(Power::ZERO)).collect(),
+        }
+    }
+
+    /// How many quarter hours the run lasts.
+    #[must_use]
+    pub fn slots(&self) -> usize {
+        self.steps.len()
+    }
+
+    /// Whether there is anything to run.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.is_empty()
+    }
+
+    /// The power drawn `offset` quarter hours after the start, or zero once the
+    /// programme has finished.
+    #[must_use]
+    pub fn power_at(&self, offset: usize) -> Power {
+        self.steps.get(offset).copied().unwrap_or(Power::ZERO)
+    }
+
+    /// The largest power the run ever draws — what a fuse and a § 14a ceiling
+    /// have to survive, and what a driver quotes.
+    #[must_use]
+    pub fn peak(&self) -> Power {
+        self.steps.iter().copied().fold(Power::ZERO, Power::max)
+    }
+
+    /// The energy the whole run consumes.
+    #[must_use]
+    pub fn energy(&self) -> Energy {
+        self.steps.iter().map(|p| p.over(crate::slot::SLOT)).sum()
+    }
+
+    /// How long the run takes.
+    #[must_use]
+    pub fn duration(&self) -> time::Duration {
+        crate::slot::SLOT * i32::try_from(self.slots()).unwrap_or(i32::MAX)
+    }
+}
+
+/// How much freedom a load gives the planner.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case", tag = "kind"))]
 pub enum LoadKind {
     /// Cannot be influenced. The household base load.
     #[default]
     Fixed,
-    /// Can be started later, but not interrupted once running — a dishwasher.
-    Shiftable,
+    /// Runs a fixed [`Programme`] that can be started later but not turned down
+    /// or interrupted — a dishwasher, a washing machine, a tumble dryer. S2
+    /// calls this `PPBC`.
+    ///
+    /// The programme is carried rather than referenced because a shiftable load
+    /// with no programme is not a modelling gap the planner can work around: it
+    /// is an appliance that has announced flexibility and then declined to say
+    /// what of.
+    Shiftable(Programme),
     /// Can be interrupted and resumed — a pool pump, a dehumidifier.
     Interruptible,
+}
+
+impl LoadKind {
+    /// The programme this load runs, if it runs one.
+    #[must_use]
+    pub fn programme(&self) -> Option<&Programme> {
+        match self {
+            LoadKind::Shiftable(p) => Some(p),
+            LoadKind::Fixed | LoadKind::Interruptible => None,
+        }
+    }
 }
 
 /// A load other than the modelled appliances.
@@ -608,9 +846,20 @@ pub struct FlexibleLoad {
     /// Identity and connection.
     pub meta: AssetMeta,
     /// Nominal power while running.
+    ///
+    /// For a [`LoadKind::Shiftable`] appliance this is what its plate says; the
+    /// shape the planner works from is [`Programme`].
     pub nominal: Power,
     /// How much freedom the planner has.
     pub kind: LoadKind,
+}
+
+impl FlexibleLoad {
+    /// The programme this appliance runs, if it is a shiftable one.
+    #[must_use]
+    pub fn programme(&self) -> Option<&Programme> {
+        self.kind.programme()
+    }
 }
 
 /// What a meter measures.
@@ -849,7 +1098,7 @@ mod tests {
             ac_nominal: Power::from_kw(8.0),
             tilt_deg: 35.0,
             azimuth_deg: 180.0,
-            cap_relief: CapRelief::None,
+            para9: Para9Status::default(),
         });
         // An inverter cannot consume, so its ceiling is zero, not +8 kW.
         assert_eq!(pv.ratings().ceiling, Power::ZERO);

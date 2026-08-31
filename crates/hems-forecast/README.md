@@ -49,6 +49,12 @@ service cannot.
   units the forecasting literature compares models in — because a forecast nobody
   scores is a number nobody should act on, and because a score of zero means the
   forecaster was shown the answer.
+- 📅 **…counted in days, not in quarter hours.** Forecast error is correlated
+  across a day, so ninety-six slots of one Tuesday are one draw wearing ninety-six
+  hats. `Calibration` carries an **episode** count beside its sample count and
+  `is_well_calibrated` asks for twenty *days*, so a single day that happened to
+  land inside its band cannot report itself calibrated. `merge` and `back_test`
+  are what a sweep accumulates with.
 - 🚫 **A model with no evidence looks like one.** An untrained corrector is the
   identity with a wide band; a weekday with fewer than three observed sessions
   produces no forecast at all.

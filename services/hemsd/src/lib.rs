@@ -16,10 +16,13 @@
     clippy::cast_precision_loss
 )]
 
+pub mod backtest;
+pub mod drivers;
 pub mod forecasting;
 pub mod scenario;
 pub mod site;
 
+pub use backtest::{Spread, spread_over_days};
 pub use forecasting::{Learned, Weather, WeatherSpec};
 pub use scenario::{DayResult, EvPlan, Scenario, run};
 pub use site::{Household, HouseholdConfig};

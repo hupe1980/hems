@@ -1,0 +1,34 @@
+[package]
+name        = "hems-drv"
+description = "Drivers for a home energy system — the sans-I/O contract, plus EEBUS (§ 14a) and SunSpec over Modbus behind features"
+keywords    = ["energy", "hems", "eebus", "sunspec", "modbus"]
+categories  = ["science", "hardware-support"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core = { workspace = true }
+metering  = { workspace = true }
+serde     = { workspace = true, optional = true }
+thiserror = { workspace = true }
+time      = { workspace = true }
+
+# The protocol crates, each behind the feature that needs it. A box that speaks
+# only Modbus never compiles, audits or ships the EEBUS stack.
+eebus     = { workspace = true, optional = true }
+hems-grid = { workspace = true, optional = true }
+sunspec   = { workspace = true, optional = true }
+
+[features]
+default = ["serde"]
+## Serialize/deserialize every public type.
+serde = ["dep:serde", "hems-core/serde"]
+## EEBUS: the Controllable System of LPC/LPP — the § 14a side of a household.
+eebus = ["dep:eebus", "dep:hems-grid"]
+## SunSpec over Modbus TCP: inverters, meters and batteries.
+modbus = ["dep:sunspec"]

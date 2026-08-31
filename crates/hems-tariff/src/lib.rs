@@ -43,6 +43,7 @@ pub mod levies;
 pub mod source;
 pub mod stack;
 pub mod tariff;
+mod wire;
 
 pub use advisor::{Comparison, ModulChoice, compare_moduls};
 pub use levies::Levies;

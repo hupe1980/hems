@@ -127,9 +127,29 @@ pub struct Forecast {
 
 impl Forecast {
     /// The band for one slot.
+    ///
+    /// # It is a jump, not a scan
+    ///
+    /// `slots` is in order and a slot is a fixed step, so the position of any
+    /// slot is arithmetic: how far it is from the first one. That matters
+    /// because this is not an occasional lookup — the planner asks it for every
+    /// slot of the horizon, in three constraint builders, once per future, on
+    /// both the mixed-integer solve and the dual pass. A linear scan made that
+    /// quadratic in the horizon for a value that could be indexed.
+    ///
+    /// The result is still checked against the entry it lands on rather than
+    /// trusted, so a forecast whose slots are *not* contiguous — one merged from
+    /// two sources, one with a gap — gives the right answer or `None`, never a
+    /// neighbour's band.
     #[must_use]
     pub fn at(&self, slot: Slot) -> Option<Band> {
-        self.slots.iter().find(|(s, _)| *s == slot).map(|(_, b)| *b)
+        let first = self.slots.first()?.0;
+        let i = usize::try_from(first.distance_to(slot)).ok()?;
+        match self.slots.get(i) {
+            Some((s, b)) if *s == slot => Some(*b),
+            // Not contiguous after all: fall back to looking properly.
+            _ => self.slots.iter().find(|(s, _)| *s == slot).map(|(_, b)| *b),
+        }
     }
 
     /// The medians, in order.
@@ -174,5 +194,39 @@ mod tests {
     #[test]
     fn a_certain_band_has_no_width() {
         assert_eq!(Band::certain(42.0).width(), 0.0);
+    }
+
+    #[test]
+    fn a_lookup_lands_on_the_right_slot_contiguous_or_not() {
+        use hems_core::prelude::Horizon;
+        let h = Horizon::new(time::macros::datetime!(2026-01-15 00:00:00 UTC), 8);
+        let all: Vec<Slot> = h.slots().collect();
+
+        let f = Forecast {
+            slots: all
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (*s, Band::certain(i as f64)))
+                .collect(),
+        };
+        for (i, s) in all.iter().enumerate() {
+            assert_eq!(f.at(*s).map(|b| b.p50), Some(i as f64));
+        }
+        // Outside it in both directions, and neither is a neighbour's band.
+        assert_eq!(f.at(all[0].prev()), None);
+        assert_eq!(f.at(all[7].next()), None);
+
+        // A forecast with a hole in it: the index no longer predicts the
+        // position, and the answer still has to be the right band or none.
+        let gapped = Forecast {
+            slots: vec![
+                (all[0], Band::certain(0.0)),
+                (all[1], Band::certain(1.0)),
+                (all[5], Band::certain(5.0)),
+            ],
+        };
+        assert_eq!(gapped.at(all[5]).map(|b| b.p50), Some(5.0));
+        assert_eq!(gapped.at(all[2]), None);
+        assert_eq!(gapped.at(all[3]), None);
     }
 }

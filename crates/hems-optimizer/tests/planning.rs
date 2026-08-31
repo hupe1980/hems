@@ -5,8 +5,9 @@
 
 use std::collections::BTreeMap;
 
-use hems_core::prelude::{AssetId, Energy, Horizon, Power, Slot, Soc};
+use hems_core::prelude::{AssetId, CompressorState, Energy, Horizon, Power, Programme, Slot, Soc};
 use hems_forecast::{Band, Forecast};
+use hems_optimizer::Risk;
 use hems_optimizer::model::{
     BatteryModel, DhwModel, EvSession, HeatPumpModel, PlanningLimits, Problem, ThermalModel,
     TimedLimit,
@@ -75,10 +76,8 @@ fn prices(h: Horizon, ct: &[i64]) -> PriceStack {
         // Below every import price used in these tests, as an EEG tariff is in
         // reality — so a plan that exports rather than storing is choosing to
         // lose money, not spotting an arbitrage.
-        feed_in: FeedIn::Eeg {
-            ct_per_kwh: Decimal::new(4, 0),
-            negative_price_rule: true,
-        },
+        feed_in: FeedIn::eeg(Decimal::new(4, 0))
+            .under_para51_from(Some(time::macros::date!(2020 - 01 - 01))),
         standing_charge_eur_per_year: Decimal::ZERO,
     };
     PriceStack::build(&tariff, h)
@@ -107,6 +106,7 @@ fn names() -> AssetNames {
         pv: Some(AssetId::new("pv").unwrap()),
         heat_pump: Some(AssetId::new("waermepumpe").unwrap()),
         dhw: Some(AssetId::new("warmwasser").unwrap()),
+        shiftable: vec![AssetId::new("spuelmaschine").unwrap()],
     }
 }
 
@@ -1132,4 +1132,694 @@ fn shadow_prices_can_be_switched_off_and_the_plan_is_otherwise_the_same() {
     );
     // …and the slot marginal still comes back, from the price the plan faces.
     assert!(without.plan.slots[0].marginal_eur_per_kwh.is_some());
+}
+
+// ── Shiftable appliances (S2 PPBC) ──────────────────────────────────────────
+
+/// A dishwasher: a heating quarter hour, four of washing, a heating one to dry.
+///
+/// Deliberately *shaped* rather than flat, because the shape is the whole reason
+/// the model carries a programme instead of a duration and an average.
+fn h_ct() -> [i64; 12] {
+    // Dear, cheap, dear — four quarter hours each.
+    [40, 40, 40, 40, 5, 5, 5, 5, 40, 40, 40, 40]
+}
+
+fn dishwasher() -> Programme {
+    Programme::from_steps([
+        Power::from_kw(2.0),
+        Power::from_kw(0.2),
+        Power::from_kw(0.2),
+        Power::from_kw(0.2),
+        Power::from_kw(0.2),
+        Power::from_kw(1.8),
+    ])
+}
+
+#[test]
+fn a_programme_runs_in_the_cheapest_window_its_deadline_allows() {
+    // Twelve quarter hours: the first four are dear, the next four cheap, the
+    // last four dear again. A six-slot programme has one obviously right place.
+    let h = horizon(12);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let problem = Problem::new(h, &p, &pv, &load).with_shiftable(
+        hems_optimizer::ShiftableRun::before(dishwasher(), h.get(11).unwrap()).worth(5.0),
+    );
+    let solved = solve(&problem, &names(), T0).expect("a plan");
+
+    let start = solved
+        .flows
+        .iter()
+        .position(|f| f.shiftable > Power::ZERO)
+        .expect("the machine runs");
+    assert!(
+        (3..=6).contains(&start),
+        "the programme should straddle the cheap hours, started at {start}"
+    );
+
+    // Every kilowatt-hour of the programme is accounted for, once.
+    let ran: f64 = solved.flows.iter().map(|f| f.shiftable.kw() * 0.25).sum();
+    assert!(
+        (ran - dishwasher().energy().kwh()).abs() < 1e-6,
+        "the whole programme ran exactly once: {ran} kWh"
+    );
+}
+
+#[test]
+fn a_programme_keeps_its_shape_rather_than_being_smeared() {
+    // The failure this exists to catch: a planner that treats a shiftable load
+    // as movable energy schedules 400 W into every sunny slot, which is a
+    // schedule no dishwasher will carry out.
+    let h = horizon(12);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let problem = Problem::new(h, &p, &pv, &load).with_shiftable(
+        hems_optimizer::ShiftableRun::before(dishwasher(), h.get(11).unwrap()).worth(5.0),
+    );
+    let solved = solve(&problem, &names(), T0).expect("a plan");
+
+    let start = solved
+        .flows
+        .iter()
+        .position(|f| f.shiftable > Power::ZERO)
+        .expect("the machine runs");
+    for (offset, step) in dishwasher().steps.iter().enumerate() {
+        let actual = solved.flows[start + offset].shiftable;
+        assert!(
+            (actual - *step).abs() < Power::new(1.0),
+            "slot {offset} of the programme drew {actual} instead of {step}"
+        );
+    }
+}
+
+#[test]
+fn a_window_too_tight_for_the_programme_costs_its_price_rather_than_the_plan() {
+    // Four slots of window for a six-slot programme. A hard constraint would
+    // return no plan at all; the household is better served by one that says
+    // "not this wash".
+    let h = horizon(12);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let run = hems_optimizer::ShiftableRun::before(dishwasher(), h.get(4).unwrap()).worth(5.0);
+    let problem = Problem::new(h, &p, &pv, &load).with_shiftable(run);
+    let solved = solve(&problem, &names(), T0).expect("a plan, not an infeasibility");
+
+    assert!(
+        solved.flows.iter().all(|f| f.shiftable == Power::ZERO),
+        "there is nowhere to put it"
+    );
+    let cost = solved.plan.expected_cost.expect("a cost");
+    assert!(
+        cost.unserved_eur >= 5.0,
+        "and the report says what was given up: {cost:?}"
+    );
+}
+
+#[test]
+fn the_earliest_start_is_respected() {
+    let h = horizon(24);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    // The cheap hours are slots 4..8; the household is out until slot 10.
+    let run = hems_optimizer::ShiftableRun::before(dishwasher(), h.get(23).unwrap())
+        .not_before(h.get(10).unwrap())
+        .worth(5.0);
+    let problem = Problem::new(h, &p, &pv, &load).with_shiftable(run);
+    let solved = solve(&problem, &names(), T0).expect("a plan");
+
+    let start = solved
+        .flows
+        .iter()
+        .position(|f| f.shiftable > Power::ZERO)
+        .expect("the machine runs");
+    assert!(start >= 10, "started at {start}, before it was allowed to");
+}
+
+#[test]
+fn moving_a_programme_into_the_cheap_hours_is_what_the_saving_is_made_of() {
+    // The baseline presses start when the machine is loaded; the plan waits for
+    // the cheap window. Nothing else differs, so the whole difference is the
+    // shift — and it is charged on both sides if it cannot happen.
+    let h = horizon(12);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let problem = Problem::new(h, &p, &pv, &load).with_shiftable(
+        hems_optimizer::ShiftableRun::before(dishwasher(), h.get(11).unwrap()).worth(5.0),
+    );
+    let solved = solve(&problem, &names(), T0).expect("a plan");
+
+    let saving = solved
+        .plan
+        .expected_saving_eur()
+        .expect("both sides priced");
+    assert!(
+        saving > 0.0,
+        "shifting the wash into the cheap hours has to be worth something: {saving}"
+    );
+    // …and neither side is charged for a wash it did do.
+    let cost = solved.plan.expected_cost.expect("a cost");
+    let baseline = solved.plan.baseline_cost.expect("a baseline");
+    assert_eq!(cost.unserved_eur, 0.0);
+    assert_eq!(baseline.unserved_eur, 0.0);
+}
+
+#[test]
+fn two_appliances_do_not_both_take_the_same_cheapest_slot_for_free() {
+    // Both want the cheap window; the model has to place both programmes and
+    // account for both, which is the property a single-appliance implementation
+    // silently loses.
+    let h = horizon(16);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let names = AssetNames {
+        shiftable: vec![
+            AssetId::new("spuelmaschine").unwrap(),
+            AssetId::new("waschmaschine").unwrap(),
+        ],
+        ..names()
+    };
+    let problem = Problem::new(h, &p, &pv, &load)
+        .with_shiftable(
+            hems_optimizer::ShiftableRun::before(dishwasher(), h.get(15).unwrap()).worth(5.0),
+        )
+        .with_shiftable(
+            hems_optimizer::ShiftableRun::before(
+                Programme::uniform(Power::from_kw(1.0), 4),
+                h.get(15).unwrap(),
+            )
+            .worth(5.0),
+        );
+    let solved = solve(&problem, &names, T0).expect("a plan");
+
+    let ran: f64 = solved.flows.iter().map(|f| f.shiftable.kw() * 0.25).sum();
+    let expected = dishwasher().energy().kwh() + 1.0;
+    assert!(
+        (ran - expected).abs() < 1e-6,
+        "both programmes ran exactly once: {ran} against {expected} kWh"
+    );
+    // Both appear in the plan, so a household can see which is which.
+    for slot in &solved.plan.slots {
+        assert_eq!(
+            slot.targets
+                .iter()
+                .filter(|t| names.shiftable.contains(&t.asset))
+                .count(),
+            2,
+        );
+    }
+}
+
+// ── Uncertainty: scenarios and the tail ─────────────────────────────────────
+
+/// A forecast that is genuinely uncertain: a median with a wide band around it.
+fn uncertain(h: Horizon, median: f64, spread: f64, active: &[usize]) -> Forecast {
+    Forecast {
+        slots: h
+            .slots()
+            .enumerate()
+            .map(|(i, s)| {
+                let m = if active.contains(&i) { median } else { 0.0 };
+                (s, Band::relative(m, spread))
+            })
+            .collect(),
+    }
+}
+
+#[test]
+fn a_single_future_is_the_model_the_planner_always_had() {
+    // The property that makes `Risk::deterministic` an honest comparison rather
+    // than a differently-conditioned model: with one future and no weight on the
+    // tail, not one variable or row of the scenario machinery is declared, and
+    // the plan is the one the deterministic planner produced.
+    let h = horizon(12);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = uncertain(h, 4000.0, 0.5, &[4, 5, 6, 7]);
+    let load = flat(h, 500.0);
+
+    let problem = |risk| {
+        Problem::new(h, &p, &pv, &load)
+            .with_battery(battery(10.0, 0.3, 0.0))
+            .with_risk(risk)
+    };
+    let plain = solve(&problem(Risk::deterministic()), &names(), T0).expect("a plan");
+    let explicit = solve(
+        &problem(Risk::at_quantile(
+            hems_optimizer::Quantile::P50,
+            hems_optimizer::Quantile::P50,
+        )),
+        &names(),
+        T0,
+    )
+    .expect("a plan");
+    assert_eq!(plain.flows, explicit.flows);
+}
+
+#[test]
+fn a_plan_over_three_futures_commits_between_what_the_pessimist_and_the_optimist_would() {
+    // What "it prices all three" means, as a decision rather than a number.
+    //
+    // The sun is uncertain from the very first quarter hour, so the optimist and
+    // the pessimist disagree about what the battery should do *now* — and now is
+    // the one slot the plan has to commit (`non_anticipativity`). A plan built on
+    // three futures cannot take either side: its first slot lies between them,
+    // which is the whole content of reading a band as a distribution instead of
+    // picking a point on it.
+    //
+    // A single quantile, by contrast, *is* one of those sides. That is the
+    // difference between a robustness knob and a stochastic program, and it is
+    // why `ScenarioSet::Quantile` is kept only as the old behaviour.
+    let h = horizon(16);
+    let ct = [30_i64; 16];
+    let p = prices(h, &ct);
+    let pv = uncertain(h, 6000.0, 0.9, &(0..10).collect::<Vec<_>>());
+    let load = flat(h, 500.0);
+
+    let first_slot = |risk| -> f64 {
+        let problem = Problem::new(h, &p, &pv, &load)
+            .with_battery(battery(10.0, 0.2, 0.0))
+            .with_risk(risk);
+        let solved = solve(&problem, &names(), T0).expect("a plan");
+        solved.flows[0].battery_charge.kw() - solved.flows[0].battery_discharge.kw()
+    };
+
+    let pessimist = first_slot(Risk::at_quantile(
+        hems_optimizer::Quantile::P10,
+        hems_optimizer::Quantile::P90,
+    ));
+    let optimist = first_slot(Risk::at_quantile(
+        hems_optimizer::Quantile::P90,
+        hems_optimizer::Quantile::P10,
+    ));
+    let three = first_slot(Risk {
+        cvar_weight: 0.0,
+        ..Risk::hedged()
+    });
+
+    assert!(
+        optimist > pessimist + 0.1,
+        "the two extremes have to disagree for the test to mean anything: \
+         {pessimist:.2} against {optimist:.2} kW"
+    );
+    assert!(
+        (pessimist - 1e-6..=optimist + 1e-6).contains(&three),
+        "three futures commit between the two extremes: {three:.2} kW is outside \
+         [{pessimist:.2}, {optimist:.2}]"
+    );
+}
+
+#[test]
+fn the_tail_pulls_the_commitment_towards_the_pessimist() {
+    // …and weight on the tail moves it towards the dull future, which is the
+    // whole of what `cvar_weight` buys. A knob that changed nothing would be a
+    // knob nobody should ship.
+    let h = horizon(16);
+    let ct = [30_i64; 16];
+    let p = prices(h, &ct);
+    let pv = uncertain(h, 6000.0, 0.9, &(0..10).collect::<Vec<_>>());
+    let load = flat(h, 500.0);
+
+    let first_slot = |risk| -> f64 {
+        let problem = Problem::new(h, &p, &pv, &load)
+            .with_battery(battery(10.0, 0.2, 0.0))
+            .with_risk(risk);
+        let solved = solve(&problem, &names(), T0).expect("a plan");
+        solved.flows[0].battery_charge.kw() - solved.flows[0].battery_discharge.kw()
+    };
+
+    let neutral = first_slot(Risk {
+        cvar_weight: 0.0,
+        ..Risk::hedged()
+    });
+    let hedged = first_slot(Risk {
+        cvar_weight: 1.0,
+        ..Risk::hedged()
+    });
+    assert!(
+        hedged <= neutral + 1e-6,
+        "weight on the tail cannot make the plan *more* optimistic about the sun: \
+         {hedged:.3} against {neutral:.3} kW"
+    );
+}
+
+#[test]
+fn weight_on_the_tail_never_makes_the_expected_cost_better() {
+    // The defining property of a hedge, and the one that makes it *measurable*:
+    // it costs something in expectation. A "risk-aware" plan that were cheaper
+    // on average as well would not be a hedge, it would be a bug in the
+    // risk-neutral objective.
+    let h = horizon(24);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = uncertain(h, 5000.0, 0.7, &(8..16).collect::<Vec<_>>());
+    let load = flat(h, 400.0);
+    let draw: Vec<f64> = (0..24).map(|k| if k >= 20 { 900.0 } else { 0.0 }).collect();
+
+    let cost_of = |risk| {
+        let problem = Problem::new(h, &p, &pv, &load)
+            .with_dhw(
+                DhwModel {
+                    stored_now: Energy::from_kwh(0.4),
+                    ..DhwModel::tank(Energy::from_kwh(5.0), Power::from_kw(1.5))
+                },
+                &draw,
+            )
+            .with_risk(risk);
+        solve(&problem, &names(), T0)
+            .expect("a plan")
+            .plan
+            .expected_cost
+            .expect("a cost")
+            .total()
+    };
+
+    let neutral = cost_of(Risk {
+        cvar_weight: 0.0,
+        ..Risk::hedged()
+    });
+    let hedged = cost_of(Risk::hedged());
+    assert!(
+        hedged >= neutral - 1e-6,
+        "a hedge costs something in expectation: {hedged} against {neutral}"
+    );
+}
+
+#[test]
+fn the_first_slot_is_one_decision_however_many_futures_there_are() {
+    // Non-anticipativity. The arbiter is about to commit the next fifteen
+    // minutes; a plan that gave three different answers for it would be three
+    // plans and a coin. Everything after it is recourse, which is what makes
+    // hedging affordable.
+    let h = horizon(16);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = uncertain(h, 4000.0, 0.8, &(0..12).collect::<Vec<_>>());
+    let load = flat(h, 600.0);
+    let problem = Problem::new(h, &p, &pv, &load)
+        .with_battery(battery(10.0, 0.5, 0.05))
+        .with_risk(Risk::hedged());
+    let solved = solve(&problem, &names(), T0).expect("a plan");
+
+    // The reported flows are the central future's; the property under test is
+    // that its first slot is a commitment the plan can actually keep, so the
+    // target the arbiter reads is finite and inside the battery's own rating.
+    let first = solved.flows[0];
+    assert!(first.battery_charge.is_finite() && first.battery_discharge.is_finite());
+    let target = solved.plan.slots[0]
+        .target(&AssetId::new("battery").unwrap())
+        .expect("the battery is commanded");
+    assert!(
+        (target.power - (first.battery_charge - first.battery_discharge)).abs() < Power::new(1.0),
+        "the plan's first slot and the flows it reports are the same decision"
+    );
+}
+
+#[test]
+fn swansons_weights_are_a_probability_distribution() {
+    // Three futures, 0,3 / 0,4 / 0,3 — Swanson's rule on a P10/P50/P90 band, so
+    // the scenario set costs nothing to produce beyond the band the forecast
+    // already publishes.
+    let futures = hems_optimizer::ScenarioSet::Swanson.realisations();
+    assert_eq!(futures.len(), 3);
+    let total: f64 = futures.iter().map(|r| r.probability).sum();
+    assert!((total - 1.0).abs() < 1e-12, "{total}");
+    // And the misfortune is comonotone: the pessimistic future is dull *and*
+    // hungry, which is what a household's bad day actually looks like.
+    assert_eq!(futures[0].pv, hems_optimizer::Quantile::P10);
+    assert_eq!(futures[0].load, hems_optimizer::Quantile::P90);
+
+    // A single-future set is still a distribution.
+    for set in [
+        hems_optimizer::ScenarioSet::Median,
+        hems_optimizer::ScenarioSet::Quantile {
+            pv: hems_optimizer::Quantile::P10,
+            load: hems_optimizer::Quantile::P90,
+        },
+    ] {
+        let r = set.realisations();
+        assert_eq!(r.len(), 1);
+        assert!((r[0].probability - 1.0).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn a_nonsense_risk_setting_falls_back_rather_than_exploding() {
+    // `α → 1` makes `1/(1 − α)` infinite and a weight outside `[0, 1]` is a
+    // caller error. Neither may reach the solver: an objective with an infinite
+    // coefficient is not a worse plan, it is no plan at all.
+    let h = horizon(8);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let problem = Problem::new(h, &p, &pv, &load).with_risk(Risk {
+        scenarios: hems_optimizer::ScenarioSet::Swanson,
+        cvar_alpha: f64::NAN,
+        cvar_weight: 7.0,
+    });
+    let solved = solve(&problem, &names(), T0).expect("a plan, not an explosion");
+    assert!(solved.flows.iter().all(|f| f.grid_import.is_finite()));
+}
+
+#[test]
+fn a_band_that_narrows_to_nothing_costs_no_premium() {
+    // The premium a scenario plan pays is a function of the **width of the
+    // band**, and this is that statement as a limit: shrink the band and the
+    // three futures become one, so there is nothing left to insure and the plan
+    // costs exactly what the deterministic one costs.
+    //
+    // It is the reason `hemsd risk` reports what it does, and why a calibrated
+    // band is a *precondition* for the scenario planner rather than an
+    // improvement to it. A band that covers 93 % of outcomes against the 80 % it
+    // promises makes the pessimistic future worse than any day that happens, and
+    // a plan that insures against it pays a premium for a claim nobody makes.
+    //
+    // Compared on **cost**, not on a decision: with surplus in every slot there
+    // are many equally good times to charge a battery, and "the two plans chose
+    // differently" would be a statement about the solver's tie-breaking.
+    let h = horizon(16);
+    let ct = h_ct();
+    let p = prices(h, &ct);
+    let load = flat(h, 500.0);
+
+    let cost_of = |spread: f64, risk| -> f64 {
+        let pv = uncertain(h, 6000.0, spread, &(0..10).collect::<Vec<_>>());
+        let problem = Problem::new(h, &p, &pv, &load)
+            .with_battery(battery(10.0, 0.2, 0.05))
+            .with_risk(risk);
+        solve(&problem, &names(), T0)
+            .expect("a plan")
+            .plan
+            .expected_cost
+            .expect("a cost")
+            .total()
+    };
+    let premium = |spread: f64| -> f64 {
+        cost_of(spread, Risk::hedged()) - cost_of(spread, Risk::deterministic())
+    };
+
+    let narrow = premium(0.0);
+    assert!(
+        narrow.abs() < 0.01,
+        "a band of no width is a certainty, and there is no premium: {narrow:.4} €"
+    );
+}
+
+#[test]
+fn tightness_is_the_share_of_a_sessions_own_capacity_the_promise_uses() {
+    let session = |now_kwh: f64, target_kwh: f64, slots: i64| EvSession {
+        energy_now: Energy::from_kwh(now_kwh),
+        energy_target: Energy::from_kwh(target_kwh),
+        capacity: Energy::from_kwh(60.0),
+        max_charge: Power::from_kw(11.0),
+        min_charge: Power::from_kw(4.14),
+        efficiency: 1.0,
+        arrival: None,
+        departure: Slot::containing(T0 + time::Duration::minutes(15 * slots)),
+    };
+    let now = Slot::containing(T0);
+
+    // A car that is already full asks nothing of the session it has left.
+    assert_eq!(session(40.0, 40.0, 40).tightness(now), 0.0);
+
+    // Fourteen hours to take 20 kWh at 11 kW: a seventh of what the cable could
+    // deliver, and nothing whatever to insure.
+    let overnight = session(18.0, 38.0, 56).tightness(now);
+    assert!(overnight < 0.15, "{overnight}");
+
+    // Three hours to take 13 kWh: two fifths, and the evening the reference
+    // `deadline` day is built around.
+    let teatime = session(18.0, 31.0, 12).tightness(now);
+    assert!((0.35..0.45).contains(&teatime), "{teatime}");
+
+    // A departure that has already been and gone leaves no capacity at all, and
+    // the answer is one rather than a division by zero.
+    assert_eq!(session(10.0, 40.0, 0).tightness(now), 1.0);
+}
+
+// ── The inputs have to describe the horizon they are planned over ───────────
+
+#[test]
+fn a_forecast_that_stops_short_of_the_horizon_is_refused_rather_than_read_as_zero() {
+    // The horizon runs 16 slots; the forecasts cover 8. Read as zero, the last
+    // eight slots say the roof is dark *and* the house is empty — a lie in both
+    // directions, and one that produces a confident plan nothing complains
+    // about. See `SolveError::ForecastTooShort`.
+    let h = horizon(16);
+    let short = horizon(8);
+    let p = prices(h, &[20]);
+    let pv = flat(short, 0.0);
+    let load = flat(short, 1000.0);
+
+    let err = solve(&Problem::new(h, &p, &pv, &load), &names(), T0).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            hems_optimizer::SolveError::ForecastTooShort {
+                series: "production",
+                covered: 8,
+                slots: 16
+            }
+        ),
+        "{err:?}"
+    );
+
+    // And the load is named separately, because the two come from different
+    // estimators and a caller has to know which one it truncated.
+    let pv_full = flat(h, 0.0);
+    let err = solve(&Problem::new(h, &p, &pv_full, &load), &names(), T0).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            hems_optimizer::SolveError::ForecastTooShort { series: "load", .. }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn a_price_stack_for_the_wrong_hours_is_refused_and_a_short_one_is_not() {
+    let h = horizon(8);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 1000.0);
+
+    // Built for a day that starts an hour later: every entry is the right shape
+    // and the wrong hour, which is the one misalignment nothing downstream can
+    // notice. The stack carries its own slot, so this costs one comparison.
+    let elsewhere = prices(Horizon::new(T0 + time::Duration::hours(1), 8), &[20]);
+    let err = solve(&Problem::new(h, &elsewhere, &pv, &load), &names(), T0).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            hems_optimizer::SolveError::PricesMisaligned { position: 0, .. }
+        ),
+        "{err:?}"
+    );
+
+    // A stack that simply stops short is *not* an error: a horizon can run past
+    // the last published auction, and a flat default out there is an honest
+    // answer rather than an invented one.
+    let stops_short = prices(horizon(4), &[20]);
+    assert!(solve(&Problem::new(h, &stops_short, &pv, &load), &names(), T0).is_ok());
+}
+
+// ── A compressor's minimum runtime survives the re-plan ─────────────────────
+
+#[test]
+fn a_compressor_that_has_just_started_is_not_stopped_by_the_next_plan() {
+    // The defect this pins: the minimum-runtime rows are written against
+    // `k − 1`, so they say nothing about the first slot — the only one a
+    // receding horizon executes. A box could therefore start the compressor,
+    // commit that quarter hour, re-plan against a model with no memory, and stop
+    // it again, for ever, with every individual plan feasible.
+    let h = horizon(16);
+    // Dear from the start, so a planner with a free hand keeps the unit off.
+    let p = prices(h, &[40]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let outdoor = vec![8.0; 16];
+
+    let plan_with = |compressor: CompressorState| {
+        let mut hp = HeatPumpModel::on_off(Power::from_kw(5.0));
+        hp.min_on_slots = 3;
+        hp.min_off_slots = 3;
+        hp.compressor = compressor;
+        let t = ThermalModel {
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            ..ThermalModel::house(22.5, hp)
+        };
+        solve(
+            &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+            &names(),
+            T0,
+        )
+        .unwrap()
+    };
+
+    // A warm house and an expensive hour: with the compressor settled and idle,
+    // the plan leaves it alone.
+    let idle = plan_with(CompressorState::settled(false));
+    assert_eq!(
+        idle.flows[0].heat_pump,
+        Power::ZERO,
+        "nothing should make a warm house heat at 40 ct"
+    );
+
+    // The same house, the same hour — but the compressor started one slot ago
+    // and owes two more. It has to keep running, and the plan has to say so.
+    let just_started = plan_with(CompressorState {
+        running: true,
+        slots_in_state: 1,
+    });
+    for k in 0..2 {
+        assert!(
+            just_started.flows[k].heat_pump > Power::ZERO,
+            "slot {k}: a compressor one slot into a three-slot minimum owes two \
+             more, and the plan stopped it instead"
+        );
+    }
+    assert_eq!(
+        just_started.flows[2].heat_pump,
+        Power::ZERO,
+        "once the minimum has run the plan is free again, and a warm house at \
+         40 ct should stop"
+    );
+}
+
+#[test]
+fn a_settled_compressor_is_free_and_a_modulating_unit_has_no_memory_at_all() {
+    let free =
+        HeatPumpModel::on_off(Power::from_kw(5.0)).with_compressor(CompressorState::settled(true));
+    assert_eq!(free.committed(), None, "a settled unit owes nothing");
+
+    let mut owing = HeatPumpModel::on_off(Power::from_kw(5.0));
+    owing.min_on_slots = 4;
+    owing.compressor = CompressorState {
+        running: true,
+        slots_in_state: 1,
+    };
+    assert_eq!(owing.committed(), Some((true, 3)));
+
+    // A modulating unit has one output range and no cycling to schedule, so the
+    // question does not arise however its state field is filled in.
+    let mut modulating = HeatPumpModel::modulating(Power::from_kw(5.0));
+    modulating.compressor = CompressorState {
+        running: true,
+        slots_in_state: 0,
+    };
+    assert_eq!(modulating.committed(), None);
 }

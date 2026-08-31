@@ -5,7 +5,10 @@
 //! simulator that ignores that flatters the controller and hides exactly the
 //! bugs worth finding, so every model here has at least one way of saying no.
 
-use hems_core::prelude::{CopCurve, Current, Energy, PhaseMode, Power, Rc2, Soc, ThermalState};
+use hems_core::prelude::{
+    CompressorState, CopCurve, Current, Energy, PhaseMode, Power, Programme, Rc2, SLOT, Soc,
+    ThermalState,
+};
 use time::Duration;
 
 /// A stationary battery with efficiency, limits and a state of charge.
@@ -160,6 +163,97 @@ impl TankSim {
             .min(self.capacity)
             .max(Energy::ZERO);
         (actual, short)
+    }
+}
+
+/// An appliance that runs a fixed programme once somebody starts it.
+///
+/// The dishwasher, the washing machine, the tumble dryer. It is the only device
+/// in this simulator with **no** dial: it is off, or it is at whatever quarter
+/// hour of its programme it has reached, and the only decision anybody makes
+/// about it is *when* — which is exactly what S2's `PPBC` says about it and what
+/// the planner's start binary decides.
+///
+/// # It ignores a stop, and that is the point
+///
+/// A controller that has changed its mind can command zero, and this keeps
+/// running. That is what the hardware does: a dishwasher interrupted mid-cycle
+/// is not one that resumes later, it is one somebody has to restart with the
+/// dishes still dirty. A simulator that let a controller pause it for free would
+/// let the planner shed a kilowatt from the one device that cannot give one, and
+/// the day would report a saving nobody could reproduce in a kitchen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApplianceSim {
+    /// The shape it draws once started.
+    pub programme: Programme,
+    /// How far into the programme it is, in whole steps. `None` until it starts.
+    started_at: Option<Duration>,
+    /// Time since the start, accumulated by [`ApplianceSim::step`].
+    elapsed: Duration,
+    /// `true` once the programme has run to its end.
+    finished: bool,
+}
+
+impl ApplianceSim {
+    /// An appliance loaded with `programme` and waiting.
+    #[must_use]
+    pub fn new(programme: Programme) -> Self {
+        Self {
+            programme,
+            started_at: None,
+            elapsed: Duration::ZERO,
+            finished: false,
+        }
+    }
+
+    /// Whether the programme is running right now.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.started_at.is_some() && !self.finished
+    }
+
+    /// Whether the programme has run to its end.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// How long after the simulation began the programme was started.
+    #[must_use]
+    pub fn started_at(&self) -> Option<Duration> {
+        self.started_at
+    }
+
+    /// Advance by `dt`, having been asked to start or not.
+    ///
+    /// `start` is a request, honoured only from a standing start: an appliance
+    /// already running cannot be started again, and one that has finished cannot
+    /// be run twice from the same load of dishes. `now` is the time since the
+    /// simulation began, recorded so a day can report how far the wash moved.
+    ///
+    /// Returns the power a meter would see.
+    pub fn step(&mut self, start: bool, now: Duration, dt: Duration) -> Power {
+        if self.finished || self.programme.is_empty() {
+            return Power::ZERO;
+        }
+        if self.started_at.is_none() {
+            if !start {
+                return Power::ZERO;
+            }
+            self.started_at = Some(now);
+        }
+        // The step the appliance is in. Averaging across a boundary would be
+        // more precise and less honest: the plan and the meter agree about
+        // quarter hours, and a control period is a minute.
+        let index =
+            usize::try_from((self.elapsed.whole_seconds() / SLOT.whole_seconds().max(1)).max(0))
+                .unwrap_or(usize::MAX);
+        let power = self.programme.power_at(index);
+        self.elapsed += dt;
+        if self.elapsed >= self.programme.duration() {
+            self.finished = true;
+        }
+        power
     }
 }
 
@@ -391,10 +485,137 @@ pub struct BuildingSim {
     pub cop: CopCurve,
     /// The indoor temperature the unit's own thermostat aims for, °C.
     pub thermostat_set_c: f64,
+    /// The lowest average a single-speed compressor can hold across a slot.
+    ///
+    /// Ignored without a [`CompressorSim`]. It is the simulator's half of the
+    /// planner's `min_electrical`, and the two have to agree or the plan is
+    /// solved against a machine the house does not contain.
+    pub min_electrical: Power,
     /// The indoor temperature it will not heat past whatever it is told, °C.
     pub thermostat_max_c: f64,
     /// Whether the unit's own thermostat is currently calling for heat.
     pub calling: bool,
+    /// The compressor, when this unit is one that cannot modulate.
+    ///
+    /// `None` is a modulating unit: it takes any power up to its rating, which
+    /// is what most heat pumps sold in Germany today do and what the rest of
+    /// this simulator has always assumed. `Some` is a single-speed compressor —
+    /// full output or nothing — and it is the only configuration in which a
+    /// planner's minimum runtime constrains anything, so it is the only one that
+    /// can show whether the planner's honours it.
+    pub compressor: Option<CompressorSim>,
+}
+
+/// A single-speed compressor: on at its rating or off, with the two facts that
+/// decide whether it may change state.
+///
+/// The only configuration in which a planner's minimum runtime constrains
+/// anything, so the only one in which a day can be watched obeying it — and a
+/// constraint nobody can watch being obeyed is one nobody can watch being broken
+/// (D68). It refuses a change its minimum has not earned, the way the hardware
+/// does, and counts its starts.
+///
+/// # It counts in minutes and reports in slots
+///
+/// A minimum runtime is a fact about a machine, so it is held as a [`Duration`]
+/// and advanced by however long a tick actually was. The planner works in
+/// quarter hours, so [`CompressorSim::state`] divides — **rounding down**, which
+/// is the safe direction: a unit fourteen minutes into a run is reported as
+/// having run no whole slot, so the plan believes it still owes the full minimum
+/// and will not ask for a stop the hardware would refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressorSim {
+    /// Whether it is running.
+    pub running: bool,
+    /// How long it has been in that state.
+    pub time_in_state: Duration,
+    /// The least time it stays on once started.
+    pub min_on: Duration,
+    /// The least time it stays off once stopped.
+    pub min_off: Duration,
+    /// How many times it has started.
+    ///
+    /// The number a day reports about itself: a compressor is damaged by
+    /// starting far faster than by running, so this is the cost the minimum
+    /// runtime exists to bound.
+    pub starts: usize,
+    /// How long it stayed on against a command to stop, because its minimum
+    /// runtime had not run.
+    ///
+    /// A **duration**, not a count of occasions, and the distinction is the
+    /// whole point: the control loop ticks once a minute, so a single blocked
+    /// stop refuses fourteen times in a row. Counting those as fourteen
+    /// disagreements reads like a broken controller and is really one piece of
+    /// hardware doing exactly what it says on its datasheet.
+    ///
+    /// It is not by itself a defect. The guard may lawfully command zero in the
+    /// middle of a run — a § 14a reduction does not wait for a compressor — and
+    /// the unit's own inertia then overrides it, which is a fact about the house
+    /// rather than a fault in the plan. What it measures is how much of the
+    /// manager's authority the hardware takes back.
+    pub held_against_command: Duration,
+}
+
+impl CompressorSim {
+    /// An idle compressor that has been idle long enough to be free.
+    #[must_use]
+    pub const fn new(min_on: Duration, min_off: Duration) -> Self {
+        Self {
+            running: false,
+            // Long enough that the first instruction is never refused: a day
+            // that opened by refusing to start would be measuring its own
+            // initial condition.
+            time_in_state: Duration::days(1),
+            min_on,
+            min_off,
+            starts: 0,
+            held_against_command: Duration::ZERO,
+        }
+    }
+
+    /// What the planner should be told, in its own units.
+    #[must_use]
+    pub fn state(&self) -> CompressorState {
+        let slots = (self.time_in_state.whole_seconds() / SLOT.whole_seconds()).max(0);
+        CompressorState {
+            running: self.running,
+            slots_in_state: usize::try_from(slots).unwrap_or(usize::MAX),
+        }
+    }
+
+    /// Whether it may change to `running` now.
+    #[must_use]
+    pub fn may_be(&self, running: bool) -> bool {
+        if running == self.running {
+            return true;
+        }
+        let required = if self.running {
+            self.min_on
+        } else {
+            self.min_off
+        };
+        self.time_in_state >= required
+    }
+
+    /// Take `wanted` for `dt`, and report what the compressor actually did.
+    fn take(&mut self, wanted: bool, dt: Duration) -> bool {
+        let running = if self.may_be(wanted) {
+            wanted
+        } else {
+            self.held_against_command += dt;
+            self.running
+        };
+        if running == self.running {
+            self.time_in_state += dt;
+        } else {
+            if running {
+                self.starts += 1;
+            }
+            self.running = running;
+            self.time_in_state = dt;
+        }
+        running
+    }
 }
 
 impl BuildingSim {
@@ -405,10 +626,12 @@ impl BuildingSim {
             state: ThermalState::uniform(indoor_c),
             building: Rc2::house(),
             nominal_electrical: Power::from_kw(5.0),
+            min_electrical: Power::from_kw(5.0) * 0.3,
             cop: CopCurve::air_source(),
             thermostat_set_c: 20.5,
             thermostat_max_c: 23.0,
             calling: false,
+            compressor: None,
         }
     }
 
@@ -476,7 +699,29 @@ impl BuildingSim {
         } else {
             self.nominal_electrical
         };
-        let drawn = asked.clamp(Power::ZERO, ceiling);
+        let mut drawn = asked.clamp(Power::ZERO, ceiling);
+
+        // A single-speed compressor has one output and two answers. Whatever it
+        // is asked for becomes "run" or "do not", it may refuse a change its
+        // minimum runtime has not earned, and what it then draws is its rating
+        // rather than the request — which is the whole difference between a
+        // plan that schedules cycling and one that pretends to modulate.
+        if let Some(c) = self.compressor.as_mut() {
+            let wanted = drawn > Power::ZERO;
+            drawn = if c.take(wanted, dt) && ceiling > Power::ZERO {
+                // While it runs it holds the average it was asked for, down to
+                // its own floor — which is what a single-speed unit does by
+                // short-cycling inside the quarter hour, and exactly what the
+                // planner's `min_electrical` means for a unit whose *slots* are
+                // the thing being scheduled. Asking for less than the floor gets
+                // the floor: the compressor cannot average lower and still be
+                // the unit that was committed.
+                drawn.max(self.min_electrical).min(self.nominal_electrical)
+            } else {
+                Power::ZERO
+            };
+        }
+
         let heat_kw = drawn.kw() * self.cop(outdoor_c);
         self.state = self.building.step(self.state, heat_kw, outdoor_c, dt);
         drawn
@@ -488,6 +733,83 @@ mod tests {
     use super::*;
 
     const QUARTER: Duration = Duration::minutes(15);
+
+    #[test]
+    fn a_compressor_will_not_stop_before_its_minimum_has_run() {
+        let mut c = CompressorSim::new(Duration::minutes(30), Duration::minutes(30));
+        let tick = Duration::minutes(1);
+
+        // Idle long enough to be free, so the first start is taken.
+        assert!(c.take(true, tick));
+        assert_eq!(c.starts, 1);
+
+        // Now told to stop, every minute, for the next twenty-nine. It cannot.
+        for minute in 1..30 {
+            assert!(
+                c.take(false, tick),
+                "minute {minute}: stopped {minute} minutes into a 30-minute minimum"
+            );
+        }
+        // The thirtieth minute is when it may, and does.
+        assert!(!c.take(false, tick));
+        assert_eq!(c.starts, 1, "refusing a stop is not a start");
+
+        // Twenty-nine minutes of holding on against a command, counted as time
+        // rather than as twenty-nine separate disagreements.
+        assert_eq!(c.held_against_command, Duration::minutes(29));
+    }
+
+    #[test]
+    fn a_compressor_will_not_restart_before_its_off_time_has_run() {
+        let mut c = CompressorSim::new(Duration::minutes(30), Duration::minutes(30));
+        let tick = Duration::minutes(15);
+        assert!(c.take(true, tick));
+        // The starting tick already counts, so one more slot completes the
+        // thirty minutes and the stop lands on the tick after it.
+        assert!(c.take(false, tick), "still inside the 30-minute minimum on");
+        assert!(!c.take(false, tick), "thirty minutes run, and free to stop");
+        // Off, and it owes thirty minutes of it.
+        assert!(!c.take(true, tick), "one slot off is not two");
+        assert!(c.take(true, tick), "two slots off, and it may start again");
+        assert_eq!(c.starts, 2);
+    }
+
+    #[test]
+    fn what_the_planner_is_told_rounds_down_to_whole_slots() {
+        let mut c = CompressorSim::new(Duration::minutes(30), Duration::minutes(30));
+        // Fourteen minutes into a run is no *whole* slot, and the planner is
+        // told so: it then believes the unit still owes its full minimum and
+        // will not ask for a stop the hardware would refuse. Rounding the other
+        // way is the direction that produces a plan the house cannot carry out.
+        c.take(true, Duration::minutes(14));
+        assert_eq!(c.state().slots_in_state, 0);
+        assert!(c.state().running);
+
+        c.take(true, Duration::minutes(1));
+        assert_eq!(c.state().slots_in_state, 1, "fifteen minutes is one slot");
+    }
+
+    #[test]
+    fn a_running_compressor_holds_the_average_it_was_asked_for_down_to_its_floor() {
+        let mut b = BuildingSim {
+            compressor: Some(CompressorSim::new(
+                Duration::minutes(30),
+                Duration::minutes(30),
+            )),
+            ..BuildingSim::new(18.0)
+        };
+        // Cold house, so nothing else is holding it back. Asked for 2 kW of a
+        // 5 kW unit: it runs, and it holds 2 kW — which is what a single-speed
+        // compressor does by short-cycling inside the quarter hour, and what the
+        // planner's `min_electrical` means for a unit whose slots are scheduled.
+        let drawn = b.step(Power::from_kw(2.0), -5.0, QUARTER);
+        assert_eq!(drawn, Power::from_kw(2.0));
+
+        // Below the floor it cannot average lower and still be the unit that was
+        // committed, so it takes the floor rather than the request.
+        let drawn = b.step(Power::from_kw(0.2), -5.0, QUARTER);
+        assert_eq!(drawn, Power::from_kw(5.0) * 0.3);
+    }
 
     #[test]
     fn a_battery_reports_what_it_took_not_what_it_was_told() {

@@ -183,8 +183,15 @@ impl Horizon {
         }
     }
 
-    /// A 48-hour horizon — the default: long enough to see tomorrow's prices
-    /// and a full heating cycle, short enough to solve in a second.
+    /// A 48-hour horizon: long enough to see tomorrow's prices and a full
+    /// heating cycle.
+    ///
+    /// Not what `hemsd` plans over — it re-plans on 24 hours, which is already
+    /// enough to place an overnight charging session and a heating cycle, and
+    /// costs half the solve on every one of a day's ninety-six re-plans. This is
+    /// the longer option, for a caller that has a reason: anticipating a
+    /// reduction window a network operator has published for tomorrow
+    /// (`[A1 8.4]`) is the one that would need it.
     #[must_use]
     pub fn two_days(from: OffsetDateTime) -> Self {
         Self::new(from, 2 * SLOTS_PER_DAY)

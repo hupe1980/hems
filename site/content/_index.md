@@ -35,40 +35,42 @@ $ cargo run -p hemsd -- simulate --day winter
 
   produced                                  8.4 kWh
   charged into the car                     21.7 kWh
-  heat pump                                26.0 kWh
+  heat pump                                26.1 kWh
   hot water                                 3.1 kWh
+  dishwasher                         1.1 kWh, 75 min later
   self-sufficiency                             13 %
 
   roof, as the box learned it        90 % of the model
   production forecast, CRPS          65 W (93 % covered)
   load forecast, CRPS                18 W (85 % covered)
 
-  electricity bill                          20.67 €
-  battery life spent                         0.64 €
-  comfort given up                           0.20 €
-  cost of the day                           21.51 €
-  without optimisation                      23.72 €
-  saved                                      2.21 €
-  …of it on the bill                         3.39 €
+  electricity bill                          21.06 €
+  battery life spent                         0.62 €
+  comfort given up                           0.19 €
+  cost of the day                           22.02 €
+  without optimisation                      24.12 €
+  saved                                      2.10 €
+  …of it on the bill                         3.41 €
 
   § 14a limit in force                       90 min
   …against a minimum of                     10.5 kW
-  …covered by the store                     1.5 kWh
+  …covered by the store                     1.4 kWh
   control events recorded            1 (93 samples)
   slowest reaction                   0 s, commanded
   minutes without a plan                          0
   limit respected throughout                    yes
 
-  described in S2                       5 resources
+  described in S2                       6 resources
   relief from § 14a was worth            0.00 €/kWh
 ```
 
-Seven lines in that table are not in anybody else's:
+Eight lines in that table are not in anybody else's:
 
 | Line | What it means |
 |---|---|
 | **without optimisation** | the same day delivering the **same service** — car charged, house warm, shower hot — with no battery, a wallbox that starts on plug-in and ordinary thermostats, against the **same weather** down to the cloud at 12:19, and under the **same grid rules**. A saving computed any other way flatters itself. |
-| **saved / …of it on the bill** | €2,21 against €3,39. The saving counts the battery life, the comfort and the service the plan actually spent; the bill is the flattering number every other system quotes. |
+| **saved / …of it on the bill** | €2,09 against €3,39. The saving counts the battery life, the comfort and the service the plan actually spent; the bill is the flattering number every other system quotes. |
+| **dishwasher** | the one piece of flexibility a household can *watch*: the programme's own shape, placed in the cheapest window the household allowed, and **how far it moved**. A shift of zero is a mechanism that decided nothing, which is worth seeing. |
 | **…against a minimum of** | what § 14a Ziff. 4.5.2 owes *this* household — `4,2 kW + (n − 1) · GZF(n) · 4,2 kW`, so 10,5 kW with three controllable devices. The flat 4,2 kW is the base of that formula, not the whole of it, and a box that cannot tell the difference cannot tell a customer that an instruction was unlawful. |
 | **…covered by the store** | `[A1 2.3]` in one number — kilowatt-hours the battery lent the controllable devices during the reduction, which never crossed the connection point and which the Festlegung therefore does not count. |
 | **slowest reaction** | whether the household had to be *commanded* into the reduction or was **already below** it. Both satisfy `[A1 4.2]`; a record that cannot tell them apart reports a compliant quiet house as one that took minutes to react. |
@@ -80,7 +82,7 @@ the model* is the box having found, from six weeks of its own metering, that thi
 roof delivers a tenth less than its geometry says — nothing told it. *CRPS* is
 the standard probabilistic-forecast score, in watts. A day that scored zero is a
 day the planner was shown the answer, and its saving is an upper bound nobody in
-a real house can reach; the same day with `--perfect-foresight` saves €5,49.
+a real house can reach; the same day with `--perfect-foresight` saves €5,25.
 
 ## Where to start
 

@@ -29,8 +29,8 @@ which is the one thing a standard exists to prevent.
 | **FRBC** Fill Rate Based Control | a fill level and a rate | battery, hot water tank, a car with a departure time |
 | **PEBC** Power Envelope Based Control | a bound is all that is needed | charge point, inverter curtailment, a heat pump that takes a ceiling |
 | **OMBC** Operation Mode Based Control | discrete states | SG Ready heat pump, interruptible load |
-| **PPBC** Power Profile Based Control | a fixed sequence started in a window | washing machine, dishwasher |
-| **DDBC** Demand Driven Based Control | actuators serving a reported demand | — |
+| **PPBC** Power Profile Based Control | a fixed sequence started in a window | washing machine, dishwasher, tumble dryer |
+| **DDBC** Demand Driven Based Control | actuators serving a reported demand | — (no driver reports a heat demand yet) |
 
 The choice follows from **what the energy manager needs to be able to say**, not
 from the device class. A charge point with no departure time is a power envelope;
@@ -52,12 +52,19 @@ Three details that are easy to get wrong and expensive to get wrong:
   6 A a wallbox cannot operate at all; an envelope that says 0 invites a manager
   to allocate 2 kW and wonder why nothing charges.
 
-A fourth, which only shows up on the second connection: **the identifiers are
+- **A shiftable appliance is not interruptible**, and says so. A dishwasher
+  stopped halfway is not one that resumes; it is one somebody has to restart with
+  the dishes still dirty. `is_interruptible: false` is the whole content of the
+  control type, and a manager told otherwise will pause one to shed a kilowatt.
+
+A fifth, which only shows up on the second connection: **the identifiers are
 derived, not generated.** An instruction names an operation mode by ID, so a
 Resource Manager that re-mints its IDs on every reconnect invalidates every
 description the manager cached, and a manager replaying a ten-minute-old plan
 addresses modes that no longer exist. hems derives them (UUIDv5) from the
-asset's own identity, so a restart changes nothing.
+asset's own identity, so a restart changes nothing — every description, the SG
+Ready heat pump's included, which was the one that generated them until the fifth
+audit found it.
 
 And one that carries real money: `consequence_type` is `DEFER` for a wallbox and
 `VANISH` for an inverter. Curtailed sunlight does not come back later. That single
@@ -76,15 +83,31 @@ let description = describe_battery(&battery, now);
 let power = battery_power(&description, &instruction, &battery)?;
 ```
 
+## A whole site in one call
+
+```rust,ignore
+let described = describe_site(&site, &DescribeContext::new(now, horizon_end, &modes)
+    .with_ev_session(EvStorage { stored, capacity, efficiency }));
+
+for message in described.messages() { connection.send(message).await?; }
+```
+
+`SiteDescription` groups what it built by control type and — this is the part
+that matters — keeps a separate list of what it **could not** build.
+
 ## Written, and *reached*
 
 A flexibility model nothing imports is documentation, not a feature, and no
-property test catches a module with no caller. So the reference day describes the
-whole site in S2 and reports the count (`described in S2: 5 resources` — battery,
-charge point, heat pump, hot-water tank, roof), and a test asserts that every
-asset the arbiter can command has a control type and declares a role. A device
-the S2 layer cannot describe is the first thing a real Resource Manager would
-find, and better found here.
+property test catches a module with no caller. So the reference day calls
+`describe_site` every run and reports both numbers
+(`described in S2: 6 resources` — battery, charge point with a car on it, heat
+pump, hot-water tank, dishwasher, roof), and a test pins them.
+
+Counting *descriptions built* rather than assets whose control type is not
+`NotControllable` is the whole point. The second number goes up when a device is
+added and never notices that no `describe_*` was ever written for it, which is
+how the hot-water tank sat inside it for four versions with nothing to send. A
+gap now says so out loud: `6 resources, 1 it cannot express`.
 
 ## License
 

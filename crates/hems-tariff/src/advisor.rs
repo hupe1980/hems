@@ -36,13 +36,17 @@ pub struct Comparison {
     /// The candidate's label.
     pub label: String,
     /// What the measured consumption would have cost under it, euros.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub energy_cost_eur: Decimal,
     /// Fixed annual effects — a Modul 1 reduction, a Modul 2 metering charge.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub fixed_eur: Decimal,
     /// The two together.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub total_eur: Decimal,
     /// How much better or worse than the first candidate, euros. Negative is a
     /// saving.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub delta_eur: Decimal,
 }
 
@@ -137,7 +141,7 @@ mod tests {
             },
             network,
             levies: Levies::household_2026(),
-            feed_in: FeedIn::None,
+            feed_in: FeedIn::NONE,
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

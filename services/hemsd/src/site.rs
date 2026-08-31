@@ -2,7 +2,7 @@
 
 use hems_core::asset::{
     AssetMeta, Battery, Capabilities, Chemistry, DhwTank, Evse, FlexibleLoad, HeatPump,
-    HeatPumpControl, LoadKind, PvArray,
+    HeatPumpControl, LoadKind, Programme, PvArray,
 };
 use hems_core::prelude::*;
 use hems_optimizer::solve::AssetNames;
@@ -42,14 +42,15 @@ pub struct HouseholdConfig {
     pub dhw_litres: f64,
     /// Electrical power of the hot-water heat pump.
     pub dhw_heater: Power,
-    /// What, if anything, has lifted the § 9 Abs. 2 EEG 60 % feed-in cap.
+    /// The § 9 EEG facts declared about the roof.
     ///
-    /// [`CapRelief::None`] is the default and the realistic one: most systems
-    /// commissioned since 25.02.2025 are still waiting for an intelligent
-    /// metering system with a control device, and until it is **in operation**
-    /// they may feed in 60 % of their installed direct-current power and no
-    /// more.
-    pub cap_relief: CapRelief,
+    /// The default is the realistic pair rather than the tidy one: an
+    /// intelligent metering system fitted years ago, so § 51 EEG has been taking
+    /// the negative quarter hours since the end of that year — and the 60 %
+    /// feed-in cap still on, because § 9 Abs. 2 lifts it only after the network
+    /// operator's first successful Ansteuerbarkeit test, which is a different
+    /// event on a different clock and has not happened.
+    pub para9: Para9Status,
     /// The state of charge the household asked its car to reach.
     ///
     /// `None` means "fill it". It is only ever read by the real-time fallback —
@@ -58,6 +59,14 @@ pub struct HouseholdConfig {
     /// tracker with no notion of *enough* charges past the limit in preference to
     /// exporting.
     pub ev_charge_limit: Option<Soc>,
+    /// The programme a shiftable appliance is loaded with, if the household has
+    /// one waiting.
+    ///
+    /// The dishwasher is the cheapest flexibility a house owns: nothing is
+    /// stored, nothing degrades, and the only cost of moving it is that somebody
+    /// unloads it later. `None` leaves the household without one, which is what
+    /// every reference day was until it existed.
+    pub dishwasher: Option<Programme>,
     /// Whether the charge point can drop to a single conductor.
     ///
     /// Almost every wallbox sold in Germany since about 2022 can, and it is what
@@ -90,11 +99,32 @@ impl Default for HouseholdConfig {
             // and 60 °C for under two kilowatt-hours of electricity.
             dhw_litres: 300.0,
             dhw_heater: Power::from_kw(0.5),
-            cap_relief: CapRelief::None,
+            // The ordinary German § 14a household of 2026, and the two halves
+            // are deliberately different answers. An intelligent metering
+            // system has been in since 2024 — every § 14a household has one,
+            // because the Steuerungseinrichtung the network operator writes
+            // limits through comes with it — so § 51 EEG has been taking the
+            // negative quarter hours since the start of 2025. And the § 9
+            // Abs. 2 cap is **still on**, because that one runs until the
+            // operator's first successful Ansteuerbarkeit test and nobody has
+            // run it. `--imsys` is that test happening.
+            para9: Para9Status::default().with_imsys_since(time::macros::date!(2024 - 06 - 01)),
             // Three quarters, the figure most owners of a car they drive daily
             // set: it is where lithium ageing turns and where a charging session
             // stops being worth waiting for.
             ev_charge_limit: Soc::new(0.75).ok(),
+            // Ninety minutes: heat the water, wash, heat again to dry. The shape
+            // is what makes it worth carrying a programme rather than a duration
+            // and an average — a plan allowed to smear 700 W over six hours
+            // would schedule a machine that does not exist.
+            dishwasher: Some(Programme::from_steps([
+                Power::from_kw(2.0),
+                Power::from_kw(0.2),
+                Power::from_kw(0.2),
+                Power::from_kw(0.2),
+                Power::from_kw(1.8),
+                Power::from_kw(0.1),
+            ])),
             evse_switchable: true,
             location: GeoPoint {
                 latitude: 52.52,
@@ -122,6 +152,8 @@ pub struct Household {
     pub load: AssetId,
     /// The hot-water tank.
     pub dhw: AssetId,
+    /// The shiftable appliance, where the household has one.
+    pub dishwasher: Option<AssetId>,
     /// The names, as the optimiser wants them.
     pub names: AssetNames,
 }
@@ -143,6 +175,11 @@ impl Household {
         let heat_pump = AssetId::new("waermepumpe")?;
         let load = AssetId::new("haushalt")?;
         let dhw = AssetId::new("warmwasser")?;
+        let dishwasher = config
+            .dishwasher
+            .as_ref()
+            .map(|_| AssetId::new("spuelmaschine"))
+            .transpose()?;
 
         let assets = assets_of(config, &main, &garage)?;
         let site = Site::new(
@@ -163,6 +200,7 @@ impl Household {
                 pv: Some(pv.clone()),
                 heat_pump: Some(heat_pump.clone()),
                 dhw: Some(dhw.clone()),
+                shiftable: dishwasher.iter().cloned().collect(),
             },
             site,
             pv,
@@ -171,6 +209,7 @@ impl Household {
             heat_pump,
             load,
             dhw,
+            dishwasher,
         })
     }
 }
@@ -216,7 +255,7 @@ fn assets_of(
             ac_nominal: config.pv_ac_nominal,
             tilt_deg: 35.0,
             azimuth_deg: 180.0,
-            cap_relief: config.cap_relief,
+            para9: config.para9,
         }),
         Asset::Battery(Battery {
             meta: meta("battery", config.battery_power.kw(), main, driven)?,
@@ -277,19 +316,56 @@ fn assets_of(
             t_set_c: 55.0,
             t_max_c: 60.0,
         }),
-        Asset::Load(FlexibleLoad {
-            // No control capability: this is the part of the house
-            // nobody manages, and the arbiter must leave it alone.
-            meta: AssetMeta::new(
-                AssetId::new("haushalt")?,
-                main.clone(),
-                PhaseConnection::Three,
-                Power::from_kw(3.0),
-            ),
-            nominal: Power::from_kw(0.5),
-            kind: LoadKind::Fixed,
-        }),
-    ])
+        base_load(main)?,
+    ]
+    .into_iter()
+    .chain(
+        config
+            .dishwasher
+            .clone()
+            .map(|p| shiftable_appliance(p, main)),
+    )
+    .collect())
+}
+
+/// The part of the house nobody manages.
+///
+/// No control capability at all, so the arbiter leaves it alone and the guard
+/// counts it as what it is: load that happens whatever anybody decides.
+fn base_load(circuit: &CircuitId) -> anyhow::Result<Asset> {
+    Ok(Asset::Load(FlexibleLoad {
+        meta: AssetMeta::new(
+            AssetId::new("haushalt")?,
+            circuit.clone(),
+            PhaseConnection::Three,
+            Power::from_kw(3.0),
+        ),
+        nominal: Power::from_kw(0.5),
+        kind: LoadKind::Fixed,
+    }))
+}
+
+/// The shiftable appliance, where the household has loaded one.
+///
+/// `SCHEDULE`, and deliberately **not** `LIMIT_CONSUMPTION`: the only thing
+/// anybody may tell a running dishwasher is when to start. Giving it a
+/// consumption ceiling would let the arbiter shed a kilowatt from the one device
+/// in the house that cannot give one — and the guard would then count on power
+/// that kept flowing anyway, which is the failure mode the whole
+/// nameplate-assumption rule exists to prevent.
+fn shiftable_appliance(programme: Programme, circuit: &CircuitId) -> Asset {
+    Asset::Load(FlexibleLoad {
+        meta: AssetMeta::new(
+            AssetId::new("spuelmaschine").expect("a valid identifier"),
+            circuit.clone(),
+            PhaseConnection::Three,
+            programme.peak(),
+        )
+        .with_capabilities(Capabilities::MEASURE | Capabilities::SCHEDULE)
+        .commissioned(time::macros::date!(2025 - 03 - 01)),
+        nominal: programme.peak(),
+        kind: LoadKind::Shiftable(programme),
+    })
 }
 
 /// The § 14a network-charge modules this household could choose between.
@@ -330,8 +406,14 @@ pub fn modul_choices(current: &Tariff) -> Vec<hems_tariff::ModulChoice> {
 }
 
 /// A dynamic tariff with the given day-ahead prices, in ct/kWh per slot.
+///
+/// `site` is read for one thing only, and it is the thing a tariff cannot know
+/// about itself: whether § 51 EEG reaches this household's roof, and from when.
+/// The answer is a property of the *plant* — its size and the year an intelligent
+/// metering system went in (§ 51 Abs. 2) — so it is derived from the site rather
+/// than set as a preference on the tariff.
 #[must_use]
-pub fn tariff_for(prices_ct: &[i64], horizon: Horizon) -> Tariff {
+pub fn tariff_for(site: &Site, prices_ct: &[i64], horizon: Horizon) -> Tariff {
     let spot: BTreeMap<Slot, Decimal> = horizon
         .slots()
         .enumerate()
@@ -349,11 +431,14 @@ pub fn tariff_for(prices_ct: &[i64], horizon: Horizon) -> Tariff {
         },
         levies: Levies::household_2026(),
         // 7,86 ct/kWh, and nothing at all in a quarter hour with a negative
-        // day-ahead price — § 51 EEG since 25.02.2025.
-        feed_in: FeedIn::Eeg {
-            ct_per_kwh: Decimal::new(786, 2),
-            negative_price_rule: true,
-        },
+        // day-ahead price **once § 51 EEG reaches this plant** — which for a
+        // household roof is the first of January after its intelligent metering
+        // system goes in, and not before (§ 51 Abs. 2 Nr. 1).
+        feed_in: FeedIn::eeg(Decimal::new(786, 2)).under_para51_from(
+            hems_grid::para9::GenerationProfile::of_site(site)
+                .as_ref()
+                .and_then(hems_grid::para9::para51_applies_from),
+        ),
         standing_charge_eur_per_year: Decimal::new(120, 0),
     }
 }

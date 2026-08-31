@@ -94,6 +94,7 @@ pub struct Member {
     /// Any non-negative number: the shares are normalised, so 1/2/3 and
     /// 10/20/30 mean the same thing and a community can express its key in
     /// whatever units its contract uses.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub key: Decimal,
 }
 
@@ -170,13 +171,16 @@ pub struct Share {
     /// Which member.
     pub malo: String,
     /// What they consumed in the quarter hour, kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub consumption: Decimal,
     /// What was allocated to them from the community's generation, kWh.
     ///
     /// Never more than [`Share::consumption`]: a member cannot be sold shared
     /// electricity they did not use.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub shared: Decimal,
     /// What is left for their ordinary supplier to deliver, kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub residual: Decimal,
 }
 
@@ -187,6 +191,7 @@ pub struct Allocation {
     /// The quarter hour.
     pub slot: Slot,
     /// The community's renewable generation offered in it, kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub generation: Decimal,
     /// One entry per member, in the community's own order.
     pub shares: Vec<Share>,
@@ -197,6 +202,7 @@ pub struct Allocation {
     /// Direktvermarkter or under the EEG — the community simply did not use it.
     /// A community whose surplus is persistently large has a key that does not
     /// match its load, and this is the number that says so.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub unallocated: Decimal,
 }
 

@@ -13,7 +13,7 @@
 //! hold energy — so a fill rate is kWh/s. The number is small; that is what the
 //! standard asks for, and [`KWH_PER_S_PER_W`] converts once, in one place.
 
-use hems_core::asset::{Battery, Evse, HeatPump, PvArray};
+use hems_core::asset::{Battery, DhwTank, Evse, FlexibleLoad, HeatPump, Programme, PvArray};
 use hems_core::prelude::*;
 use time::OffsetDateTime;
 
@@ -26,7 +26,7 @@ fn utc(at: OffsetDateTime) -> chrono::DateTime<chrono::Utc> {
 }
 use hems_device::SgReadyState;
 use s2energy::common::{Commodity, CommodityQuantity, Duration, Id, NumberRange, PowerRange, Role};
-use s2energy::{frbc, ombc, pebc};
+use s2energy::{frbc, ombc, pebc, ppbc};
 
 use crate::map::{control_type_for, roles_for};
 
@@ -43,7 +43,7 @@ const HEMS_NAMESPACE: uuid::Uuid = uuid::uuid!("6f9c1f0e-4b3a-5d2e-9a71-2c8e5b4d
 /// replays a plan it made ten minutes ago addresses modes that no longer exist.
 /// Deriving them from the asset's own identity means a restart changes nothing,
 /// which is the behaviour a manager is entitled to assume.
-fn stable_id(asset: &AssetId, part: &str) -> Id {
+pub(crate) fn stable_id(asset: &AssetId, part: &str) -> Id {
     Id(uuid::Uuid::new_v5(
         &HEMS_NAMESPACE,
         format!("{asset}/{part}").as_bytes(),
@@ -204,6 +204,337 @@ pub fn describe_battery(battery: &Battery, valid_from: OffsetDateTime) -> Batter
     }
 }
 
+/// A hot-water tank, described as fill-rate-based control.
+#[derive(Debug, Clone)]
+pub struct DhwDescription {
+    /// The description to send.
+    pub system: frbc::SystemDescription,
+    /// The single actuator: the heater.
+    pub actuator: Id,
+    /// Heating. Factor 0 is idle, factor 1 is the heater at full power.
+    pub heat: Id,
+}
+
+/// Describe a hot-water tank as a store with one direction.
+///
+/// The same shape as a battery and deliberately so — that is S2's whole
+/// argument, and it is why a Customer Energy Manager that has never heard of a
+/// Brauchwasserwärmepumpe can plan one. Three differences, and each is a fact
+/// about water rather than about the encoding:
+///
+/// * **one operation mode, not two.** A tank cannot give its heat back to the
+///   house's electricity, so there is no discharge to describe. It empties on
+///   its own — by standing loss and by somebody having a shower — which is
+///   `provides_leakage_behaviour`.
+/// * **the fill rate carries the coefficient of performance.** A tank told to
+///   draw 500 W of electricity gains 1,5 kW of heat, and a manager that plans on
+///   the electrical figure will think the tank fills three times more slowly
+///   than it does.
+/// * **the fill level is heat above the lowest acceptable temperature**, in
+///   kilowatt-hours like every other store here — the same quantity
+///   [`DhwTank::usable_heat`] defines, so the description and the planner cannot
+///   disagree about how full "full" is.
+#[must_use]
+pub fn describe_dhw(tank: &DhwTank, valid_from: OffsetDateTime) -> DhwDescription {
+    let usable = NumberRange {
+        start_of_range: 0.0,
+        end_of_range: tank.usable_heat().kwh(),
+    };
+    let q = quantity(tank.meta.phases, tank.meta.phases.default_mode());
+    let heat = stable_id(&tank.meta.id, "dhw/heat");
+    let actuator = stable_id(&tank.meta.id, "dhw/heater");
+
+    let system = frbc::SystemDescription::builder()
+        .message_id(Id::generate())
+        .valid_from(utc(valid_from))
+        .actuators(vec![
+            frbc::ActuatorDescription::builder()
+                .id(actuator.clone())
+                .diagnostic_label("water heater")
+                .supported_commodities(vec![Commodity::Electricity])
+                .operation_modes(vec![
+                    frbc::OperationMode::builder()
+                        .id(heat.clone())
+                        .diagnostic_label("heat")
+                        .abnormal_condition_only(false)
+                        .elements(vec![frbc::OperationModeElement {
+                            fill_level_range: usable.clone(),
+                            fill_rate: NumberRange {
+                                start_of_range: 0.0,
+                                end_of_range: tank.heater.get()
+                                    * tank.cop.max(0.0)
+                                    * KWH_PER_S_PER_W,
+                            },
+                            power_ranges: vec![PowerRange {
+                                start_of_range: 0.0,
+                                end_of_range: tank.heater.get(),
+                                commodity_quantity: q,
+                            }],
+                            running_costs: None,
+                        }])
+                        .build(),
+                ])
+                .transitions(Vec::new())
+                .timers(Vec::new())
+                .build(),
+        ])
+        .storage(
+            frbc::StorageDescription::builder()
+                .diagnostic_label("hot water tank")
+                .fill_level_label("kWh")
+                .fill_level_range(usable)
+                // A tank that is not heated goes cold, and a manager that does
+                // not know it will schedule the morning shower the night before.
+                .provides_leakage_behaviour(true)
+                .provides_fill_level_target_profile(false)
+                .provides_usage_forecast(false)
+                .build(),
+        )
+        .build();
+
+    DhwDescription {
+        system,
+        actuator,
+        heat,
+    }
+}
+
+/// A shiftable appliance, described as power-profile-based control, with the
+/// identifiers a `PPBC.ScheduleInstruction` has to name.
+#[derive(Debug, Clone)]
+pub struct ProgrammeDescription {
+    /// The description to send.
+    pub definition: ppbc::PowerProfileDefinition,
+    /// The container the alternatives live in — one, here.
+    pub container: Id,
+    /// The sequence: the programme the appliance is loaded with.
+    pub sequence: Id,
+}
+
+/// Describe a shiftable appliance as the one profile it is loaded with.
+///
+/// PPBC's container is a set of **alternatives** a manager may choose between —
+/// eco versus intensive, 40 °C versus 60 °C. A machine reports the programme it
+/// was actually set to, so hems sends one, and the manager's only decision is
+/// *when*. Offering alternatives is a capability of the appliance rather than of
+/// the energy manager: nothing in a house lets a HEMS change the wash.
+///
+/// `is_interruptible` is `false` and that is the whole point of the control
+/// type. A dishwasher stopped halfway is not a dishwasher that resumes; it is a
+/// dishwasher somebody has to restart, and a manager told otherwise will pause
+/// one to shed a kilowatt.
+///
+/// The window is `[valid_from, deadline)`: `start_time` is the first moment the
+/// household will let the programme begin and `end_time` the moment it must
+/// already be finished — half-open, like every other window in this workspace.
+#[must_use]
+pub fn describe_programme(
+    load: &FlexibleLoad,
+    programme: &Programme,
+    valid_from: OffsetDateTime,
+    deadline: OffsetDateTime,
+) -> ProgrammeDescription {
+    let q = quantity(load.meta.phases, load.meta.phases.default_mode());
+    let sequence = stable_id(&load.meta.id, "load/programme");
+    let container = stable_id(&load.meta.id, "load/alternatives");
+
+    let elements = programme
+        .steps
+        .iter()
+        .map(|step| ppbc::PowerSequenceElement {
+            duration: Duration(
+                u64::try_from(hems_core::prelude::SLOT.whole_milliseconds()).unwrap_or(u64::MAX),
+            ),
+            power_values: vec![s2energy::common::PowerForecastValue {
+                commodity_quantity: q,
+                value_expected: step.get(),
+                value_lower_68ppr: None,
+                value_lower_95ppr: None,
+                value_lower_limit: None,
+                value_upper_68ppr: None,
+                value_upper_95ppr: None,
+                value_upper_limit: None,
+            }],
+        })
+        .collect();
+
+    let definition = ppbc::PowerProfileDefinition::builder()
+        .message_id(Id::generate())
+        .id(stable_id(&load.meta.id, "load/profile"))
+        .start_time(utc(valid_from))
+        .end_time(utc(deadline))
+        .power_sequences_containers(vec![
+            ppbc::PowerSequenceContainer::builder()
+                .id(container.clone())
+                .power_sequences(vec![
+                    ppbc::PowerSequence::builder()
+                        .id(sequence.clone())
+                        .abnormal_condition_only(false)
+                        // Started, never paused: see the note above.
+                        .is_interruptible(false)
+                        .elements(elements)
+                        .build(),
+                ])
+                .build(),
+        ])
+        .build();
+
+    ProgrammeDescription {
+        definition,
+        container,
+        sequence,
+    }
+}
+
+/// A charging session, as the store S2 says it is.
+///
+/// A parked car is a battery with a departure time, and everything the standard
+/// needs to say about one is here: how full it is, how full it can get, and what
+/// the household asked for. None of it is a property of the *charge point*,
+/// which is why it is a separate type — a wallbox with no car plugged in is an
+/// envelope and has nothing to fill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EvStorage {
+    /// Energy in the car now.
+    pub stored: Energy,
+    /// Usable battery capacity.
+    pub capacity: Energy,
+    /// Charging efficiency, so the fill rate is what the car receives rather
+    /// than what the meter sees.
+    pub efficiency: f64,
+}
+
+/// A charge point with a car on it, described as fill-rate-based control.
+#[derive(Debug, Clone)]
+pub struct EvDescription {
+    /// The description to send.
+    pub system: frbc::SystemDescription,
+    /// The single actuator: the charge point.
+    pub actuator: Id,
+    /// Charging.
+    pub charge: Id,
+    /// Discharging, for a bidirectional charge point.
+    pub discharge: Option<Id>,
+}
+
+/// Describe a charge point with a car on it as a store.
+///
+/// This is the whole argument for S2 in one function. The same wallbox is a
+/// [power envelope](describe_evse) when nothing is plugged in and a **store**
+/// when something is, because what a Customer Energy Manager needs to be able to
+/// say has changed — and a manager that has never heard of a car can plan this
+/// one with exactly the code it plans a battery with.
+///
+/// Two things a battery's description does not have to carry:
+///
+/// * **the power range starts at the minimum, not at zero.** A charge point
+///   below the 6 A of IEC 61851 is not charging slowly, it is idle, and S2's
+///   `PowerRange` is where that fact belongs. A manager handed a range from zero
+///   will ask for 2 kW on three conductors and believe a car is charging.
+/// * **the fill level range is the whole battery**, and the household's own
+///   target is not in it. A target is a `FillLevelTargetProfile`, which is a
+///   message rather than a description, and folding it into the range would tell
+///   a manager the car physically cannot hold more — which is how a manager
+///   stops offering the surplus that would have filled it.
+#[must_use]
+pub fn describe_ev(
+    evse: &Evse,
+    session: &EvStorage,
+    mode: PhaseMode,
+    valid_from: OffsetDateTime,
+) -> EvDescription {
+    let held = evse.meta.phases.clamp_mode(mode);
+    let max = evse.max_power(held);
+    let min = evse.min_power(held);
+    let q = quantity(evse.meta.phases, mode);
+    let usable = NumberRange {
+        start_of_range: 0.0,
+        end_of_range: session.capacity.kwh(),
+    };
+    let efficiency = session.efficiency.clamp(f64::EPSILON, 1.0);
+
+    let actuator = stable_id(&evse.meta.id, "evse/charger");
+    let charge = stable_id(&evse.meta.id, "evse/charge");
+    let discharge = evse
+        .bidirectional
+        .then(|| stable_id(&evse.meta.id, "evse/discharge"));
+
+    let mode_of = |id: &Id, label: &str, rate: f64, from: f64, to: f64| {
+        frbc::OperationMode::builder()
+            .id(id.clone())
+            .diagnostic_label(label)
+            .abnormal_condition_only(false)
+            .elements(vec![frbc::OperationModeElement {
+                fill_level_range: usable.clone(),
+                fill_rate: NumberRange {
+                    start_of_range: 0.0,
+                    end_of_range: rate,
+                },
+                power_ranges: vec![PowerRange {
+                    start_of_range: from,
+                    end_of_range: to,
+                    commodity_quantity: q,
+                }],
+                running_costs: None,
+            }])
+            .build()
+    };
+
+    let mut modes = vec![mode_of(
+        &charge,
+        "charge",
+        max.get() * efficiency * KWH_PER_S_PER_W,
+        min.get(),
+        max.get(),
+    )];
+    if let Some(id) = &discharge {
+        modes.push(mode_of(
+            id,
+            "discharge",
+            -max.get() * KWH_PER_S_PER_W / efficiency,
+            -max.get(),
+            -min.get(),
+        ));
+    }
+
+    let system = frbc::SystemDescription::builder()
+        .message_id(Id::generate())
+        .valid_from(utc(valid_from))
+        .actuators(vec![
+            frbc::ActuatorDescription::builder()
+                .id(actuator.clone())
+                .diagnostic_label("charge point")
+                .supported_commodities(vec![Commodity::Electricity])
+                .operation_modes(modes)
+                .transitions(Vec::new())
+                .timers(Vec::new())
+                .build(),
+        ])
+        .storage(
+            frbc::StorageDescription::builder()
+                .diagnostic_label("vehicle battery")
+                .fill_level_label("kWh")
+                .fill_level_range(usable)
+                // A parked car does not measurably self-discharge over a night,
+                // and claiming a leakage nobody can quantify is worse than
+                // saying nothing.
+                .provides_leakage_behaviour(false)
+                // The household's departure target is a message of its own; see
+                // the note above.
+                .provides_fill_level_target_profile(false)
+                .provides_usage_forecast(false)
+                .build(),
+        )
+        .build();
+
+    EvDescription {
+        system,
+        actuator,
+        charge,
+        discharge,
+    }
+}
+
 /// Describe a charge point as a power envelope.
 ///
 /// The consequence of a tighter envelope is [`Defer`] — the car charges later,
@@ -320,7 +651,19 @@ pub fn describe_heat_pump(
     .map(|state| {
         let expected =
             hems_device::expected_power(state, hp.electrical_nominal, grid_connection_power);
-        (Id::generate(), state, expected)
+        // Derived from the asset and the state, never minted: an instruction
+        // names an operation mode by ID, so a Resource Manager that re-mints
+        // them on reconnect invalidates every description a manager cached and
+        // every instruction still in flight. This was the one description in
+        // the crate that generated them, and the bug it hid is silent — a CEM
+        // that replays a ten-minute-old plan addresses modes that no longer
+        // exist and gets `UnknownOperationMode` for a heat pump that never
+        // changed.
+        let id = stable_id(
+            &hp.meta.id,
+            &format!("heat-pump/sg-ready-{}", state.number()),
+        );
+        (id, state, expected)
     });
 
     let system = ombc::SystemDescription::builder()

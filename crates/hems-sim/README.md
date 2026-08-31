@@ -9,16 +9,28 @@ contactor that takes a tick to change its conductor count and a car whose onboar
 charger is measurably less efficient on one of them; an inverter that follows a
 curtailment command in a second or two rather than instantly; the same two-mass
 building the planner solves against, discretised the same way and fitted with the
-thermostat a real one has; a hot-water tank that runs out of hot water; and a
-**Steuerbox** that emits EEBUS limitation events on a script.
+thermostat a real one has; a hot-water tank that runs out of hot water; a
+**dishwasher that ignores a stop**, because a programme interrupted halfway is
+not one that resumes; and a **Steuerbox** that emits EEBUS limitation events on
+a script.
 
 **Every simulator has at least one way of saying no.** A charge point below 6 A
 per conductor charges nothing rather than charging slowly; a battery reports what
 it took rather than what it was told; a contactor costs a session while the
 vehicle re-negotiates; a heat pump handed back its own controls refuses to keep
 heating a house that is already warm — without which a manager that stopped
-planning cooked the reference house to 64 °C and reported it as a saving. A simulator that agrees with its controller flatters it and
-hides exactly the bugs worth finding.
+planning cooked the reference house to 64 °C and reported it as a saving; and a
+**single-speed compressor refuses a stop its minimum runtime has not earned**,
+counting its starts and the time it held on against a command. A simulator that
+agrees with its controller flatters it and hides exactly the bugs worth finding.
+
+That last one is the clearest case in the workspace. The planner had modelled a
+minimum runtime for the life of the project — implemented, documented, cited and
+unit-tested — and every reference day ran a *modulating* unit, so nothing that
+ran a day could tell whether it was obeyed. It was not: the constraint's rows
+need the slot before them, and a receding horizon executes only the slot that has
+none. A constraint no simulator can be watched obeying is a constraint no
+simulator can be watched breaking.
 
 **And the day is not the day that was forecast.** `weather::Realisation` is a
 seeded process — four octaves of value noise on the cloud cover at about four

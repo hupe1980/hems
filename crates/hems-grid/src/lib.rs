@@ -75,7 +75,7 @@ pub use modul3::{
     Modul3Calendar, Modul3Conformance, Modul3Context, Modul3Eligibility, Modul3Finding, Preisstufe,
     Quarter, Zaehlzeitdefinition,
 };
-pub use para9::{CapRelief, FeedInLimits, GenerationProfile};
+pub use para9::{CapRelief, FeedInLimits, GenerationProfile, Para9Status, StatutoryLimit};
 pub use para14a::{
     ControlMode, Participation, SteuVe, classify_at, classify_on, is_controlled_on, minimum_power,
     netzwirksamer_leistungsbezug, participation, steuve_budget,

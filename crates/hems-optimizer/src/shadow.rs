@@ -195,7 +195,7 @@ impl RawDuals {
     /// weight**, and a negative weight is not a lower priority, it is a
     /// different arithmetic. The sign belongs in a flexibility offer, not in a
     /// max-min share.
-    pub(crate) fn into_shadow(self, problem: &Problem<'_>) -> Shadow {
+    pub(crate) fn into_shadow(self, problem: &Problem<'_>, k: usize) -> Shadow {
         Shadow {
             site: (self.balance * WH_PER_KWH / DT_HOURS).max(0.0),
             battery: self
@@ -210,12 +210,12 @@ impl RawDuals {
                 .dhw
                 .zip(problem.dhw)
                 .map(|(d, t)| (-d * WH_PER_KWH * t.cop).max(0.0)),
-            heat_pump: self.heat_pump_price(problem).map(|v| v.max(0.0)),
+            heat_pump: self.heat_pump_price(problem, k).map(|v| v.max(0.0)),
             flexibility: self.steuve.map(|d| (-d * WH_PER_KWH / DT_HOURS).max(0.0)),
         }
     }
 
-    fn heat_pump_price(self, problem: &Problem<'_>) -> Option<f64> {
+    fn heat_pump_price(self, problem: &Problem<'_>, k: usize) -> Option<f64> {
         let t = problem.thermal?;
         let air = self.air?;
         let mass = self.mass.unwrap_or(0.0);
@@ -224,7 +224,12 @@ impl RawDuals {
         // is kelvin per kilowatt of *heat* held for the step; the coefficient of
         // performance turns the one into the other.
         let kw_per_kwh = 1.0 / DT_HOURS;
-        let cop = t.heat_pump.cop(problem.outdoor_at(0));
+        // The coefficient of performance of **this** slot. Reading slot zero's
+        // priced every hour of a winter day at the small hours' COP: a 2,7 at
+        // four in the morning against a 3,6 at two in the afternoon is a third
+        // of the heat pump's own marginal value, and it is the weight the guard
+        // uses to decide which device keeps its power under a teatime reduction.
+        let cop = t.heat_pump.cop(problem.outdoor_at(k));
         let kelvin = (air * d.b_heat[0] + mass * d.b_heat[1]) * cop * kw_per_kwh;
         Some(-kelvin)
     }
@@ -243,6 +248,7 @@ mod tests {
             pv: None,
             heat_pump: Some(AssetId::new("wp").expect("valid")),
             dhw: Some(AssetId::new("tank").expect("valid")),
+            shiftable: Vec::new(),
         }
     }
 

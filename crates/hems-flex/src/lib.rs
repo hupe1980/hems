@@ -44,10 +44,16 @@
 pub mod describe;
 pub mod instruct;
 pub mod map;
+pub mod site;
 
 pub use describe::{
-    BatteryDescription, HeatPumpDescription, describe_battery, describe_evse, describe_heat_pump,
-    describe_pv, resource_manager_details,
+    BatteryDescription, DhwDescription, EvDescription, EvStorage, HeatPumpDescription,
+    ProgrammeDescription, describe_battery, describe_dhw, describe_ev, describe_evse,
+    describe_heat_pump, describe_programme, describe_pv, resource_manager_details,
 };
-pub use instruct::{InstructError, battery_power, envelope_command, envelope_now, heat_pump_state};
+pub use instruct::{
+    InstructError, battery_power, dhw_power, envelope_command, envelope_now, heat_pump_state,
+    programme_start,
+};
 pub use map::{ControlType, control_type_for, roles_for};
+pub use site::{DescribeContext, SiteDescription, describe_site};

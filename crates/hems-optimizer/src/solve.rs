@@ -13,18 +13,32 @@
 //! | `ev[k]` | charging power at the charge point |
 //! | `ev_e[k]` | energy in the car at the end of slot `k`, Wh |
 //! | `curtail[k]` | production thrown away |
+//! | `sh_start[i][k]` | binary: appliance `i` starts its programme in slot `k` |
 //!
 //! subject to, in every slot,
 //!
 //! ```text
-//! g_in − g_out = load + b_ch − b_dis + ev − (pv − curtail)      (energy balance)
+//! g_in − g_out = load + b_ch − b_dis + ev + hp + dhw + a − (pv − curtail)
+//!                                                               (energy balance)
 //! g_out ≤ pv − curtail + b_dis                                  (no invented export)
 //! e[k] = e[k−1] + Δ(η_ch·b_ch − b_dis/η_dis)                    (battery state)
 //! ev_e[k] = ev_e[k−1] + Δ·η·ev                                  (car state)
-//! b_ch + ev ≤ ceiling + max(0, pv − load)                       (§ 14a)
+//! b_ch + ev + hp − b_dis + curtail + dhw + a ≤ ceiling + (pv − load)
+//!                                                               (§ 14a, with a surplus)
+//! b_ch + ev + hp − b_dis ≤ ceiling                              (§ 14a, without one)
 //! g_out ≤ feed-in ceiling                                       (§ 9 EEG, LPP)
 //! curtail ≤ pv
 //! ```
+//!
+//! `a` is what the shiftable appliances draw. Four details of the § 14a rows are
+//! each a decision rather than an accident, and `grid_rules` gives the argument
+//! for every one: curtailment is on the **left** because throwing energy away
+//! cannot buy headroom; the tank and the appliances are on the left because they
+//! spend the surplus without being steuerbare Verbrauchseinrichtungen
+//! themselves; the battery's **discharge** is on the left with a minus, because
+//! `[A1 2.3]` measures what crosses the connection point; and the `max(0, ·)`
+//! around the surplus is dropped, which is exact wherever the surplus survives
+//! and conservative where it does not.
 //!
 //! and minimising
 //!
@@ -105,6 +119,43 @@ pub enum SolveError {
     /// The horizon has no slots.
     #[error("the horizon is empty")]
     EmptyHorizon,
+    /// A forecast does not reach the end of the horizon.
+    ///
+    /// Refused rather than filled in, because the only honest filler is one
+    /// nobody has: a slot with no band was previously planned as **zero
+    /// production and zero load**, which is a confident lie in both directions.
+    /// It makes the roof dark and the house empty, so the plan defers every
+    /// flexible kilowatt-hour into hours it believes are free, and the day
+    /// arrives to find them ordinary.
+    #[error(
+        "the {series} forecast covers {covered} of the horizon's {slots} slots; \
+         planning the rest would assume no sun and no household at all"
+    )]
+    ForecastTooShort {
+        /// Which of the two — `"production"` or `"load"`.
+        series: &'static str,
+        /// How many of the horizon's slots the forecast has a band for.
+        covered: usize,
+        /// How many the horizon has.
+        slots: usize,
+    },
+    /// The price stack is indexed by position, and its `slot` says it belongs
+    /// somewhere else.
+    ///
+    /// A stack **shorter** than the horizon is fine and deliberate — a horizon
+    /// can run past the last published auction, and a flat default price is a
+    /// plausible answer out there. A stack that is *the wrong hours* is not: the
+    /// plan is then optimised against somebody else's day, and nothing about the
+    /// result looks wrong.
+    #[error("the price stack's slot {position} is {found}, but the horizon's is {expected}")]
+    PricesMisaligned {
+        /// Where in the stack the two first disagree.
+        position: usize,
+        /// The slot the stack carries there, as an RFC 3339 instant.
+        found: String,
+        /// The slot the horizon has there.
+        expected: String,
+    },
 }
 
 /// The names the planner gives the assets it plans for.
@@ -123,6 +174,9 @@ pub struct AssetNames {
     pub heat_pump: Option<AssetId>,
     /// The hot-water tank.
     pub dhw: Option<AssetId>,
+    /// The appliances waiting to run a programme, in the same order as
+    /// [`crate::model::Problem::shiftable`].
+    pub shiftable: Vec<AssetId>,
 }
 
 impl AssetNames {
@@ -135,6 +189,7 @@ impl AssetNames {
             pv: None,
             heat_pump: None,
             dhw: None,
+            shiftable: Vec::new(),
         }
     }
 }
@@ -161,6 +216,8 @@ pub struct Flows {
     pub heat_pump: Power,
     /// Electrical power drawn by the hot-water heater.
     pub dhw: Power,
+    /// Electrical power drawn by the shiftable appliances together.
+    pub shiftable: Power,
     /// Heat in the tank at the end of the slot, above its lowest acceptable
     /// temperature.
     pub dhw_stored: hems_core::prelude::Energy,
@@ -187,36 +244,61 @@ pub struct Solved {
     /// plan at all, which is a worse answer to the same question.
     pub unmet_charge: hems_core::prelude::Energy,
     /// Hot water the household asked for that the tank could not deliver, as
-    /// heat, summed over the horizon.
+    /// heat, summed over the horizon (see [`Solved::unmet_charge`] for why both
+    /// are expectations).
     ///
     /// The same shape as [`Solved::unmet_charge`] and for the same reason: a
     /// cold shower is expensive, not impossible, and a plan that says how short
     /// it fell is worth more than no plan at all.
     pub unmet_hot_water: hems_core::prelude::Energy,
+    /// What this plan decided discretely, for the **next** re-plan to start
+    /// from.
+    ///
+    /// Shift it by the slots that elapse before the next solve
+    /// ([`Commitment::shifted`]) and hand it back through
+    /// [`Problem::with_warm_start`]. It is a hint and cannot change what a plan
+    /// says; see [`Commitment`].
+    ///
+    /// [`Commitment`]: crate::model::Commitment
+    /// [`Commitment::shifted`]: crate::model::Commitment::shifted
+    /// [`Problem::with_warm_start`]: crate::model::Problem::with_warm_start
+    pub commitment: crate::model::Commitment,
 }
+
+// There is deliberately no `Solved::service_is_at_risk` here, and the absence is
+// a decision rather than an omission.
+//
+// It existed, and it read the plan's own predicted shortfall to decide whether
+// the household was worth planning against three futures. Measured, it **never
+// fires**: on the reference evening the median plan expects to make the target,
+// the weather disappoints, and by then it is too late. A plan that has looked
+// only at the median cannot know it is at risk — asking it is asking the wrong
+// oracle. `EvSession::tightness` is the replacement, because it is a property of
+// the *session* and needs no solve at all.
+//
+// Keeping the method would leave a public API whose documentation recommended
+// the thing this project measured and rejected. `Solved::unmet_charge` and
+// `Solved::unmet_hot_water` are still there for a caller that wants to *report*
+// a shortfall, which is the honest use.
 
 /// Solve `problem` and turn the result into a [`Plan`].
 ///
 /// `now` stamps the plan so the arbiter can tell how old it is.
 ///
 /// # Errors
-/// [`SolveError`] when the horizon is empty, the constraints conflict, or the
-/// solver fails.
+/// [`SolveError`] when the horizon is empty, its inputs do not line up with it
+/// ([`check_inputs`]), the constraints conflict, or the solver fails.
 pub fn solve(
     problem: &Problem<'_>,
     names: &AssetNames,
     now: OffsetDateTime,
 ) -> Result<Solved, SolveError> {
-    let n = problem.horizon.len;
-    if n == 0 {
-        return Err(SolveError::EmptyHorizon);
-    }
+    check_inputs(problem)?;
 
     // The solver takes the problem by value, so the variable *handles* are kept
     // separately: they stay valid across the hand-over and the read-back.
-    let (problem_vars, declared) = build_variables(problem, None);
-    let v = declared.borrow();
-    let objective = build_objective(problem, &v);
+    let (problem_vars, declared, risk, shared) = build_variables(problem, None);
+    let objective = build_objective(problem, &declared, risk.as_ref());
 
     // The backend is chosen here rather than through `good_lp::default_solver`,
     // because Cargo unifies features across a workspace build: a crate that
@@ -247,8 +329,8 @@ pub fn solve(
     #[cfg(all(feature = "microlp", not(feature = "highs")))]
     let mut model = problem_vars.minimise(objective).using(good_lp::microlp);
 
-    let mut rows = Rows::default();
-    model = add_constraints(model, problem, &v, &mut rows);
+    let mut rows = Vec::new();
+    model = add_constraints(model, problem, &declared, &shared, risk.as_ref(), &mut rows);
 
     let solution = model.solve().map_err(|e| match e {
         good_lp::ResolutionError::Infeasible => SolveError::Infeasible(
@@ -265,12 +347,94 @@ pub fn solve(
     // with `microlp` and one built with HiGHS agree about what a kilowatt-hour
     // is worth. See `crate::shadow`.
     let shadows = if problem.shadow_prices {
-        shadow_prices(problem, &solution, &v)
+        shadow_prices(problem, &solution, &declared[0].borrow())
     } else {
         Vec::new()
     };
 
-    Ok(read_back(problem, names, now, &solution, &v, &shadows))
+    // The report shows the **central** future — the one with the largest
+    // probability, and the one a household would recognise as "the plan". Its
+    // first slot is shared with every other future by construction
+    // (`non_anticipativity`), so the only decision the arbiter is about to
+    // commit is unambiguous whatever the weather does; the slots after it are
+    // advisory, and the plan is re-made long before they arrive.
+    let central = central_future(problem);
+    Ok(read_back(
+        problem, names, now, &solution, &declared, central, &shadows,
+    ))
+}
+
+/// Whether the problem's inputs actually describe the horizon it plans over.
+///
+/// An input that does not reach far enough has to be refused rather than filled
+/// in, because a plan built on a filler is not obviously wrong, is not logged
+/// and fails no test — it is simply optimal against a day nobody is going to
+/// have. Two fillers are lies:
+///
+/// * a **forecast** with no band for a slot reads as zero, which says the roof
+///   is dark *and* the house is empty — wrong in both directions at once, so the
+///   plan defers flexible load into hours it believes cost nothing;
+/// * a **price stack** whose entry `k` is not the horizon's slot `k` prices the
+///   day against somebody else's hours. The stack carries its own [`Slot`], so
+///   this costs one comparison per slot.
+///
+/// A price stack that merely *stops short* is allowed: a horizon can run past
+/// the last published auction, and a flat default out there makes the plan
+/// indifferent about when to act, which is the state of knowledge. So do the
+/// outdoor temperature (the last value given, then 10 °C) and the hot-water draw
+/// (no draw). See D67.
+///
+/// [`Slot`]: hems_core::prelude::Slot
+///
+/// # Errors
+/// [`SolveError::EmptyHorizon`], [`SolveError::ForecastTooShort`] or
+/// [`SolveError::PricesMisaligned`].
+pub fn check_inputs(problem: &Problem<'_>) -> Result<(), SolveError> {
+    let slots = problem.horizon.len;
+    if slots == 0 {
+        return Err(SolveError::EmptyHorizon);
+    }
+
+    for (series, forecast) in [("production", problem.pv), ("load", problem.load)] {
+        let covered = problem
+            .horizon
+            .slots()
+            .take_while(|s| forecast.at(*s).is_some())
+            .count();
+        if covered < slots {
+            return Err(SolveError::ForecastTooShort {
+                series,
+                covered,
+                slots,
+            });
+        }
+    }
+
+    for (position, price) in problem.prices.slots.iter().enumerate().take(slots) {
+        let expected = problem.horizon.get(position);
+        if expected != Some(price.slot) {
+            return Err(SolveError::PricesMisaligned {
+                position,
+                found: format!("{}", price.slot.start()),
+                expected: expected.map_or_else(
+                    || "past the end of the horizon".into(),
+                    |s| format!("{}", s.start()),
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Which future the report shows: the most likely one.
+fn central_future(problem: &Problem<'_>) -> usize {
+    problem
+        .realisations()
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.probability.total_cmp(&b.probability))
+        .map_or(0, |(i, _)| i)
 }
 
 /// Re-solve with the binaries pinned and read the duals of the state equations.
@@ -295,10 +459,36 @@ fn shadow_prices(
         hp_on: (0..n)
             .map(|k| solution.value(solved.hp_on[k]).round())
             .collect(),
+        sh_start: solved
+            .sh_start
+            .iter()
+            .map(|starts| starts.iter().map(|v| solution.value(*v).round()).collect())
+            .collect(),
     };
 
-    let (problem_vars, declared) = build_variables(problem, Some(&pins));
-    let v = declared.borrow();
+    // ── The duals are prices, so the objective they come from is a price ─────
+    //
+    // The plan may have been made under a risk preference: `(1 − λ)·mean +
+    // λ·CVaR`. Its duals are marginal values *of that objective*, which is a
+    // mixture of money and a household's appetite for being caught out — and
+    // "what is a kilowatt-hour worth here" is a question about money. Worse, the
+    // state equations appear inside `cost_s`, which appears in both the
+    // objective and the tail rows, so under a mixture the dual of a battery's
+    // own state equation is a combination nobody can put a unit on.
+    //
+    // So the dual pass re-solves the same futures, with the same discrete
+    // decisions pinned, against the **expectation**. The risk preference decided
+    // the plan; it does not get to decide what the plan says a kilowatt-hour
+    // costs.
+    let priced = Problem {
+        risk: crate::model::Risk {
+            cvar_weight: 0.0,
+            ..problem.risk
+        },
+        ..problem.clone()
+    };
+    let problem = &priced;
+    let (problem_vars, declared, risk, shared) = build_variables(problem, Some(&pins));
     // The objective is scaled before the dual pass, and this is not a tuning
     // knob — it is the difference between duals and noise.
     //
@@ -315,36 +505,54 @@ fn shadow_prices(
     // Multiplying the objective by a positive constant leaves the optimum
     // exactly where it was and scales every dual by the same constant, so
     // dividing them back out afterwards is not an approximation.
-    let objective = build_objective(problem, &v) * DUAL_OBJECTIVE_SCALE;
-    let mut rows = Rows::default();
+    let objective = build_objective(problem, &declared, risk.as_ref()) * DUAL_OBJECTIVE_SCALE;
+    let mut rows: Vec<Rows> = Vec::new();
     let mut lp_model = problem_vars.minimise(objective).using(good_lp::clarabel);
     lp_model.settings().verbose(false);
-    let model = add_constraints(lp_model, problem, &v, &mut rows);
+    let model = add_constraints(
+        lp_model,
+        problem,
+        &declared,
+        &shared,
+        risk.as_ref(),
+        &mut rows,
+    );
     let Ok(mut lp) = model.solve() else {
         return Vec::new();
     };
     let duals = lp.compute_dual();
 
-    let at = |refs: &[good_lp::constraint::ConstraintReference], k: usize| {
-        refs.get(k)
-            .map(|r| duals.dual(r.clone()) / DUAL_OBJECTIVE_SCALE)
+    // ── Summed across the futures, not read from one ─────────────────────────
+    //
+    // Each future has its own copy of every state equation, and the objective
+    // already carries that future's probability — so the dual of one of them is
+    // already `p_s ×` the marginal value *in that future*. What a household
+    // wants to know is what a kilowatt-hour in the battery is worth **whatever
+    // happens**, which is a kilowatt-hour appearing in every future at once, and
+    // the marginal value of that is the plain sum. Reading the central future
+    // alone would silently report the median day's price as though the dull one
+    // could not happen, which is the belief the scenario set exists to remove.
+    let sum = |pick: &dyn Fn(&Rows) -> Option<good_lp::constraint::ConstraintReference>| {
+        let mut total = None;
+        for r in &rows {
+            if let Some(reference) = pick(r) {
+                *total.get_or_insert(0.0) += duals.dual(reference) / DUAL_OBJECTIVE_SCALE;
+            }
+        }
+        total
     };
     (0..n)
         .map(|k| {
             crate::shadow::RawDuals {
-                balance: at(&rows.balance, k).unwrap_or(0.0),
-                battery: at(&rows.battery, k),
-                ev: at(&rows.ev, k),
-                dhw: at(&rows.dhw, k),
-                air: at(&rows.air, k),
-                mass: at(&rows.mass, k),
-                steuve: rows
-                    .steuve
-                    .get(k)
-                    .and_then(Option::as_ref)
-                    .map(|r| duals.dual(r.clone()) / DUAL_OBJECTIVE_SCALE),
+                balance: sum(&|r| r.balance.get(k).cloned()).unwrap_or(0.0),
+                battery: sum(&|r| r.battery.get(k).cloned()),
+                ev: sum(&|r| r.ev.get(k).cloned()),
+                dhw: sum(&|r| r.dhw.get(k).cloned()),
+                air: sum(&|r| r.air.get(k).cloned()),
+                mass: sum(&|r| r.mass.get(k).cloned()),
+                steuve: sum(&|r| r.steuve.get(k).and_then(Clone::clone)),
             }
-            .into_shadow(problem)
+            .into_shadow(problem, k)
         })
         .collect()
 }
@@ -384,6 +592,12 @@ struct Vars<'a> {
     dhw_e: &'a [Variable],
     /// Hot water the household asked for and the tank could not give, Wh.
     dhw_short: &'a [Variable],
+    /// `1` where appliance `i` starts its programme in slot `k`, indexed
+    /// `[i][k]`. Zero-pinned wherever a start would not fit the window.
+    sh_start: &'a [Vec<Variable>],
+    /// `1` where appliance `i` was not run at all — the soft half of its
+    /// deadline. Integral for free: it is one minus a sum of binaries.
+    sh_short: &'a [Variable],
 }
 
 /// Every decision variable of the model, owned.
@@ -411,6 +625,8 @@ struct Variables {
     dhw: Vec<Variable>,
     dhw_e: Vec<Variable>,
     dhw_short: Vec<Variable>,
+    sh_start: Vec<Vec<Variable>>,
+    sh_short: Vec<Variable>,
 }
 
 impl Variables {
@@ -436,6 +652,8 @@ impl Variables {
             dhw: &self.dhw,
             dhw_e: &self.dhw_e,
             dhw_short: &self.dhw_short,
+            sh_start: &self.sh_start,
+            sh_short: &self.sh_short,
         }
     }
 }
@@ -451,6 +669,8 @@ impl Variables {
 struct Pins {
     ev_on: Vec<f64>,
     hp_on: Vec<f64>,
+    /// Where each appliance's programme was placed, `[i][k]`.
+    sh_start: Vec<Vec<f64>>,
 }
 
 /// Declare the variables and their bounds.
@@ -458,9 +678,99 @@ struct Pins {
 /// `pins`, when given, replaces every binary with a constant — which is what
 /// turns the mixed-integer model into the linear program whose duals are the
 /// shadow prices of [`crate::shadow`].
-fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariables, Variables) {
-    let n = problem.horizon.len;
+fn build_variables(
+    problem: &Problem<'_>,
+    pins: Option<&Pins>,
+) -> (
+    ProblemVariables,
+    Vec<Variables>,
+    Option<RiskVars>,
+    SharedBinaries,
+) {
     let mut vars = ProblemVariables::new();
+    let futures = problem.realisations();
+
+    // The discrete commitments, created **once** and shared by every future.
+    // See `Risk`: whether the charge point runs at all in a slot, whether an
+    // on/off heat pump is on, when the dishwasher starts — those are things a
+    // household does once. Letting them differ per future would triple the
+    // integrality, which is the expensive part, to buy a schedule nobody can
+    // carry out.
+    let shared = shared_binaries(problem, &mut vars, pins);
+
+    let per: Vec<Variables> = futures
+        .iter()
+        .map(|realisation| recourse_variables(problem, &mut vars, &shared, *realisation))
+        .collect();
+
+    // ζ and one tail excess per future — the Rockafellar–Uryasev linearisation
+    // of the conditional value at risk. ζ is free: at the optimum it is the
+    // value at risk itself, which can be any sign.
+    //
+    // Declared **only** where the tail carries weight. A risk-neutral solve then
+    // hands the backend exactly the model it had before any of this existed —
+    // no free unbounded column, no dead rows — which is what makes
+    // `Risk::deterministic` a comparison against the old planner rather than
+    // against a differently-conditioned one.
+    let risk = (problem.risk.tail_weight() > 0.0).then(|| RiskVars {
+        zeta: vars.add(variable()),
+        tail: futures
+            .iter()
+            .map(|_| vars.add(variable().min(0.0)))
+            .collect(),
+    });
+
+    (vars, per, risk, shared)
+}
+
+/// The decisions every future shares.
+struct SharedBinaries {
+    ev_on: Vec<Variable>,
+    hp_on: Vec<Variable>,
+    sh_start: Vec<Vec<Variable>>,
+    sh_short: Vec<Variable>,
+}
+
+/// ζ and the tail excesses of the conditional value at risk.
+struct RiskVars {
+    /// The value at risk. Free: at the optimum it is the `α`-quantile of the
+    /// scenario costs, and a household's cost can be negative on a June day.
+    zeta: Variable,
+    /// `max(0, cost_s − ζ)` for each future, one row each.
+    tail: Vec<Variable>,
+}
+
+/// The discrete commitments, shared by every future.
+fn shared_binaries(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    pins: Option<&Pins>,
+) -> SharedBinaries {
+    let n = problem.horizon.len;
+    let mut shared = SharedBinaries {
+        ev_on: Vec::with_capacity(n),
+        hp_on: Vec::with_capacity(n),
+        sh_start: Vec::with_capacity(problem.shiftable.len()),
+        sh_short: Vec::with_capacity(problem.shiftable.len()),
+    };
+    for k in 0..n {
+        shared
+            .ev_on
+            .push(charge_point_binary(problem, vars, k, pins));
+        shared.hp_on.push(heat_pump_binary(problem, vars, k, pins));
+    }
+    shiftable_variables(problem, vars, &mut shared, pins);
+    shared
+}
+
+/// The continuous decisions of one future.
+fn recourse_variables(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    shared: &SharedBinaries,
+    realisation: crate::model::Realisation,
+) -> Variables {
+    let n = problem.horizon.len;
     let mut v = Variables {
         g_in: Vec::with_capacity(n),
         g_out: Vec::with_capacity(n),
@@ -481,6 +791,8 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
         dhw: Vec::with_capacity(n),
         dhw_e: Vec::with_capacity(n),
         dhw_short: Vec::with_capacity(n),
+        sh_start: Vec::with_capacity(problem.shiftable.len()),
+        sh_short: Vec::with_capacity(problem.shiftable.len()),
     };
 
     let import_ceiling = problem
@@ -489,7 +801,7 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
         .map_or(f64::INFINITY, Power::get);
 
     for k in 0..n {
-        let (pv, _load) = problem.forecasts_at(k);
+        let (pv, _load) = problem.forecasts_in(realisation, k);
         // The feed-in ceiling is per slot: § 9 EEG does not lapse, an LPP
         // session does, and a horizon that spans the end of one has to know
         // which of its slots the limit reaches.
@@ -518,7 +830,8 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
             .push(vars.add(variable().min(0.0).max(discharge_max)));
         v.b_e.push(vars.add(variable().min(floor).max(ceiling)));
 
-        charge_point_variables(problem, &mut vars, &mut v, k, pins);
+        charge_point_variables(problem, vars, &mut v);
+        v.ev_on.push(shared.ev_on[k]);
 
         let (dhw_max, dhw_capacity) = problem
             .dhw
@@ -538,21 +851,10 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
         v.dhw_short
             .push(vars.add(variable().min(0.0).max(dhw_deficit)));
 
+        v.hp_on.push(shared.hp_on[k]);
         match problem.thermal {
             Some(t) => {
                 v.hp.push(vars.add(variable().min(0.0).max(t.heat_pump.max_electrical.get())));
-                // A binary only where the unit really is on/off. For a
-                // modulating unit it is pinned to one and never branches, so the
-                // problem stays a linear program — which is what keeps a
-                // 192-slot horizon solvable on a gateway box.
-                v.hp_on.push(match (t.heat_pump.modulating, pins) {
-                    (true, _) => vars.add(variable().min(1.0).max(1.0)),
-                    (false, Some(p)) => {
-                        let on = p.hp_on.get(k).copied().unwrap_or(0.0);
-                        vars.add(variable().min(on).max(on))
-                    }
-                    (false, None) => vars.add(variable().binary()),
-                });
                 // Wide bounds on the temperatures: the comfort band is a *soft*
                 // constraint, and pinning the state variable to it would make a
                 // cold snap infeasible instead of merely uncomfortable.
@@ -564,7 +866,6 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
             None => {
                 for target in [
                     &mut v.hp,
-                    &mut v.hp_on,
                     &mut v.t_in,
                     &mut v.t_mass,
                     &mut v.cold,
@@ -576,39 +877,29 @@ fn build_variables(problem: &Problem<'_>, pins: Option<&Pins>) -> (ProblemVariab
         }
     }
 
-    (vars, v)
+    v.sh_start.clone_from(&shared.sh_start);
+    v.sh_short.clone_from(&shared.sh_short);
+    v
 }
 
-/// The charge point's variables for one slot.
+/// The charge point's on/off binary for one slot.
 ///
-/// Split out because it is where most of the model's integrality lives, and
-/// because the rule that keeps the model fast is easiest to see in one place: a
-/// binary is declared **only where it can decide something**. There is a car, it
-/// has a floor to respect, and the slot is one it could still be charging in.
+/// A binary is declared **only where it can decide something**: there is a car,
+/// it has a floor to respect, and the slot is one it could still be charging in.
 /// Every other slot is pinned, so branch and bound never opens a node for a car
 /// that has already left — which on a 192-slot horizon is most of them, and the
 /// difference between a plan in a second and a plan in a minute.
-fn charge_point_variables(
+fn charge_point_binary(
     problem: &Problem<'_>,
     vars: &mut ProblemVariables,
-    v: &mut Variables,
     k: usize,
     pins: Option<&Pins>,
-) {
-    let (ev_max, ev_capacity) = problem
-        .ev
-        .map_or((0.0, 0.0), |e| (e.max_charge.get(), e.capacity.get()));
-    // Absent, because it has not arrived yet or has already left. Either way
-    // the charge point can do nothing in this slot, so it gets no binary: on a
-    // 192-slot horizon that is most of them, and it is the difference between a
-    // plan in a second and a plan in a minute.
+) -> Variable {
     let absent = problem
         .ev
         .zip(problem.horizon.get(k))
         .is_some_and(|(e, slot)| !e.present_in(slot));
-
-    v.ev.push(vars.add(variable().min(0.0).max(ev_max)));
-    v.ev_on.push(match (problem.ev, pins) {
+    match (problem.ev, pins) {
         (Some(e), Some(p)) if e.min_charge > Power::ZERO && !absent => {
             let on = p.ev_on.get(k).copied().unwrap_or(0.0);
             vars.add(variable().min(on).max(on))
@@ -616,7 +907,130 @@ fn charge_point_variables(
         (Some(e), None) if e.min_charge > Power::ZERO && !absent => vars.add(variable().binary()),
         (Some(_), _) if absent => vars.add(variable().min(0.0).max(0.0)),
         _ => vars.add(variable().min(1.0).max(1.0)),
-    });
+    }
+}
+
+/// The heat pump's on/off binary for one slot.
+///
+/// A binary only where the unit really is on/off. For a modulating unit it is
+/// pinned to one and never branches, so the problem stays a linear program —
+/// which is what keeps a long horizon solvable on a gateway box.
+///
+/// It is also pinned over the slots the compressor's **own history** has already
+/// decided. A unit that started four minutes ago owes its minimum runtime
+/// whatever this plan would prefer, and the model's own `min_on_slots` rows
+/// cannot say so: they are written against a `k − 1` that, for the first slot of
+/// a horizon, does not exist. Pinning is the same mechanism the charge point's
+/// absent slots use — the bound enforces it, so branch and bound never opens a
+/// node for a decision that was made before the plan started. See
+/// [`CompressorState`].
+///
+/// [`CompressorState`]: crate::model::CompressorState
+fn heat_pump_binary(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    k: usize,
+    pins: Option<&Pins>,
+) -> Variable {
+    let Some(t) = problem.thermal else {
+        return vars.add(variable().min(0.0).max(0.0));
+    };
+    if t.heat_pump.modulating {
+        return vars.add(variable().min(1.0).max(1.0));
+    }
+    // What the compressor is already committed to, before this plan decides
+    // anything.
+    if let Some((running, left)) = t.heat_pump.committed()
+        && k < left
+    {
+        let on = f64::from(u8::from(running));
+        return vars.add(variable().min(on).max(on));
+    }
+    match pins {
+        Some(p) => {
+            let on = p.hp_on.get(k).copied().unwrap_or(0.0);
+            vars.add(variable().min(on).max(on))
+        }
+        None => vars.add(warm(variable().binary(), problem, |c| {
+            crate::model::Commitment::hint(&c.hp_on, k)
+        })),
+    }
+}
+
+/// Attach the previous plan's value to a variable, where there is one.
+///
+/// An initial value is a hint the backend may use as an incumbent and may
+/// ignore; it changes no bound, no row and no objective coefficient, which is
+/// what makes a warm-started plan the same plan as a cold one. Clarabel — the
+/// dual pass — does not read it, and does not need to: its binaries are pinned.
+fn warm(
+    v: good_lp::variable::VariableDefinition,
+    problem: &Problem<'_>,
+    pick: impl Fn(&crate::model::Commitment) -> Option<f64>,
+) -> good_lp::variable::VariableDefinition {
+    match problem.warm_start.and_then(pick) {
+        Some(value) => v.initial(value),
+        None => v,
+    }
+}
+
+/// One binary per **feasible** start for every appliance, and the soft
+/// alternative of not running it.
+///
+/// Declaring a binary for every slot would be the obvious loop and it is what
+/// makes a 192-slot horizon slow for nothing: a two-hour programme that must
+/// finish by six has a few dozen places it can go, and branch and bound has no
+/// business opening a node for the other hundred and fifty. Every infeasible
+/// start is pinned to zero here instead, so the window is enforced by the
+/// variable's own bounds rather than by a constraint the solver has to discover.
+fn shiftable_variables(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    v: &mut SharedBinaries,
+    pins: Option<&Pins>,
+) {
+    for (i, run) in problem.shiftable.iter().enumerate() {
+        let starts: Vec<Variable> = (0..problem.horizon.len)
+            .map(|k| {
+                if !run.can_start_at(problem.horizon, k) {
+                    return vars.add(variable().min(0.0).max(0.0));
+                }
+                match pins {
+                    // The dual pass re-solves with the placement fixed, so the
+                    // duals it reads are the marginal values *given* where the
+                    // machine went — which is the conditioning the arbiter is
+                    // living under too.
+                    Some(p) => {
+                        let on = p
+                            .sh_start
+                            .get(i)
+                            .and_then(|r| r.get(k))
+                            .copied()
+                            .unwrap_or(0.0);
+                        vars.add(variable().min(on).max(on))
+                    }
+                    None => vars.add(variable().binary()),
+                }
+            })
+            .collect();
+        v.sh_start.push(starts);
+        // Integral without being declared so: one minus a sum of binaries.
+        v.sh_short.push(vars.add(variable().min(0.0).max(1.0)));
+    }
+}
+
+/// The charge point's variables for one slot.
+///
+/// Split out because it is where most of the model's integrality lives, and
+/// because the charge point's *binary* is shared across the futures
+/// ([`charge_point_binary`]) while its power, its stored energy and its
+/// shortfall are recourse — a car may charge harder in a sunny future and the
+/// plan is allowed to say so.
+fn charge_point_variables(problem: &Problem<'_>, vars: &mut ProblemVariables, v: &mut Variables) {
+    let (ev_max, ev_capacity) = problem
+        .ev
+        .map_or((0.0, 0.0), |e| (e.max_charge.get(), e.capacity.get()));
+    v.ev.push(vars.add(variable().min(0.0).max(ev_max)));
     v.ev_e.push(vars.add(variable().min(0.0).max(ev_capacity)));
     // How much of the promise the plan had to give up. Priced high enough to be
     // lexicographic in practice, but *finite* — a deadline that cannot be met
@@ -625,8 +1039,88 @@ fn charge_point_variables(
         .push(vars.add(variable().min(0.0).max(ev_capacity)));
 }
 
-/// What the plan is trying to minimise, in euros over the horizon.
-fn build_objective(problem: &Problem<'_>, vars: &Vars<'_>) -> Expression {
+/// The power appliance `i` draws in slot `k`, as a linear expression.
+///
+/// A start in slot `j` puts `programme[k − j]` into slot `k`, so the power in a
+/// slot is the sum over every start that would still be running. It is an
+/// expression rather than a variable on purpose: there is nothing to decide
+/// beyond the start, and a variable tied to one by an equality is a row the
+/// solver has to carry for every slot of every appliance.
+fn shiftable_power(problem: &Problem<'_>, vars: &Vars<'_>, i: usize, k: usize) -> Expression {
+    let run = &problem.shiftable[i];
+    let first = k.saturating_sub(run.programme.slots().saturating_sub(1));
+    vars.sh_start[i][first..=k].iter().enumerate().fold(
+        Expression::from(0.0),
+        |acc, (offset, start)| {
+            // `offset` counts forward from the earliest start still running in
+            // this slot, so the step it is in counts backward from `k`.
+            let watts = run.programme.power_at(k - (first + offset)).get();
+            if watts > 0.0 {
+                acc + *start * watts
+            } else {
+                acc
+            }
+        },
+    )
+}
+
+/// Everything the shiftable appliances draw in slot `k`.
+fn shiftable_total(problem: &Problem<'_>, vars: &Vars<'_>, k: usize) -> Expression {
+    (0..problem.shiftable.len()).fold(Expression::from(0.0), |acc, i| {
+        acc + shiftable_power(problem, vars, i, k)
+    })
+}
+
+/// What the plan is trying to minimise: a weighted sum of the **mean** cost over
+/// the futures and the **tail** of them.
+///
+/// ```text
+/// (1 − λ)·Σ_s p_s·cost_s  +  λ·CVaR_α
+/// CVaR_α = ζ + 1/(1 − α)·Σ_s p_s·tail_s ,  tail_s ≥ cost_s − ζ ,  tail_s ≥ 0
+/// ```
+///
+/// The second line is Rockafellar and Uryasev's linearisation: minimising over
+/// `ζ` makes it exactly the mean cost of the worst `1 − α` of outcomes, at the
+/// price of one free variable and one row per future. With
+/// [`ScenarioSet::Swanson`]'s three futures and `α = 0,7` the tail is the
+/// pessimistic one, so the objective reads "mostly the average day, partly the
+/// dull cold one".
+///
+/// `λ = 0` collapses it to expected cost, and a single-future set collapses the
+/// whole construction to the deterministic objective — the same expression the
+/// planner minimised before any of this existed, which is what makes
+/// [`Risk::deterministic`] an honest comparison rather than a different model.
+///
+/// [`ScenarioSet::Swanson`]: crate::model::ScenarioSet::Swanson
+/// [`Risk::deterministic`]: crate::model::Risk::deterministic
+fn build_objective(
+    problem: &Problem<'_>,
+    per: &[Variables],
+    risk: Option<&RiskVars>,
+) -> Expression {
+    let futures = problem.realisations();
+    let mut mean = Expression::from(0.0);
+    for (s, realisation) in futures.iter().enumerate() {
+        mean += scenario_cost(problem, &per[s].borrow(), *realisation) * realisation.probability;
+    }
+    let Some(risk) = risk else {
+        return mean;
+    };
+
+    let lambda = problem.risk.tail_weight();
+    let mut tail = Expression::from(risk.zeta);
+    for (s, realisation) in futures.iter().enumerate() {
+        tail += risk.tail[s] * (realisation.probability * problem.risk.tail_scale());
+    }
+    mean * (1.0 - lambda) + tail * lambda
+}
+
+/// What one future costs, in euros over the horizon.
+fn scenario_cost(
+    problem: &Problem<'_>,
+    vars: &Vars<'_>,
+    realisation: crate::model::Realisation,
+) -> Expression {
     let mut objective = Expression::from(0.0);
     for k in 0..problem.horizon.len {
         let price = problem.prices.slots.get(k);
@@ -671,6 +1165,18 @@ fn build_objective(problem: &Problem<'_>, vars: &Vars<'_>) -> Expression {
         }
     }
 
+    // A programme the plan decided not to run at all. Priced once, not per slot:
+    // it is a decision rather than a flow, and it is the term that stops the
+    // cheapest schedule being the one where nothing ever happens.
+    //
+    // It is the same shared variable in every future, so it adds the same
+    // constant to each — which shifts ζ and leaves the tail where it was. It is
+    // carried inside the scenario cost anyway, so that `cost_s` is the whole of
+    // what a future costs and the report and the objective say the same thing.
+    for (i, run) in problem.shiftable.iter().enumerate() {
+        objective += vars.sh_short[i] * run.unserved_eur.max(0.0);
+    }
+
     // What is left in the tank is worth what it would cost to put back — the
     // same argument as the battery's terminal value, and without it a
     // receding-horizon plan lets the water go cold on the last evening of every
@@ -687,6 +1193,7 @@ fn build_objective(problem: &Problem<'_>, vars: &Vars<'_>) -> Expression {
     // value, and the reason a plan does not let the house coast cold into its
     // own last slot. Valuing it at the replacement cost keeps it neutral: the
     // plan pre-heats when that is genuinely cheaper, and not otherwise.
+    let _ = realisation;
     if let Some(t) = problem.thermal {
         let mean_outdoor = if problem.outdoor_c.is_empty() {
             10.0
@@ -774,16 +1281,96 @@ struct Rows {
 fn add_constraints<M: SolverModel>(
     mut model: M,
     problem: &Problem<'_>,
-    vars: &Vars<'_>,
-    rows: &mut Rows,
+    per: &[Variables],
+    shared: &SharedBinaries,
+    risk: Option<&RiskVars>,
+    rows: &mut Vec<Rows>,
 ) -> M {
-    for k in 0..problem.horizon.len {
-        model = balance(model, problem, vars, k, rows);
-        model = storage(model, problem, vars, k, rows);
-        model = charging(model, problem, vars, k, rows);
-        model = grid_rules(model, problem, vars, k, rows);
-        model = building(model, problem, vars, k, rows);
-        model = hot_water(model, problem, vars, k, rows);
+    let futures = problem.realisations();
+    for (s, realisation) in futures.iter().enumerate() {
+        let vars = per[s].borrow();
+        let mut scenario_rows = Rows::default();
+        for k in 0..problem.horizon.len {
+            model = balance(model, problem, &vars, *realisation, k, &mut scenario_rows);
+            model = storage(model, problem, &vars, *realisation, k, &mut scenario_rows);
+            model = charging(model, problem, &vars, k, &mut scenario_rows);
+            model = grid_rules(model, problem, &vars, *realisation, k, &mut scenario_rows);
+            model = building(model, problem, &vars, k, &mut scenario_rows);
+            model = hot_water(model, problem, &vars, k, &mut scenario_rows);
+        }
+        rows.push(scenario_rows);
+    }
+    // Shared by every future, so stated once.
+    model = shiftable_runs(model, problem, &per[0].borrow());
+    model = minimum_runtime(model, problem, shared);
+    model = non_anticipativity(model, problem, per);
+    conditional_value_at_risk(model, problem, per, risk)
+}
+
+/// The first slot is decided **once**, whatever the weather turns out to be.
+///
+/// Non-anticipativity, and it is what makes the plan a plan. The arbiter is
+/// about to commit the next fifteen minutes; a schedule that gave three
+/// different answers for it — one per future — would be three schedules and a
+/// coin. Everything after the first slot is *recourse*: the plan may say "and if
+/// the afternoon is dull I do this instead", which is exactly what makes hedging
+/// affordable rather than a tax on every sunny day.
+///
+/// Only the **controllable** decisions are tied. The grid, the curtailment and
+/// every state variable are left free, and that is not an oversight: production
+/// differs between the futures by kilowatts in the first slot, so an import that
+/// had to be identical in all three would be infeasible the moment the band was
+/// wider than nothing.
+fn non_anticipativity<M: SolverModel>(mut model: M, problem: &Problem<'_>, per: &[Variables]) -> M {
+    if problem.horizon.len == 0 {
+        return model;
+    }
+    let first = per[0].borrow();
+    for other in per.iter().skip(1) {
+        let o = other.borrow();
+        for (a, b) in [
+            (first.b_ch[0], o.b_ch[0]),
+            (first.b_dis[0], o.b_dis[0]),
+            (first.ev[0], o.ev[0]),
+            (first.hp[0], o.hp[0]),
+            (first.dhw[0], o.dhw[0]),
+        ] {
+            model = model.with(constraint!(a - b == 0.0));
+        }
+    }
+    model
+}
+
+/// The two rows per future that turn a tail into a linear program.
+///
+/// `tail_s ≥ cost_s − ζ` with `tail_s ≥ 0` (a bound, already declared). At the
+/// optimum of [`build_objective`] `ζ` is the value at risk and `tail_s` the
+/// excess above it, so the weighted sum of the excesses is the conditional value
+/// at risk. Nothing here is an approximation: it is exact for any finite
+/// scenario set.
+fn conditional_value_at_risk<M: SolverModel>(
+    mut model: M,
+    problem: &Problem<'_>,
+    per: &[Variables],
+    risk: Option<&RiskVars>,
+) -> M {
+    // With no weight on the tail there are no such variables to constrain, and a
+    // risk-neutral solve is byte for byte the model it always was.
+    let Some(risk) = risk else {
+        return model;
+    };
+    for (s, realisation) in problem.realisations().iter().enumerate() {
+        let cost = scenario_cost(problem, &per[s].borrow(), *realisation);
+        // `tail_s + ζ − cost_s ≥ 0`, built as one expression rather than through
+        // the comparison macro: `cost_s` is the whole of a future's objective —
+        // several hundred terms — and a macro that has to decide which side of a
+        // relation each of them belongs on is not the place to find that out.
+        //
+        // Getting the sign wrong is not subtle and does not fail quietly: ζ
+        // appears in the objective with a positive coefficient, so with the row
+        // reversed nothing stops it going to minus infinity and every solve
+        // comes back `Unbounded`.
+        model = model.with((risk.tail[s] + risk.zeta - cost).geq(0.0));
     }
     model
 }
@@ -793,10 +1380,11 @@ fn balance<M: SolverModel>(
     mut model: M,
     problem: &Problem<'_>,
     vars: &Vars<'_>,
+    realisation: crate::model::Realisation,
     k: usize,
     rows: &mut Rows,
 ) -> M {
-    let (pv, load) = problem.forecasts_at(k);
+    let (pv, load) = problem.forecasts_in(realisation, k);
 
     // Energy balance:
     //     import − export = load + charging + car − (production − curtailed)
@@ -809,6 +1397,7 @@ fn balance<M: SolverModel>(
             - vars.ev[k]
             - vars.hp[k]
             - vars.dhw[k]
+            - shiftable_total(problem, vars, k)
             - vars.curtail[k]
             == load - pv
     )));
@@ -846,6 +1435,7 @@ fn storage<M: SolverModel>(
     mut model: M,
     problem: &Problem<'_>,
     vars: &Vars<'_>,
+    realisation: crate::model::Realisation,
     k: usize,
     rows: &mut Rows,
 ) -> M {
@@ -866,7 +1456,7 @@ fn storage<M: SolverModel>(
         // The battery may only take what the roof is producing — the setting
         // that keeps a storage system outside MiSpeL's flow bookkeeping
         // altogether, because none of its energy is ever grey.
-        let (pv, _) = problem.forecasts_at(k);
+        let (pv, _) = problem.forecasts_in(realisation, k);
         model = model.with(constraint!(vars.b_ch[k] <= pv));
     }
     model
@@ -924,6 +1514,79 @@ fn charging<M: SolverModel>(
     model
 }
 
+/// A compressor's minimum on- and off-times.
+///
+/// ```text
+/// on[j] ≥ on[k] − on[k−1]      for j ∈ (k, k + L)     (once started, stay on)
+/// on[j] ≤ 1 − on[k−1] + on[k]  for j ∈ (k, k + ℓ)     (once stopped, stay off)
+/// ```
+///
+/// Both rows constrain a **transition**, so each needs the slot before it — and
+/// the first slot of the horizon is the one a receding-horizon controller
+/// actually executes. Written for `k ≥ 1` only, they leave it unconstrained: the
+/// box starts the compressor, commits that quarter hour, re-plans against a
+/// model with no memory and stops it again, every plan feasible and the day
+/// short-cycling as though the minimum runtime had never been written.
+///
+/// So `on[−1]` is a constant here — the compressor's own
+/// [`CompressorState`](hems_core::prelude::CompressorState) — and
+/// `heat_pump_binary` pins the opening slots its minimum still owes. Anchoring
+/// that first transition also shrinks the search: a 96-slot heating day solves
+/// in about 1,0 s against 5,0 s, because a free first transition branches the
+/// length of the horizon (D65).
+///
+/// The rows are the pairwise ones rather than Rajan and Takriti's convex hull,
+/// which was built and measured at 6,9 s against 4,9 s here (D66).
+///
+/// `hp_on` is shared by every scenario, so these are stated once rather than
+/// per future.
+fn minimum_runtime<M: SolverModel>(
+    mut model: M,
+    problem: &Problem<'_>,
+    shared: &SharedBinaries,
+) -> M {
+    let Some(t) = problem.thermal.filter(|t| !t.heat_pump.modulating) else {
+        return model;
+    };
+    let n = problem.horizon.len;
+    let on = &shared.hp_on;
+    // A minimum of one slot is no minimum: the windows below are empty and the
+    // rows are simply not built.
+    let min_on = t.heat_pump.min_on_slots.max(1);
+    let min_off = t.heat_pump.min_off_slots.max(1);
+    let was_on = f64::from(u8::from(t.heat_pump.compressor.running));
+
+    for k in 0..n {
+        let previous: Expression = if k == 0 {
+            Expression::from(was_on)
+        } else {
+            on[k - 1].into()
+        };
+        for j in (k + 1)..(k + min_on).min(n) {
+            model = model.with(constraint!(on[j] >= on[k] - previous.clone()));
+        }
+        for j in (k + 1)..(k + min_off).min(n) {
+            model = model.with(constraint!(on[j] <= 1.0 - previous.clone() + on[k]));
+        }
+    }
+    model
+}
+
+/// Every appliance runs its programme exactly once, or says it did not.
+///
+/// `Σ start + short = 1`. The sum is over binaries, so `short` comes out
+/// integral without being declared so, and the row is the only one an appliance
+/// contributes — everything else about it is arithmetic on the starts.
+fn shiftable_runs<M: SolverModel>(mut model: M, problem: &Problem<'_>, vars: &Vars<'_>) -> M {
+    for i in 0..problem.shiftable.len() {
+        let placed = vars.sh_start[i]
+            .iter()
+            .fold(Expression::from(0.0), |acc, v| acc + *v);
+        model = model.with(constraint!(placed + vars.sh_short[i] == 1.0));
+    }
+    model
+}
+
 /// § 14a: the controllable devices, net of the surplus that covers them.
 ///
 /// A heat pump is Fallgruppe b `[A1 2.4.1.b]`, so it counts here too. The
@@ -948,6 +1611,7 @@ fn grid_rules<M: SolverModel>(
     mut model: M,
     problem: &Problem<'_>,
     vars: &Vars<'_>,
+    realisation: crate::model::Realisation,
     k: usize,
     rows: &mut Rows,
 ) -> M {
@@ -959,25 +1623,47 @@ fn grid_rules<M: SolverModel>(
         rows.steuve.push(None);
         return model;
     };
-    let (pv, load) = problem.forecasts_at(k);
+    let (pv, load) = problem.forecasts_in(realisation, k);
     let row = if pv <= load {
         // No surplus to lift the ceiling with, so the rule is the bare one — and
         // nothing that is *not* a steuerbare Verbrauchseinrichtung belongs on
-        // the left. A hot-water tank counts here for what it *spends* of the
-        // surplus, never against the ceiling itself.
+        // the left. A hot-water tank and a dishwasher count here for what they
+        // *spend* of the surplus, never against the ceiling itself; with no
+        // surplus to spend they do not appear at all, which makes this branch
+        // exact.
         model.add_constraint(constraint!(
             vars.b_ch[k] + vars.ev[k] + vars.hp[k] - vars.b_dis[k] <= ceiling.get()
         ))
     } else {
         // With a surplus, everything that consumes it reduces the headroom it
-        // buys: the curtailed production that never happened, and the tank that
-        // took some. Writing them on the left is the linear way to say
-        // `Σ SteuVE ≤ ceiling + max(0, pv − load − curtail − dhw)` — exact
-        // wherever the surplus survives them, and conservative by at most the
-        // tank's own rating where it does not, which is the safe direction for a
-        // plan the guard has to be able to carry out.
+        // buys: the curtailed production that never happened, the tank that took
+        // some, and the appliance somebody set running. Writing them on the left
+        // is the linear way to say
+        // `Σ SteuVE − b_dis ≤ ceiling + max(0, pv − load − curtail − dhw − shiftable)`.
+        //
+        // # The `max` is dropped, and that is a decision rather than an oversight
+        //
+        // Exact wherever the surplus survives the three of them; where it does
+        // not, the right-hand side falls *below* the ceiling, so the plan asks
+        // less of the connection than the Festlegung allows. The safe direction —
+        // the guard runs the exact formula against measurements a second at a
+        // time (`hems_grid::steuve_budget`) and would refuse the difference
+        // anyway.
+        //
+        // Restoring the `max` exactly is a disjunction and needs a binary per
+        // slot: substituting the energy balance turns the constraint into
+        // `min(Σ SteuVE − b_dis, g_in − g_out) ≤ ceiling`, which is a union of
+        // two half-spaces and therefore not convex. A § 14a limit sent without a
+        // duration covers the whole horizon, so that is up to sixty more
+        // binaries on a summer day, to buy at most the tank's and the
+        // appliance's own rating of headroom in the slots where a surplus is
+        // small *and* a reduction is in force. Measured on the reference days it
+        // is worth nothing at all, and it was not built.
         model.add_constraint(constraint!(
-            vars.b_ch[k] + vars.ev[k] + vars.hp[k] - vars.b_dis[k] + vars.curtail[k] + vars.dhw[k]
+            vars.b_ch[k] + vars.ev[k] + vars.hp[k] - vars.b_dis[k]
+                + vars.curtail[k]
+                + vars.dhw[k]
+                + shiftable_total(problem, vars, k)
                 <= ceiling.get() + (pv - load)
         ))
     };
@@ -1084,22 +1770,10 @@ fn building<M: SolverModel>(
     model = model.with(constraint!(vars.hp[k] <= vars.hp_on[k] * max));
     model = model.with(constraint!(vars.hp[k] >= vars.hp_on[k] * min));
 
-    // Minimum runtime. A compressor is damaged by short cycling far faster than
-    // by running, so a plan that switches every slot is cheaper on paper and
-    // more expensive in fact.
-    if k >= 1 {
-        let n = problem.horizon.len;
-        for j in (k + 1)..(k + t.heat_pump.min_on_slots).min(n) {
-            model = model.with(constraint!(
-                vars.hp_on[j] >= vars.hp_on[k] - vars.hp_on[k - 1]
-            ));
-        }
-        for j in (k + 1)..(k + t.heat_pump.min_off_slots).min(n) {
-            model = model.with(constraint!(
-                vars.hp_on[j] <= 1.0 - vars.hp_on[k - 1] + vars.hp_on[k]
-            ));
-        }
-    }
+    // The minimum runtime is **not** here. It ties slots to each other rather
+    // than describing one, and `hp_on` is shared by every future, so stating it
+    // per scenario per slot would add the same rows three times over. See
+    // `minimum_runtime`.
     model
 }
 
@@ -1150,12 +1824,13 @@ fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
         let ev = house.charge_point(problem, k, device_ceiling, &mut cost);
         let hp = house.heat_pump(problem, k, device_ceiling);
         let dhw = house.hot_water(problem, k, &mut cost);
+        let appliances: f64 = house.appliances(problem, k);
 
         // § 9 EEG and an LPP session bound what leaves the connection point, and
         // they do not ask whether there is an energy manager behind it. What the
         // baseline cannot export it throws away, at the same price the plan pays
         // for doing so.
-        let mut net = load + ev + hp + dhw - pv;
+        let mut net = load + ev + hp + dhw + appliances - pv;
         if net < 0.0
             && let Some(ceiling) = slot_k.and_then(|s| problem.limits.feed_in_at(s))
         {
@@ -1194,6 +1869,13 @@ fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
     // of `charging_target`. Charging it the whole outstanding balance instead
     // would invent a failure on a car that has not left yet — the same
     // asymmetry, pointing the other way.
+    cost.unserved_eur += problem
+        .shiftable
+        .iter()
+        .zip(&house.appliance_starts)
+        .filter(|(_, start)| start.is_none())
+        .map(|(run, _)| run.unserved_eur.max(0.0))
+        .sum::<f64>();
     if let Some(e) = problem.ev
         && problem.horizon.index_of(e.deadline()).is_none()
     {
@@ -1217,6 +1899,9 @@ struct Unmanaged {
     dhw_stored: f64,
     thermal_state: hems_core::prelude::ThermalState,
     thermal_step: hems_core::prelude::Rc2Discrete,
+    /// Where each programme runs with nobody deciding: the first slot the
+    /// household is allowed to press start in.
+    appliance_starts: Vec<Option<usize>>,
 }
 
 impl Unmanaged {
@@ -1231,7 +1916,32 @@ impl Unmanaged {
                 .thermal
                 .map_or(hems_core::prelude::ThermalState::default(), |t| t.state),
             thermal_step: problem.thermal_step(),
+            appliance_starts: problem
+                .shiftable
+                .iter()
+                .map(|run| (0..problem.horizon.len).find(|k| run.can_start_at(problem.horizon, *k)))
+                .collect(),
         }
+    }
+
+    /// What the shiftable appliances draw with nobody scheduling them.
+    ///
+    /// A household with no energy manager presses start when it loads the
+    /// machine, which is the first slot its own window allows — and pays the
+    /// same price as the plan for a programme that has nowhere to go at all. The
+    /// whole difference being measured is *when*, so the baseline must run the
+    /// same programme rather than not run one.
+    fn appliances(&self, problem: &Problem<'_>, k: usize) -> f64 {
+        problem
+            .shiftable
+            .iter()
+            .zip(&self.appliance_starts)
+            .map(|(run, start)| {
+                start
+                    .filter(|s| k >= *s)
+                    .map_or(0.0, |s| run.programme.power_at(k - s).get())
+            })
+            .sum()
     }
 
     /// An unmanaged charge point runs flat out from the moment the cable goes in
@@ -1358,6 +2068,24 @@ fn charging_target(problem: &Problem<'_>, ev: EvSession, k: usize) -> Option<f64
     Some(ev.energy_now.get() + needed * fraction)
 }
 
+/// What each appliance draws in slot `k`, given where its programme was placed.
+fn shiftable_at(
+    problem: &Problem<'_>,
+    placements: &[Option<usize>],
+    k: usize,
+) -> Vec<hems_core::prelude::Power> {
+    problem
+        .shiftable
+        .iter()
+        .zip(placements)
+        .map(|(run, start)| {
+            start
+                .filter(|s| k >= *s)
+                .map_or(Power::ZERO, |s| run.programme.power_at(k - s))
+        })
+        .collect()
+}
+
 /// The per-asset targets a solved slot implies.
 ///
 /// Each carries an envelope as well as a value, and the two say different
@@ -1373,6 +2101,7 @@ fn slot_targets(
     f: &Flows,
     k: usize,
     shadow: Option<&crate::shadow::Shadow>,
+    appliances: &[Power],
 ) -> Vec<AssetTarget> {
     let mut targets = Vec::new();
     let value_of = |asset: &AssetId| shadow.map(|s| s.for_asset(names, asset));
@@ -1427,6 +2156,18 @@ fn slot_targets(
             envelope: Envelope::new(Power::ZERO, d.heater),
         });
     }
+    // A programme is *placed*, not modulated: once a dishwasher starts it is
+    // household load, and the envelope says so. What the target carries is the
+    // one thing a driver, a household and a user interface need — the quarter
+    // hour it is running in.
+    for (id, power) in names.shiftable.iter().zip(appliances) {
+        targets.push(AssetTarget {
+            marginal_eur_per_kwh: value_of(id),
+            asset: id.clone(),
+            power: *power,
+            envelope: Envelope::exactly(*power),
+        });
+    }
     if let Some(id) = &names.pv
         && f.curtailed > Power::ZERO
     {
@@ -1442,87 +2183,134 @@ fn slot_targets(
     targets
 }
 
+/// One slot's flows, read back from the solution.
+///
+/// A solver returns a basis, not a decision. Two roundings happen here, and the
+/// second one is not cosmetic.
+///
+/// A variable that is logically zero comes back as 1e-13, and it travels from
+/// here into plan targets, JSON and tests that compare against zero. No device
+/// in a household resolves a milliwatt, so neither does this.
+///
+/// And a variable that landed exactly **on** a bound comes back a nanowatt short
+/// of it: a semi-continuous charge point pinned to its own 4 140 W minimum
+/// returns 4 139,999 999 999 896. Downstream that is not a rounding error, it is
+/// a different decision — the arbiter's conductor policy reads it as "below the
+/// three-phase minimum", drops the wallbox to one conductor, and the car charges
+/// at 3,68 kW and 85 % instead of 4,14 kW and 92 % for the rest of the session.
+/// Snapping to the milliwatt costs nothing and removes a whole class of that.
+fn read_flows(solution: &impl Solution, vars: &Vars<'_>, appliances: &[Power], k: usize) -> Flows {
+    let value = |v: Variable| {
+        let w = solution.value(v).max(0.0);
+        Power::new(if w < 1e-3 {
+            0.0
+        } else {
+            (w * 1e3).round() / 1e3
+        })
+    };
+    Flows {
+        grid_import: value(vars.g_in[k]),
+        grid_export: value(vars.g_out[k]),
+        battery_charge: value(vars.b_ch[k]),
+        battery_discharge: value(vars.b_dis[k]),
+        battery_energy: hems_core::prelude::Energy::new(solution.value(vars.b_e[k]).max(0.0)),
+        ev_charge: value(vars.ev[k]),
+        curtailed: value(vars.curtail[k]),
+        heat_pump: value(vars.hp[k]),
+        dhw: value(vars.dhw[k]),
+        shiftable: appliances.iter().copied().sum(),
+        dhw_stored: hems_core::prelude::Energy::new(solution.value(vars.dhw_e[k]).max(0.0)),
+        indoor_c: solution.value(vars.t_in[k]),
+        discomfort_k: solution.value(vars.cold[k]) + solution.value(vars.warm[k]),
+    }
+}
+
+/// Add one slot's costs to the report.
+///
+/// The same terms the objective minimises, so the reported saving cannot flatter
+/// itself by leaving out what the plan actually spent. Only the *preference*
+/// weights of the objective are dropped: a carbon price and an autarky premium
+/// are what a household is willing to pay, not what it is charged, and adding
+/// them to a reported bill would invent an invoice nobody sends.
+fn charge_the_report(
+    problem: &Problem<'_>,
+    f: &Flows,
+    k: usize,
+    cost: &mut hems_core::prelude::CostBreakdown,
+) {
+    let price = problem.prices.slots.get(k);
+    let import_eur = price.map_or(
+        DEFAULT_IMPORT_EUR_PER_KWH,
+        hems_tariff::SlotPrice::import_f64,
+    );
+    let export_eur = price.map_or(
+        DEFAULT_EXPORT_EUR_PER_KWH,
+        hems_tariff::SlotPrice::export_f64,
+    );
+    cost.energy_eur +=
+        (f.grid_import.get() * import_eur - f.grid_export.get() * export_eur) * SLOT_KWH_PER_W;
+    if let Some(b) = problem.battery {
+        cost.wear_eur += (f.battery_charge.get() + f.battery_discharge.get())
+            * (b.degradation_eur_per_kwh / 2.0)
+            * SLOT_KWH_PER_W;
+    }
+    cost.curtailment_eur +=
+        f.curtailed.get() * problem.curtailment_penalty_eur_per_kwh * SLOT_KWH_PER_W;
+    if let Some(t) = problem.thermal {
+        cost.discomfort_eur += f.discomfort_k * t.discomfort_eur_per_kelvin_hour * DT_HOURS;
+    }
+}
+
+/// The marginal value of a kilowatt-hour where the dual pass did not run.
+///
+/// The price the plan faces in this slot — what the first four versions used,
+/// and enough to rank slots even though it cannot rank devices.
+fn fallback_marginal(problem: &Problem<'_>, f: &Flows, k: usize) -> f64 {
+    let price = problem.prices.slots.get(k);
+    if f.grid_import > f.grid_export {
+        price.map_or(
+            DEFAULT_IMPORT_EUR_PER_KWH,
+            hems_tariff::SlotPrice::import_f64,
+        )
+    } else {
+        price.map_or(
+            DEFAULT_EXPORT_EUR_PER_KWH,
+            hems_tariff::SlotPrice::export_f64,
+        )
+    }
+}
+
 /// Turn a solved model into a plan.
 fn read_back(
     problem: &Problem<'_>,
     names: &AssetNames,
     now: OffsetDateTime,
     solution: &impl Solution,
-    vars: &Vars<'_>,
+    per: &[Variables],
+    central: usize,
     shadows: &[crate::shadow::Shadow],
 ) -> Solved {
     let n = problem.horizon.len;
+    let futures = problem.realisations();
+    let vars = &per[central].borrow();
+    let central_realisation = futures[central];
+    // Where each appliance's programme was placed, as a slot index. Read once:
+    // it is a single decision per appliance and re-deriving it inside the slot
+    // loop would make a quadratic scan out of a lookup.
+    let placements: Vec<Option<usize>> = (0..problem.shiftable.len())
+        .map(|i| (0..n).find(|k| solution.value(vars.sh_start[i][*k]) > 0.5))
+        .collect();
+
     // ── Read the answer back ────────────────────────────────────────────────
     let mut flows = Vec::with_capacity(n);
     let mut slots = Vec::with_capacity(n);
     let mut cost = hems_core::prelude::CostBreakdown::default();
 
     for k in 0..n {
-        // A solver returns a basis, not a decision. Two roundings, and the
-        // second one is not cosmetic.
-        //
-        // A variable that is logically zero comes back as 1e-13, and it travels
-        // from here into plan targets, JSON and tests that compare against zero.
-        // No device in a household resolves a milliwatt, so neither does this.
-        //
-        // And a variable that landed exactly **on** a bound comes back a
-        // nanowatt short of it: a semi-continuous charge point pinned to its own
-        // 4 140 W minimum returns 4 139,999 999 999 896. Downstream that is not
-        // a rounding error, it is a different decision — the arbiter's conductor
-        // policy reads it as "below the three-phase minimum", drops the wallbox
-        // to one conductor, and the car charges at 3,68 kW and 85 % instead of
-        // 4,14 kW and 92 % for the rest of the session. Snapping to the
-        // milliwatt costs nothing and removes a whole class of that.
-        let value = |v: Variable| {
-            let w = solution.value(v).max(0.0);
-            Power::new(if w < 1e-3 {
-                0.0
-            } else {
-                (w * 1e3).round() / 1e3
-            })
-        };
-        let f = Flows {
-            grid_import: value(vars.g_in[k]),
-            grid_export: value(vars.g_out[k]),
-            battery_charge: value(vars.b_ch[k]),
-            battery_discharge: value(vars.b_dis[k]),
-            battery_energy: hems_core::prelude::Energy::new(solution.value(vars.b_e[k]).max(0.0)),
-            ev_charge: value(vars.ev[k]),
-            curtailed: value(vars.curtail[k]),
-            heat_pump: value(vars.hp[k]),
-            dhw: value(vars.dhw[k]),
-            dhw_stored: hems_core::prelude::Energy::new(solution.value(vars.dhw_e[k]).max(0.0)),
-            indoor_c: solution.value(vars.t_in[k]),
-            discomfort_k: solution.value(vars.cold[k]) + solution.value(vars.warm[k]),
-        };
-
-        // The same four terms the objective minimises, so the reported saving
-        // cannot flatter itself by leaving out what the plan actually spent.
-        // Only the *preference* weights of the objective are dropped here: a
-        // carbon price and an autarky premium are what a household is willing to
-        // pay, not what it is charged, and adding them to a reported bill would
-        // invent an invoice nobody sends.
-        let price = problem.prices.slots.get(k);
-        let import_eur = price.map_or(
-            DEFAULT_IMPORT_EUR_PER_KWH,
-            hems_tariff::SlotPrice::import_f64,
-        );
-        let export_eur = price.map_or(
-            DEFAULT_EXPORT_EUR_PER_KWH,
-            hems_tariff::SlotPrice::export_f64,
-        );
-        cost.energy_eur +=
-            (f.grid_import.get() * import_eur - f.grid_export.get() * export_eur) * SLOT_KWH_PER_W;
-        if let Some(b) = problem.battery {
-            cost.wear_eur += (f.battery_charge.get() + f.battery_discharge.get())
-                * (b.degradation_eur_per_kwh / 2.0)
-                * SLOT_KWH_PER_W;
-        }
-        cost.curtailment_eur +=
-            f.curtailed.get() * problem.curtailment_penalty_eur_per_kwh * SLOT_KWH_PER_W;
-        if let Some(t) = problem.thermal {
-            cost.discomfort_eur += f.discomfort_k * t.discomfort_eur_per_kelvin_hour * DT_HOURS;
-        }
+        let appliances = shiftable_at(problem, &placements, k);
+        let f = read_flows(solution, vars, &appliances, k);
+        charge_the_report(problem, &f, k, &mut cost);
+        let _ = central_realisation;
 
         // The marginal value of a kilowatt-hour in this slot. Where the dual
         // pass ran it is the **shadow price** of the energy balance — what the
@@ -1531,21 +2319,11 @@ fn read_back(
         // back to the price the plan faces, which is what the first four
         // versions used and is enough to rank slots.
         let shadow = shadows.get(k).copied();
-        let site_marginal = shadow.map_or_else(
-            || {
-                if f.grid_import > f.grid_export {
-                    import_eur
-                } else {
-                    export_eur
-                }
-            },
-            |s| s.site,
-        );
-        let targets = slot_targets(problem, names, &f, k, shadow.as_ref());
+        let site_marginal = shadow.map_or_else(|| fallback_marginal(problem, &f, k), |s| s.site);
 
         slots.push(SlotPlan {
             slot: problem.horizon.get(k).expect("k < horizon length"),
-            targets,
+            targets: slot_targets(problem, names, &f, k, shadow.as_ref(), &appliances),
             marginal_eur_per_kwh: Some(site_marginal),
             flexibility_eur_per_kwh: shadow.and_then(|s| s.flexibility),
         });
@@ -1553,17 +2331,33 @@ fn read_back(
     }
 
     let baseline = baseline_cost(problem);
-    let unmet_charge = hems_core::prelude::Energy::new(
-        (0..n)
-            .map(|k| solution.value(vars.ev_short[k]))
-            .fold(0.0_f64, f64::max)
-            .max(0.0),
-    );
 
+    // ── The soft terms, in **expectation** ───────────────────────────────────
+    //
+    // Each future has its own shortfall, and the objective priced each at that
+    // future's probability. Reporting the central one would tell a household the
+    // median day's answer and leave the dull one out of the number the plan was
+    // actually built around; reporting the worst would say the plan expects a bad
+    // day. The expectation is what the objective minimised, so it is what the
+    // report carries.
+    let expectation = |pick: &dyn Fn(&Vars<'_>, usize) -> f64| -> f64 {
+        futures
+            .iter()
+            .enumerate()
+            .map(|(s, realisation)| {
+                let v = per[s].borrow();
+                realisation.probability * (0..n).map(|k| pick(&v, k)).sum::<f64>()
+            })
+            .sum()
+    };
+    // The charging shortfall is a *level*, not a flow: at most one slot carries a
+    // target, so summing over the horizon and taking the largest come to the same
+    // thing, and summing composes with the expectation above.
+    let unmet_charge = hems_core::prelude::Energy::new(
+        expectation(&|v, k| solution.value(v.ev_short[k]).max(0.0)).max(0.0),
+    );
     let unmet_hot_water = hems_core::prelude::Energy::new(
-        (0..n)
-            .map(|k| solution.value(vars.dhw_short[k]).max(0.0))
-            .sum::<f64>(),
+        expectation(&|v, k| solution.value(v.dhw_short[k]).max(0.0)).max(0.0),
     );
 
     // The two soft terms of the objective, reported. Uncharged, they let the
@@ -1573,7 +2367,18 @@ fn read_back(
         + unmet_hot_water.get()
             * problem
                 .dhw
-                .map_or(0.0, |d| d.shortfall_eur_per_kwh / 1000.0);
+                .map_or(0.0, |d| d.shortfall_eur_per_kwh / 1000.0)
+        // …and a programme the plan decided not to run. Same argument as the
+        // other two: a wash nobody got is a wash nobody paid for, and leaving it
+        // off the report would let the cheapest plan be the one where the
+        // machine stays full.
+        + problem
+            .shiftable
+            .iter()
+            .zip(&placements)
+            .filter(|(_, placed)| placed.is_none())
+            .map(|(run, _)| run.unserved_eur.max(0.0))
+            .sum::<f64>();
 
     Solved {
         plan: Plan {
@@ -1587,5 +2392,21 @@ fn read_back(
         flows,
         unmet_charge,
         unmet_hot_water,
+        // What the next re-plan starts from. Rounded, because a solver returns
+        // 0,999 999 999 for a binary and a hint is only useful if it is the
+        // decision rather than a number near it.
+        commitment: crate::model::Commitment {
+            ev_on: (0..n)
+                .map(|k| solution.value(vars.ev_on[k]).round())
+                .collect(),
+            hp_on: (0..n)
+                .map(|k| solution.value(vars.hp_on[k]).round())
+                .collect(),
+            shiftable: vars
+                .sh_start
+                .iter()
+                .map(|starts| starts.iter().map(|v| solution.value(*v).round()).collect())
+                .collect(),
+        },
     }
 }

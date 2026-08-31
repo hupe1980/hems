@@ -53,9 +53,9 @@ pub mod solar;
 
 pub use building::{Identified, ThermalSample, identify};
 pub use load::{DayType, LoadProfile};
-pub use metrics::Calibration;
+pub use metrics::{CALIBRATION_DAYS, Calibration, is_informative};
 pub use naive::{persistence, seasonal_naive};
 pub use quantile::{Band, Forecast, PowerBand};
-pub use residual::ResidualModel;
+pub use residual::{ResidualModel, SETTLED_SAMPLES};
 pub use session::{Session, SessionForecast, SessionHistory};
 pub use solar::{ArrayModel, SunPosition, clear_sky_ghi, sun_position};

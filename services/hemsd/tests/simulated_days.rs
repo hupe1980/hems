@@ -316,7 +316,13 @@ fn the_sixty_percent_cap_costs_a_roof_what_an_intelligent_meter_would_have_saved
     // hours actually are.
     let capped = run(&Scenario::summer_capped(&HouseholdConfig::default())).unwrap();
     let relieved = run(&Scenario::summer_capped(&HouseholdConfig {
-        cap_relief: CapRelief::ImsysWithControl,
+        // The operator's first successful Ansteuerbarkeit test has happened,
+        // which is the only thing § 9 Abs. 2 waits for. The intelligent
+        // metering system itself is unchanged, so § 51's negative quarter
+        // hours are identical on both sides and what moves is the cap.
+        para9: HouseholdConfig::default()
+            .para9
+            .with_relief(CapRelief::ImsysWithControl),
         ..HouseholdConfig::default()
     }))
     .unwrap();
@@ -387,6 +393,58 @@ fn the_sixty_percent_cap_costs_a_roof_what_an_intelligent_meter_would_have_saved
     assert!(
         capped.baseline.curtailment_eur > relieved.baseline.curtailment_eur,
         "the baseline is capped too: a household with no energy manager does not          get to ignore § 9 EEG"
+    );
+}
+
+#[test]
+fn an_older_meter_brings_paragraph_51_with_it_and_it_is_a_different_clock() {
+    // One intelligent metering system, two rules, two clocks — and reading one
+    // fact for both makes the ordinary German household of 2026 impossible to
+    // describe.
+    //
+    // § 9 Abs. 2 EEG lifts the 60 % feed-in cap only once the system is in
+    // operation **and** the network operator's first Ansteuerbarkeit test has
+    // succeeded. § 51 Abs. 2 Nr. 1 EEG stops exempting a plant below 100 kW from
+    // the negative-price rule at the end of the calendar year the meter was
+    // **fitted** in, and asks nothing about a test. A meter can sit in the
+    // cupboard for a year between the two.
+    //
+    // This is the § 51 clock on its own: the cap is on in both runs, and the
+    // only difference is whether the meter went in this year or last.
+    let base = HouseholdConfig::default();
+    let this_year = run(&Scenario::summer_capped(&HouseholdConfig {
+        para9: base
+            .para9
+            .with_imsys_since(time::macros::date!(2026 - 03 - 01)),
+        ..base.clone()
+    }))
+    .unwrap();
+    let last_year = run(&Scenario::summer_capped(&HouseholdConfig {
+        para9: base
+            .para9
+            .with_imsys_since(time::macros::date!(2025 - 03 - 01)),
+        ..base.clone()
+    }))
+    .unwrap();
+
+    assert_eq!(
+        this_year.feed_in_ceiling_kw, last_year.feed_in_ceiling_kw,
+        "the § 9 cap is on in both: this is § 51 alone"
+    );
+    let para51_cost = last_year.cost.total() - this_year.cost.total();
+    assert!(
+        para51_cost > 0.0,
+        "§ 51 can only cost a household that feeds in, never pay it: \
+         {para51_cost:.2} €"
+    );
+    // …and it costs the *unmanaged* household more, because a box that can
+    // absorb a negative afternoon into a battery, a tank and a car is the whole
+    // answer to § 51 and a box that cannot has none.
+    let unmanaged = last_year.baseline.total() - this_year.baseline.total();
+    assert!(
+        unmanaged > para51_cost,
+        "an energy manager is worth more once § 51 starts, not less: \
+         {para51_cost:.2} € against {unmanaged:.2} €"
     );
 }
 
@@ -618,8 +676,18 @@ fn every_asset_the_arbiter_moves_can_be_described_in_s2() {
     // is the first thing a real Resource Manager would find.
     let r = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
     assert_eq!(
-        r.s2_resources, 5,
-        "battery, charge point, heat pump, hot-water tank and the roof"
+        r.s2_resources, 6,
+        "battery, charge point, heat pump, hot-water tank, dishwasher and the roof"
+    );
+    // And the figure counts descriptions that were **built**, not assets whose
+    // control type is merely not `NotControllable`. The difference is the whole
+    // reason it is worth reporting: the second number goes up when a device is
+    // added and never notices that no `describe_*` was ever written for it,
+    // which is how the hot-water tank sat in it for four versions with nothing
+    // to send.
+    assert_eq!(
+        r.s2_undescribed, 0,
+        "nothing claims a control type this workspace cannot express"
     );
 
     let household =
@@ -633,6 +701,7 @@ fn every_asset_the_arbiter_moves_can_be_described_in_s2() {
             hems_core::asset::Asset::Pv(_) | hems_core::asset::Asset::HeatPump(_) => {
                 ControlType::Pebc
             }
+            hems_core::asset::Asset::Load(l) if l.programme().is_some() => ControlType::Ppbc,
             _ => ControlType::NotControllable,
         };
         assert_eq!(
@@ -655,6 +724,33 @@ fn every_asset_the_arbiter_moves_can_be_described_in_s2() {
 }
 
 #[test]
+fn a_day_shown_the_weather_in_advance_says_so_about_itself() {
+    // The failure this project's whole saving argument is about, applied to its
+    // own report: a day the planner could not be surprised by is an upper bound,
+    // not a result, and the two used to print identically. The winter day saves
+    // €2,09 honestly and €5,25 with the answer in hand.
+    let honest = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    assert!(
+        !honest.foresight_is_perfect,
+        "the reference day is run against a forecast that can be wrong"
+    );
+
+    let mut oracle = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    oracle.weather = hemsd::WeatherSpec::PERFECT;
+    let oracle = run(&oracle).unwrap();
+    assert!(
+        oracle.foresight_is_perfect,
+        "a day handed the simulator's own series has to label itself"
+    );
+    assert!(
+        oracle.saving_eur() > honest.saving_eur(),
+        "and knowing the future has to be worth something: {:.2} € against {:.2} €",
+        oracle.saving_eur(),
+        honest.saving_eur()
+    );
+}
+
+#[test]
 fn the_reference_day_is_not_run_on_perfect_foresight() {
     // A simulated day whose forecast *is* the series the simulator is about to
     // run cannot tell a good planner from one that was shown the answer, and the
@@ -666,10 +762,25 @@ fn the_reference_day_is_not_run_on_perfect_foresight() {
     // saving mean something.
     let r = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
 
+    // The *lit* quarter hours, and only those. A January day is dark for two
+    // thirds of its length, and a band of nothing against an outcome of nothing
+    // is midnight rather than a forecast that came true — the assertion that
+    // used to stand here demanded all ninety-six and was, without anybody
+    // noticing, requiring the defect that made a 93 % coverage figure out of a
+    // band that covers 80 %.
     assert!(
-        r.pv_forecast.samples > 90,
-        "every quarter hour of the day should have been scored: {}",
+        (20..=40).contains(&r.pv_forecast.samples),
+        "a mid-January day is lit for about eight hours: {} slots scored",
         r.pv_forecast.samples
+    );
+    assert_eq!(
+        r.pv_forecast.samples + r.pv_forecast.skipped,
+        96,
+        "and the dark ones are counted rather than quietly dropped"
+    );
+    assert_eq!(
+        r.load_forecast.skipped, 0,
+        "a household's load is never nothing, so nothing is skipped there"
     );
     assert!(
         r.pv_forecast.crps > 1.0,
@@ -706,8 +817,9 @@ fn the_reference_day_is_not_run_on_perfect_foresight() {
     );
     // It does not score *zero*, and that is right rather than a defect: even
     // with the weather known, the box's own model of the roof is never certain
-    // (`ResidualModel::floor_spread`) and the band it publishes has width. A
-    // forecast that claimed certainty would let the planner bet a battery on it.
+    // — the calibrated tails bottom out at `HARD_MIN_SPREAD` — and the band it
+    // publishes has width. A forecast that claimed certainty would let the
+    // planner bet a battery on it.
     assert!(p.pv_forecast.crps > 0.0);
     assert!(
         p.saving_eur() > r.saving_eur() + 1.0,
@@ -1004,10 +1116,173 @@ fn the_fallback_stops_at_the_charge_limit_the_household_set() {
         "the car still gets what it was promised: {:.1} kWh short",
         limited.unmet_charge_kwh
     );
+    // And respecting it **costs** money, which is the honest answer and was not
+    // the one this test used to assert.
+    //
+    // Until the day's ledger valued what was left in the car
+    // (`CostBreakdown::vehicle_eur`), a kilowatt-hour pushed into a car past the
+    // household's own limit was worth nothing and exporting the same
+    // kilowatt-hour earned the feed-in tariff — so ignoring the limit looked
+    // expensive, and the mechanism appeared to pay for itself. It does not. A
+    // kilowatt-hour in a car is a kilowatt-hour nobody buys later, so filling
+    // one past the limit is worth roughly the retail price, and the reason to
+    // stop is **lithium ageing**, which is a cost this ledger does not price and
+    // the household is entitled to weigh for itself.
+    //
+    // Asserting it the other way round was a saving figure flattering a
+    // behaviour by leaving out what it produced.
     assert!(
-        limited.saving_eur() > unlimited.saving_eur(),
-        "so respecting the limit is worth money: {:.2} € against {:.2} €",
+        unlimited.saving_eur() > limited.saving_eur(),
+        "the limit costs money on the ledger, and buys battery life that is not          on it: {:.2} € against {:.2} €",
         limited.saving_eur(),
         unlimited.saving_eur()
+    );
+}
+
+#[test]
+fn the_dishwasher_is_moved_and_the_move_is_reported() {
+    // The one piece of household flexibility a household can *see*, and the one
+    // it can check: the machine ran, it ran later than a household with no
+    // energy manager would have started it, and the day says by how much.
+    //
+    // A structural zero here is the failure this workspace keeps finding in
+    // itself — a mechanism that is implemented, tested, and decides nothing —
+    // so the number is asserted rather than printed and hoped for.
+    let r = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    assert!(r.appliance_ran(), "the wash has to happen");
+    assert!(
+        r.appliance_kwh > 1.0,
+        "and it has to draw its programme: {:.2} kWh",
+        r.appliance_kwh
+    );
+    assert!(
+        r.appliance_shift_minutes > 0,
+        "the planner moved it by {} minutes, which is nothing",
+        r.appliance_shift_minutes
+    );
+    // Never before the household said it could start, whatever it costs.
+    assert!(r.appliance_shift_minutes >= 0);
+}
+
+#[test]
+fn a_programme_the_household_leaves_no_room_for_is_charged_on_both_sides() {
+    // A window shorter than the programme is a household asking for something
+    // impossible. The plan must come back — "not this wash" is a better answer
+    // than no plan at all — and both sides of the comparison must pay for it, or
+    // the saving is made of a wash nobody got.
+    let mut scenario = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    scenario.dishwasher = Some((
+        time::Duration::hours(12),
+        time::Duration::minutes(12 * 60 + 30),
+    ));
+    let r = run(&scenario).unwrap();
+    assert!(!r.appliance_ran(), "there is nowhere to put it");
+    assert!(r.cost.unserved_eur > 0.0, "the plan is charged for it");
+    assert!(r.baseline.unserved_eur > 0.0, "and so is the baseline");
+}
+
+#[test]
+fn a_household_with_no_shiftable_appliance_still_plans() {
+    // The appliance is optional, and its absence must not be a special case
+    // anywhere: a house with nothing to shift is most houses.
+    let config = HouseholdConfig {
+        dishwasher: None,
+        ..HouseholdConfig::default()
+    };
+    let r = run(&Scenario::winter_with_grid_event(config)).unwrap();
+    assert_eq!(r.appliance_kwh, 0.0);
+    assert!(!r.appliance_ran());
+    assert_eq!(r.s2_resources, 5, "one fewer resource to describe");
+    assert!(r.saving_eur() > 0.0);
+}
+
+#[test]
+fn a_box_with_no_planner_still_washes_up() {
+    // G3: the house is never worse off when the planner is gone. A shiftable
+    // appliance is the one device whose whole instruction is "start", so a box
+    // with no plan that simply never sends it leaves the household with dirty
+    // dishes and — because the comparison ran the machine — a *negative* saving.
+    //
+    // The fallback is the behaviour every appliance timer has always had: start
+    // it when the sun is out, and no later than the last moment that still
+    // finishes inside the window the household gave.
+    let scenario = Scenario {
+        dishwasher: Some((time::Duration::hours(9), time::Duration::hours(23))),
+        ..Scenario::summer_without_a_planner(HouseholdConfig::default())
+    };
+    let r = run(&scenario).unwrap();
+    assert!(r.appliance_ran(), "the wash happens with no planner at all");
+    assert!(r.appliance_kwh > 1.0, "{:.2} kWh", r.appliance_kwh);
+    // …and it waits for the sun rather than starting the moment it is allowed,
+    // which is the whole difference between a fallback and a timer.
+    assert!(
+        r.appliance_shift_minutes > 0,
+        "started {} minutes after it was allowed to",
+        r.appliance_shift_minutes
+    );
+}
+
+#[test]
+fn the_tight_evening_plans_against_three_futures_and_the_slack_night_does_not() {
+    // Planning against three futures costs seven times the solve, so something
+    // has to decide which days are worth it. The trigger is a property of the
+    // charging session rather than of the plan — a plan that has looked only at
+    // the median cannot know it is at risk, which is measured in
+    // `EvSession::tightness` and is why the obvious trigger was not used.
+    //
+    // A structural zero on the evening the mechanism exists for would mean it
+    // decides nothing; a large number on the ordinary night would mean it costs
+    // on every day and buys on few.
+    let tight = run(&Scenario {
+        adaptive_risk: true,
+        ..Scenario::winter_evening_deadline(HouseholdConfig::default())
+    })
+    .unwrap();
+    assert!(
+        tight.risk_re_solves > 0,
+        "the evening a car arrives as the reduction starts is the day this is for"
+    );
+
+    let slack = run(&Scenario {
+        adaptive_risk: true,
+        ..Scenario::winter_with_grid_event(HouseholdConfig::default())
+    })
+    .unwrap();
+    assert!(
+        slack.risk_re_solves < tight.risk_re_solves / 2,
+        "a night with fourteen hours to take twenty kilowatt-hours is not: \
+         {} against {}",
+        slack.risk_re_solves,
+        tight.risk_re_solves
+    );
+
+    // …and it is off by default, because four weathers on two days support a
+    // sign and not a change to what a household's box does.
+    let off = run(&Scenario::winter_evening_deadline(
+        HouseholdConfig::default(),
+    ))
+    .unwrap();
+    assert_eq!(off.risk_re_solves, 0);
+}
+
+#[test]
+fn a_days_forecast_scores_are_one_episode_and_never_claim_calibration() {
+    // Forecast error is correlated across a day, so ninety-six slots of one
+    // Tuesday are one draw wearing ninety-six hats. The day scores its own
+    // forecasts and it may not call the result calibration — R22, and the reason
+    // `Calibration` counts episodes as well as samples.
+    let r = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    assert!(
+        r.pv_forecast.samples > 20,
+        "a winter day's worth of lit quarter hours"
+    );
+    assert_eq!(r.pv_forecast.episodes, 1);
+    assert!(
+        !r.pv_forecast.is_well_calibrated(),
+        "no single day may report itself calibrated, whatever its coverage"
+    );
+    assert!(
+        !r.load_forecast.is_well_calibrated(),
+        "nor the load forecast"
     );
 }

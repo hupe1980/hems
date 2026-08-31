@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hems-core", "crates/hems-device", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-sim", "services/hemsd", "xtask"]
+members = ["crates/hems-core", "crates/hems-device", "crates/hems-drv", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-sim", "services/hemsd", "xtask"]
 
 [workspace.package]
 version      = "0.1.0"
@@ -36,7 +36,22 @@ quick-xml    = { version = "0.42", default-features = false }
 # quality flags, §14a Modul 3 Zählzeit registers, virtual meters (§42b), §42c
 # eligibility. hems computes *control*; `metering` owns *quantities*, and the
 # two must never disagree about what a quarter-hour is.
-metering     = { version = "0.21", features = ["serde"] }
+metering     = { version = "0.22", features = ["serde"] }
+
+# EEBUS: SHIP + SPINE + the certifiable use cases. Taken with `default-features
+# = false` so the domain side gets the sans-I/O cores and nothing else — no
+# tokio, no TLS, no mDNS. `hemsd` is where a socket is allowed to exist.
+eebus        = { version = "0.1", default-features = false, features = ["std"] }
+
+# SunSpec's generated model definitions. Taken with `default-features = false`
+# so the tokio-modbus client stays out: what hems wants is `Model::parse`, which
+# is a pure function from a register block to a typed struct, and the register
+# maps are a thousand pages of specification nobody should retype.
+sunspec      = { version = "0.9", default-features = false, features = [
+    "model1", "model101", "model102", "model103", "model123",
+    "model201", "model202", "model203", "model204",
+    "model701", "model702", "model802",
+] }
 
 # Linear/mixed-integer programming façade. `microlp` is the pure-Rust default so
 # a plain `cargo test` needs no C++ toolchain; production boxes enable `highs`.
@@ -45,6 +60,7 @@ good_lp      = { version = "1.15", default-features = false }
 # ── Internal (path + version so the domain crates can be published) ─────────
 hems-core      = { path = "crates/hems-core",      version = "0.1" }
 hems-device    = { path = "crates/hems-device",    version = "0.1" }
+hems-drv       = { path = "crates/hems-drv",       version = "0.1" }
 hems-flex      = { path = "crates/hems-flex",      version = "0.1" }
 hems-grid      = { path = "crates/hems-grid",      version = "0.1" }
 hems-tariff    = { path = "crates/hems-tariff",    version = "0.1" }

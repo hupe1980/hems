@@ -13,16 +13,22 @@ use rust_decimal::prelude::ToPrimitive;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Levies {
     /// Stromsteuer (§ 3 StromStG).
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub stromsteuer: Decimal,
     /// KWKG-Umlage.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub kwkg: Decimal,
     /// § 19 StromNEV-Umlage.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub para19: Decimal,
     /// Offshore-Netzumlage.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub offshore: Decimal,
     /// Konzessionsabgabe — depends on the municipality and the tariff type.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub konzessionsabgabe: Decimal,
     /// Value added tax, as a fraction (0.19 for the ordinary rate).
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub vat_rate: Decimal,
 }
 

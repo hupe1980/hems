@@ -12,6 +12,51 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run one day under several weathers, under each risk policy, and report
+    /// what hedging costs and what it buys.
+    ///
+    /// The only evaluation that can judge a hedge: a single realisation pays the
+    /// premium and never makes the claim, so it reports insurance as a pure
+    /// loss. See `hemsd::backtest`.
+    Risk {
+        /// Which day to run.
+        #[arg(long, value_enum, default_value_t = Day::Winter)]
+        day: Day,
+        /// How many weathers to run it under.
+        ///
+        /// Small on purpose: three futures cost seven times the solve, so this
+        /// is minutes rather than seconds. Enough to see a sign, not enough to
+        /// quote a figure.
+        #[arg(long, default_value_t = 4)]
+        days: usize,
+        /// Report as JSON rather than a table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one day under many weathers and score the **forecast band** over
+    /// them.
+    ///
+    /// The question `simulate` cannot answer. Forecast error is correlated
+    /// across a day, so ninety-six quarter hours of one Tuesday are close to
+    /// one draw: a day's coverage figure is a coin toss reported to three
+    /// significant figures, and `Calibration::is_well_calibrated` refuses to
+    /// answer on fewer than twenty independent days. This produces them.
+    ///
+    /// One policy — the ordinary median plan — because the box learns the same
+    /// roof whatever it then does with the band, and running four policies to
+    /// answer a question about the forecast costs four times as long for the
+    /// same answer.
+    Backtest {
+        /// Which day to run.
+        #[arg(long, value_enum, default_value_t = Day::Summer)]
+        day: Day,
+        /// How many weathers to run it under.
+        #[arg(long, default_value_t = 20)]
+        days: usize,
+        /// Report as JSON rather than a table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run one simulated day through the whole control stack and report on it.
     Simulate {
         /// Which day to run.
@@ -32,6 +77,15 @@ enum Command {
         /// were in operation, which lifts the § 9 Abs. 2 EEG 60 % feed-in cap.
         #[arg(long)]
         imsys: bool,
+        /// Fit a single-speed heat pump rather than a modulating one.
+        ///
+        /// The only configuration in which a minimum runtime constrains
+        /// anything: the compressor is at its rating or off, so cycling is a
+        /// decision the planner makes and the day can count. A modulating unit
+        /// — what most German households have, and what every other reference
+        /// day runs — has nothing to start.
+        #[arg(long)]
+        heat_pump_on_off: bool,
         /// Hand the planner the exact series the simulator is about to run.
         ///
         /// A comparison, never a default: the difference between this and an
@@ -39,6 +93,9 @@ enum Command {
         /// quoted from it is an upper bound no box in a real house can reach.
         #[arg(long)]
         perfect_foresight: bool,
+        /// How the planner treats the fact that its forecasts are wrong.
+        #[arg(long, value_enum, default_value_t = Risk::Median)]
+        risk: Risk,
         /// Give every asset the same allocation weight.
         ///
         /// Without per-asset shadow prices the guard's *weighted* max-min
@@ -48,6 +105,48 @@ enum Command {
         #[arg(long)]
         uniform_weights: bool,
     },
+}
+
+/// How the planner treats forecast error.
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Risk {
+    /// One future: the median of both forecasts, priced as though it were
+    /// certain. What every deterministic energy manager does.
+    Median,
+    /// Three futures from the band the forecast already carries, minimising the
+    /// **expected** cost across them.
+    Expected,
+    /// The same three futures, with a third of the objective on the worst of
+    /// them — a household that would rather not be caught out.
+    Hedged,
+    /// One median, and **three futures on the days that need them** — decided by
+    /// how much slack the charging session has left.
+    ///
+    /// `hemsd risk` measures it at within €0,03 of always planning against three
+    /// futures on the evening that needs them, and within €0,04 of the median on
+    /// the night that does not. Not the default, because that measurement is
+    /// four weathers on two days.
+    Adaptive,
+}
+
+impl Risk {
+    /// The starting policy, before any re-solve.
+    fn model(self) -> hems_optimizer::Risk {
+        match self {
+            Risk::Median | Risk::Adaptive => hems_optimizer::Risk::deterministic(),
+            Risk::Expected => hems_optimizer::Risk {
+                cvar_weight: 0.0,
+                ..hems_optimizer::Risk::hedged()
+            },
+            Risk::Hedged => hems_optimizer::Risk::hedged(),
+        }
+    }
+
+    /// Whether a plan that says a service is at risk is re-solved against three
+    /// futures.
+    const fn adaptive(self) -> bool {
+        matches!(self, Risk::Adaptive)
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -88,7 +187,9 @@ fn main() -> anyhow::Result<()> {
             wear_eur_per_kwh,
             no_phase_switching,
             imsys,
+            heat_pump_on_off,
             perfect_foresight,
+            risk,
             uniform_weights,
         } => {
             let mut config = HouseholdConfig::default();
@@ -96,22 +197,23 @@ fn main() -> anyhow::Result<()> {
                 config.battery_wear_eur_per_kwh = wear;
             }
             config.evse_switchable = !no_phase_switching;
+            config.heat_pump_modulating = !heat_pump_on_off;
             if imsys {
-                config.cap_relief = hems_core::prelude::CapRelief::ImsysWithControl;
+                // The network operator's first successful Ansteuerbarkeit test
+                // — which is what § 9 Abs. 2 EEG actually waits for, and the
+                // only thing this flag changes. The intelligent metering system
+                // itself has been in since 2024 on both sides of the comparison,
+                // so § 51's negative quarter hours are held constant and what
+                // moves is the 60 % cap alone.
+                config.para9.relief = hems_core::prelude::CapRelief::ImsysWithControl;
             }
-            let mut scenario = match day {
-                Day::Winter => Scenario::winter_with_grid_event(config),
-                Day::Summer => Scenario::summer_surplus(config),
-                Day::Deadline => Scenario::winter_evening_deadline(config),
-                Day::Shared => Scenario::winter_evening_no_store(&config),
-                Day::Offline => Scenario::summer_without_a_planner(config),
-                Day::Autumn => Scenario::autumn_without_a_planner(config),
-                Day::Capped => Scenario::summer_capped(&config),
-            };
+            let mut scenario = scenario_for(day, config);
             if perfect_foresight {
                 scenario.weather = hemsd::WeatherSpec::PERFECT;
             }
             scenario.per_asset_weights = !uniform_weights;
+            scenario.risk = risk.model();
+            scenario.adaptive_risk = risk.adaptive();
             let result = hemsd::run(&scenario)?;
 
             if json {
@@ -120,8 +222,200 @@ fn main() -> anyhow::Result<()> {
                 print_report(&scenario, &result);
             }
         }
+        Command::Backtest { day, days, json } => {
+            let mut scenario = scenario_for(day, HouseholdConfig::default());
+            scenario.per_asset_weights = false;
+            let spread = hemsd::spread_over_days(&scenario, days)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "day": scenario.date.to_string(),
+                        "days": spread.days(),
+                        "pv": {
+                            "coverage": spread.pv_forecast.coverage,
+                            "crps": spread.pv_forecast.crps,
+                            "bias": spread.pv_forecast.bias,
+                            "samples": spread.pv_forecast.samples,
+                            "skipped": spread.pv_forecast.skipped,
+                        },
+                        "load": {
+                            "coverage": spread.load_forecast.coverage,
+                            "crps": spread.load_forecast.crps,
+                            "bias": spread.load_forecast.bias,
+                            "samples": spread.load_forecast.samples,
+                            "skipped": spread.load_forecast.skipped,
+                        },
+                        "well_calibrated": spread.is_well_calibrated(),
+                    }))?
+                );
+            } else {
+                print_backtest(&scenario, &spread);
+            }
+        }
+        Command::Risk { day, days, json } => {
+            let config = HouseholdConfig::default();
+            let base = scenario_for(day, config);
+            let policies = [
+                ("one median", Risk::Median),
+                ("three futures", Risk::Expected),
+                ("…and the tail", Risk::Hedged),
+                ("only when at risk", Risk::Adaptive),
+            ];
+            let mut rows = Vec::new();
+            for (label, policy) in policies {
+                let mut scenario = base.clone();
+                scenario.risk = policy.model();
+                scenario.adaptive_risk = policy.adaptive();
+                // The per-asset weights change no reference-day outcome and cost
+                // a second solve of the same model; the sweep is about the
+                // *plan*, so it runs without them and takes a third of the time.
+                scenario.per_asset_weights = false;
+                rows.push((label, hemsd::spread_over_days(&scenario, days)?));
+            }
+            if json {
+                let as_json: Vec<_> = rows
+                    .iter()
+                    .map(|(label, s)| {
+                        serde_json::json!({
+                            "policy": label,
+                            "days": s.days(),
+                            "mean_saving_eur": s.mean_saving_eur(),
+                            "worst_saving_eur": s.worst_saving_eur(),
+                            "best_saving_eur": s.best_saving_eur(),
+                            "mean_unserved_eur": s.mean_unserved_eur(),
+                            "worst_unserved_eur": s.worst_unserved_eur(),
+                            "seconds": s.seconds,
+                            "pv_coverage": s.pv_forecast.coverage,
+                            "pv_crps": s.pv_forecast.crps,
+                            "load_coverage": s.load_forecast.coverage,
+                            "load_crps": s.load_forecast.crps,
+                            "well_calibrated": s.is_well_calibrated(),
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&as_json)?);
+            } else {
+                print_risk(&base, &rows);
+            }
+        }
     }
     Ok(())
+}
+
+/// The scenario for one named day.
+fn scenario_for(day: Day, config: HouseholdConfig) -> Scenario {
+    match day {
+        Day::Winter => Scenario::winter_with_grid_event(config),
+        Day::Summer => Scenario::summer_surplus(config),
+        Day::Deadline => Scenario::winter_evening_deadline(config),
+        Day::Shared => Scenario::winter_evening_no_store(&config),
+        Day::Offline => Scenario::summer_without_a_planner(config),
+        Day::Autumn => Scenario::autumn_without_a_planner(config),
+        Day::Capped => Scenario::summer_capped(&config),
+    }
+}
+
+fn print_backtest(scenario: &Scenario, s: &hemsd::Spread) {
+    println!(
+        "\n  {} — {} weathers, the band scored against every one of them\n",
+        scenario.date,
+        s.days()
+    );
+    println!(
+        "  {:<16}{:>10}{:>10}{:>9}{:>10}{:>9}",
+        "band", "covered", "CRPS", "bias", "scored", "dark"
+    );
+    for (label, c) in [
+        ("production", &s.pv_forecast),
+        ("household load", &s.load_forecast),
+    ] {
+        println!(
+            "  {:<16}{:>9.0}%{:>9.0}W{:>8.0}W{:>10}{:>9}",
+            label,
+            c.coverage * 100.0,
+            c.crps,
+            c.bias,
+            c.samples,
+            c.skipped
+        );
+    }
+    println!(
+        "\n  a 10–90 band should cover 80 %; `dark` is the quarter hours where\n  \
+         there was nothing to forecast and which are therefore not scored.\n"
+    );
+    println!(
+        "  {}\n",
+        if s.is_well_calibrated() {
+            "calibrated — over enough independent days to say so."
+        } else if s.pv_forecast.episodes < hems_forecast::CALIBRATION_DAYS {
+            "too few days to call it either way — try --days 20."
+        } else {
+            "not calibrated: the plan is hedging against a future of the wrong width."
+        }
+    );
+}
+
+fn print_risk(scenario: &Scenario, rows: &[(&str, hemsd::Spread)]) {
+    let days = rows.first().map_or(0, |(_, s)| s.days());
+    println!(
+        "\n  {} — {days} weathers, the same household under each policy\n",
+        scenario.date
+    );
+    println!(
+        "  {:<16}{:>10}{:>10}{:>10}{:>12}{:>10}",
+        "policy", "mean", "worst", "best", "unserved", "solve"
+    );
+    for (label, s) in rows {
+        println!(
+            "  {:<16}{:>9.2}€{:>9.2}€{:>9.2}€{:>11.2}€{:>9.0}s",
+            label,
+            s.mean_saving_eur(),
+            s.worst_saving_eur(),
+            s.best_saving_eur(),
+            s.mean_unserved_eur(),
+            s.seconds
+        );
+    }
+    // The sweep is also the only thing in this workspace that produces
+    // *independent* days, so it is the only thing that can say whether the band
+    // the whole hedge is planned against is the width it claims to be. Read off
+    // the first policy, because the forecasts do not depend on the policy — the
+    // box learned the same roof either way.
+    if let Some((_, s)) = rows.first() {
+        let pv = &s.pv_forecast;
+        let load = &s.load_forecast;
+        println!(
+            "\n  {:<16}{:>10}{:>10}{:>12}",
+            "band", "covered", "CRPS", "episodes"
+        );
+        for (label, c, unit) in [("production", pv, "W"), ("household load", load, "W")] {
+            println!(
+                "  {:<16}{:>9.0}%{:>9.0}{unit}{:>12}",
+                label,
+                c.coverage * 100.0,
+                c.crps,
+                c.episodes
+            );
+        }
+        println!(
+            "\n  a 10–90 band should cover 80 %. {}",
+            if s.is_well_calibrated() {
+                "It does, over enough days to say so."
+            } else if pv.episodes < hems_forecast::CALIBRATION_DAYS {
+                "Too few days to say — run --days 20."
+            } else {
+                "It does not: the plan is hedging against a future that is the \
+                 wrong width."
+            }
+        );
+    }
+    println!(
+        "\n  mean is what the household saves on an average day; worst is the day\n  \
+         it bought the insurance for. A hedge worth having has a lower mean and a\n  \
+         higher worst — and if it has a lower mean and nothing else, it is not\n  \
+         worth having, which is a result rather than a failure.\n"
+    );
 }
 
 fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
@@ -134,6 +428,15 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
             "no grid event"
         }
     );
+    // A day the planner could not be surprised by is not a measurement of a
+    // controller, and its saving is an upper bound rather than a result. Saying
+    // so here is the whole of this project's argument applied to its own output:
+    // the same winter day saves €2,09 honestly and €5,25 with the answer in
+    // hand, and until this line existed both printed identically.
+    if r.foresight_is_perfect {
+        println!("  ⚠ the planner was shown the weather in advance — every figure");
+        println!("    below is an upper bound, not a result\n");
+    }
     let row = |label: &str, value: String| println!("  {label:<34} {value:>14}");
     row("produced", format!("{:.1} kWh", r.produced_kwh));
     row(
@@ -146,6 +449,15 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
     );
     row("heat pump", format!("{:.1} kWh", r.heat_pump_kwh));
     row("hot water", format!("{:.1} kWh", r.dhw_kwh));
+    if r.appliance_ran() {
+        row(
+            "dishwasher",
+            format!(
+                "{:.1} kWh, {} min later",
+                r.appliance_kwh, r.appliance_shift_minutes
+            ),
+        );
+    }
     row(
         "battery throughput",
         format!("{:.1} kWh", r.battery_throughput_kwh),
@@ -184,6 +496,24 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         "hot-water tank, emptiest",
         format!("{:.0} % full", r.tank_min_fill * 100.0),
     );
+    // Only where there is a compressor to cycle. A modulating unit has nothing
+    // to start, and a structural zero printed every day is how a number stops
+    // being read.
+    if r.compressor_starts > 0 || r.compressor_held_minutes > 0 {
+        row(
+            "compressor starts",
+            if r.compressor_held_minutes == 0 {
+                format!("{}", r.compressor_starts)
+            } else {
+                // Time the unit's own minimum runtime overrode a command to
+                // stop — the part of a plan the hardware does not carry out.
+                format!(
+                    "{} ({} min held against a command)",
+                    r.compressor_starts, r.compressor_held_minutes
+                )
+            },
+        );
+    }
     if r.cold_water_kwh > 0.01 {
         row(
             "hot water not delivered",
@@ -196,12 +526,18 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
             "roof, as the box learned it",
             format!("{:.0} % of the model", r.roof_correction * 100.0),
         );
+        // The slot count is on the line on purpose. A production score is over
+        // the *lit* part of the day — a band of nothing against an outcome of
+        // nothing is midnight, not a forecast that came true — and a reader who
+        // cannot see how much of the day was scored cannot tell a good January
+        // figure from an arithmetic about how long the night is.
         row(
             "production forecast, CRPS",
             format!(
-                "{:.0} W ({:.0} % covered)",
+                "{:.0} W ({:.0} % of {} lit)",
                 r.pv_forecast.crps,
-                r.pv_forecast.coverage * 100.0
+                r.pv_forecast.coverage * 100.0,
+                r.pv_forecast.samples
             ),
         );
         row(
@@ -237,6 +573,13 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
             "borrowed from the stores",
             format!("{:.2} €", r.cost.stored_eur),
         );
+    }
+    // Signed, and shown against the baseline's own entry: both households own
+    // the same car, so the comparison is only fair once both are credited for
+    // what is in it at midnight.
+    let car = r.cost.vehicle_eur - r.baseline.vehicle_eur;
+    if car.abs() > 0.005 {
+        row("left in the car", format!("{car:+.2} €"));
     }
     row("cost of the day", format!("{:.2} €", r.cost.total()));
     row(
@@ -312,7 +655,19 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         },
     );
     println!();
-    row("described in S2", format!("{} resources", r.s2_resources));
+    if r.risk_re_solves > 0 {
+        row(
+            "re-solved against three futures",
+            format!("{}×, because a service was at risk", r.risk_re_solves),
+        );
+    }
+    row(
+        "described in S2",
+        match r.s2_undescribed {
+            0 => format!("{} resources", r.s2_resources),
+            n => format!("{} resources, {n} it cannot express", r.s2_resources),
+        },
+    );
     if r.widest_asset_value_ratio > 1.0 {
         row(
             "dearest asset vs cheapest",

@@ -36,7 +36,7 @@ is that internal model.
 | **FRBC** Fill Rate Based Control | a fill level and a rate | battery, hot water tank, a car with a departure time |
 | **PEBC** Power Envelope Based Control | a bound is all that is needed | charge point, inverter curtailment |
 | **OMBC** Operation Mode Based Control | discrete states | SG Ready heat pump, interruptible load |
-| **PPBC** Power Profile Based Control | a fixed sequence started in a window | washing machine, dishwasher |
+| **PPBC** Power Profile Based Control | a fixed sequence started in a window | washing machine, dishwasher, tumble dryer |
 | **DDBC** Demand Driven Based Control | actuators serving a reported demand | a heat pump following a heat demand |
 
 ## The mapping depends on the situation
@@ -57,6 +57,15 @@ distinction S2 draws and a use-case-organised protocol cannot.
 
 A battery also declares **three** roles, not one — producer, consumer *and*
 storage. A manager that assumes a single role plans a battery as a load.
+
+And a shiftable appliance carries the *shape* it will draw, not a duration and an
+average. A dishwasher takes two kilowatts to heat, two hundred watts to wash and
+two kilowatts again to dry; a manager given the average would schedule seven
+hundred watts of dishwasher into every sunny slot, which no dishwasher will
+carry out. `LoadKind::Shiftable` therefore **carries** its `Programme` — an
+appliance that announces flexibility and cannot say what of has told a manager
+nothing it can act on — and `is_interruptible` is `false`, because a dishwasher
+stopped halfway is not one that resumes, it is one somebody has to restart.
 
 ## Three details that are expensive to get wrong
 
@@ -121,23 +130,44 @@ modulating unit draws in state 2.
 hems encodes this rather than assuming the states are ordered, and picks a state
 by comparing the wanted power to fractions of the unit's *own* rating.
 
+## The same wallbox, described two ways
+
+This is the argument for S2 in one function. With a car on it that has a
+departure time, a charge point is a **store**: a fill level, a rate, a range —
+and a Customer Energy Manager that has never heard of a car plans it with exactly
+the code it plans a battery with. With nothing plugged in, a bound is all anybody
+can usefully say, and it is an **envelope**.
+
+Two details of the store description are facts about hardware rather than about
+the encoding. Its power range starts at the **minimum charging current**, not at
+zero, because a charge point below the 6 A of IEC 61851 is not charging slowly —
+it is idle, and a manager handed a range from zero will ask for 2 kW on three
+conductors and believe a car is charging. And the fill-level range is the whole
+battery: the household's own target is a `FillLevelTargetProfile`, which is a
+message rather than a description, and folding it into the range would tell a
+manager the car physically cannot hold more.
+
 ## And it has to be reached, not just written
 
 A module can be implemented, cited, tested and reached by no caller at all, and
 no property test catches that — a property is a statement about code that runs. A
 flexibility model nothing imports is documentation, not a feature.
 
-So the reference day describes the whole site in S2 and reports how many
-resources it managed to describe:
+So `describe_site` builds **every message a Resource Manager would send** for a
+whole household, the reference day calls it every run, and the day reports two
+numbers:
 
 ```console
-  described in S2                       5 resources
+  described in S2                       6 resources
 ```
 
-Five: the battery, the charge point, the heat pump, the hot-water tank and the
-roof. A number that stops matching the site's asset count is a device the S2
-layer cannot describe — the first thing a real Resource Manager on the other end
-of a WebSocket would find, and better found here.
+Six: the battery, the charge point with a car on it, the heat pump, the
+hot-water tank, the dishwasher and the roof. Where a description cannot be
+built the count is followed by how many — `6 resources, 1 it cannot express` —
+and that second number is the one that earns its keep. Counting assets whose
+control type is merely not `NotControllable` produces a figure that goes up when
+a device is added and never notices that no description was ever written for it,
+which is how a hot-water tank can sit inside it with nothing to send.
 
 ## Standing on the authors' work
 

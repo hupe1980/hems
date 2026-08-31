@@ -87,20 +87,97 @@ impl Decision {
 /// nobody wanted. On the reference winter day it bought 2,2 kWh of it, at the
 /// evening price.
 #[must_use]
-pub fn realisable(asset: &Asset, wanted: Power, mode: PhaseMode) -> Power {
+pub fn realisable(asset: &Asset, wanted: Power, mode: PhaseMode, allowed: Envelope) -> Power {
     match asset {
         Asset::Evse(evse) => {
             let held = evse.meta.phases.clamp_mode(mode);
-            if wanted < evse.min_power(held) {
+            let candidate = wanted.min(evse.max_power(held)).min(allowed.ceiling);
+            if candidate < evse.min_power(held) {
                 Power::ZERO
             } else {
-                wanted.min(evse.max_power(held))
+                candidate
+            }
+        }
+        // A hot-water tank is the other device with no dial. An immersion
+        // heater and a small hot-water heat pump are both **on or off**, and
+        // `commands_for` sends the only thing their driver accepts: a contact
+        // state.
+        //
+        // So it rounds to the **nearest** of the two values it has, and the
+        // envelope decides whether the upper one is available at all. Both
+        // halves of that are load-bearing:
+        //
+        // * rounding *down* only — refusing to run until the request reaches the
+        //   full rating — starves the tank. The arbiter tracks a slot's energy,
+        //   so it asks for the *average* power the slot still needs, and a
+        //   device that waits for its own rating never runs while that average
+        //   is below it. Measured on the § 9 EEG reference day, the tank emptied
+        //   completely and the household lost 0,3 kWh of hot water it had asked
+        //   for — €0,90 at the objective's own price, which was two thirds of
+        //   that day's entire saving.
+        // * rounding *up* without asking the envelope hands the device more than
+        //   the guard allowed it, which under a § 14a budget is an exceedance
+        //   rather than a rounding error.
+        //
+        // Together they are ordinary bang-bang: the tank runs at its rating when
+        // the slot needs about that much on average, stops when the energy is
+        // in, and never crosses a limit to do it.
+        Asset::Dhw(tank) => {
+            let full = tank.heater.max(Power::ZERO);
+            if full > Power::ZERO && allowed.ceiling >= full - EPS && wanted >= full * 0.5 {
+                full
+            } else {
+                Power::ZERO
             }
         }
         // Everything else in the model takes a continuous value, or is mapped to
         // a discrete state by `commands_for` in a way that loses nothing.
-        _ => wanted,
+        _ => allowed.clamp(wanted),
     }
+}
+
+/// A milliwatt, for comparisons against a hardware threshold.
+///
+/// A value that lands exactly on one comes back from arithmetic a nanowatt short
+/// of it, and no device in a household resolves a milliwatt.
+const EPS: Power = Power::new_const(1e-3);
+
+/// The one power a device has, where it has exactly one.
+///
+/// A hot-water tank is on at its rating or off; there is nothing in between and
+/// nothing above. That is a different shape from a charge point, which is off or
+/// anywhere in a **range** above its minimum, and the difference decides how the
+/// arbiter should track a slot's energy through it.
+///
+/// For a device with a range, the average power a slot still needs is itself a
+/// value the device can hold, so asking for it is right. For a device with one
+/// operating point it is not, and asking for it means asking for nothing until
+/// the average happens to reach half the rating — by which time the device has
+/// to run flat out for the rest of the slot, and any interruption at all leaves
+/// the energy undelivered. Measured on the § 9 EEG reference day, that emptied
+/// the tank and lost the household hot water it had asked for.
+///
+/// So the arbiter runs a single-speed device **early**: at its rating for as
+/// long as the slot still owes energy, then off. That is ordinary bang-bang, it
+/// is what a thermostat behind a relay does, and it cannot under-deliver by
+/// waiting.
+#[must_use]
+pub fn single_speed(asset: &Asset) -> Option<Power> {
+    match asset {
+        Asset::Dhw(tank) if tank.heater > Power::ZERO => Some(tank.heater),
+        _ => None,
+    }
+}
+
+/// Whether a hot-water tank's relay should be closed for `wanted`.
+///
+/// The single definition of the threshold, because [`realisable`] and
+/// [`commands_for`] have to agree about it exactly: one decides what the arbiter
+/// records as commanded and the other decides what the driver is sent, and a box
+/// whose two answers differ is one that under-delivers hot water and reports
+/// that it did not.
+fn dhw_is_on(tank: &hems_core::asset::DhwTank, wanted: Power) -> bool {
+    tank.heater > Power::ZERO && wanted >= tank.heater - EPS
 }
 
 /// The commands to send to `asset` for `decision`.
@@ -120,8 +197,17 @@ pub fn commands_for(asset: &Asset, decision: Decision) -> Vec<Command> {
         Asset::Battery(_) => vec![Command::ActivePower(decision.power)],
         Asset::Relay(_) => vec![Command::OnOff(decision.power > Power::ZERO)],
         Asset::Dhw(tank) => {
-            // A hot-water tank is a resistive heater: on, or off.
-            vec![Command::OnOff(decision.power >= tank.heater * 0.5)]
+            // An immersion heater or a small hot-water heat pump: on, or off.
+            // The same predicate `realisable` uses, so what the arbiter believes
+            // it commanded and what the driver is sent cannot disagree.
+            vec![Command::OnOff(dhw_is_on(tank, decision.power))]
+        }
+        // An appliance running a programme is started, never turned down: S2
+        // calls that PPBC, and the whole content of the decision is *when*. So
+        // the command is a switch, and a driver that receives it starts the
+        // programme the machine is already loaded with.
+        Asset::Load(load) if load.programme().is_some() => {
+            vec![Command::OnOff(decision.power > Power::ZERO)]
         }
         Asset::Load(_) | Asset::Meter(_) => {
             if asset
@@ -318,7 +404,7 @@ mod tests {
             ac_nominal: Power::from_kw(8.0),
             tilt_deg: 35.0,
             azimuth_deg: 180.0,
-            cap_relief: CapRelief::None,
+            para9: Para9Status::default(),
         });
         // Production is negative in the load convention; a ceiling is positive.
         assert_eq!(
@@ -373,9 +459,37 @@ mod tests {
             t_set_c: 55.0,
             t_max_c: 65.0,
         });
+        // A tank has one power, so two thirds of its rating is not a request it
+        // can hold — and the answer is the relay *open*, not closed. Rounding it
+        // up would hand the device more than whatever narrowed it to 2 kW
+        // allowed, which under a § 14a budget is an exceedance rather than a
+        // rounding error. `realisable` is what turns a request into one of the
+        // two values the hardware has, and the arbiter runs it last for exactly
+        // this reason.
         assert_eq!(
             commands_for(&tank, Decision::new(Power::from_kw(2.0))),
+            vec![Command::OnOff(false)]
+        );
+        assert_eq!(
+            commands_for(&tank, Decision::new(Power::from_kw(3.0))),
             vec![Command::OnOff(true)]
+        );
+
+        // And that is what `realisable` hands it: the nearer of its two values,
+        // and only where the envelope can hold the upper one.
+        let full = Power::from_kw(3.0);
+        let open = Envelope::new(Power::ZERO, full);
+        let kw = |v: f64| realisable(&tank, Power::from_kw(v), PhaseMode::Three, open);
+        assert_eq!(kw(1.4), Power::ZERO, "below half its rating: off");
+        assert_eq!(kw(2.0), full, "above half: on, at the only power it has");
+        assert_eq!(kw(9.0), full, "never more than its rating");
+
+        // A guard that has left it less than its rating gets **off**, not a
+        // fraction it cannot hold and not an exceedance.
+        let narrowed = Envelope::new(Power::ZERO, Power::from_kw(2.0));
+        assert_eq!(
+            realisable(&tank, Power::from_kw(2.0), PhaseMode::Three, narrowed),
+            Power::ZERO
         );
     }
 

@@ -359,6 +359,7 @@ pub enum Participation {
     /// given date, then the new ones apply, `[A1 10.1]`, `[A1 10.2.a]`.
     Legacy {
         /// The last day the old regime covers.
+        #[cfg_attr(feature = "serde", serde(with = "hems_core::wire::iso_date"))]
         until: Date,
     },
     /// A night-storage heater: the old rule continues until the contract ends or

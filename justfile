@@ -34,11 +34,17 @@ lint:
 # clock, a whole winter day stops being a unit test — which is the property the
 # guard and the arbiter are built around.
 #
+# `hems-drv` is on the list for the same reason and with more force: a driver is
+# the crate most likely to reach for a socket, because a socket is what it is
+# *about*. Keeping it sans-I/O is what makes a § 14a failsafe — a sixty-second
+# heartbeat and a two-hour minimum — an assertion rather than two hours of
+# waiting.
+#
 # 🧊 Enforce the "no I/O, no clock" promise of the domain crates
 purity:
     #!/usr/bin/env bash
     set -uo pipefail
-    pure="hems-core hems-device hems-flex hems-grid hems-tariff hems-forecast hems-optimizer hems-realtime hems-events"
+    pure="hems-core hems-device hems-drv hems-flex hems-grid hems-tariff hems-forecast hems-optimizer hems-realtime hems-events"
     fail=0
     for crate in $pure; do
         hits="$(grep -rn --include='*.rs' -E \
@@ -87,7 +93,7 @@ demo-all:
     @just demo autumn
     @just demo capped
     @echo "  ── the same winter day with the future known in advance ──"
-    @echo "  ── (what every saving figure in this project was, before v1.2) ──"
+    @echo "  ── (what a saving figure quoted without a forecast measures) ──"
     cargo run -q -p hemsd -- simulate --day winter --perfect-foresight
     @echo "  ── the same winter day with battery wear priced at zero ──"
     cargo run -q -p hemsd -- simulate --day winter --wear-eur-per-kwh 0
@@ -98,8 +104,39 @@ demo-all:
     @echo "  ── the shared reduction with every asset weighted the same ──"
     cargo run -q -p hemsd -- simulate --day shared --uniform-weights
 
+# A modulating heat pump is a linear program; a single-speed one is ninety-six
+# binaries in every one of ninety-six re-plans, and most of them exhaust the
+# solver's budget. Fourteen minutes against nine seconds — which is why it is
+# not in `demo-all` and not in CI.
+#
+# It is also the only configuration in which a minimum runtime constrains
+# anything, so it is the only one that can show the constraint being obeyed.
+#
+# ❄️ The same winter day on a compressor that has to cycle
+demo-on-off day="winter":
+    cargo run --release -p hemsd -- simulate --day {{ day }} --heat-pump-on-off
+
+# A single realisation pays a hedge's premium on every day and makes its claim on
+# none, so measured once, insurance is always a pure loss. This runs the day under
+# several weathers under each risk policy — minutes rather than seconds, because
+# three futures cost seven times the solve, which is why it is not in CI.
+#
+# 🎲 What planning against three futures costs, and what it buys
+risk day="deadline" days="4":
+    cargo run --release -p hemsd -- risk --day {{ day }} --days {{ days }}
+
+# Forecast error is correlated across a day, so ninety-six quarter hours of one
+# Tuesday are close to one draw: a day's coverage figure is a coin toss reported
+# to three significant figures. This runs twenty of them and merges the scores,
+# which is the only thing in the workspace that can say whether the band the
+# planner hedges against is the width it claims to be. Minutes, not seconds.
+#
+# 📏 Is the forecast band the width it says it is?
+backtest day="summer" days="20":
+    cargo run --release -p hemsd -- backtest --day {{ day }} --days {{ days }}
+
 # `cargo publish` cannot be undone, so the dry run is the cheap half of the
-# decision: it packages the ten publishable crates in dependency order, verifies
+# decision: it packages the eleven publishable crates in dependency order, verifies
 # each builds from its own tarball, and skips the two that are `publish = false`.
 #
 # 🚢 Everything the release workflow checks, before the tag exists

@@ -79,10 +79,10 @@ pub fn control_type_for(asset: &Asset, has_deadline: bool) -> ControlType {
         // Curtailment is a ceiling and nothing else.
         Asset::Pv(_) => ControlType::Pebc,
 
-        Asset::Load(load) => match load.kind {
+        Asset::Load(load) => match &load.kind {
             // A washing machine runs a programme; it can be started later but
             // not turned down, which is precisely PPBC.
-            LoadKind::Shiftable => ControlType::Ppbc,
+            LoadKind::Shiftable(_) => ControlType::Ppbc,
             LoadKind::Interruptible => ControlType::Ombc,
             LoadKind::Fixed => ControlType::NotControllable,
         },
@@ -210,7 +210,13 @@ mod tests {
             })
         };
         assert_eq!(
-            control_type_for(&load(LoadKind::Shiftable), false),
+            control_type_for(
+                &load(LoadKind::Shiftable(Programme::uniform(
+                    Power::from_kw(2.0),
+                    8
+                ))),
+                false
+            ),
             ControlType::Ppbc
         );
         assert_eq!(
@@ -231,7 +237,7 @@ mod tests {
             ac_nominal: Power::from_kw(8.0),
             tilt_deg: 35.0,
             azimuth_deg: 180.0,
-            cap_relief: CapRelief::None,
+            para9: Para9Status::default(),
         });
         assert_eq!(control_type_for(&pv, false), ControlType::Pebc);
         assert_eq!(roles_for(&pv), vec![RoleType::EnergyProducer]);

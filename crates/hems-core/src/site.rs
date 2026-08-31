@@ -193,7 +193,9 @@ impl Site {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::asset::{AssetMeta, CapRelief, Capabilities, Evse, FlexibleLoad, LoadKind, PvArray};
+    use crate::asset::{
+        AssetMeta, Capabilities, Evse, FlexibleLoad, LoadKind, Para9Status, PvArray,
+    };
     use crate::circuit::Circuit;
     use crate::ids::CircuitId;
     use crate::units::PhaseConnection;
@@ -233,7 +235,7 @@ mod tests {
                     ac_nominal: Power::from_kw(8.0),
                     tilt_deg: 35.0,
                     azimuth_deg: 180.0,
-                    cap_relief: CapRelief::None,
+                    para9: Para9Status::default(),
                 }),
                 Asset::Evse(Evse {
                     meta: meta("wallbox", "garage", 11.0),

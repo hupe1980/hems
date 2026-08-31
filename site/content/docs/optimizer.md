@@ -6,26 +6,34 @@ weight = 4
 
 ## The formulation
 
-One set of variables per quarter-hour slot of a 48-hour horizon, all in watts and
+One set of variables per quarter-hour slot of a 24-hour horizon, all in watts and
 all non-negative: grid import and export, battery charging and discharging, the
 energy in the battery, charging power at the charge point, the energy in the car,
-the hot-water heater and the heat in its tank, and production thrown away.
+the hot-water heater and the heat in its tank, and production thrown away. Plus,
+per shiftable appliance, one binary per **feasible** start.
 
 ```text
-g_in − g_out = load + b_ch − b_dis + ev + hp + dhw − (pv − curtail)
+g_in − g_out = load + b_ch − b_dis + ev + hp + dhw + app − (pv − curtail)
                                                                (energy balance)
 e[k]    = e[k−1] + Δ(η_ch·b_ch − b_dis/η_dis)                  (battery state)
 ev_e[k] = ev_e[k−1] + Δ·η·ev                                   (car state)
 w[k]    = w[k−1] + Δ·cop·dhw − loss − draw[k] + short[k]       (tank state)
 ev_on·min_charge ≤ ev ≤ ev_on·max_charge, ev_on ∈ {0,1}        (6 A or nothing)
-b_ch + ev + hp − b_dis + curtail + dhw ≤ ceiling[k] + (pv − load)
+Σ_k start[i][k] + not_run[i] = 1,  start ∈ {0,1}               (one wash, once)
+app[k] = Σ_i Σ_j start[i][j]·programme_i[k − j]                (its own shape)
+b_ch + ev + hp − b_dis + curtail + dhw + app ≤ ceiling[k] + (pv − load)
                                                     while pv > load
 b_ch + ev + hp − b_dis                ≤ ceiling[k]  otherwise   (§ 14a)
 g_out ≤ feed-in ceiling[k]                                     (§ 9 EEG, LPP)
-g_out ≤ pv − curtail + b_dis                                   (you can only
-g_in  ≤ load + b_ch + ev + hp + dhw                             export what you
-                                                                actually have)
+g_out ≤ pv − curtail + b_dis                                   (no invented export)
 ```
+
+There is deliberately **no mirror** of that last line. "Imported power has to go
+into the house or a store" is implied by it and the energy balance, so it
+constrains nothing — and it is always tight whenever the household is not
+exporting, which gives it a free non-negative dual that absorbs the energy
+balance's own. With it in the model every shadow price below is meaningless: an
+ordinary 20 ct hour came back at 5 986 €/kWh.
 
 minimising, in euros throughout,
 
@@ -37,10 +45,11 @@ minimising, in euros throughout,
       + discomfort_price·(kelvin outside the comfort band) )
   + shortfall_price·(hot water not delivered)
   + unmet_charge_price·(charge not delivered by the deadline)
+  + Σ_i unrun_price_i·not_run[i]
   − terminal value of what is left in the battery, the building and the tank
 ```
 
-## Nine decisions worth explaining
+## Fourteen decisions worth explaining
 
 ### Battery wear is a cost, not a constraint
 
@@ -95,7 +104,7 @@ while a full battery sits behind the meter.
 
 And the ceiling is read **per slot**. A reduction has a duration — `[LPC-909]`
 sends one with the limit, and the failsafe releases after its own minimum — and
-stretching today's ninety minutes across a forty-eight-hour horizon plans the
+stretching today's ninety minutes across a whole horizon plans the
 house under a limit that lapsed before teatime. It costs money in both
 directions: the plan charges the car at three in the morning as though the
 network operator were still asking for something, and it never sees the next one
@@ -112,7 +121,7 @@ nothing at all, and nobody finds out until the morning.
 
 So the charge point is **semi-continuous**: one binary per slot, off or between
 its minimum and its maximum. It is the only binary a car needs, and it is pinned
-rather than branched in every slot after the car has left, which on a 192-slot
+rather than branched in every slot after the car has left, which on a 96-slot
 horizon is most of them.
 
 ### The charging deadline is soft, and priced
@@ -154,7 +163,7 @@ slower.
 
 Measured on a September day with the planner off — the shoulder season, where the
 surplus sits in the 1,4 – 4,1 kW band for hours: a switchable charge point puts
-**6,0 kWh** into the car against **0,2** for a fixed three-phase one, for one
+**13,1 kWh** into the car against **0,2** for a fixed three-phase one, for one
 contactor operation. Midsummer measures nothing, because the roof spends the
 middle of the day above the 4,14 kW three conductors need.
 
@@ -178,6 +187,87 @@ exactly the reason the charging deadline is: a household that starts the day wit
 a cold tank cannot have a hot shower at seven whatever the plan says, and "this
 schedule, and it is two kilowatt-hours short" is a better answer than "no
 schedule exists".
+
+### A dishwasher is placed, not spread
+
+The obvious model for a shiftable load — energy the planner may move between
+slots — is wrong in the way that matters. A dishwasher's programme is *shaped*:
+two kilowatts while it heats, two hundred watts while it washes, two kilowatts
+again to dry. A planner allowed to smear that over six hours schedules seven
+hundred watts of dishwasher into every sunny slot, which no dishwasher will carry
+out, and the household's day arrives with the machine still full.
+
+So the decision is a single binary per feasible start, and the programme follows
+it exactly. Binaries are declared **only where a start would fit** — after the
+household's earliest, finishing before its deadline and inside the horizon — so a
+two-hour programme in an eight-hour window leaves a few dozen places to go rather
+than a hundred and ninety.
+
+It is also the one device in the model with **no ceiling to give**. A controller
+that pauses a running dishwasher has not shed a kilowatt, it has left the dishes
+dirty — so the appliance declares `SCHEDULE` and not `LIMIT_CONSUMPTION`, the
+one-second arbiter never touches it, and its power reaches the guard as a
+*measurement* inside the household's own load. In the § 14a line above it is on
+the side that **spends** the surplus, not the side the ceiling bounds: a white
+good is in none of the four Fallgruppen of `[A1 2.4.1]`.
+
+Not running it is soft, at €2 — a household that asked for a wash in a window too
+tight for it is owed a plan that says "not this one" rather than no plan at all —
+and the report charges it, on both sides.
+
+And with **no plan at all**, the box still starts it: when the measured surplus
+covers its first step, and no later than the last start that finishes inside the
+window. A box that waits for a plan that is not coming leaves the household with
+dirty dishes and a worse day than a €10 appliance timer would have given them.
+
+### The forecast is a distribution, and the plan may be priced against it
+
+The forecast publishes a band. A deterministic planner throws two thirds of it
+away and optimises against a median that will not happen.
+
+`Risk` reads it as **three futures** instead — Swanson's rule on the P10, P50 and
+P90, weighted 0,3 / 0,4 / 0,3, so the scenario set costs nothing to produce
+beyond the band that is already there. They are paired **comonotone in the
+household's misfortune**: the pessimistic future is dull *and* hungry, because a
+household's bad day is the correlated one, and sampling the two independently
+would put most of the probability on the bland middle.
+
+Only the **first slot's** controllable decisions are shared across the futures.
+That is the slot the arbiter is about to commit, and a plan with three answers for
+the next quarter hour is three plans and a coin; everything after it is
+**recourse**, which is what makes hedging affordable rather than a tax on every
+sunny day. The grid and the state variables are deliberately not tied —
+production differs between the futures by kilowatts in that first slot.
+
+The tail is Rockafellar–Uryasev, exactly:
+
+```text
+minimise (1 − λ)·Σ p_s·cost_s  +  λ·( ζ + 1/(1−α)·Σ p_s·tail_s )
+subject to  tail_s ≥ cost_s − ζ ,  tail_s ≥ 0
+```
+
+**And the evaluation that can falsify it ships with it.** A single simulated day
+pays a hedge's premium every time and makes its claim never, so measured once,
+insurance is always a pure loss. `hemsd risk` runs the day under several weathers
+under each policy:
+
+```console
+$ just risk deadline
+  policy                mean     worst      best    unserved     solve
+  one median           2.35€     1.79€     2.99€       0.17€        9s
+  three futures        2.70€     1.77€     3.99€       0.00€      103s
+```
+
+Scenarios are worth **€0,35 a day where a service is at risk** and remove the
+charge the median plan leaves undelivered; they cost **€0,95 a day where nothing
+is**; and **no** policy improves the worst day. So the default is one median.
+
+A calibrated band is a *precondition* for planning against scenarios, not an
+improvement to it. Scored only where there is something to forecast — a band of
+nothing against an outcome of nothing is midnight, not a forecast that came true
+— and with each tail calibrated against its own outcomes, the bands cover 80 % on
+the January day and 75 % on the June one over twenty weathers each. So these
+figures are about the machinery rather than about the input.
 
 ### The building is discretised exactly, not by explicit Euler
 
@@ -223,12 +313,60 @@ energy price rather than replacing it, and every term is comparable with every
 other. Setting one to zero switches that concern off; setting it high makes it
 lexicographic in practice, without the machinery of a lexicographic solve.
 
+### A compressor's minimum runtime needs the compressor's own state
+
+A non-modulating heat pump has minimum on- and off-times, and they are stated the
+way every unit-commitment model states them:
+
+```text
+on[j] ≥ on[k] − on[k−1]      for j ∈ (k, k + L)     once started, stay on
+on[j] ≤ 1 − on[k−1] + on[k]  for j ∈ (k, k + ℓ)     once stopped, stay off
+```
+
+Every row there constrains a **transition**, so every row needs the slot before
+it — and none of them says anything about slot 0. Slot 0 is the only slot a
+receding horizon ever executes.
+
+So a box could start the compressor, commit that quarter hour, re-plan against a
+model with no memory of it, and stop it again. For ever, at every re-plan, with
+every individual plan feasible and no property violated anywhere. The minimum
+runtime was stated in every plan and enforced on no day.
+
+The plan is therefore given `CompressorState` — whether the unit is running, and
+for how long — so `on[−1]` is a constant and the opening slots its minimum still
+owes are pinned rather than branched. Anchoring the first transition also shrinks
+the search: a 96-slot heating day went from **5,0 s to about 1,0 s**, because a
+free first transition is a branch that propagates the length of the horizon.
+
+The rows stay the pairwise ones above. Rajan and Takriti's turn-on/turn-off
+inequalities describe the convex hull of this polytope, so the relaxation is
+integral and the solver stops branching on it — built, and measured over five
+96-slot heating days at **6,9 s against 4,9 s**. The tighter relaxation is real,
+and the `2n` extra columns and `2n` extra rows cost more than it returns at a
+household's size, where the horizon is a hundred slots rather than a utility's
+thousands.
+
+### The inputs have to describe the horizon
+
+Every input to a plan is indexed by slot, and a slot an input does not reach is
+the dangerous case. A forecast is the worst of them: a missing band read as
+**zero** says the roof is dark *and* the house is empty. Wrong in both directions at once, so the plan defers every flexible
+kilowatt-hour into hours it believes cost nothing, and the day arrives to find
+them ordinary. Nothing logged it, nothing failed, and the plan looked like any
+other.
+
+Both forecasts must now cover the horizon, and a price stack must be the
+horizon's own hours — it carries its own slot, so that is one comparison per
+slot. A stack that merely *stops short* is still allowed and still filled with a
+flat default: a horizon can outrun the last published day-ahead auction, and
+being indifferent about when to act out there is exactly the state of knowledge.
+
 ## Solvers
 
 `good_lp` behind a feature flag. The default is **microlp**, pure Rust, so
 `cargo test` needs no C++ toolchain and the crate cross-compiles to a gateway box
 without a build environment on it. **HiGHS** is markedly faster on a full
-192-slot horizon and is what a production box should be built with; CI runs the
+96-slot horizon and is what a production box should be built with; CI runs the
 test suite against both.
 
 The model has binaries, so it also carries a **relative gap** (0,5 % by default)
@@ -330,7 +468,7 @@ plan *and* for the baseline. The invariant is that **every term of the objective
 is a term of the report**: comparing energy bills alone credits the optimiser for
 a cycle it has already paid for in cell life, for a degree of cold it accepted,
 and for a charging session it abandoned. On the reference winter day the
-difference is €3,39 of bill against €2,21 of actual saving. The larger number is
+difference is €3,41 of bill against €2,10 of actual saving. The larger number is
 the one every other system quotes.
 
 The ledger is closed on the stores as well. A period that ends with an emptier
@@ -340,6 +478,14 @@ already puts in the objective, on the other side of the ledger. The mirror case
 is deliberately *not* credited: the baseline has no battery to store anything in
 and could never earn it, so a saving figure may understate itself and may not
 flatter itself.
+
+The **car** is the exception and has an entry of its own, because both households
+own the same one. Charge pushed into it *past* what the household asked for is a
+kilowatt-hour nobody buys later, so it is credited on both sides. That reverses a
+claim worth stating plainly: respecting the household's own Ladelimit costs
+money on the ledger, and what it buys — lithium life — is a cost the ledger does
+not price. Saying the limit paid for itself was an artefact of valuing energy in
+a car at nothing.
 
 That baseline has to deliver the **same service** or it is not a comparison: the
 car still reaches its target, the house is still warm and the shower is still

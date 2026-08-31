@@ -19,6 +19,9 @@ path = "src/lib.rs"
 
 [dependencies]
 hems-core      = { workspace = true }
+# Both protocols: this is the process that owns the sockets, so it is the one
+# place the transports are allowed to exist.
+hems-drv       = { workspace = true, features = ["eebus", "modbus"] }
 hems-events    = { workspace = true }
 hems-flex      = { workspace = true }
 hems-forecast  = { workspace = true }
@@ -37,6 +40,7 @@ clap         = { version = "4", features = ["derive", "env"] }
 rust_decimal = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
+thiserror    = { workspace = true }
 time         = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

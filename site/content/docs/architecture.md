@@ -186,14 +186,14 @@ average. In midsummer it is worth nothing even with the planner off: the roof
 spends the middle of the day above the 4,14 kW three conductors need, so the car
 fills either way. The German shoulder season is the other nine months — on the
 September reference day the surplus sits in the 1,4 – 4,1 kW band all afternoon,
-and a switchable wallbox puts **6,0 kWh** into the car against **0,2**, for one
+and a switchable wallbox puts **13,1 kWh** into the car against **0,2**, for one
 contactor operation.
 
 ### The planner
 
-A receding-horizon mixed-integer linear program over 48 hours of quarter-hour
+A receding-horizon mixed-integer linear program over 24 hours of quarter-hour
 slots. It prices battery wear, respects § 14a and § 9 EEG as hard constraints
-**per slot** — a ninety-minute reduction is not a forty-eight-hour one — plans
+**per slot** — a ninety-minute reduction is not an all-day one — plans
 the building and the hot-water tank as the stores they are, values what is left
 in all three at the end of the horizon, and hands back a plan with an envelope
 per asset: how much freedom it is giving away, rather than leaving the arbiter to
@@ -222,6 +222,39 @@ without a line of difference.
 
 `just purity` fails the build if a domain crate reaches for a clock, the
 filesystem, the network or `unsafe`.
+
+### …including the drivers
+
+A driver is the part of a system most likely to be written in a hurry, against a
+device that behaves badly, by somebody who has not read the rest. So the contract
+is the narrowest one in the workspace: **bytes and a clock in, events and bytes
+out**. `hemsd` owns the socket.
+
+The § 14a failsafe is a sixty-second heartbeat and a two-hour minimum. A driver
+that read a clock could only be tested by waiting; one that takes time as a
+parameter makes *"the Steuerbox goes quiet at 17:04 and comes back at 19:11"* an
+ordinary assertion — and `hems-drv/eebus` runs a whole day of it in
+milliseconds: a reduction, its own expiry, heartbeat loss, the failsafe, and the
+release.
+
+Something has to own a *set* of them, and that is `hemsd`'s registry: it gives
+each driver its bytes, folds what they say into what the house is doing and what
+the operator is asking for, and — before a single byte moves — checks that the
+drivers and the site agree about what they are for. Four mismatches are loud at
+startup rather than silent for months: a driver for an asset that does not exist,
+two drivers for one asset, a controllable device whose driver cannot command it,
+and a § 14a household with nothing that could hear a reduction.
+
+Two rules keep a driver from becoming a second control plane:
+
+- **A driver reports; it does not decide.** What the site may do is the guard's
+  decision, made with every asset in view. A grid driver accepts no commands at
+  all, because a household does not command its own reduction.
+- **The protocol logic is not ours.** The five-state EEBUS limitation machine
+  lives in the [`eebus`](https://crates.io/crates/eebus) crate and hems *derives*
+  its own state from it rather than tracking one alongside. Two implementations
+  of a certifiable state machine disagree, and the one that is wrong is whichever
+  the certification lab is not looking at.
 
 ## One sign convention
 

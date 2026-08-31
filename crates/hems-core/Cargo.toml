@@ -13,7 +13,6 @@ rust-version.workspace = true
 
 [dependencies]
 metering     = { workspace = true }
-rust_decimal = { workspace = true }
 serde        = { workspace = true, optional = true }
 thiserror    = { workspace = true }
 time         = { workspace = true }
@@ -22,7 +21,7 @@ uuid         = { workspace = true }
 [features]
 default = ["serde"]
 ## Serialize/deserialize every public type.
-serde = ["dep:serde", "metering/serde", "uuid/serde", "time/serde-well-known", "rust_decimal/serde"]
+serde = ["dep:serde", "metering/serde", "uuid/serde", "time/serde-well-known"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

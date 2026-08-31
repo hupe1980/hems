@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use hems_core::prelude::Slot;
 use hems_grid::modul3::{Modul3Calendar, Preisstufe};
 use rust_decimal::Decimal;
+use time::Date;
 
 use crate::levies::Levies;
 
@@ -16,6 +17,7 @@ pub enum EnergyPrice {
     /// One price all year, ct/kWh net.
     Fixed {
         /// The price.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         ct_per_kwh: Decimal,
     },
     /// The day-ahead price plus the supplier's markup, ct/kWh net.
@@ -26,11 +28,14 @@ pub enum EnergyPrice {
     Dynamic {
         /// The spot price per slot, ct/kWh. Slots outside the map fall back to
         /// [`EnergyPrice::Dynamic::fallback_ct_per_kwh`].
+        #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_map"))]
         spot: BTreeMap<Slot, Decimal>,
         /// The supplier's markup, ct/kWh.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         markup_ct_per_kwh: Decimal,
         /// What to assume where no spot price is known yet — beyond tomorrow's
         /// auction, and after an outage. Refusing to plan at all would be worse.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         fallback_ct_per_kwh: Decimal,
     },
 }
@@ -72,15 +77,18 @@ pub enum NetworkCharge {
     /// No § 14a module: the ordinary Arbeitspreis, ct/kWh.
     None {
         /// The ordinary working price.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         arbeitspreis: Decimal,
     },
     /// **Modul 1** — a flat annual reduction, the working price unchanged.
     Modul1 {
         /// The ordinary working price, ct/kWh.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         arbeitspreis: Decimal,
         /// The annual reduction, euros. Shown to the household as a lump sum
         /// because that is how it is billed; it never changes a marginal price,
         /// so it never changes what the optimiser does.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         reduction_eur_per_year: Decimal,
     },
     /// **Modul 2** — 60 % off the working price, at a Marktlokation of its own.
@@ -91,10 +99,13 @@ pub enum NetworkCharge {
     /// a rule of thumb.
     Modul2 {
         /// The ordinary working price, ct/kWh.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         arbeitspreis: Decimal,
         /// The share of the working price that remains, 0.4 by default.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         remaining_share: Decimal,
         /// The annual metering charge for the extra measuring point, euros.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         metering_eur_per_year: Decimal,
     },
     /// **Modul 3** — time-variable network charges, only together with Modul 1.
@@ -102,12 +113,16 @@ pub enum NetworkCharge {
         /// The operator's calendar of windows and levels.
         calendar: Modul3Calendar,
         /// The high-tariff working price, ct/kWh.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         ht: Decimal,
         /// The standard working price, ct/kWh.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         st: Decimal,
         /// The low-tariff working price, ct/kWh.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         nt: Decimal,
         /// The Modul 1 reduction that comes with it, euros per year.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         reduction_eur_per_year: Decimal,
     },
 }
@@ -164,32 +179,116 @@ impl NetworkCharge {
     }
 }
 
-/// How feed-in is remunerated.
+/// Which way a household is paid for what it exports.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case", tag = "kind"))]
-pub enum FeedIn {
+pub enum Remuneration {
     /// Nothing is paid for exported energy.
     None,
-    /// The EEG feed-in tariff, ct/kWh.
-    ///
-    /// Since 25.02.2025 a supported system earns **nothing** in a quarter hour
-    /// with a negative day-ahead price (§ 51 EEG) — 573 hours of 2025 were like
-    /// that. Self-consumption or curtailment is then the rational choice, and
-    /// [`crate::stack::SlotPrice`] carries the zero so the optimiser sees it.
+    /// The EEG feed-in tariff (§ 19 Abs. 1 Nr. 2), ct/kWh.
     Eeg {
         /// The tariff.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         ct_per_kwh: Decimal,
-        /// Whether the § 51 negative-price rule applies to this system.
-        negative_price_rule: bool,
     },
-    /// Direktvermarktung: the market value plus the market premium, ct/kWh.
+    /// Direktvermarktung (§ 19 Abs. 1 Nr. 1): the spot price the seller actually
+    /// realises, plus the Marktprämie.
     Direktvermarktung {
-        /// The monthly Marktwert Solar.
+        /// The Marktwert to fall back on where no spot price is known.
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         marktwert_ct_per_kwh: Decimal,
-        /// The premium on top.
+        /// The Marktprämie on top, `MP = AW − MW` (Anlage 1 zu § 23a).
+        #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
         praemie_ct_per_kwh: Decimal,
     },
+}
+
+/// What exporting earns, and the one statutory fact that reaches both schemes.
+///
+/// # Why § 51 is a field of the struct and not of the variant
+///
+/// *"Für Zeiträume, in denen der Spotmarktpreis negativ ist, verringert sich der
+/// **anzulegende Wert** auf null"* (§ 51 Abs. 1 EEG). The anzulegender Wert is
+/// what the Einspeisevergütung is calculated from (§ 53 Abs. 1) **and** what the
+/// Marktprämie is calculated from (Anlage 1 zu § 23a Nr. 1, *"AW der anzulegende
+/// Wert unter Berücksichtigung der §§ 19 bis 54"*), so the rule reaches both and
+/// zeroes both.
+///
+/// Carrying it inside one variant is how it reached only one. A household in
+/// Direktvermarktung was priced at `spot + Prämie` in a negative quarter hour —
+/// which is the household being told it still earns the premium in exactly the
+/// hours the statute is paying it to stop, so the plan feeds in where it should
+/// absorb or curtail. That is the whole behavioural point of § 51, inverted.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FeedIn {
+    /// How the export is paid for.
+    pub scheme: Remuneration,
+    /// The day from which § 51 EEG reduces this plant's anzulegender Wert to
+    /// zero in a negative quarter hour, if it ever does.
+    ///
+    /// `None` is "not yet, and possibly never", which is the ordinary state of a
+    /// German household roof: § 51 Abs. 2 Nr. 1 exempts a plant below 100 kW for
+    /// every period **before the end of the calendar year in which it is fitted
+    /// with an intelligent metering system**, and Nr. 2 exempts one below 2 kW
+    /// until the end of the year the Bundesnetzagentur makes its § 85 Abs. 2
+    /// Nr. 12 Festlegung in — which it has not.
+    ///
+    /// So this is a date rather than a boolean, and the date is not the day the
+    /// meter was fitted: it is the first of January after it.
+    /// `hems_grid::para9::para51_applies_from` derives it, because the facts it
+    /// needs are the plant's, not the tariff's.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, with = "hems_core::wire::iso_date::option")
+    )]
+    pub para51_from: Option<Date>,
+}
+
+impl FeedIn {
+    /// Nothing is paid for what leaves the house.
+    pub const NONE: Self = Self {
+        scheme: Remuneration::None,
+        para51_from: None,
+    };
+
+    /// The EEG feed-in tariff, with § 51 not yet reaching this plant.
+    #[must_use]
+    pub const fn eeg(ct_per_kwh: Decimal) -> Self {
+        Self {
+            scheme: Remuneration::Eeg { ct_per_kwh },
+            para51_from: None,
+        }
+    }
+
+    /// Direktvermarktung, with § 51 not yet reaching this plant.
+    #[must_use]
+    pub const fn direktvermarktung(
+        marktwert_ct_per_kwh: Decimal,
+        praemie_ct_per_kwh: Decimal,
+    ) -> Self {
+        Self {
+            scheme: Remuneration::Direktvermarktung {
+                marktwert_ct_per_kwh,
+                praemie_ct_per_kwh,
+            },
+            para51_from: None,
+        }
+    }
+
+    /// Say from which day § 51 EEG reaches this plant.
+    #[must_use]
+    pub const fn under_para51_from(mut self, from: Option<Date>) -> Self {
+        self.para51_from = from;
+        self
+    }
+
+    /// Whether § 51 EEG zeroes the anzulegender Wert on `day`.
+    #[must_use]
+    pub fn para51_applies_on(&self, day: Date) -> bool {
+        self.para51_from.is_some_and(|from| day >= from)
+    }
 }
 
 /// A household's complete price situation.
@@ -206,6 +305,7 @@ pub struct Tariff {
     pub feed_in: FeedIn,
     /// The supplier's annual standing charge, euros.
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub standing_charge_eur_per_year: Decimal,
 }
 
@@ -218,7 +318,7 @@ impl Tariff {
             energy: EnergyPrice::Fixed { ct_per_kwh },
             network: NetworkCharge::None { arbeitspreis },
             levies: Levies::default(),
-            feed_in: FeedIn::None,
+            feed_in: FeedIn::NONE,
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

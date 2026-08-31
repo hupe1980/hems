@@ -23,9 +23,39 @@ so a full cycle pays it once.
   temperature, with a leak and a draw, which is S2's own view of a tank — and a
   cold shower is priced rather than forbidden, for the same reason the charging
   deadline is.
+- 🍽️ **A dishwasher is placed, not spread.** One binary per *feasible* start, and
+  the programme's own shape — two kilowatts to heat, two hundred watts to wash,
+  two kilowatts to dry. A planner given the average schedules seven hundred watts
+  of dishwasher into every sunny slot, which no dishwasher will carry out. Not
+  running it is soft and priced, like every other deadline here.
+- 🎲 **The forecast is a distribution, not a number.** `Risk` reads the band the
+  forecast already publishes as **three futures** (Swanson's 0,3 / 0,4 / 0,3),
+  paired so the pessimistic one is dull *and* hungry; the first slot is decided
+  once and everything after it is recourse; a **CVaR** tail is linearised exactly
+  (Rockafellar–Uryasev). And the duals still come from a risk-neutral re-solve,
+  because a price is a question about money.
+
+  The unusual part is that the evaluation which can *falsify* it ships too: a
+  single simulated day pays a hedge's premium every time and makes its claim
+  never. `hemsd risk` says scenarios are worth €0,35 a day where a service is at
+  risk, cost €0,95 a day where nothing is, and that **no** policy improves the
+  worst day — so the default is one median.
+- ❄️ **A compressor's minimum runtime remembers the compressor.** The rows that
+  state it constrain a *transition*, so each needs the slot before it — and none
+  of them says anything about slot 0, which is the only slot a receding horizon
+  executes. So a box could start the unit, commit that quarter hour, re-plan
+  against a model with no memory, and stop it again, for ever, with every
+  individual plan feasible. `CompressorState` makes `on[−1]` a fact, and the
+  slots the unit still owes are pinned rather than branched; anchoring the first
+  transition also took a 96-slot heating day from 5,0 s to about 1,0 s.
+- 🚫 **A plan whose inputs do not describe its horizon is refused.** A forecast
+  with no band for a slot used to be read as zero — the roof dark *and* the house
+  empty, wrong in both directions at once — and a price stack was indexed by
+  position without checking it was the right hours. Both are now errors rather
+  than confident, ordinary-looking plans.
 - ⚖️ **Grid rules are hard constraints, per slot** — § 14a on the netzwirksamer
   Leistungsbezug (a discharging store raises it; a ninety-minute reduction is not
-  a forty-eight-hour one), § 9 EEG on feed-in, the connection on import.
+  an all-day one), § 9 EEG on feed-in, the connection on import.
 - 📉 **An honest baseline.** The plan reports its cost *and* what the same
   horizon costs delivering the same service with none of the decisions, so a
   saving is a subtraction rather than a claim.

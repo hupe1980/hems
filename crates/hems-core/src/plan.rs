@@ -188,6 +188,33 @@ pub struct CostBreakdown {
     /// state, which is what a week or a month does, it is zero either way.
     #[cfg_attr(feature = "serde", serde(default))]
     pub stored_eur: f64,
+    /// Charge put into the car **beyond what the household asked for**, valued
+    /// at what it would cost to buy — a credit, and zero on any period that
+    /// delivered exactly the service it was asked to.
+    ///
+    /// # Why the excess and not the whole charge
+    ///
+    /// Energy delivered *up to* the target is the service the household bought;
+    /// it is already in the bill, and crediting it again would report a day with
+    /// a €21 electricity bill as costing €12. Energy delivered *past* it is
+    /// something nobody asked for, and that is the case this entry exists for.
+    ///
+    /// # Why it is not [`CostBreakdown::stored_eur`]
+    ///
+    /// `stored_eur` is deliberately one-sided: the baseline has no battery and no
+    /// managed tank, so it can never earn the credit and taking it would be a
+    /// saving flattering itself. **Both households have the same car.** A
+    /// kilowatt-hour a controller pushed into it past the target is a
+    /// kilowatt-hour nobody buys later, and refusing to credit it measures a
+    /// manager that absorbed a sunny afternoon into the car against one that
+    /// exported the same energy at the feed-in tariff — and loses. That is not a
+    /// modelling nicety: it is how a switchable wallbox came to *appear* to be
+    /// rewarded for charging past the household's own Ladelimit.
+    ///
+    /// The other direction — a car left short — is
+    /// [`CostBreakdown::unserved_eur`]'s, at the household's own price for it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub vehicle_eur: f64,
     /// Service the household asked for and did not get, at its own price: the
     /// kilowatt-hours the car was promised and did not receive by its
     /// departure, and the hot water drawn from a tank that had none left.
@@ -225,6 +252,7 @@ impl CostBreakdown {
             + self.curtailment_eur
             + self.discomfort_eur
             + self.stored_eur
+            + self.vehicle_eur
             + self.unserved_eur
     }
 

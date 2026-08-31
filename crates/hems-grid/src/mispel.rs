@@ -184,25 +184,33 @@ pub struct QuarterHour {
     /// The quarter hour.
     pub slot: Slot,
     /// `Z1NB¼` — grid draw at the Entnahmestelle.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub grid_draw: Decimal,
     /// `Z1NE¼` — grid feed-in at the Einspeisestelle.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub grid_feed_in: Decimal,
     /// `Z2V¼` — consumption of the storage system and/or charge point.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub device_consumption: Decimal,
     /// `Z2E¼` — generation from the storage system and/or charge point.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub device_generation: Decimal,
     /// `Z3V¼` — consumption of the storage system alone. Only case A4.
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str_option"))]
     pub storage_consumption: Option<Decimal>,
     /// `Z3E¼` — generation from the storage system alone. Only case A4.
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str_option"))]
     pub storage_generation: Option<Decimal>,
     /// `AW¼` — the anzulegender Wert of the generating plant in this quarter
     /// hour, ct/kWh. Zero in the hours § 51 EEG switches support off.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub anzulegender_wert: Decimal,
     /// `SP¼` — the spot price in this quarter hour, ct/kWh. Only the
     /// Pauschaloption reads it, `[MiSpeL A2 (P5)]`.
     #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub spot_price: Decimal,
 }
 
@@ -301,50 +309,72 @@ pub struct Abgrenzung {
     /// Which version of the Festlegung.
     pub rules: RuleSet,
     /// `(3)` total grid draw in the month.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub grid_draw: Decimal,
     /// `(4)` total grid feed-in in the month.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub grid_feed_in: Decimal,
     /// `(5)` total consumption of storage and/or charge point.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub device_consumption: Decimal,
     /// `(6)` total generation of storage and/or charge point.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub device_generation: Decimal,
     /// `(9)` grid electricity that went into the store.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub grid_charged: Decimal,
     /// `(10)` plant electricity that went into the store.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub plant_charged: Decimal,
     /// `(11)` base value of simultaneous feed-in out of the store.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub device_feed_in_base: Decimal,
     /// `(12)` **Fremdtankstrom**: energy the car brought back from somebody
     /// else's charge point, which may be neither settled nor supported here.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub foreign_charge: Decimal,
     /// `(13)` feed-in out of the store that may be considered at all.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub device_feed_in_considered: Decimal,
     /// `(14)` round-trip efficiency — measured in A1, presumed at 0,85 otherwise.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub efficiency: Decimal,
     /// `(15)` the green share of what came out of the store.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub renewable_storage_output: Decimal,
     /// `(16)` **saldierungsfähige Netzeinspeisung** — the feed-in that reduces
     /// the levies on the grid draw.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub settleable_feed_in: Decimal,
     /// `(17)` storage losses in the month, where they can be seen at all.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub storage_losses: Decimal,
     /// `(18)` the settleable share of the store's output.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub settleable_share: Decimal,
     /// `(19)` the privilegeable part of the storage losses.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub privilegeable_losses: Decimal,
     /// `(20)` the quantity that reduces the levies.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub levy_reducing: Decimal,
     /// `(21)` **umlagebelasteter Netzbezug** — what levies are still owed on.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub levied_grid_draw: Decimal,
     /// `(26)` supportable feed-in straight from the plant.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub supported_direct: Decimal,
     /// `(28)` supportable feed-in out of the store, before the AW>0 share.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub supportable_storage_feed_in: Decimal,
     /// `(30)` the AW>0 share of the store's feed-in.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub supported_share_of_storage: Decimal,
     /// `(31)` supportable feed-in out of the store.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub supported_storage: Decimal,
     /// `(32)` **förderfähige Netzeinspeisung** for the month.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub supported_feed_in: Decimal,
 }
 
@@ -546,8 +576,10 @@ pub struct PauschalPlant {
     /// Which case.
     pub fall: PauschalFall,
     /// `Pinst` — installed solar power behind the Einspeisestelle, kWp.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub solar_kwp: Decimal,
     /// `SKinst` — installed storage capacity behind it, kWh. Ignored in P2.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub storage_kwh: Decimal,
 }
 
@@ -587,23 +619,32 @@ pub struct Pauschal {
     /// Which version of the Festlegung.
     pub rules: RuleSet,
     /// `(P1)` the cap on supportable feed-in, kWh.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub support_cap: Decimal,
     /// `(P3)` the indifference band: feed-in that is neither supported nor
     /// settleable.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub indifference_band: Decimal,
     /// `(P4)` the threshold above which feed-in becomes settleable.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub settlement_threshold: Decimal,
     /// `(P7)` total grid draw in the year.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub grid_draw: Decimal,
     /// `(P8)` feed-in in quarter hours with a non-negative spot price.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub feed_in_at_non_negative_prices: Decimal,
     /// `(P10)` **saldierungsfähige Netzeinspeisung** for the year.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub settleable_feed_in: Decimal,
     /// `(P11)` **umlagebelasteter Netzbezug** for the year.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub levied_grid_draw: Decimal,
     /// `(P14)` feed-in in supported quarter hours.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub feed_in_when_supported: Decimal,
     /// `(P15)` **förderfähige Netzeinspeisung** for the year.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
     pub supported_feed_in: Decimal,
 }
 

@@ -486,6 +486,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "eebus"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea9c8a6de3ae366de46df7d3041e2971fa39af87ab8bff8fb0f565858dff0433"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -634,7 +645,6 @@ name = "hems-core"
 version = "0.1.0"
 dependencies = [
  "metering",
- "rust_decimal",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -652,6 +662,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hems-drv"
+version = "0.1.0"
+dependencies = [
+ "eebus",
+ "hems-core",
+ "hems-grid",
+ "metering",
+ "serde",
+ "sunspec",
+ "thiserror 2.0.20",
+ "time",
+]
+
+[[package]]
 name = "hems-events"
 version = "0.1.0"
 
@@ -663,6 +687,7 @@ dependencies = [
  "hems-core",
  "hems-device",
  "s2energy",
+ "serde_json",
  "thiserror 2.0.20",
  "time",
  "uuid",
@@ -752,6 +777,7 @@ dependencies = [
  "anyhow",
  "clap",
  "hems-core",
+ "hems-drv",
  "hems-events",
  "hems-flex",
  "hems-forecast",
@@ -764,6 +790,7 @@ dependencies = [
  "rust_decimal",
  "serde",
  "serde_json",
+ "thiserror 2.0.20",
  "time",
  "tracing",
  "tracing-subscriber",
@@ -925,9 +952,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metering"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ae04084cd88635ca3326ef2ab5b385bb94b4034ed12a66cd2fbfed335dd2445"
+checksum = "fbfd52cc1cec00262ad91650fb05003a02990c74ec80848b40970edddacc132f"
 dependencies = [
  "rust_decimal",
  "serde",
@@ -1579,6 +1606,38 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
+
+[[package]]
+name = "strum"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9628de9b8791db39ceda2b119bbe13134770b56c138ec1d3af810d045c04f9bd"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab85eea0270ee17587ed4156089e10b9e6880ee688791d45a905f5b1ca36f664"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "sunspec"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76af4b6503ee8aee422bd0629bea94eb1fca68ab5a3e9166a03c94b8c63cb5d9"
+dependencies = [
+ "bitflags",
+ "strum",
+ "thiserror 2.0.20",
+]
 
 [[package]]
 name = "syn"

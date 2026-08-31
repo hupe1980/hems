@@ -62,13 +62,14 @@ pub mod site;
 pub mod slot;
 pub mod thermal;
 pub mod units;
+pub mod wire;
 
 /// Everything a consumer normally wants, in one `use`.
 pub mod prelude {
     pub use crate::asset::{
         Asset, AssetMeta, Battery, CapRelief, Capabilities, Chemistry, DhwTank, Evse, Fallgruppe,
-        FlexibleLoad, HeatPump, HeatPumpControl, LegacyStatus, LoadKind, Meter, MeterRole, PvArray,
-        Relay, SteuVeExemption,
+        FlexibleLoad, HeatPump, HeatPumpControl, LegacyStatus, LoadKind, Meter, MeterRole,
+        Para9Status, Programme, PvArray, Relay, SteuVeExemption,
     };
     pub use crate::circuit::{Circuit, Circuits};
     pub use crate::envelope::Envelope;
@@ -81,7 +82,7 @@ pub mod prelude {
     };
     pub use crate::site::{GeoPoint, GridConnection, Site};
     pub use crate::slot::{Horizon, SLOT, SLOTS_PER_DAY, Slot};
-    pub use crate::thermal::{CopCurve, Rc2, Rc2Discrete, ThermalState};
+    pub use crate::thermal::{CompressorState, CopCurve, Rc2, Rc2Discrete, ThermalState};
     pub use crate::units::{
         ApparentPower, Current, Energy, NOMINAL_VOLTAGE, PerPhase, Phase, PhaseConnection,
         PhaseMode, Power, Soc, Voltage,

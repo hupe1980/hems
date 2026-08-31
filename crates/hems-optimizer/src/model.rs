@@ -1,6 +1,8 @@
 //! What the planner is asked to decide, and what it is allowed to trade off.
 
-use hems_core::prelude::{CopCurve, Energy, Horizon, Power, Rc2, Slot, Soc, ThermalState};
+use hems_core::prelude::{
+    CompressorState, CopCurve, Energy, Horizon, Power, Programme, Rc2, Slot, Soc, ThermalState,
+};
 use hems_forecast::Forecast;
 use hems_tariff::PriceStack;
 
@@ -152,6 +154,150 @@ impl EvSession {
     pub fn deadline(&self) -> Slot {
         self.departure.prev()
     }
+
+    /// How much of the session's own capacity the promise uses up, in `[0, 1]`.
+    ///
+    /// The energy still owed, over the energy the charge point could deliver if
+    /// it ran flat out for every quarter hour the cable is in. Zero is a car
+    /// that is already full; one is a session with no slack at all.
+    ///
+    /// # What it is for
+    ///
+    /// It is the cheap answer to "is this household at risk today", and the
+    /// reason it exists is a measurement. Planning against three futures instead
+    /// of one median is worth €0,35 a day on the evening a car arrives *as* a
+    /// § 14a reduction starts — and it removes the charge the median plan leaves
+    /// undelivered — while costing €0,95 a day and seven times the solve on an
+    /// ordinary winter evening where nothing is at stake. Something has to
+    /// decide which day it is.
+    ///
+    /// The obvious candidate — ask the plan whether it expects a shortfall —
+    /// **does not work**, and the way it fails is worth stating: a plan that has
+    /// looked only at the median cannot know it is at risk. On the reference
+    /// evening it predicts it will make the target, the weather disappoints, and
+    /// the trigger never fires. Asking it is asking the wrong oracle. A property
+    /// of the *session*, which needs no solve at all, is not blind in that way.
+    #[must_use]
+    pub fn tightness(&self, now: Slot) -> f64 {
+        let owed = (self.energy_target - self.energy_now)
+            .max(Energy::ZERO)
+            .get();
+        if owed <= 0.0 {
+            return 0.0;
+        }
+        let from = self.arrival.unwrap_or(now).max(now);
+        let slots = from.distance_to(self.departure).max(0) as f64;
+        let deliverable = self.max_charge.get() * self.efficiency.clamp(0.0, 1.0) * slots * 0.25;
+        if deliverable <= 0.0 {
+            return 1.0;
+        }
+        (owed / deliverable).clamp(0.0, 1.0)
+    }
+}
+
+/// An appliance that runs a fixed programme, placed in a window.
+///
+/// The washing machine, the dishwasher, the tumble dryer — S2 calls the pattern
+/// `PPBC`, and it is the one piece of household flexibility a household can
+/// actually see happening. It is also the only flexible thing in the model that
+/// is **atomic**: a battery can be charged a little, a heat pump turned down a
+/// little, and a dishwasher cannot be run a little. Either the whole programme
+/// goes in somewhere, or it does not go in.
+///
+/// # Why this is a start time and not a power
+///
+/// The obvious model — a load that may be moved between slots — is wrong in the
+/// way that matters. A dishwasher's programme is *shaped*: two kilowatts while
+/// it heats, two hundred watts while it washes, two kilowatts again to dry. A
+/// planner allowed to smear that over six hours will schedule 400 W of
+/// dishwasher into every sunny slot, which no dishwasher will do, and the
+/// household's day arrives with the machine still full. So the decision is a
+/// single binary per feasible start, the programme follows it exactly, and what
+/// the model reports is a schedule the appliance can carry out.
+///
+/// One binary per **feasible** start, not per slot: a two-hour programme that
+/// must finish by six leaves a few dozen, which costs the solver nothing next to
+/// the charge point's own integrality.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ShiftableRun {
+    /// The shape it draws once started.
+    pub programme: Programme,
+    /// The first slot the household will let it start in.
+    ///
+    /// `None` means "as soon as the horizon does" — which is what a machine
+    /// loaded and switched to `Auto` is.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub earliest: Option<Slot>,
+    /// The first slot it must already be **finished** in — half-open, like
+    /// [`EvSession::departure`] and for the same reason.
+    ///
+    /// `None` means the end of the horizon, which for a two-day horizon is a
+    /// household saying "sometime". Anybody who means "before we get up" says
+    /// so here; the plan is otherwise entitled to find the cheapest two hours in
+    /// forty-eight and it will.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub deadline: Option<Slot>,
+    /// What leaving the programme unrun is worth avoiding, €.
+    ///
+    /// **Soft, like every other deadline in this model.** A window too tight for
+    /// the programme, or a household that asked for a wash between two and three
+    /// on a day with a § 14a reduction across it, must produce a plan that says
+    /// "not this one" rather than no plan at all. Set it well above what the run
+    /// costs in electricity and it is lexicographic in practice; set it to zero
+    /// and the machine will simply never run, which is a legitimate way to say
+    /// "only if it is free".
+    pub unserved_eur: f64,
+}
+
+impl ShiftableRun {
+    /// A run of `programme` that must be finished before `deadline`.
+    #[must_use]
+    pub fn before(programme: Programme, deadline: Slot) -> Self {
+        Self {
+            programme,
+            earliest: None,
+            deadline: Some(deadline),
+            unserved_eur: 2.0,
+        }
+    }
+
+    /// Not before `earliest`.
+    #[must_use]
+    pub fn not_before(mut self, earliest: Slot) -> Self {
+        self.earliest = Some(earliest);
+        self
+    }
+
+    /// What leaving it unrun is worth avoiding.
+    #[must_use]
+    pub fn worth(mut self, eur: f64) -> Self {
+        self.unserved_eur = eur;
+        self
+    }
+
+    /// Whether a run started in slot index `k` of `horizon` fits the window.
+    ///
+    /// Three conditions, and the third is the one an implementation forgets: the
+    /// programme has to finish **inside the horizon**, or the plan commits to
+    /// slots it cannot see and reports an energy it never accounted for.
+    #[must_use]
+    pub fn can_start_at(&self, horizon: Horizon, k: usize) -> bool {
+        let len = self.programme.slots();
+        if len == 0 || k + len > horizon.len {
+            return false;
+        }
+        let Some(start) = horizon.get(k) else {
+            return false;
+        };
+        if self.earliest.is_some_and(|e| start < e) {
+            return false;
+        }
+        // The last slot the programme occupies is `k + len − 1`; it must end
+        // before the deadline slot begins.
+        self.deadline
+            .is_none_or(|d| horizon.get(k + len - 1).is_some_and(|last| last < d))
+    }
 }
 
 /// A heat pump, as the planner sees it.
@@ -166,15 +312,38 @@ pub struct HeatPumpModel {
     pub max_electrical: Power,
     /// The lowest electrical power at which the unit runs at all.
     ///
-    /// A modulating heat pump turns down to perhaps 30 % of its rating; below
-    /// that it cycles instead, which is where compressors die.
+    /// # It bounds an on/off unit and not a modulating one, and that is physics
+    ///
+    /// A compressor that cannot go below 30 % of its rating still delivers a
+    /// *quarter-hour average* below that, by running for four minutes of the
+    /// fifteen — which is exactly what an on/off unit does all winter. So at the
+    /// resolution this model works in, a modulation floor is not a constraint on
+    /// the slot average, and imposing one would forbid a plan the hardware can
+    /// carry out.
+    ///
+    /// What the floor does constrain is a unit whose *cycling* is being
+    /// scheduled, and that is [`HeatPumpModel::modulating`] `== false`: there the
+    /// binary says the unit is on for the whole slot, so the floor applies to it
+    /// and [`HeatPumpModel::min_on_slots`] prices the cycling. Reading this field
+    /// for a modulating unit would be modelling a machine nobody sells.
+    ///
+    /// The cost of a modulating unit spending a slot below its floor is
+    /// therefore compressor starts rather than infeasibility, and it is priced
+    /// nowhere — an honest gap, and a small one: a modulating unit under an MPC
+    /// spends most of the day at a steady output, which is the reason to buy
+    /// one.
     pub min_electrical: Power,
     /// Whether the unit modulates.
     ///
-    /// A modulating unit is a linear program — fast, and exactly right. An
-    /// on/off unit needs a binary per slot plus minimum-runtime constraints,
-    /// which is a genuine mixed-integer problem and markedly slower on the
-    /// pure-Rust solver. Most heat pumps sold in Germany today modulate.
+    /// A modulating unit is a linear program — fast, and exactly right, because
+    /// the quantity the model decides is a quarter-hour average and a
+    /// modulating unit can deliver any average up to its rating. An on/off unit
+    /// needs a binary per slot plus minimum-runtime constraints, which is a
+    /// genuine mixed-integer problem and markedly slower on the pure-Rust
+    /// solver. Most heat pumps sold in Germany today modulate.
+    ///
+    /// It also decides whether [`HeatPumpModel::min_electrical`] binds anything;
+    /// see the note there.
     pub modulating: bool,
     /// How the coefficient of performance moves with the weather.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -184,6 +353,13 @@ pub struct HeatPumpModel {
     pub min_on_slots: usize,
     /// The fewest consecutive slots it must stay off once stopped.
     pub min_off_slots: usize,
+    /// What the compressor is doing as the horizon opens.
+    ///
+    /// Ignored when `modulating`, and the whole of what makes
+    /// [`HeatPumpModel::min_on_slots`] mean anything on a **receding** horizon.
+    /// See [`CompressorState`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub compressor: CompressorState,
 }
 
 impl HeatPumpModel {
@@ -197,13 +373,133 @@ impl HeatPumpModel {
             cop: CopCurve::air_source(),
             min_on_slots: 2,
             min_off_slots: 2,
+            compressor: CompressorState::default(),
         }
+    }
+
+    /// An on/off air-source unit of `max_electrical`, idle.
+    ///
+    /// The unit a minimum runtime is *for*: it has one output and the plan
+    /// decides when it runs, so cycling is a decision the planner makes rather
+    /// than one the unit's own controller hides.
+    ///
+    /// The binary commits the **slot**, and
+    /// [`HeatPumpModel::min_electrical`] is the lowest average the unit can hold
+    /// across one by short-cycling inside it — which is what a single-speed
+    /// compressor's own controller does and why the floor is a third of the
+    /// rating rather than all of it. Pinning the floor *to* the rating was
+    /// tried: it is arguably more literal, and it turns a comfort band into a
+    /// packing problem in five-kilowatt pulses that did not solve a 48-slot day
+    /// in twelve minutes. The unit hardware actually ships is the one modelled
+    /// here.
+    #[must_use]
+    pub fn on_off(max_electrical: Power) -> Self {
+        Self {
+            modulating: false,
+            ..Self::modulating(max_electrical)
+        }
+    }
+
+    /// The same unit, with the compressor in the state `compressor` describes.
+    #[must_use]
+    pub const fn with_compressor(mut self, compressor: CompressorState) -> Self {
+        self.compressor = compressor;
+        self
     }
 
     /// The coefficient of performance at an outdoor temperature.
     #[must_use]
     pub fn cop(&self, outdoor_c: f64) -> f64 {
         self.cop.at(outdoor_c)
+    }
+
+    /// How many slots at the start of the horizon the compressor's own history
+    /// has already decided, and what it decided.
+    ///
+    /// `None` for a modulating unit and for one that has been in its current
+    /// state long enough to be free.
+    #[must_use]
+    pub fn committed(&self) -> Option<(bool, usize)> {
+        if self.modulating {
+            return None;
+        }
+        let required = if self.compressor.running {
+            self.min_on_slots
+        } else {
+            self.min_off_slots
+        };
+        let left = required.saturating_sub(self.compressor.slots_in_state);
+        (left > 0).then_some((self.compressor.running, left))
+    }
+}
+
+/// What a plan committed its discrete decisions to, ready to start the next one.
+///
+/// # Why a receding horizon should hand one to itself
+///
+/// A box re-plans every quarter of an hour over a horizon of a day. Consecutive
+/// plans therefore differ by **one slot of new information** and agree about
+/// almost everything else — and a branch-and-bound solver, handed the second
+/// problem cold, rediscovers the whole schedule from nothing every time.
+///
+/// A mixed-integer solver given a feasible incumbent can prune against its
+/// objective from the first node instead. The previous plan, shifted forward by
+/// the slots that have elapsed, is exactly such an incumbent and costs nothing
+/// to produce: the plan was solved anyway.
+///
+/// Only the **discrete** decisions are carried. The continuous ones are cheap
+/// for a simplex to recover once the integers are decided, and a stale
+/// continuous value is a worse starting point than none — the weather has moved.
+///
+/// # It cannot make a plan wrong
+///
+/// An initial solution is a *hint*. It is checked by the solver and discarded if
+/// it is not feasible, so a commitment that has gone stale — the car left early,
+/// the network operator sent a limit — costs one feasibility check and nothing
+/// else. Nothing here relaxes a constraint or changes an objective, which is why
+/// a warm-started plan and a cold one are the same plan.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Commitment {
+    /// Whether the charge point was running, one entry per slot.
+    pub ev_on: Vec<f64>,
+    /// Whether an on/off heat pump was running.
+    pub hp_on: Vec<f64>,
+    /// Where each appliance's programme was placed, indexed `[i][k]`.
+    pub shiftable: Vec<Vec<f64>>,
+}
+
+impl Commitment {
+    /// The same commitment read `by` slots later — what the next plan inherits.
+    ///
+    /// The decisions that have already happened drop off the front and the tail
+    /// is padded with zeros, which is the honest answer for slots the previous
+    /// horizon never reached: "no reason to think anything runs here", not a
+    /// guess. A solver improves on a zero tail in the first few nodes; it would
+    /// have to *undo* an invented one.
+    #[must_use]
+    pub fn shifted(&self, by: usize) -> Self {
+        fn slide(v: &[f64], by: usize) -> Vec<f64> {
+            let mut out: Vec<f64> = v.iter().skip(by).copied().collect();
+            out.resize(v.len(), 0.0);
+            out
+        }
+        Self {
+            ev_on: slide(&self.ev_on, by),
+            hp_on: slide(&self.hp_on, by),
+            shiftable: self.shiftable.iter().map(|s| slide(s, by)).collect(),
+        }
+    }
+
+    /// Whether there is anything here to start from.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.ev_on.is_empty() && self.hp_on.is_empty() && self.shiftable.is_empty()
+    }
+
+    /// The hint for one slot of a vector, if this commitment reaches that far.
+    pub(crate) fn hint(values: &[f64], k: usize) -> Option<f64> {
+        values.get(k).copied().filter(|v| v.is_finite())
     }
 }
 
@@ -545,6 +841,14 @@ pub struct Problem<'a> {
     pub thermal: Option<ThermalModel>,
     /// The hot-water tank, if there is one.
     pub dhw: Option<DhwModel>,
+    /// Appliances waiting to run a programme, in the order
+    /// [`crate::solve::AssetNames::shiftable`] names them.
+    ///
+    /// Empty on most solves. Each one is a handful of binaries, and they are the
+    /// cheapest flexibility a household owns after the tank: nothing is stored,
+    /// nothing degrades, and the only cost of moving one is that somebody has to
+    /// unload it later.
+    pub shiftable: Vec<ShiftableRun>,
     /// Hot water drawn in each slot, in watt-hours of heat.
     ///
     /// A forecast like any other — the morning shower and the evening washing-up
@@ -582,15 +886,15 @@ pub struct Problem<'a> {
     /// have heated water is a real loss, and a plan that is indifferent to it
     /// will curtail whenever that is a rounding error cheaper.
     pub curtailment_penalty_eur_per_kwh: f64,
-    /// Which quantile of the forecasts to plan against.
+    /// How the plan is asked to treat the fact that the forecast is wrong.
     ///
-    /// The median is the honest central case. Planning production against the
-    /// pessimistic quantile and load against the optimistic one produces a plan
-    /// that holds up when the weather disappoints — worth doing when the battery
-    /// is small relative to the array.
-    pub pv_quantile: Quantile,
-    /// Which quantile of the load forecast to plan against.
-    pub load_quantile: Quantile,
+    /// [`Risk::deterministic`] by default — one future, the median of both
+    /// forecasts. Not because it is the best plan: `hemsd risk` measures three
+    /// futures as worth about €0,35 a day where a service is at risk and as
+    /// costing about €0,95 a day where none is, and three futures cost seven
+    /// times the solve. That is a trade a household's box should make
+    /// deliberately rather than inherit. See [`Risk`].
+    pub risk: Risk,
     /// What a kilowatt-hour still in the battery at the end of the horizon is
     /// worth, as a multiple of the mean import price over the horizon.
     ///
@@ -623,6 +927,17 @@ pub struct Problem<'a> {
     /// solve — and it is worth turning off only for a caller that computes flows
     /// and commands nothing.
     pub shadow_prices: bool,
+    /// The previous plan's discrete decisions, shifted onto this horizon.
+    ///
+    /// A **hint**, never a constraint: the solver checks it, uses it as an
+    /// incumbent if it is feasible, and discards it if it is not. See
+    /// [`Commitment`] for why a receding-horizon controller should always have
+    /// one, and [`Problem::with_warm_start`] for how it is set.
+    ///
+    /// Honoured by the HiGHS and `microlp` backends. The dual pass runs on
+    /// Clarabel with the binaries already pinned, so it neither needs nor reads
+    /// one.
+    pub warm_start: Option<&'a Commitment>,
     /// The longest the solver may take, in seconds. Zero or infinite means no
     /// limit.
     ///
@@ -645,6 +960,220 @@ pub struct Problem<'a> {
     /// [`Problem::mip_gap`] is not affected: it is a property of the search, not
     /// of the clock.
     pub solve_budget_s: f64,
+}
+
+/// How the plan is asked to treat the fact that the forecast is wrong.
+///
+/// # Why a scenario set and not a quantile
+///
+/// Planning against one quantile is a *robustness knob*: it says "assume the
+/// weather disappoints and act on that", and the plan it produces is optimal
+/// against a world nobody expects. The household then pays the hedge on every
+/// ordinary day and gets no credit for it on the bad one, because the model
+/// never priced the bad one — it only ever saw a single, pessimistic future.
+///
+/// A **scenario set** says the honest thing instead: here are three futures and
+/// what each is worth. The plan minimises a weighted sum of the mean and the
+/// **tail**, so the hedge is bought exactly where the tail is expensive — a car
+/// that will leave short, a tank that will be cold at seven — and not where it
+/// is merely inconvenient.
+///
+/// # What is decided once and what is decided later
+///
+/// Only the **first slot's controllable decisions** are shared across scenarios
+/// (non-anticipativity): they are what the arbiter is about to commit, and a plan
+/// that gave three different answers for the next fifteen minutes would not be a
+/// plan. Everything after it is *recourse* — the plan is allowed to say "and if
+/// the afternoon is dull I do this instead", which is what makes the hedge cheap.
+///
+/// The **discrete** commitments are shared over the whole horizon: whether the
+/// charge point runs at all in a slot, whether an on/off heat pump is on, when
+/// the dishwasher starts. Those are things a household does once, and letting
+/// them differ per scenario would triple the integrality — the expensive part —
+/// to buy a schedule nobody can carry out.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Risk {
+    /// Which futures the plan is asked to survive.
+    pub scenarios: ScenarioSet,
+    /// The confidence level of the conditional value at risk, in `(0, 1)`.
+    ///
+    /// `CVaR_α` is the mean cost of the worst `1 − α` of outcomes. With
+    /// [`ScenarioSet::Swanson`]'s three futures and their 0,3 / 0,4 / 0,3
+    /// weights, `α = 0,7` makes the tail exactly the pessimistic scenario, which
+    /// is the reading a household would give it and the reason it is the
+    /// default.
+    pub cvar_alpha: f64,
+    /// How much of the objective is the tail rather than the mean, in `[0, 1]`.
+    ///
+    /// Zero is expected cost — the risk-neutral plan, and still better than a
+    /// single quantile because it prices all three futures. One is
+    /// worst-case-only, which buys a hedge on every sunny day. A third is a
+    /// household that would rather not be caught out.
+    pub cvar_weight: f64,
+}
+
+impl Default for Risk {
+    /// **The median, and nothing else.**
+    ///
+    /// Not because it is the best plan — it is not, and `hemsd risk` measures by
+    /// how much — but because it is the plan a caller who has said nothing about
+    /// uncertainty is entitled to: the cheapest to solve, and the one every
+    /// figure in this workspace is calibrated against. Three futures cost
+    /// **seven times the solve** on the reference winter day, which is a
+    /// decision a household's box should make deliberately rather than inherit.
+    fn default() -> Self {
+        Self::deterministic()
+    }
+}
+
+impl Risk {
+    /// One scenario: the median of both forecasts, priced as though it were
+    /// certain. What every deterministic MPC does, and the comparison the
+    /// scenario plan has to beat.
+    #[must_use]
+    pub const fn deterministic() -> Self {
+        Self {
+            scenarios: ScenarioSet::Median,
+            cvar_alpha: 0.7,
+            cvar_weight: 0.0,
+        }
+    }
+
+    /// Three futures, a third of the objective on the tail.
+    #[must_use]
+    pub const fn hedged() -> Self {
+        Self {
+            scenarios: ScenarioSet::Swanson,
+            cvar_alpha: 0.7,
+            cvar_weight: 1.0 / 3.0,
+        }
+    }
+
+    /// One scenario at a chosen quantile of each forecast — the old robustness
+    /// knob, kept because a household with a battery small against its array
+    /// sometimes wants exactly that and nothing more expensive.
+    #[must_use]
+    pub const fn at_quantile(pv: Quantile, load: Quantile) -> Self {
+        Self {
+            scenarios: ScenarioSet::Quantile { pv, load },
+            cvar_alpha: 0.7,
+            cvar_weight: 0.0,
+        }
+    }
+
+    /// How much weight the tail carries, clamped to something meaningful.
+    #[must_use]
+    pub fn tail_weight(&self) -> f64 {
+        if self.cvar_weight.is_finite() {
+            self.cvar_weight.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// `1 / (1 − α)`, the factor the tail excesses are scaled by, clamped so a
+    /// nonsense `α` cannot make the objective explode.
+    #[must_use]
+    pub fn tail_scale(&self) -> f64 {
+        let alpha = if self.cvar_alpha.is_finite() {
+            self.cvar_alpha.clamp(0.0, 0.99)
+        } else {
+            0.7
+        };
+        1.0 / (1.0 - alpha)
+    }
+
+    /// The futures the plan is asked to survive, with their probabilities.
+    #[must_use]
+    pub fn realisations(&self) -> Vec<Realisation> {
+        self.scenarios.realisations()
+    }
+}
+
+/// Which futures a plan is priced against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case", tag = "kind"))]
+pub enum ScenarioSet {
+    /// The median of both forecasts, and nothing else.
+    Median,
+    /// One chosen quantile of each forecast.
+    Quantile {
+        /// Which quantile of production.
+        pv: Quantile,
+        /// Which quantile of load.
+        load: Quantile,
+    },
+    /// Three futures from the three quantiles the forecast already carries,
+    /// weighted by **Swanson's rule** — 0,3 / 0,4 / 0,3 on the 10th, 50th and
+    /// 90th percentiles.
+    ///
+    /// Swanson's rule is the standard three-point discretisation of a continuous
+    /// distribution from its P10/P50/P90, and using it means the scenario set
+    /// costs *nothing to produce*: it is the band `hems-forecast` already
+    /// publishes, read as three paths rather than as three numbers per slot.
+    ///
+    /// The pairing is **comonotone in the household's misfortune**: the
+    /// pessimistic future is low production *and* high load together, the
+    /// optimistic one is the reverse. Sampling the two independently would put
+    /// most of the probability on the bland middle and never generate the day the
+    /// hedge exists for — and a household's bad day is precisely the correlated
+    /// one, because a dull cold afternoon is both at once.
+    ///
+    /// Three, not thirty: the error is correlated across a day (a front three
+    /// hours late, not a coin flip per quarter hour), so the useful variation is
+    /// between *paths* rather than within them, and three paths already contain
+    /// the decision — hedge or do not.
+    #[default]
+    Swanson,
+}
+
+/// One future the plan is priced against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Realisation {
+    /// Which quantile of production this future takes.
+    pub pv: Quantile,
+    /// Which quantile of load.
+    pub load: Quantile,
+    /// How likely it is, summing to one across the set.
+    pub probability: f64,
+}
+
+impl ScenarioSet {
+    /// The futures, with their probabilities.
+    #[must_use]
+    pub fn realisations(self) -> Vec<Realisation> {
+        let one = |pv, load| {
+            vec![Realisation {
+                pv,
+                load,
+                probability: 1.0,
+            }]
+        };
+        match self {
+            ScenarioSet::Median => one(Quantile::P50, Quantile::P50),
+            ScenarioSet::Quantile { pv, load } => one(pv, load),
+            // Swanson's rule on a P10/P50/P90 band.
+            ScenarioSet::Swanson => vec![
+                Realisation {
+                    pv: Quantile::P10,
+                    load: Quantile::P90,
+                    probability: 0.3,
+                },
+                Realisation {
+                    pv: Quantile::P50,
+                    load: Quantile::P50,
+                    probability: 0.4,
+                },
+                Realisation {
+                    pv: Quantile::P90,
+                    load: Quantile::P10,
+                    probability: 0.3,
+                },
+            ],
+        }
+    }
 }
 
 /// Which quantile of a forecast to use.
@@ -691,19 +1220,32 @@ impl<'a> Problem<'a> {
             ev: None,
             thermal: None,
             dhw: None,
+            shiftable: Vec::new(),
             dhw_draw: &[],
             outdoor_c: &[],
             limits: PlanningLimits::default(),
             objective: Objective::cost(),
             curtailment_penalty_eur_per_kwh: 0.01,
             unmet_charge_eur_per_kwh: 5.0,
-            pv_quantile: Quantile::P50,
-            load_quantile: Quantile::P50,
+            risk: Risk::default(),
             terminal_value_factor: 1.0,
             mip_gap: 0.005,
             shadow_prices: true,
+            warm_start: None,
             solve_budget_s: 10.0,
         }
+    }
+
+    /// Start the search from what the previous plan committed.
+    ///
+    /// The commitment must already be **aligned to this horizon** — use
+    /// [`Commitment::shifted`] with the number of slots that have elapsed since
+    /// it was made. A misaligned one is not unsafe, merely useless: the solver
+    /// finds it infeasible and throws it away.
+    #[must_use]
+    pub const fn with_warm_start(mut self, commitment: &'a Commitment) -> Self {
+        self.warm_start = Some(commitment);
+        self
     }
 
     /// Add a battery.
@@ -742,6 +1284,13 @@ impl<'a> Problem<'a> {
         self.dhw_draw.get(k).copied().unwrap_or(0.0).max(0.0)
     }
 
+    /// Add an appliance waiting to run a programme.
+    #[must_use]
+    pub fn with_shiftable(mut self, run: ShiftableRun) -> Self {
+        self.shiftable.push(run);
+        self
+    }
+
     /// Set the grid's limits.
     #[must_use]
     pub fn with_limits(mut self, limits: PlanningLimits) -> Self {
@@ -776,16 +1325,52 @@ impl<'a> Problem<'a> {
             .unwrap_or(10.0)
     }
 
-    /// The forecast values for slot `k`, in watts: production, then load.
+    /// The futures this problem is priced against.
+    ///
+    /// Never empty: a nonsense risk configuration falls back to the median,
+    /// because a plan against no future at all is not a safer answer than a plan
+    /// against one.
     #[must_use]
-    pub fn forecasts_at(&self, k: usize) -> (f64, f64) {
+    pub fn realisations(&self) -> Vec<Realisation> {
+        let mut out = self.risk.realisations();
+        if out.is_empty() {
+            out = ScenarioSet::Median.realisations();
+        }
+        out
+    }
+
+    /// The forecast values for slot `k` under one future, in watts: production,
+    /// then load.
+    #[must_use]
+    pub fn forecasts_in(&self, realisation: Realisation, k: usize) -> (f64, f64) {
         let slot = self.horizon.get(k);
         let pv = slot
             .and_then(|s| self.pv.at(s))
-            .map_or(0.0, |b| self.pv_quantile.of(b).max(0.0));
+            .map_or(0.0, |b| realisation.pv.of(b).max(0.0));
         let load = slot
             .and_then(|s| self.load.at(s))
-            .map_or(0.0, |b| self.load_quantile.of(b).max(0.0));
+            .map_or(0.0, |b| realisation.load.of(b).max(0.0));
         (pv, load)
+    }
+
+    /// The forecast values for slot `k` in the **central** future — the median
+    /// of both — which is what a report shows a household.
+    #[must_use]
+    pub fn forecasts_at(&self, k: usize) -> (f64, f64) {
+        self.forecasts_in(
+            Realisation {
+                pv: Quantile::P50,
+                load: Quantile::P50,
+                probability: 1.0,
+            },
+            k,
+        )
+    }
+
+    /// Set how the plan treats forecast error.
+    #[must_use]
+    pub const fn with_risk(mut self, risk: Risk) -> Self {
+        self.risk = risk;
+        self
     }
 }

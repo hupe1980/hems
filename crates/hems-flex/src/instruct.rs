@@ -6,12 +6,15 @@
 //! interprets an instruction without reference to what it advertised is
 //! guessing.
 
-use hems_core::asset::Battery;
+use hems_core::asset::{Battery, DhwTank};
 use hems_core::prelude::*;
 use hems_device::SgReadyState;
-use s2energy::{frbc, ombc, pebc};
+use s2energy::{frbc, ombc, pebc, ppbc};
+use time::OffsetDateTime;
 
-use crate::describe::{BatteryDescription, HeatPumpDescription};
+use crate::describe::{
+    BatteryDescription, DhwDescription, HeatPumpDescription, ProgrammeDescription,
+};
 
 /// Why an instruction could not be executed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -66,6 +69,61 @@ pub fn battery_power(
     } else {
         Err(InstructError::UnknownOperationMode)
     }
+}
+
+/// The electrical power an FRBC instruction asks a hot-water tank for.
+///
+/// One direction only: a tank has no discharge mode, so an instruction naming
+/// anything but its heater is a manager talking to a device it did not describe.
+///
+/// # Errors
+/// [`InstructError`] when the instruction names something that was never
+/// described, or carries a factor outside `[0, 1]`.
+pub fn dhw_power(
+    description: &DhwDescription,
+    instruction: &frbc::Instruction,
+    tank: &DhwTank,
+) -> Result<Power, InstructError> {
+    if instruction.actuator_id != description.actuator {
+        return Err(InstructError::UnknownActuator);
+    }
+    let f = factor(instruction.operation_mode_factor)?;
+    if instruction.operation_mode == description.heat {
+        Ok(Power::new(tank.heater.get() * f))
+    } else {
+        Err(InstructError::UnknownOperationMode)
+    }
+}
+
+/// When a `PPBC.ScheduleInstruction` says the programme should start.
+///
+/// The whole of what a manager decides about a shiftable appliance, so the whole
+/// of what has to be read back. An execution time already in the past means
+/// "start as soon as possible", which the standard states explicitly and which
+/// this deliberately does not silently correct — the caller knows what "now" is
+/// and this crate reads no clock.
+///
+/// # Errors
+/// [`InstructError::UnknownOperationMode`] when the instruction names a
+/// sequence or a container this Resource Manager never described. Refusing is
+/// the only safe answer: a sequence we cannot name is a programme whose shape we
+/// do not know, and starting the wrong one is a wash nobody asked for.
+pub fn programme_start(
+    description: &ProgrammeDescription,
+    instruction: &ppbc::ScheduleInstruction,
+) -> Result<OffsetDateTime, InstructError> {
+    if instruction.sequence_container_id != description.container
+        || instruction.power_sequence_id != description.sequence
+    {
+        return Err(InstructError::UnknownOperationMode);
+    }
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(
+        instruction
+            .execution_time
+            .timestamp_nanos_opt()
+            .unwrap_or(0),
+    ))
+    .map_err(|_| InstructError::UnknownOperationMode)
 }
 
 /// The SG Ready state an OMBC instruction selects.
@@ -347,7 +405,7 @@ mod tests {
             ac_nominal: Power::from_kw(8.0),
             tilt_deg: 35.0,
             azimuth_deg: 180.0,
-            cap_relief: CapRelief::None,
+            para9: Para9Status::default(),
         }
     }
 

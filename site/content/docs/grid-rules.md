@@ -231,8 +231,10 @@ away real kilowatt-hours to avoid a one-second transient nobody meters.
 `just demo capped` runs a clear **May** day on a 20 kWp roof with a small store —
 May, not June, because the cap is a fraction of *direct-current* power and how
 close a roof gets to that fraction is decided by cell temperature — and prints
-the quarter-hour feed-in peak against the ceiling. The cap binds, at 12,00 of
-12,00 kW for four quarter hours around solar noon, and the household loses
+the quarter-hour feed-in peak against the ceiling. The cap binds, at 12,06 of
+12,00 kW for four quarter hours around solar noon — the 60 W over is the
+simulated inverter's own settling time at a one-minute control period, not a
+decision — and the household loses
 **0,2 kWh** of export.
 
 That is far less than "60 %" sounds, and the arithmetic is worth stating: a
@@ -251,8 +253,7 @@ them wrong inflates it several-fold: the month (a 50 °C cell in June keeps a ro
 barely above the 60 % line), whether the planner is being shown the weather in
 advance, and whether the roof is modelled at its datasheet or at what a roof
 three years old actually delivers. With the cap lifted there is no curtailment at
-all and none at
-intelligent metering system fitted.
+all.
 
 An **LPP** session is a third source and a different story: it is a network
 operator asking for something right now. The three are reported apart, because
@@ -260,13 +261,57 @@ telling a household that a network operator intervened when in fact the statute
 simply applied is a different claim about the world.
 
 What lifts the 60 % cap is a **technical fact**, not a commercial one: an
-intelligent metering system with a control device in operation, or the output
-sold on the market *with* the Fernsteuerbarkeit § 10b EEG demands. "The contract
-is signed" and "the control path works" are different days, and on the days
-between them the cap still applies. The default is that nothing has lifted it —
-the cap staying on costs a household some feed-in, lifting it wrongly means
+intelligent metering system with a control device in operation *and* the network
+operator's first successful Ansteuerbarkeit test — § 9 Abs. 2 waits for both — or
+the output sold on the market with the Fernsteuerbarkeit § 10b EEG demands. "The
+contract is signed" and "the control path works" are different days, and on the
+days between them the cap still applies. The default is that nothing has lifted
+it: the cap staying on costs a household some feed-in, lifting it wrongly means
 feeding in above a statutory limit, and only one of those is the operator's
 problem.
+
+### The scope of the cap is three conditions and two of them are not sizes
+
+Reading § 9 Abs. 2 as *"2 to 100 kWp, from 25.02.2025"* is the obvious summary and
+every part of it is slightly wrong — in both directions.
+
+There is **no lower bound**. § 9 Abs. 2 S. 1 Nr. 3 reaches every system below
+25 kW that draws the Einspeisevergütung; the 2 kW everybody quotes is S. 4, which
+exempts *Steckersolargeräte* — and only those, and only with at most 800 VA of
+inverter, behind a Letztverbraucher's Entnahmestelle. Read as a size class it
+exempts every small roof array from a cap the statute puts on it, so it is a
+declared fact about the installation rather than an inference from a nameplate.
+
+The **upper bound is exclusive**: from 100 kW up, Nr. 1 demands remote
+reducibility and no percentage at all.
+
+And the date is a **window**. § 100 Abs. 3b disapplies the cap to systems
+commissioned between 01.01.2023 and 24.02.2025, so "before the Solarspitzengesetz"
+does not mean "uncapped": a system from 2019 still carries the obligation of the
+EEG version applicable to it, which it met either with equipment the operator can
+reduce it with — no static ceiling — or by limiting itself to **70 %**
+(§ 100 Abs. 3 S. 2 Nr. 2). Which of the two is, again, a declaration.
+
+### § 51 — one meter, two rules, two clocks
+
+§ 51 Abs. 1 reduces the **anzulegender Wert** to zero in a quarter hour with a
+negative spot price. Both remuneration schemes are computed from the anzulegender
+Wert — § 53 Abs. 1 for the Einspeisevergütung, Anlage 1 zu § 23a Nr. 1 for the
+Marktprämie — so the rule zeroes the tariff *and* the premium. A household in
+Direktvermarktung priced at `spot + Prämie` in a negative hour is being told it
+still earns the premium in exactly the hours the statute is paying it to stop.
+
+Whether the rule reaches a plant at all is a **date**. § 51 Abs. 2 Nr. 1 exempts
+anything below 100 kW for every period *before the end of the calendar year in
+which it is fitted with an intelligent metering system* — so a meter fitted in
+March keeps the negative hours of that whole year — and Nr. 2 exempts anything
+below 2 kW until a Bundesnetzagentur Festlegung that has not been made.
+
+That date is deliberately **not** the same fact as the one that lifts the 60 %
+cap. § 9 waits for the Ansteuerbarkeit test; § 51 asks only when the meter went
+in. The ordinary German § 14a household of 2026 is exactly the gap between them:
+an intelligent metering system in for years, so the negative quarter hours earn
+nothing, and the 60 % cap still on because nobody has run the test.
 
 ## The evidence record — and what "acted on it" means
 

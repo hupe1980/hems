@@ -1415,7 +1415,7 @@ mod tests {
                     ac_nominal: Power::from_kw(8.0),
                     tilt_deg: 35.0,
                     azimuth_deg: 180.0,
-                    cap_relief: CapRelief::None,
+                    para9: Para9Status::default(),
                 }),
                 Asset::Evse(Evse {
                     meta: meta("wallbox", 11.0),

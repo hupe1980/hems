@@ -22,6 +22,12 @@ market identifiers — comes from
   same house and none of them can ring or diverge at a quarter-hour step. So is
   the hot-water tank: three hundred litres between 45 and 60 °C are five
   kilowatt-hours of heat that can be bought hours before they are used.
+- 🍽️ **A shiftable appliance carries its programme** — `LoadKind::Shiftable`
+  holds the `Programme` it will run, quarter hour by quarter hour, so the state
+  where a machine announces flexibility and cannot say what of is not
+  representable. And it is a *shape*, not a duration and an average: a dishwasher
+  takes two kilowatts to heat and two hundred watts to wash, and a planner handed
+  the average schedules a machine that does not exist.
 - 🔀 **Wiring and mode are different questions** — `PhaseConnection` is what a
   device is wired to, `PhaseMode` is what it is using right now. Answering the
   second with the first is how an 11 kW wallbox drawing symmetrically on three

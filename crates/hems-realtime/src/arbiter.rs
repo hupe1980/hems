@@ -250,7 +250,19 @@ impl Arbiter {
             let mode = phases
                 .get(id)
                 .map_or_else(|| tick.state.phase_mode(asset), |p| p.mode);
-            let smoothed = envelope.clamp(hems_device::realisable(asset, ramped, mode));
+            // The envelope goes *into* the question rather than being applied
+            // after it. For an indivisible device the two are one question —
+            // "what may it take" and "what can it hold" have to be answered
+            // together — and answering them in sequence gets it wrong whichever
+            // order you pick. Clamping a realisable value puts it back between
+            // the device's steps (a charge point at 3,8 kW of a 4,14 kW minimum,
+            // a tank at 300 W of a 500 W relay), so the arbiter records a command
+            // the hardware answers with something else and the energy tracker
+            // spends the slot chasing energy that was never going to flow.
+            // Resolving after clamping instead can round *up* past the ceiling
+            // the guard just imposed, which under a § 14a budget is an
+            // exceedance. `realisable` therefore takes the envelope.
+            let smoothed = hems_device::realisable(asset, ramped, mode, envelope);
             commanded.insert(id.clone(), smoothed);
 
             // A change smaller than the deadband is not worth a message — unless
@@ -401,7 +413,7 @@ impl Arbiter {
                         Desire::Plan,
                     ),
                     Some(target) => (
-                        Self::tracking_power(tick, target),
+                        Self::tracking_power(tick, asset, target),
                         target_weight(
                             target.value_or(slot_plan.and_then(|s| s.marginal_eur_per_kwh)),
                         ),
@@ -526,7 +538,7 @@ impl Arbiter {
     /// so the last instant of a slot cannot produce a division by zero; and the
     /// result is clamped into the plan's own envelope, which is sign-consistent
     /// with the target — so catching up can never turn a charge into a discharge.
-    fn tracking_power(tick: &Tick<'_>, target: &AssetTarget) -> Power {
+    fn tracking_power(tick: &Tick<'_>, asset: &Asset, target: &AssetTarget) -> Power {
         let slot = Slot::containing(tick.now);
         let remaining = (slot.end() - tick.now).max(Duration::seconds(1));
         let done = tick
@@ -535,6 +547,20 @@ impl Arbiter {
             .copied()
             .unwrap_or(Energy::ZERO);
         let outstanding = target.energy() - done;
+
+        // A device with a single operating point is asked for that point while
+        // the slot still owes it energy, and for nothing once it does not. The
+        // average would be a power it cannot hold, and rounding the average to
+        // the nearest thing it can makes it wait until half its rating is due —
+        // after which it has to run flat out to the end of the slot and any
+        // interruption loses the difference. See `hems_device::single_speed`.
+        if let Some(rating) = hems_device::single_speed(asset) {
+            return if outstanding > Energy::ZERO {
+                target.envelope.clamp(rating)
+            } else {
+                Power::ZERO
+            };
+        }
         target.envelope.clamp(outstanding.over(remaining))
     }
 
@@ -548,11 +574,14 @@ impl Arbiter {
     /// exists to avoid, and it runs in both directions.
     ///
     /// Both directions share one rule: the claims are **increments** on what an
-    /// asset is already doing. The imbalance is measured at the connection point
-    /// with the assets already running, so an asset charging at 2 kW while 3 kW
-    /// leaves the house can absorb 3 kW *more*, not 3 kW in total. Claiming the
-    /// total is a mistake that hides itself — the loop still converges, by
-    /// oscillating around the answer once a second for as long as the sun is out.
+    /// asset is already doing, and the increment is **signed**. The imbalance is
+    /// measured at the connection point with the assets already running, so an
+    /// asset charging at 2 kW while 3 kW leaves the house can absorb 3 kW
+    /// *more*, not 3 kW in total — and a battery *discharging* at 2 kW while
+    /// 3 kW leaves the house ends at +1 kW, not at +3. Claiming the total, or
+    /// clamping the measurement at zero on the way in, is a mistake that hides
+    /// itself: the loop still converges, by oscillating around the answer once a
+    /// second for as long as the sun is out.
     fn self_consumption(
         &self,
         tick: &Tick<'_>,
@@ -621,8 +650,21 @@ impl Arbiter {
             .filter(|g| g.power > Power::ZERO)
             .map(|g| {
                 let now_p = tick.site.asset(&g.asset).map_or(Power::ZERO, &current);
+                // Both directions add the grant to what the asset is **already
+                // doing**, signed, because that is what the claim was: an
+                // increment on a measurement taken with the asset running.
+                //
+                // Clamping `now_p` at zero on the way in looks harmless and is
+                // the bug the module's own note describes. A battery covering
+                // the house at 2 kW when a cloud clears is measured at −2 kW
+                // while the meter shows 3 kW leaving; the increment that
+                // balances the connection is `−2 + 3 = +1 kW`, and dropping the
+                // sign asks for +3 kW, imports two, and the next tick sees a
+                // deficit and discharges again. The loop still converges — by
+                // oscillating around the answer once a second for as long as
+                // the sun is out.
                 let want = if cause == RealtimeCause::SurplusTracking {
-                    now_p.max(Power::ZERO) + g.power
+                    now_p + g.power
                 } else {
                     now_p - g.power
                 };
@@ -852,7 +894,7 @@ mod tests {
                     ac_nominal: Power::from_kw(8.0),
                     tilt_deg: 35.0,
                     azimuth_deg: 180.0,
-                    cap_relief: CapRelief::None,
+                    para9: Para9Status::default(),
                 }),
                 Asset::Evse(Evse {
                     meta: meta("wallbox", 11.0),
@@ -1123,6 +1165,31 @@ mod tests {
             d.setpoints
                 .iter()
                 .any(|s| matches!(s.reason, Reason::Realtime(RealtimeCause::SurplusTracking)))
+        );
+    }
+
+    #[test]
+    fn a_store_that_is_still_discharging_absorbs_only_the_surplus_that_exists() {
+        // The moment a cloud clears. The battery is covering the house at 2 kW
+        // and the roof has just come back, so the meter shows 3 kW leaving —
+        // *with the battery still discharging*. Turning the battery round to
+        // +3 kW imports 2 kW and the next tick sees a deficit, discharges
+        // again, and the pair oscillate for as long as the sun is out. The
+        // target is `now + surplus` = +1 kW, and the reason the claim is an
+        // increment in the first place.
+        let f = Fixture::new()
+            .grid(-3.0)
+            .measure("pv", -5.5)
+            .measure("battery", -2.0)
+            .measure("haushalt", 0.5)
+            // No car on the cable, so the whole pool is the battery's.
+            .measure("wallbox", 0.0);
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
+        let battery = commanded(&d, "battery");
+        assert!(
+            (battery.kw() - 1.0).abs() < 1e-6,
+            "the battery should take the 3 kW that is actually leaving, ending \
+             at +1 kW rather than +3: got {battery}"
         );
     }
 

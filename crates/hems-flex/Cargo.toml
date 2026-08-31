@@ -25,3 +25,6 @@ thiserror   = { workspace = true }
 
 [dev-dependencies]
 time = { workspace = true, features = ["macros"] }
+# Every description is checked against the standard's own JSON schema by
+# round-tripping it: a description that cannot be serialised cannot be sent.
+serde_json = { workspace = true }

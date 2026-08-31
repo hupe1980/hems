@@ -27,4 +27,4 @@ rust_decimal_macros = "1"
 [features]
 default = ["serde"]
 ## Serialize/deserialize every public type.
-serde = ["dep:serde", "hems-core/serde", "hems-grid/serde", "rust_decimal/serde"]
+serde = ["dep:serde", "hems-core/serde", "hems-grid/serde", "rust_decimal/serde-with-str"]

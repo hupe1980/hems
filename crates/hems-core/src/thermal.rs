@@ -97,6 +97,70 @@ impl ThermalState {
     }
 }
 
+/// What the compressor has been doing when the plan is made.
+///
+/// # Why a minimum runtime needs a memory
+///
+/// A heat pump's minimum on-time and minimum off-time are
+/// stated *inside* a plan: on at slot `k` and off at `k − 1` forces on at
+/// `k + 1`. That is the textbook unit-commitment formulation and it is right —
+/// but a receding-horizon controller commits only the **first** slot and then
+/// throws the rest away, and the first slot is the one with no `k − 1` in the
+/// model to be constrained against.
+///
+/// So without this the constraint binds only on slots that are never executed.
+/// A plan may start the compressor at 08:00, the box commits that quarter hour,
+/// re-plans at 08:15 against a model with no memory at all, and stops it again —
+/// for ever, at every re-plan, and each plan is individually feasible. The
+/// executed trajectory short-cycles exactly as though `min_on_slots` had never
+/// been written, and nothing anywhere reports a violation, because within each
+/// plan there is none.
+///
+/// Carrying the two facts a compressor has — whether it is running, and for how
+/// long — closes the horizon boundary: the planner turns them into the slots at
+/// the start of the plan that are not decisions any more, and pins those rather
+/// than branching on them.
+///
+/// It lives here rather than in the planner because the **simulator** needs the
+/// same two facts to answer one, and a house whose compressor obeyed a different
+/// rule from the plan's would make every cycling figure meaningless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CompressorState {
+    /// Whether the compressor is running as the horizon opens.
+    pub running: bool,
+    /// How many whole slots it has been in that state.
+    ///
+    /// Saturating: a unit that has been off since yesterday and one that has
+    /// been off for an hour are equally free, so a caller may count as far as it
+    /// likes and does not have to clamp.
+    pub slots_in_state: usize,
+}
+
+impl CompressorState {
+    /// A compressor that has been in its state long enough to be free.
+    #[must_use]
+    pub const fn settled(running: bool) -> Self {
+        Self {
+            running,
+            slots_in_state: usize::MAX,
+        }
+    }
+
+    /// The state after a slot in which the unit was `running`.
+    #[must_use]
+    pub const fn after(self, running: bool) -> Self {
+        Self {
+            running,
+            slots_in_state: if self.running == running {
+                self.slots_in_state.saturating_add(1)
+            } else {
+                1
+            },
+        }
+    }
+}
+
 impl Rc2 {
     /// A well-insulated German single-family house of roughly 150 m².
     ///

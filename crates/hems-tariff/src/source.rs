@@ -120,6 +120,7 @@ pub enum Source {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PriceSeries {
     /// One entry per quarter hour, ct/kWh.
+    #[cfg_attr(feature = "serde", serde(with = "crate::wire::decimal_map"))]
     pub points: BTreeMap<Slot, Decimal>,
     /// Where it came from.
     pub source: Source,
