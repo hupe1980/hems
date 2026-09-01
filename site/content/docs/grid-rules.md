@@ -1,7 +1,7 @@
 +++
 title = "The grid rules"
 description = "§ 14a EnWG, the EEBUS limitation state machine, § 9 EEG, Modul 3, MiSpeL and § 42c — as code, with the citation for every number."
-weight = 3
+weight = 4
 +++
 
 Every rule in `hems-grid` names the document it comes from. `[A1 4.5.2]` is
@@ -75,6 +75,16 @@ in the guard once a second against measurements.
 ```text
 budget = ceiling + max(0, production − other load)
 ```
+
+<pre class="mermaid">
+flowchart LR
+  PV["roof<br/>4,0 kW"] --> N{"surplus?"}
+  HH["household load<br/>1,2 kW"] --> N
+  N -- "2,8 kW spare" --> B["budget for the<br/>controllable devices"]
+  BAT["battery discharging<br/>2,6 kW, sustainable"] --> B
+  C["§ 14a ceiling<br/>4,2 kW"] --> B
+  B --> R["9,6 kW the wallbox and the<br/>heat pump may share, lawfully"]
+</pre>
 
 Electrons carry no labels, so the split between controllable and other load has
 to be chosen — and the Festlegung does not choose. It defines the quantity as
@@ -182,6 +192,23 @@ implemented backwards.
 | `failsafe` | The heartbeat stopped; the failsafe value applies |
 | `unlimited/autonomous` | Out of contact long enough that the failsafe was released |
 
+<pre class="mermaid">
+stateDiagram-v2
+  [*] --> init : restart
+  init --> unlimited_controlled : heartbeat resumes,<br/>no limit in force
+  init --> limited : heartbeat resumes,<br/>a limit is in force
+  unlimited_controlled --> limited : Energy Guard writes a limit
+  limited --> unlimited_controlled : limit released, or its<br/>duration expires [LPC-909]
+  unlimited_controlled --> failsafe : heartbeat missed for 120 s
+  limited --> failsafe : heartbeat missed for 120 s
+  failsafe --> limited : contact returns,<br/>a limit is in force
+  failsafe --> unlimited_controlled : contact returns
+  failsafe --> unlimited_autonomous : FailsafeDurationMinimum<br/>expires [LPC-922]
+  unlimited_autonomous --> unlimited_controlled : contact returns
+  note right of init : a restart comes back limited, not free
+  note right of unlimited_autonomous : a broken control box must not<br/>block a household for ever
+</pre>
+
 - The heartbeat goes both ways at least every 60 s (`[LPC-005]`, `[LPC-006]`).
 - Missing it for 120 s means the Energy Guard is gone.
 - A restart comes back **limited**, not free (`[LPC-901/1]`) — a heat pump that
@@ -192,7 +219,10 @@ implemented backwards.
   broken control box must not block a household for ever.
 
 That last one is what an implementation written from intuition gets wrong, and
-it has a test named after it.
+it has a test named after it. The machine itself lives in the
+[`eebus`](https://crates.io/crates/eebus) crate and hems *derives* its state from
+it rather than tracking one alongside — see [devices and
+drivers](@/docs/devices.md#eebus-the-ss-14a-side).
 
 `init` and `failsafe` are also not § 14a events. The limit in force there is the
 device's own preconfigured value, applied because nothing is talking to it — the

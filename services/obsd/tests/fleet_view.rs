@@ -4,7 +4,7 @@
 //! so the two cannot drift — but a shared type still leaves a wire, and this is
 //! the test that says the wire works.
 //!
-//! The wire is a **signed CloudEvent** (D11), so every request here is signed
+//! The wire is a **signed CloudEvent**, so every request here is signed
 //! the way a box signs one, and three of the tests are about what happens when
 //! it is not.
 

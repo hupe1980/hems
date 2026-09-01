@@ -2007,7 +2007,7 @@ fn a_price_that_moves_faster_than_the_block_is_what_blocking_costs() {
 #[test]
 fn blocking_never_swallows_a_committed_slot() {
     // `heat_pump_binary` pins the slots the compressor's own history has
-    // already decided (D65). Pinning the *start* of a block would pin the whole
+    // already decided. Pinning the *start* of a block would pin the whole
     // block, so the fine head has to be at least as long as anything the unit
     // still owes — which is what `fine_for` guarantees and what this checks
     // through the plan rather than through the arithmetic.

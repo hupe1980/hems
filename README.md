@@ -41,10 +41,16 @@ This file is the front door.
 |---|---|
 | [Getting started](https://hupe1980.github.io/hems/docs/getting-started/) | clone it, run the checks, watch a January day with a § 14a reduction |
 | [Architecture](https://hupe1980.github.io/hems/docs/architecture/) | three control planes, three cadences, one order of authority |
+| [The domain model](https://hupe1980.github.io/hems/docs/domain-model/) | one sign convention, the quarter-hour grid, the electrical tree, commands that name a reason |
 | [The grid rules](https://hupe1980.github.io/hems/docs/grid-rules/) | § 14a, § 9 EEG, Modul 3, MiSpeL, § 42c — as code, with the citation for every number |
+| [Tariffs and prices](https://hupe1980.github.io/hems/docs/tariffs/) | the bill as a stack, the five day-ahead sources, § 51 EEG, the Modul advisor |
 | [The planner](https://hupe1980.github.io/hems/docs/optimizer/) | the receding-horizon MILP, and what a kilowatt-hour is worth per device |
 | [Forecasting](https://hupe1980.github.io/hems/docs/forecasting/) | what the box believes about tomorrow, and what being wrong costs |
 | [Flexibility](https://hupe1980.github.io/hems/docs/flexibility/) | S2 / EN 50491-12-2 as the internal model |
+| [Devices and drivers](https://hupe1980.github.io/hems/docs/devices/) | amperes, contact states, contactors — and the sans-I/O driver contract |
+| [Simulation](https://hupe1980.github.io/hems/docs/simulation/) | seven reference days, simulators that say no, and the sweeps a single day cannot replace |
+| [The fleet](https://hupe1980.github.io/hems/docs/services/) | five daemons around one box, and why none of them is a trust anchor |
+| [Security](https://hupe1980.github.io/hems/docs/security/) | a key the box was built with, secrets as references, SBOM and provenance |
 
 ## 🚀 Try it
 
@@ -84,8 +90,27 @@ assert!((minimum_power(&devices, ControlMode::Ems).kw() - 7.56).abs() < 1e-9);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-## 🏠 One day, end to end
+## 🧭 How it is arranged
 
+```mermaid
+flowchart TB
+  M["measurements, every second"] --> G
+  L["§ 14a limit from the Steuerbox<br/>§ 9 EEG cap · fuses · backup reserve"] --> G
+  G["<b>Guard</b> — absolute<br/>an interval per asset"]
+  F["forecasts · prices · site state"] --> P["<b>Planner</b> — advisory<br/>96 quarter-hour slots,<br/>re-solved every quarter hour"]
+  P -- "target · envelope · a price per asset" --> A["<b>Arbiter</b> — once a second<br/>desire → guard → smooth → explain"]
+  G -- "the interval nothing may widen" --> A
+  A --> S["setpoints, each naming its Reason"]
+  S --> D["drivers — sans-I/O"]
+  D --> M
+```
+
+Every layer may only **narrow** what the layer above allowed, so “the grid limit
+was respected” is a property of the structure rather than a code path somebody
+remembered to write — and it is checked as one, over a thousand randomised
+households.
+
+## 🏠 One day, end to end
 
 ```console
 $ cargo run -p hemsd -- simulate --day winter
@@ -140,7 +165,6 @@ $ cargo run -p hemsd -- simulate --day winter
   Modul 2 pays above                     2417 kWh/a
   …on this day it would have         -3.97 € on the energy
 ```
-
 
 Four lines there are not in anybody else's table, and the
 [planner page](https://hupe1980.github.io/hems/docs/optimizer/) argues each:
@@ -222,7 +246,8 @@ the index records the retrieval URL of each.
 | [`hems-forecast`](crates/hems-forecast) | Solar geometry and a physical photovoltaic model, an online residual corrector that learns what *this* roof delivers, load profiles by day type, charging-session statistics by weekday, RC identification of the building from its own record, naive fallbacks, and the metrics that score all of it | none |
 | [`hems-optimizer`](crates/hems-optimizer) | Receding-horizon MILP: cost, wear, comfort, hot water, shiftable appliances placed rather than smeared, grid limits per slot as hard constraints | none |
 | [`hems-realtime`](crates/hems-realtime) | The guard plane, fair allocation of a limited budget, the one-second arbiter | none |
-| [`hems-device`](crates/hems-device) | What a wanted power becomes on real hardware: amperes, phase counts, SG Ready contacts | none |
+| [`hems-device`](crates/hems-device) | What a wanted power becomes on real hardware: amperes, phase counts, SG Ready contacts — and `realisable`, what a semi-continuous device will *actually* take | none |
+| [`hems-drv`](crates/hems-drv) | The driver contract — bytes and a clock in, events and bytes out — with SunSpec over Modbus TCP and the EEBUS LPC Controllable System behind features | none |
 | [`hems-flex`](crates/hems-flex) | The household's flexibility in S2 (EN 50491-12-2): which control type each asset is, every description a whole site would send — the same wallbox is a store with a car on it and an envelope without one — and what an instruction means | none |
 | [`hems-sim`](crates/hems-sim) | Battery, charge point, inverter, building, hot-water tank, a dishwasher that will not be paused, and Steuerbox simulators on virtual time — each with at least one way of saying no — and a seeded weather realisation, so the day that happens is not the day that was forecast | none |
 | [`hems-events`](crates/hems-events) | The CloudEvents catalogue, enforced by a workspace guard | none |
@@ -241,29 +266,30 @@ the index records the retrieval URL of each.
 
 ## 📊 Status
 
-| Milestone | State |
-|---|---|
-| **M1–M3.17** the whole control stack: domain and grid rules, the guard and arbiter, the MILP planner, simulators and end-to-end days, S2, § 9 EEG and § 42c, shiftable appliances, planning against three futures, and the end of perfect foresight | ✅ done |
-| **M4a** the driver contract (`hems-drv`): sans-I/O, two kinds of driver in one trait, declared capabilities | ✅ done |
-| **M4b** `hems-drv/modbus`: SunSpec over Modbus TCP — discovery, scale factors, curtailment, and model 701's `ThrotPct` for what a curtailed roof *could* do | ✅ done |
-| **M4c** the driver registry: `hemsd` owns the set, checks it against the site *before* a byte moves, and folds what the drivers say into one `SiteState` | ✅ done |
-| **M4d** the event loop: a task per driver that connects, reads, writes and reconnects; and a site loaded from configuration | ⏳ next |
-| **M5a** `hems-drv/eebus`: the LPC/LPP **Controllable System** on the [`eebus`](https://crates.io/crates/eebus) crate — a whole § 14a day in virtual time | ✅ done |
-| **M5b** the SHIP/SPINE transport under it (TLS, SKI pairing, trust store); conformance harness; the ElaadNL interoperability event | ⏳ |
-| **M6a–f** the fleet: `hems-service` (the shell), `tariffd` (prices fetched), `forecastd` (ICON-D2), `histd` (the two years, and the Data Act export), `fleetd` (enrolment and signed releases), `obsd` (the fleet view) | ✅ done |
-| **M6g** `portald`, the `meterstore` tier of `histd`, GDPR erasure, RAUC A/B images and OTA campaigns | 📐 designed |
-| **M7** `flexd` (OpenADR 3.1, § 41e) and `hems-bridge-mako` — the MiSpeL and § 42c *exports*, since the arithmetic already shipped in M3.8 | 📐 designed |
-| **M8** EEBUS CEM role for devices, S2 adapter, V2H/V2G (OCPP 2.1 BPT + `iso15118`), `agentd` | 📐 designed |
-| **M9** Matter DEM, the CLS/aEMT path, a `hemstest` Python toolkit | 📐 designed |
+**Pre-alpha, and the line is worth being exact about: nothing here talks to
+household hardware yet.** `hems-sim` stands in for every device. What is real is
+the control stack, the rules and the fleet — and the simulated days run the same
+guard, arbiter and planner a box would.
 
-Nothing here talks to household hardware yet: `hems-sim` stands in for every
-device, and the drivers are M4/M5. What is real is the control stack, the rules
-and now the fleet — prices and weather are fetched rather than supplied, the
-§ 14a evidence is stored for its two years rather than dying with the process,
-and a box is enrolled, offered a configuration and an update it verifies against
-a key it was built with, and reports its day as a signed event a fleet view will
-not take unsigned. The simulated days run the same guard, arbiter and planner a
-box would.
+| Works today | |
+|---|---|
+| The domain model and the German grid rules | § 14a, § 9 EEG, § 51, Modul 3, MiSpeL, § 42c, the two-year evidence record — all cited |
+| The guard, the allocator and the one-second arbiter | with the § 14a precedence as a property test over a thousand randomised households |
+| The receding-horizon MILP | wear, comfort, hot water, placed appliances, per-slot grid limits, a shadow price per asset, and planning against three futures |
+| Forecasting, and being scored on it | solar geometry, a residual corrector that learns *this* roof, CRPS and calibration beside the money |
+| Seven reference days end to end | plus multi-day back-test and risk sweeps |
+| S2 / EN 50491-12-2 as the internal flexibility model | every message a whole site would send, and a count of what it cannot express |
+| The driver contract, SunSpec over Modbus TCP, and the EEBUS LPC Controllable System | sans-I/O; a whole § 14a day in virtual time |
+| The driver registry | `hemsd` checks the drivers against the site *before* a byte moves |
+| The five fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
+
+| Not yet | |
+|---|---|
+| The event loop that owns real sockets | a task per driver that connects, reads, writes and reconnects, and a site loaded from configuration — **next** |
+| SHIP / SPINE under EEBUS | TLS, SKI pairing, a trust store; the conformance harness and an interoperability event |
+| The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
+| The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
+| Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
 727 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
@@ -271,13 +297,13 @@ clock, the whole suite, the workspace guards (328 citations across five document
 families, each resolving to a document the index carries; 121 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
-Three of them are worth naming because of what they guard against. One asserts
-the reference day's forecasts were **wrong**, since a day the planner cannot be
-surprised by measures a planner that was shown the answer. One runs the day's own
-quarter-hour registers through the § 42c allocation. One checks that every asset
-the arbiter commands can be described in S2. A rule module can be implemented,
-cited, tested and reached by nothing at all, and no property test catches that —
-a property is a statement about code that runs.
+Three of those tests are worth naming because of what they guard against. One
+asserts the reference day's forecasts were **wrong**, since a day the planner
+cannot be surprised by measures a planner that was shown the answer. One runs the
+day's own quarter-hour registers through the § 42c allocation. One checks that
+every asset the arbiter commands can be described in S2. A rule module can be
+implemented, cited, tested and reached by nothing at all, and no property test
+catches that — a property is a statement about code that runs.
 
 ## 🤝 Related crates
 

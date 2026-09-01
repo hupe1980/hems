@@ -998,8 +998,8 @@ pub struct Problem<'a> {
 /// and fifty-two seconds** of solver time to plan one simulated day, against
 /// nine seconds for the same day on a modulating unit. Three numerical
 /// approaches were measured and none of them closed the gap: the tighter
-/// Rajan–Takriti rows (D66), the warm start (D71) and pinning the slots the
-/// compressor's own history has already decided (D65).
+/// Rajan–Takriti rows, the warm start, and pinning the slots the compressor's
+/// own history has already decided.
 ///
 /// # Why coarsening the tail is exact where it matters
 ///
@@ -1022,7 +1022,7 @@ pub struct Problem<'a> {
 /// running at all.
 ///
 /// The head stays fine, which is where every property that has to hold holds:
-/// the minimum runtime across the re-plan boundary (D65), the § 14a ceiling that
+/// the minimum runtime across the re-plan boundary, the § 14a ceiling that
 /// arrives at teatime, the comfort band this afternoon.
 ///
 /// # It cannot make a plan unlawful

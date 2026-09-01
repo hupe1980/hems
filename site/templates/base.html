@@ -23,8 +23,8 @@
 <meta name="description" content="{{ meta_desc }}">
 <link rel="canonical" href="{{ meta_url }}">
 <meta name="color-scheme" content="light dark">
-<meta name="theme-color" content="#b8410f" media="(prefers-color-scheme: light)">
-<meta name="theme-color" content="#0f1216" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d1116" media="(prefers-color-scheme: dark)">
 <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
 
 <meta property="og:site_name" content="{{ config.title }}">
@@ -40,6 +40,31 @@
 <link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
 <link rel="sitemap" type="application/xml" href="{{ get_url(path='sitemap.xml') }}">
 <link rel="alternate" type="application/atom+xml" title="{{ config.title }}" href="{{ get_url(path='atom.xml') }}">
+
+<!-- The two syntax sheets are matched on the media query by default; the theme
+     toggle in `hems.js` flips their `media` attribute so an explicit choice
+     reaches the code blocks too. They load *before* the site stylesheet so that
+     the site's own `pre` background wins the tie. -->
+<link id="syntax-light" rel="stylesheet" href="{{ get_url(path='giallo-light.css') }}" media="(prefers-color-scheme: light)">
+<link id="syntax-dark" rel="stylesheet" href="{{ get_url(path='giallo-dark.css') }}" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="{{ get_url(path='hems.css') }}">
+<script>
+/* Before first paint, so a reader who chose a theme never sees the other one.
+   The two syntax links are already parsed at this point, so their media queries
+   can be replaced here rather than after the stylesheet has painted. */
+(function () {
+  try {
+    var t = localStorage.getItem('hems-theme');
+    if (t !== 'light' && t !== 'dark') return;
+    document.documentElement.setAttribute('data-theme', t);
+    var l = document.getElementById('syntax-light');
+    var d = document.getElementById('syntax-dark');
+    if (l) l.media = t === 'light' ? 'all' : 'not all';
+    if (d) d.media = t === 'dark' ? 'all' : 'not all';
+  } catch (e) { /* private mode */ }
+})();
+</script>
+
 {% block schema %}
 <script type="application/ld+json">
 {
@@ -56,87 +81,77 @@
 }
 </script>
 {% endblock %}
-<style>
-:root{--fg:#12151a;--muted:#5b6472;--bg:#fff;--accent:#b8410f;--line:#e4e7ec;--code:#f6f7f9;--soft:#fbfcfd}
-@media(prefers-color-scheme:dark){:root{--fg:#e6e9ee;--muted:#98a2b3;--bg:#0f1216;--accent:#ff8a4c;--line:#242a33;--code:#161a20;--soft:#131820}}
-*{box-sizing:border-box}
-html{scroll-behavior:smooth}
-body{margin:0;font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--fg);background:var(--bg);text-rendering:optimizeLegibility}
-a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
-.skip{position:absolute;left:-999px}
-.skip:focus{left:.5rem;top:.5rem;background:var(--bg);border:1px solid var(--accent);padding:.4rem .7rem;border-radius:4px;z-index:20}
-header{border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:10}
-nav{max-width:56rem;margin:0 auto;padding:.9rem 1.25rem;display:flex;gap:1.25rem;align-items:baseline;flex-wrap:wrap}
-nav .brand{font-weight:700;font-size:1.15rem;color:var(--fg)}
-nav .spacer{flex:1}
-nav a[aria-current=page]{font-weight:600;color:var(--fg)}
-main{max-width:56rem;margin:0 auto;padding:2.5rem 1.25rem 4rem}
-h1{font-size:2.1rem;line-height:1.2;margin:.2em 0 .4em;letter-spacing:-.015em}
-h2{font-size:1.45rem;margin-top:2.4rem;padding-top:.4rem;border-top:1px solid var(--line);scroll-margin-top:4rem}
-h3{font-size:1.15rem;margin-top:1.8rem;scroll-margin-top:4rem}
-p.lead{font-size:1.15rem;color:var(--muted)}
-table{border-collapse:collapse;width:100%;margin:1.2rem 0;font-size:.94rem;display:block;overflow-x:auto}
-th,td{text-align:left;padding:.5rem .7rem;border-bottom:1px solid var(--line);vertical-align:top}
-th{font-weight:600}
-code{background:var(--code);padding:.12em .35em;border-radius:3px;font-size:.9em}
-pre{background:var(--code);padding:1rem;border-radius:6px;overflow-x:auto;font-size:.88rem;line-height:1.5}
-pre code{background:none;padding:0}
-blockquote{margin:1.2rem 0;padding:.1rem 1rem;border-left:3px solid var(--accent);color:var(--muted)}
-footer{border-top:1px solid var(--line);color:var(--muted);font-size:.9rem;padding:1.5rem 1.25rem 3rem;max-width:56rem;margin:0 auto}
-footer nav{padding:0 0 .8rem;max-width:none}
-.cards{display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));margin:1.5rem 0}
-.card{border:1px solid var(--line);border-radius:8px;padding:1rem 1.1rem;background:var(--soft)}
-.card h3{margin:0 0 .35rem;font-size:1rem}
-.card p{margin:0;color:var(--muted);font-size:.92rem}
-.toc{border:1px solid var(--line);border-radius:8px;padding:.9rem 1.1rem;margin:1.6rem 0;background:var(--soft);font-size:.94rem}
-.toc strong{display:block;font-size:.8rem;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:.5rem}
-.toc ul{margin:0;padding-left:1.1rem}
-.toc li{margin:.2rem 0}
-.hero{border-bottom:1px solid var(--line);background:linear-gradient(180deg,var(--soft),var(--bg))}
-.hero-inner{max-width:56rem;margin:0 auto;padding:4rem 1.25rem 3.2rem}
-.hero-eyebrow{margin:0 0 .9rem;font-size:.78rem;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-weight:600}
-.hero-title{font-size:2.7rem;line-height:1.1;letter-spacing:-.025em;margin:0 0 .9rem;max-width:20ch}
-.hero-sub{font-size:1.15rem;line-height:1.6;color:var(--muted);margin:0 0 1.8rem;max-width:60ch}
-.hero-cta{display:flex;gap:.7rem;flex-wrap:wrap}
-.btn{display:inline-block;padding:.6rem 1.15rem;border-radius:6px;font-weight:600;font-size:.95rem;border:1px solid var(--accent)}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-ghost{background:transparent;color:var(--accent)}
-.btn:hover{text-decoration:none;filter:brightness(1.08)}
-.stats{border-bottom:1px solid var(--line);background:var(--bg)}
-.stats-inner{max-width:56rem;margin:0 auto;padding:1.4rem 1.25rem;display:grid;gap:1rem;grid-template-columns:repeat(auto-fit,minmax(8rem,1fr))}
-.stats-inner div{display:flex;flex-direction:column;gap:.15rem}
-.stats-inner strong{font-size:1.5rem;line-height:1;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
-.stats-inner span{font-size:.82rem;color:var(--muted);line-height:1.35}
-@media(max-width:34rem){.hero-title{font-size:2.05rem}.hero-inner{padding:2.6rem 1.25rem 2.2rem}}
-.cta{margin:1.6rem 0 .5rem}
-.cta p{display:flex;gap:.7rem;flex-wrap:wrap;margin:0}
-.cta a{display:inline-block;padding:.55rem 1.1rem;border-radius:6px;background:var(--accent);color:#fff;font-weight:600;font-size:.95rem;border:1px solid var(--accent)}
-.cta a:hover{text-decoration:none;filter:brightness(1.08)}
-.cta a+a{background:transparent;color:var(--accent)}
-.pager{display:flex;gap:1rem;justify-content:space-between;margin-top:3rem;padding-top:1.2rem;border-top:1px solid var(--line);font-size:.94rem}
-.zola-anchor{opacity:0;margin-left:.35rem;font-weight:400;text-decoration:none}
-h2:hover .zola-anchor,h3:hover .zola-anchor,.zola-anchor:focus{opacity:.55}
-</style>
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
-<header><nav>
-  <a class="brand" href="{{ get_url(path='@/_index.md') }}">⚡ hems</a>
-  <a href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a>
-  <span class="spacer"></span>
-  <a href="{{ config.extra.repository }}" rel="noopener">GitHub</a>
-</nav></header>
-{% block prelude %}{% endblock %}
-<main id="content">{% block content %}{% endblock %}</main>
-<footer>
-  <nav>
-    <a href="{{ get_url(path='@/docs/getting-started.md') }}">Getting started</a> ·
-    <a href="{{ get_url(path='@/docs/architecture.md') }}">Architecture</a> ·
-    <a href="{{ get_url(path='@/docs/grid-rules.md') }}">Grid rules</a> ·
-    <a href="{{ config.extra.repository }}" rel="noopener">Source</a>
+
+<header class="site-header">
+  <nav class="site-nav" aria-label="Site">
+    <a class="brand" href="{{ get_url(path='@/_index.md') }}"><span class="mark" aria-hidden="true">⚡</span>hems</a>
+    <div class="links">
+      <a href="{{ get_url(path='@/docs/_index.md') }}">Documentation</a>
+      <a href="{{ get_url(path='@/docs/getting-started.md') }}">Get started</a>
+    </div>
+    <span class="spacer"></span>
+    <button id="theme-toggle" class="icon-btn" type="button" hidden aria-label="Colour theme">◐</button>
+    <a class="icon-btn" href="{{ config.extra.repository }}" rel="noopener" aria-label="Source on GitHub" title="Source on GitHub">
+      <svg width="15" height="15" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+    </a>
   </nav>
-  MIT OR Apache-2.0 · Not affiliated with the Bundesnetzagentur, the BDEW, the
-  EEBus Initiative or the VDE. Regulatory documents are cited, never redistributed.
+</header>
+
+<main id="content">{% block content %}{% endblock %}</main>
+
+<footer class="site-footer">
+  <div class="footer-inner">
+    <div>
+      <h2>Start</h2>
+      <ul>
+        <li><a href="{{ get_url(path='@/docs/getting-started.md') }}">Getting started</a></li>
+        <li><a href="{{ get_url(path='@/docs/architecture.md') }}">Architecture</a></li>
+        <li><a href="{{ get_url(path='@/docs/domain-model.md') }}">Domain model</a></li>
+      </ul>
+    </div>
+    <div>
+      <h2>The rules</h2>
+      <ul>
+        <li><a href="{{ get_url(path='@/docs/grid-rules.md') }}">Grid rules</a></li>
+        <li><a href="{{ get_url(path='@/docs/tariffs.md') }}">Tariffs and prices</a></li>
+        <li><a href="{{ get_url(path='@/docs/flexibility.md') }}">Flexibility (S2)</a></li>
+      </ul>
+    </div>
+    <div>
+      <h2>The control stack</h2>
+      <ul>
+        <li><a href="{{ get_url(path='@/docs/optimizer.md') }}">The planner</a></li>
+        <li><a href="{{ get_url(path='@/docs/forecasting.md') }}">Forecasting</a></li>
+        <li><a href="{{ get_url(path='@/docs/devices.md') }}">Devices and drivers</a></li>
+      </ul>
+    </div>
+    <div>
+      <h2>Running it</h2>
+      <ul>
+        <li><a href="{{ get_url(path='@/docs/simulation.md') }}">Simulation</a></li>
+        <li><a href="{{ get_url(path='@/docs/services.md') }}">The fleet</a></li>
+        <li><a href="{{ get_url(path='@/docs/security.md') }}">Security</a></li>
+      </ul>
+    </div>
+    <div>
+      <h2>Project</h2>
+      <ul>
+        <li><a href="{{ config.extra.repository }}" rel="noopener">Source</a></li>
+        <li><a href="{{ config.extra.repository }}/releases" rel="noopener">Releases</a></li>
+        <li><a href="{{ get_url(path='atom.xml') }}">Atom feed</a></li>
+      </ul>
+    </div>
+  </div>
+  <div class="footer-legal">
+    <p>MIT OR Apache-2.0. hems is not affiliated with the Bundesnetzagentur, the
+    BDEW, the EEBus Initiative or the VDE. Regulatory documents are cited, never
+    redistributed.</p>
+  </div>
 </footer>
+
+<script src="{{ get_url(path='hems.js') }}" defer></script>
 </body>
 </html>

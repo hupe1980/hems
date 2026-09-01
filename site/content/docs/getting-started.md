@@ -1,33 +1,60 @@
 +++
 title = "Getting started"
-description = "Clone it, run the checks, watch a household get through a January day with a § 14a reduction."
+description = "Clone it, run the checks, and watch a household get through a January day with a § 14a reduction."
 weight = 1
 +++
 
 ## Requirements
 
-Rust 1.94 (pinned in `rust-toolchain.toml`) and [`just`](https://just.systems).
-Nothing else: the default solver is pure Rust, so there is no C++ toolchain and
-no system library to install.
+Rust **1.94** (pinned in `rust-toolchain.toml`) and [`just`](https://just.systems).
 
-## Run everything
+Nothing else. The default solver is pure Rust, so there is no C++ toolchain and
+no system library to install, and every test runs on a machine with no network.
 
 ```console
 $ git clone https://github.com/hupe1980/hems && cd hems
+$ just            # lists every recipe
+```
+
+## Run the checks
+
+```console
 $ just ci
 ```
 
-`just ci` runs formatting, Clippy with warnings as errors, the purity check, the
-whole test suite, the workspace guards, `cargo-deny` and the documentation
-build — the same list, in the same order, that CI runs.
+The same list, in the same order, that CI runs:
+
+| Step | What it is |
+|---|---|
+| `fmt-check` | `cargo fmt --all --check` |
+| `lint` | Clippy, **warnings as errors**, every target and every feature |
+| `purity` | fails if a domain crate reaches for a clock, the filesystem, the network or `unsafe` |
+| `test` | the whole suite, all features |
+| `guards` | `cargo xtask check-all` — citations, the event catalogue, manifests, wire forms |
+| `deny` | licences and advisories |
+| `doc` | rustdoc with warnings as errors |
+
+`guards` is the unusual one. It resolves **328 regulatory citations** across five
+document families against an index of primary sources and fails the build if one
+names a document the index does not carry; and it checks that each of **121**
+quantities, instants and dates says how it travels on the wire.
 
 ## Watch a day
+
+```console
+$ cargo run -p hemsd -- simulate --day winter
+```
+
+One simulated January day through the whole control stack — guard, arbiter,
+planner, evidence recorder — against simulated hardware and a seeded weather the
+planner never sees. It runs in seconds and prints
+[the report on the front page](/).
 
 ```console
 $ just demo-all
 ```
 
-Seven days and six comparisons:
+Seven days, and six comparisons run against them. The days:
 
 | Day | What it shows | Saved |
 |---|---|---|
@@ -39,103 +66,30 @@ Seven days and six comparisons:
 | `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,72 |
 | `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,06 of 12,00 kW — the 60 W over is the inverter's own settling time, not a decision | €1,31 |
 
-…plus eight comparisons:
+What each comparison isolates, and why a reference day is built the way it is,
+are on [simulation and evaluation](@/docs/simulation.md).
 
-| Flag | What it isolates |
-|---|---|
-| `--perfect-foresight` | the January day with the future known in advance: €5,25 against the €2,09 an honest forecast earns |
-| `--wear-eur-per-kwh 0` | what a cost-only optimiser does to a battery — 18,7 kWh of throughput instead of 15,5 |
-| `--no-phase-switching` | on the autumn day: 0,2 kWh into the car against 13,1, and a car 4,8 kWh short of where it had to be |
-| `--risk` | one future or three, and how much of the objective sits on the worst of them. `just risk` runs the multi-weather sweep that says what each is worth — a single day pays a hedge's premium every time and makes its claim never |
-| `--imsys` | the § 9 EEG cap lifted on both households — one cent to the managed one, twelve to the unmanaged one |
-| `--uniform-weights` | every asset given the same allocation weight, which is what a single marginal value per slot amounts to |
-| `--sharing` | the household inside a § 42c energy-sharing community: 14,5 kWh allocated, the flexible load moved into the neighbours' daylight — and the baseline in the same community, so the figure is the value of shifting rather than of joining |
-| `--heat-pump-on-off` | a single-speed compressor rather than a modulating one — the only unit whose cycling is scheduled, so the only one a minimum runtime constrains. Slower on purpose: a binary per slot per re-plan, committed per clock hour beyond a two-hour head |
-
-`--store <path>` keeps the day's § 14a evidence and quarter-hour registers in the
-box's own database — the two years `[A1 7.3]` asks for, written *before* anything
-is reported anywhere, with an outbox column so what the fleet has not
-acknowledged is a backlog rather than a gap. A record that exists only once it
-has been uploaded is an intention with a network dependency.
-
-`just backtest summer 20` asks the other multi-day question: is the forecast band
-the width it claims to be? Twenty seeded weathers, each one episode, their scores
-merged — because forecast error is correlated across a day, so one day's coverage
-figure is a coin toss reported to three significant figures.
-
-## Run the fleet
-
-Five daemons sit around the box, and each is a binary with a `--config` and a set
-of `HEMS_<NAME>_*` environment variables. None of them needs the others to start.
+Three more commands answer questions a single day cannot:
 
 ```console
-$ just fleet-demo                     # or, spelled out:
-
-$ cat > obsd.toml <<'EOF'
-webhook_secrets = ["env:HEMS_OBSD_WEBHOOK_SECRET"]
-EOF
-$ HEMS_OBSD_WEBHOOK_SECRET=whsec_demo cargo run -p obsd -- --config obsd.toml &
-$ HEMS_OBSD_SECRET=whsec_demo \
-    cargo run -p hemsd -- simulate --day winter --report-to http://127.0.0.1:8080
-  …
-  reported to http://127.0.0.1:8080/v1/days — HTTP 202
-
-$ curl -s localhost:8080/v1/fleet | jq '{sites, saving_eur, breached}'
-{
-  "sites": 1,
-  "saving_eur": 2.092545122909012,
-  "breached": []
-}
-
-$ curl -s localhost:8080/readyz
-{"ready":true,"probes":{"collector":{"ready":true,"last_good":"2026-09-01T01:17:43Z"}}}
+$ just backtest summer 20      # is the forecast band the width it claims to be?
+$ just risk deadline 20        # what does planning against three futures buy?
+$ just demo-on-off             # a single-speed compressor, the only unit a
+                               # minimum runtime constrains
 ```
 
-`saving_eur` is the reference winter day's own €2,09, which is the point: the
-fleet view is fed by the same number the day prints, through a type both sides
-share, so a renamed field is a compile error rather than a dashboard reading zero
-for six weeks.
+Each is minutes rather than seconds, which is why none of them is in CI.
 
-The day travels over **TLS** as a **signed CloudEvent**, and `obsd` refuses an
-unsigned one. The two are different guarantees and the box needs both: the
-signature says the report is the one this box sent and has not been edited, TLS
-says nobody read it on the way. Plain `http` is allowed only to a loopback
-address — which is what the demo above is — and refused anywhere else.
+### Keeping the day
 
-That endpoint holds the list of households that did *not* respect a network
-operator's reduction, so an unauthenticated write to it can put a compliant site
-on that list or take a breach off it. The signature covers the message id, the
-timestamp and the exact bytes, so a captured request cannot be replayed,
-re-attributed or edited — and an `obsd` with no secret configured refuses
-everything rather than accepting everything, because the deployment where
-somebody forgot it is the one nobody would notice.
+```console
+$ cargo run -p hemsd -- simulate --day winter --store ./box.db
+```
 
-Notice what the secret looks like in that file. Any credential in this workspace
-— an ENTSO-E token, a site's enrolment secret, this one — may be written as
-`env:NAME` or `file:/run/secrets/x` instead of as itself, and an unresolvable
-reference stops the daemon rather than being taken literally. A credential in a
-configuration file is a credential in an image, in a backup, and eventually in a
-repository.
-
-| Service | Give it | It answers |
-|---|---|---|
-| `tariffd` | an endpoint per price source, with its token | `/v1/prices?from=…&slots=96` and how much of that window it can price. Open on purpose: a day-ahead curve is a published auction result |
-| `forecastd` | a list of locations | `/v1/weather/{location}` and `/v1/production/{location}?kwp=9.8`. Open on purpose: irradiance over a location is public weather |
-| `histd` | a database path, one token per site, and the operators' | `/v1/sites/{site}/nachweis` for a network operator, `/v1/sites/{site}/export` for the household — and a box may write only its own site |
-| `fleetd` | a site with an enrolment secret, and **signed** configuration and releases — it holds signatures and never a signing key | `/v1/enrol`, `/v1/config`, `/v1/releases/{component}` |
-| `obsd` | the secret boxes sign their reports with, and an operator token to read | `/v1/fleet`, and `/v1/sites/{site}` |
-
-Two of the five carry household data and are authenticated per site: a box's
-credential reaches **its own** record and no other, an operator's reaches every
-household's § 14a evidence and none of their Data Act exports — Article 4 is a
-right of the *user*, and a fleet token is not a household. The other two serve
-published auction results and public weather and are open on purpose, which is
-written down so the difference reads as a decision rather than an oversight.
-
-Every one of them answers `/livez`, `/readyz` and `/version`. `readyz` names each
-dependency, whether it is passing, and **when it was last good** — so a `tariffd`
-whose upstream is down tells you which upstream and since when, and stays up,
-because restarting it would not bring ENTSO-E back.
+`--store` keeps the day's § 14a evidence and quarter-hour registers in the box's
+own database — the two years `[A1 7.3]` asks for, written *before* anything is
+reported anywhere, with an outbox column so what the fleet has not acknowledged
+is a backlog rather than a gap.
 
 ## Use one crate
 
@@ -154,19 +108,66 @@ let devices = [
 assert!((minimum_power(&devices, ControlMode::Ems).kw() - 7.56).abs() < 1e-9);
 ```
 
-## The regulatory documents
+| Crate | What it is | Page |
+|---|---|---|
+| `hems-core` | the domain model: assets, circuits, the slot grid, setpoints that name a reason | [Domain model](@/docs/domain-model.md) |
+| `hems-grid` | § 14a, § 9 EEG, Modul 3, MiSpeL, § 42c, the LPC machine, the evidence record | [Grid rules](@/docs/grid-rules.md) |
+| `hems-tariff` | the price stack, five day-ahead parsers, the Modul advisor | [Tariffs](@/docs/tariffs.md) |
+| `hems-forecast` | solar geometry, the residual corrector, load and session models, the metrics | [Forecasting](@/docs/forecasting.md) |
+| `hems-optimizer` | the receding-horizon MILP and the shadow prices | [The planner](@/docs/optimizer.md) |
+| `hems-realtime` | the guard plane, the allocator, the one-second arbiter | [Architecture](@/docs/architecture.md) |
+| `hems-device`, `hems-drv` | what a wanted power becomes on hardware, and the driver contract | [Devices and drivers](@/docs/devices.md) |
+| `hems-flex` | the household's flexibility in S2 / EN 50491-12-2 | [Flexibility](@/docs/flexibility.md) |
+| `hems-sim` | deterministic hardware and a seeded weather | [Simulation](@/docs/simulation.md) |
+| `hems-service` | the shell the daemons share | [The fleet](@/docs/services.md) |
+
+## Run the fleet
+
+Five daemons sit around the box. Each is a binary with a `--config` and a set of
+`HEMS_<NAME>_*` environment variables, and **none of them needs the others to
+start**.
+
+```console
+$ just fleet-demo
+```
+
+That builds `obsd` and `hemsd`, starts the fleet view on loopback, runs the
+winter day, reports it as a **signed** CloudEvent, and then asks the fleet view
+what it now knows:
+
+```console
+$ curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet | jq '{sites, saving_eur, breached}'
+{
+  "sites": 1,
+  "saving_eur": 2.092545122909012,
+  "breached": []
+}
+```
+
+`saving_eur` is the reference winter day's own €2,09, which is the point: the
+fleet view is fed by the same number the day prints, through a type both sides
+share, so a renamed field is a compile error rather than a dashboard reading zero
+for six weeks.
+
+What each daemon owns, which of them are authenticated and which are open on
+purpose, and why a day only ever arrives signed is on [the
+fleet](@/docs/services.md).
+
+## Where the rules come from
 
 Every regulatory number carries the document and clause it comes from —
-`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
-all 328 of them against an index of primary sources, failing the build if one
-names a document the index does not carry.
+`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and the citation guard resolves all 328 of
+them against an index of primary sources.
 
-`cargo xtask check-wire` does the same for the quantities: every `Decimal`,
-instant and date says how it travels, because the impl each inherits accepts a
-JSON number that has already been through an `f64` — or writes a date as
-`[2024, 1]` — and the Cargo feature that would fix it is global to a build
-graph.
-
-The documents themselves are third-party copyrighted publications and are not
-redistributed here; the index records the retrieval URL of each, so a working
+The documents themselves are third-party copyrighted publications and are **not
+redistributed** here; the index records the retrieval URL of each, so a working
 copy can be rebuilt from public sources.
+
+## Where to go next
+
+- [Architecture](@/docs/architecture.md) — three planes, three cadences, one
+  order of authority. Read this before anything else.
+- [Grid rules](@/docs/grid-rules.md) — what § 14a, § 9 EEG, MiSpeL and § 42c
+  actually require, with the citation for every number.
+- [The planner](@/docs/optimizer.md) — the formulation, and the fourteen
+  decisions in it that are worth explaining.

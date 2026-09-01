@@ -436,8 +436,7 @@ pub fn tibber(json: &str) -> Result<PriceSeries, SourceError> {
 /// ```
 ///
 /// Not a price: it is what [`crate::stack::SlotPrice::co2_g_per_kwh`] carries,
-/// and what turns a carbon preference into a term the objective can add up
-/// (D15).
+/// and what turns a carbon preference into a term the objective can add up.
 ///
 /// # Errors
 /// [`SourceError`] when the arrays are missing or of different lengths.

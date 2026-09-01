@@ -377,10 +377,9 @@ mod tests {
 
     #[test]
     fn a_whole_lpc_day_runs_in_virtual_time() {
-        // The test `EEBUS_FEEDBACK.md` asked the sibling crate to make possible:
-        // a reduction, its own expiry, heartbeat loss, failsafe and release — as
-        // ordinary assertions rather than as two hours of waiting. Nothing here
-        // reads a clock.
+        // A whole § 14a day: a reduction, its own expiry, heartbeat loss, the
+        // failsafe and the release — as ordinary assertions rather than as two
+        // hours of waiting. Nothing here reads a clock.
         let mut d = lpc();
         assert_eq!(
             d.state(),

@@ -1,7 +1,7 @@
 +++
 title = "Flexibility"
 description = "S2 (EN 50491-12-2) as the internal model: a device describes what it can do, not what it is for."
-weight = 6
+weight = 8
 +++
 
 ## Why a second protocol
@@ -39,6 +39,22 @@ is that internal model.
 | **PPBC** Power Profile Based Control | a fixed sequence started in a window | washing machine, dishwasher, tumble dryer |
 | **DDBC** Demand Driven Based Control | actuators serving a reported demand | a heat pump following a heat demand |
 
+<pre class="mermaid">
+flowchart TB
+  SITE["a household's assets"] --> DS["describe_site"]
+  DS --> FRBC["<b>FRBC</b><br/>battery · hot-water tank<br/>a car with a departure"]
+  DS --> PEBC["<b>PEBC</b><br/>charge point with no car<br/>inverter curtailment"]
+  DS --> OMBC["<b>OMBC</b><br/>SG Ready heat pump"]
+  DS --> PPBC["<b>PPBC</b><br/>dishwasher"]
+  DS --> GAP["what it <i>cannot</i> express<br/><i>counted, and printed</i>"]
+  FRBC --> MSG["every message a Resource<br/>Manager would send"]
+  PEBC --> MSG
+  OMBC --> MSG
+  PPBC --> MSG
+  MSG --> INSTR["an Instruction comes back:<br/>a mode ID and a factor in [0,1]"]
+  INSTR --> WATTS["watts — only with the<br/>description that was sent"]
+</pre>
+
 ## The mapping depends on the situation
 
 The control type follows from **what the manager needs to be able to say**, not
@@ -63,8 +79,8 @@ average. A dishwasher takes two kilowatts to heat, two hundred watts to wash and
 two kilowatts again to dry; a manager given the average would schedule seven
 hundred watts of dishwasher into every sunny slot, which no dishwasher will
 carry out. `LoadKind::Shiftable` therefore **carries** its `Programme` — an
-appliance that announces flexibility and cannot say what of has told a manager
-nothing it can act on — and `is_interruptible` is `false`, because a dishwasher
+appliance that announces flexibility and cannot say what shape it takes has told
+a manager nothing it can act on — and `is_interruptible` is `false`, because a dishwasher
 stopped halfway is not one that resumes, it is one somebody has to restart.
 
 ## Three details that are expensive to get wrong
@@ -165,9 +181,9 @@ Six: the battery, the charge point with a car on it, the heat pump, the
 hot-water tank, the dishwasher and the roof. Where a description cannot be
 built the count is followed by how many — `6 resources, 1 it cannot express` —
 and that second number is the one that earns its keep. Counting assets whose
-control type is merely not `NotControllable` produces a figure that goes up when
-a device is added and never notices that no description was ever written for it,
-which is how a hot-water tank can sit inside it with nothing to send.
+control type is merely not `NotControllable` produces a figure that goes up when a
+device is added and never notices that no description was ever written for it — so
+a device can sit inside the count for versions with nothing to send.
 
 ## Standing on the authors' work
 

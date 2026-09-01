@@ -15,6 +15,23 @@ wrong.
 | **Arbiter** | about a second | inside the guard's bounds | `hems-realtime::arbiter` |
 | **Planner** | 15-minute slots, re-planned every 15 minutes or on event | advisory | `hems-optimizer` |
 
+<pre class="mermaid">
+flowchart TB
+  M["measurements<br/>every second"] --> G
+  L["§ 14a limit from the Steuerbox<br/>§ 9 EEG cap · fuses · reserve"] --> G
+  G["<b>Guard</b><br/>an interval per asset"]
+  F["forecasts · prices<br/>the site's own state"] --> P["<b>Planner</b><br/>96 slots, re-solved<br/>every quarter hour"]
+  P -- "target · envelope · a price per asset" --> A["<b>Arbiter</b><br/>desire → guard → smooth → explain"]
+  G -- "the interval nothing may widen" --> A
+  A --> S["setpoints, each naming its Reason"]
+  S --> D["drivers"]
+  D --> M
+</pre>
+
+Read the arrows rather than the boxes. The planner's output reaches the arbiter
+as **advice**; the guard's output reaches it as a **bound**; and the arbiter's own
+step can only pick a point inside what is left.
+
 ### The guard
 
 `[BK6-22-300 Anlage 1 Ziff. 4.6 S. 3]` requires that a network operator's
@@ -245,7 +262,10 @@ startup rather than silent for months: a driver for an asset that does not exist
 two drivers for one asset, a controllable device whose driver cannot command it,
 and a § 14a household with nothing that could hear a reduction.
 
-Two rules keep a driver from becoming a second control plane:
+The drivers themselves, the registry that owns a set of them and what a wanted
+power becomes on real hardware are on [devices and
+drivers](@/docs/devices.md). Two rules keep a driver from becoming a second
+control plane:
 
 - **A driver reports; it does not decide.** What the site may do is the guard's
   decision, made with every asset in view. A grid driver accepts no commands at
@@ -259,56 +279,43 @@ Two rules keep a driver from becoming a second control plane:
 ## One sign convention
 
 Every power and energy value uses the load convention: positive is power flowing
-*into* the thing being measured.
+*into* the thing being measured, so production is negative and **the grid
+connection power equals the sum of the assets behind it**. A residual that is not
+near zero means a meter is missing or mis-signed, and the arbiter reports it
+rather than optimising against a fiction.
 
-| Thing | Positive | Negative |
-|---|---|---|
-| Grid connection | import | export |
-| Photovoltaic array | — | production |
-| Battery | charging | discharging |
-| Wallbox | charging the car | discharging it |
-| Hot-water tank | heating | — |
+The table, and the rest of the vocabulary the whole workspace shares, is on
+[the domain model](@/docs/domain-model.md#one-sign-convention).
 
-The cost is that production is negative. What it buys is one invariant that holds
-everywhere and is testable: **the grid connection power equals the sum of the
-assets behind it**. A residual that is not near zero means a meter is missing or
-mis-signed, and the arbiter reports it rather than optimising against a fiction.
+## The fleet, in one paragraph
 
+Five daemons sit around the box and none of them is a trust anchor. `tariffd`
+fetches prices, `forecastd` fetches the sky, `histd` keeps everybody's two years
+of § 14a evidence, `fleetd` enrols a box and offers it **signed** configuration
+and releases, and `obsd` is the fleet view. They share one shell,
+`hems-service`, which owns configuration, logging, a health surface and a
+shutdown — and owns nothing about energy.
 
-## The fleet
+Two of that shell's decisions are load-bearing. **Live and ready are different
+questions**: an orchestrator restarts a process that fails `livez` and merely
+stops routing to one that fails `readyz`, so a daemon whose price source is down
+must not answer the first with the second. And the readiness body names **every
+dependency and when it was last good**, so the first click in an incident is also
+the last.
 
-Five daemons around the box, and one shell they share.
+The rest — what each daemon owns, which are authenticated and which are open on
+purpose, and why a day only arrives signed — is [the fleet
+page](@/docs/services.md).
 
-`hems-service` owns the forty lines every daemon has — configuration, logging, a
-health surface, a shutdown — and owns nothing about energy. Two of its decisions
-are load-bearing. **Live and ready are different questions**: an orchestrator
-restarts a process that fails `livez` and merely stops routing to one that fails
-`readyz`, so a daemon whose price source is down must not answer the first with
-the second. And the readiness body names **every dependency and when it was last
-good**, so the first click in an incident is also the last.
+### The storage half of “never worse off without the cloud”
 
-| Service | What it owns | The decision worth knowing |
-|---|---|---|
-| `tariffd` | the five published day-ahead sources | a curve arrives twice and the two disagree, so the reconciliation is **written down**: a more trusted source always wins, then a finer publication, then the later observation. "Last write wins" gets the first one wrong |
-| `forecastd` | ICON-D2 through Open-Meteo | it serves the **sky**, not a forecast. The correction that turns modelled irradiance into what *this* roof makes is learned on the box from that box's meter, because it is a property of one roof |
-| `histd` | the fleet's copy of the two years of § 14a evidence, and the registers | retention is a **column**, so "what will you still have in eighteen months" is a query. Quantities are exact decimal strings, because a settlement that went through a `double` is one nobody can reproduce. Reads open their own connection: a household's export is 370 ms of SQLite, and behind one lock a box's evidence write waits 2,7 s for it |
-| `fleetd` | enrolment, configuration, releases | the box trusts a **key it was built with**, not a server. `fleetd` holds signatures and never a signing key, so a compromised `fleetd` can serve neither a configuration nor an update any box will accept |
-| `obsd` | what the fleet is actually doing | it **counts** compliance rather than averaging it. One household in ten thousand that failed to respect a reduction is an incident with a name and a date; "99,99 %" reads as success. A day reaches it only as a **signed** CloudEvent — a list of who broke a grid rule that anybody can write to is not evidence |
+`[A1 7.3]` keeps a control event for two years, so the box holds its **own** copy
+and forwards it second: what the fleet has not acknowledged is an outbox that
+grows, not a gap. A record that exists only once it has been uploaded is an
+intention with a network dependency, and the day a network operator asks about is
+the day the link was down.
 
-Three of those are the same idea from different angles: **a store beats a
-passthrough**. `tariffd` holds two days each way, `forecastd` keeps the last good
-run, and both compute readiness from what they still *cover* rather than from
-when the last request returned — so a WAN outage shorter than the horizon costs
-the household nothing at all.
-
-Nothing here is the trust anchor for anything. The § 14a limit comes off a wire
-from a Steuerbox and the guard enforces it locally; the prices and the weather
-only ever make a plan *better*; and an update — like the box's own configuration
-— is verified against a key rather than against a hostname. The house is never
-worse off when the cloud is gone.
-
-That last sentence has a storage half. `[A1 7.3]` keeps a control event for two
-years, so the box holds its **own** copy and forwards it second: what the fleet
-has not acknowledged is an outbox that grows, not a gap. A record that exists
-only once it has been uploaded is an intention with a network dependency, and the
-day a network operator asks about is the day the link was down.
+That is also the answer to *what runs where*. The edge is **one** process,
+`hemsd`, because the § 14a failsafe is a sixty-second heartbeat and a two-hour
+minimum and an IPC hop inside that path buys nothing — so the box's stores are
+embedded and every other daemon is cloud.

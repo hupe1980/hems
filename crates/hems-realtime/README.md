@@ -3,6 +3,16 @@
 The guard plane and the one-second control loop of
 [hems](https://github.com/hupe1980/hems).
 
+```mermaid
+flowchart LR
+  D["<b>desire</b><br/>the plan's remaining energy ÷<br/>the slot's remaining time,<br/>or the fallback"] --> G["<b>guard</b><br/>intersect every interval:<br/>ratings · reserve · fuses ·<br/>§ 14a · § 9 EEG · Schieflast"]
+  G --> S["<b>smooth</b><br/>move towards the previous value,<br/><i>inside</i> the interval"]
+  S --> E["<b>explain</b><br/>a Setpoint that names its Reason"]
+```
+
+Step two is an intersection and step three only moves a value towards its
+previous one *inside* that interval, so no later step can undo an earlier bound.
+
 **Nothing the arbiter does can widen what the guard decided.** That is not a
 convention — the guard runs first and turns every limit into an interval, the
 arbiter only clamps into it, and a randomised property test over households,

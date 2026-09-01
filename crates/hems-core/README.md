@@ -24,7 +24,7 @@ market identifiers — comes from
   kilowatt-hours of heat that can be bought hours before they are used.
 - 🍽️ **A shiftable appliance carries its programme** — `LoadKind::Shiftable`
   holds the `Programme` it will run, quarter hour by quarter hour, so the state
-  where a machine announces flexibility and cannot say what of is not
+  where a machine announces flexibility and cannot say what shape it takes is not
   representable. And it is a *shape*, not a duration and an average: a dishwasher
   takes two kilowatts to heat and two hundred watts to wash, and a planner handed
   the average schedules a machine that does not exist.
@@ -32,6 +32,20 @@ market identifiers — comes from
   device is wired to, `PhaseMode` is what it is using right now. Answering the
   second with the first is how an 11 kW wallbox drawing symmetrically on three
   conductors acquires the 4,6 kVA limit a *single-phase* device is allowed.
+
+Every layer hands down an **interval**, and nobody widens one:
+
+```mermaid
+flowchart LR
+  A["physically possible"] --> B["guard: fuses, ratings,<br/>reserve, § 14a, § 9 EEG"]
+  B --> C["plan: what it wants<br/>this quarter hour"]
+  C --> D["arbiter: a point<br/>inside what is left"]
+  D --> E["device: what it will<br/>actually accept"]
+```
+
+An empty interval — `floor > ceiling` — is a real outcome rather than a bug: two
+rules that cannot both be satisfied. `Envelope::resolve` keeps the stricter
+*ceiling*, because exceeding a grid limit is worse than falling short of a floor.
 
 ```rust
 use hems_core::prelude::*;

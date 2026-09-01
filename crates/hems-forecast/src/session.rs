@@ -32,7 +32,7 @@
 //! # Refusing rather than guessing
 //!
 //! A weekday with fewer than [`MIN_SESSIONS`] observations produces **no**
-//! forecast. Principle P5: a plan built on one observed Thursday is not a plan,
+//! forecast. A plan built on one observed Thursday is not a plan,
 //! and the honest answer — "no session predicted, so nothing is reserved" —
 //! costs the household the difference between a good plan and an average one,
 //! where a wrong one costs it a car that cannot make the school run.
@@ -201,8 +201,7 @@ impl SessionHistory {
     ///
     /// `date` is the local calendar day the car is expected to arrive on, and
     /// `midnight` is that day's local midnight as an instant — the caller owns
-    /// the calendar, because [`crate`] reads no clock and holds no time zone
-    /// (P1).
+    /// the calendar, because [`crate`] reads no clock and holds no time zone.
     ///
     /// Returns `None` where a weekday has fewer than [`MIN_SESSIONS`]
     /// observations, or where the quantiles produce a window that has already

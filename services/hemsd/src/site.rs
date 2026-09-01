@@ -55,7 +55,8 @@ pub struct HouseholdConfig {
     ///
     /// `None` means "fill it". It is only ever read by the real-time fallback —
     /// the planner is given an energy target and a departure, which say the same
-    /// thing more precisely — but that is the mode G3 is about, and a surplus
+    /// thing more precisely — but that is the mode the fallback is about, and a
+    /// surplus
     /// tracker with no notion of *enough* charges past the limit in preference to
     /// exporting.
     pub ev_charge_limit: Option<Soc>,
@@ -76,8 +77,9 @@ pub struct HouseholdConfig {
 }
 
 impl Default for HouseholdConfig {
-    /// A common German single-family house in 2026: 9,8 kWp on the roof, a
-    /// 10 kWh battery, an 11 kW wallbox and an 8 kW heat pump.
+    /// A common German single-family house in 2026: 9,8 kWp on the roof behind
+    /// an 8 kW inverter, a 10 kWh battery, an 11 kW wallbox, a modulating heat
+    /// pump drawing 5 kW electrical, and 300 litres of hot water.
     fn default() -> Self {
         Self {
             pv_kwp: Power::from_kw(9.8),
@@ -373,7 +375,7 @@ fn shiftable_appliance(programme: Programme, circuit: &CircuitId) -> Asset {
 /// The first is the reference — what it is on today — and the rest are what
 /// [`hems_tariff::compare_moduls`] prices against it. Modul 3 is deliberately
 /// absent: it needs the network operator's own Zählzeitdefinition, and this
-/// workspace refuses to invent one (P5). A curated calendar per operator is
+/// workspace refuses to invent one. A curated calendar per operator is
 /// `tariffd`'s job.
 #[must_use]
 pub fn modul_choices(current: &Tariff) -> Vec<hems_tariff::ModulChoice> {

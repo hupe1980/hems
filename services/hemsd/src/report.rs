@@ -13,7 +13,7 @@
 ///
 /// `reqwest` rather than a hand-written `POST`, so the box and the fleet share
 /// one client and one TLS provider and cannot disagree about which cryptography
-/// they trust (D84, D85).
+/// they trust.
 ///
 /// # Errors
 /// Anything `reqwest` could not do: a name that does not resolve, a refused

@@ -153,7 +153,7 @@ impl CapRelief {
 /// with a control device is actually *in operation* are all statements an
 /// installer makes about a particular house. Guessing any of them either
 /// curtails a household that need not be curtailed or feeds in above a
-/// statutory limit, and principle P5 says which way to fail: the two fields
+/// statutory limit, so the defaults say which way to fail: the two fields
 /// that would *loosen* a limit default to off, and the one that would tighten
 /// one is off too, because it is a legacy regime a modern system is not in.
 ///

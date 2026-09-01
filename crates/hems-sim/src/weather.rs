@@ -11,7 +11,7 @@
 //!
 //! It also meant that the one mechanism built specifically to absorb forecast
 //! error — the arbiter tracking the plan's *energy* rather than its setpoint
-//! (D19) — was never once exercised by a day. The quantity it corrects was
+//! — was never once exercised by a day. The quantity it corrects was
 //! identically zero.
 //!
 //! So the simulator gets a **realisation** and the planner gets an
@@ -26,8 +26,8 @@
 //!
 //! # Deterministic, and not merely repeatable
 //!
-//! Replaying a day and getting the same answer is a *property* of this project
-//! (D23), so the realisation is a pure function of `(seed, instant)` — there is
+//! Replaying a day and getting the same answer is a *property* of this project,
+//! so the realisation is a pure function of `(seed, instant)` — there is
 //! no generator state, no iteration order to depend on, and no way for a
 //! parallel test run to change it. `hemsd --day winter` on any machine, any
 //! number of threads, produces the same cloud at 12:19.
@@ -227,7 +227,7 @@ mod tests {
     const NOON: OffsetDateTime = datetime!(2026-06-21 12:00:00 +02:00);
 
     // Bit-for-bit equality is the property, not an approximation of it: a day
-    // that replays to the last cent (D23) needs the same cloud at 12:19 on every
+    // that replays to the last cent needs the same cloud at 12:19 on every
     // machine and under any number of threads.
     #[allow(clippy::float_cmp)]
     #[test]

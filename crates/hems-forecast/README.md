@@ -20,8 +20,14 @@ service cannot.
 
 ```text
   roof, as the box learned it        90 % of the model
-  production forecast, CRPS          65 W (93 % covered)
+  production forecast, CRPS          192 W (81 % of 32 lit)
 ```
+
+The `of 32 lit` is not decoration. A production score is about the part of the
+day the sun was up; the other sixty-four quarter hours of a January day are a
+band of nothing against an outcome of nothing, which is midnight rather than a
+forecast that came true — and counting them puts a floor under the coverage
+figure however wrong the forecast was.
 
 - ☀️ **Solar geometry and a physical array model**, no service required.
 - 🔍 **An online residual corrector** — multiplicative, bucketed by local hour,

@@ -1,0 +1,18 @@
+{% set docs = get_section(path="docs/_index.md") %}
+<nav class="docs-nav" aria-label="Documentation">
+  <div class="search" hidden id="search">
+    <label class="skip" for="search-input">Search the documentation</label>
+    <input id="search-input" type="search" placeholder="Search the docs…" autocomplete="off" spellcheck="false">
+    <ul class="search-results" id="search-results"></ul>
+  </div>
+  <p class="group-title"><a href="{{ docs.permalink }}">Documentation</a></p>
+  <ol>
+    {% for p in docs.pages %}
+    <li>
+      <a href="{{ p.permalink }}"{% if here == p.path %} aria-current="page"{% endif %}>
+        <span class="num">{{ loop.index }}</span><span>{{ p.title }}</span>
+      </a>
+    </li>
+    {% endfor %}
+  </ol>
+</nav>

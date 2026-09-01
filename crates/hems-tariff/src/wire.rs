@@ -3,7 +3,7 @@
 //! Every [`rust_decimal::Decimal`] in this workspace is written as the exact
 //! decimal string its `Display` produces — `"12.345"` — and read back as a
 //! string. Two things follow, and both matter for a quantity that ends up on an
-//! invoice or in a Nachweis (principle P3).
+//! invoice or in a Nachweis.
 //!
 //! A JSON **number** is a type error rather than a silent trip through `f64`,
 //! so a producer that writes `0.30000000000000004` is refused instead of

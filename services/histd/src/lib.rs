@@ -13,12 +13,12 @@
 //! **The settlement record.** The quarter-hour meter registers MiSpeL's
 //! Abgrenzung and § 42c's allocation are computed from. Those are quantities
 //! that end on an invoice, so every one of them is stored as an exact decimal
-//! *string* and never as a float (P3): a settlement that went through an `f64`
+//! *string* and never as a float: a settlement that went through an `f64`
 //! is a settlement nobody can reproduce.
 //!
 //! # Where this runs, and why it is not on the box
 //!
-//! D1 makes the edge a **single** daemon: the § 14a failsafe is a sixty-second
+//! The edge is a **single** daemon: the § 14a failsafe is a sixty-second
 //! heartbeat and a two-hour minimum, and an IPC hop inside that path buys
 //! nothing. So a gateway runs `hemsd` and nothing else, and the box's own copy
 //! of these records belongs in *its* embedded stores (`chronix`, `redb`) behind
@@ -29,8 +29,8 @@
 //! # Why SQLite today, and what it is a prototype of
 //!
 //! `meterstore` — PostgreSQL for the recent window, Apache Iceberg for history —
-//! is where a fleet holding millions of measuring points ends up, and it is what
-//! D6 names. SQLite (`bundled`) is what is here now because it needs no server
+//! is where a fleet holding millions of measuring points ends up. SQLite
+//! (`bundled`) is what is here now because it needs no server
 //! and no system library, so every query in this daemon is exercised against a
 //! *real* database in `cargo test` rather than against a mock, and `just ci`
 //! stays a clone-and-run. The schema is written in `mako`'s layout so the move
@@ -39,7 +39,7 @@
 //! # The schema is a `migrations/` directory, as in `mako`
 //!
 //! `migrations/NNNN_*.sql`, a new file per revision and never an edit to one
-//! already applied (G4). `mako` is PostgreSQL and applies them with
+//! already applied. `mako` is PostgreSQL and applies them with
 //! `sqlx::migrate!`; this is SQLite, so the files are compiled in and the
 //! applied revision lives in SQLite's own `user_version`. A database written by
 //! a **newer** build is refused rather than used: two years of § 14a evidence is

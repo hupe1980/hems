@@ -81,7 +81,8 @@ pub enum StoreError {
 /// The schema, one numbered file per revision, applied in order.
 ///
 /// The layout is `mako`'s — `services/<daemon>/migrations/NNNN_*.sql`, a new
-/// file per change and never an edit to one already applied (G4). What differs is the runner:
+/// file per change and never an edit to one already applied. What differs is
+/// the runner:
 /// `mako` is PostgreSQL and calls `sqlx::migrate!`, and this is SQLite, so the
 /// files are compiled in and the applied revision is SQLite's own
 /// `user_version` — a 32-bit integer in the database header that exists for

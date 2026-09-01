@@ -45,8 +45,9 @@
 //! contributes the *cascade*, which is the § 42c-specific part; the conservation
 //! is metering's and is the same one § 42b is settled with.
 //!
-//! Every number here is billed, so it is [`rust_decimal::Decimal`] — principle
-//! P3 of the concept. The planner's `f64` view of the same community is a
+//! Every number here is billed, so it is [`rust_decimal::Decimal`]: a
+//! settlement that went through an `f64` is one nobody can reproduce. The
+//! planner's `f64` view of the same community is a
 //! forecast of what *could* be shared; this is what *was*.
 
 use core::fmt;
@@ -148,7 +149,7 @@ pub enum SharingError {
     /// Every share is zero, so the key says nothing.
     ///
     /// Splitting evenly instead would be inventing a contract the parties did
-    /// not sign, which is exactly the kind of guess principle P5 forbids.
+    /// not sign, which is exactly the kind of guess a settlement may not make.
     #[error("every share of the Aufteilungsschlüssel is zero")]
     EmptyKey,
     /// A negative share, a negative generation or a negative consumption.

@@ -18,6 +18,29 @@ specification. A rule without a citation is a bug.
 | Which kilowatt-hour through a battery was green, quarter by quarter | MiSpeL Anlage 1 (1)–(33), Anlage 2 (P1)–(P15) |
 | Allocating an energy-sharing community's generation | § 42c EnWG Abs. 1, 3, 4 |
 
+The EEBUS limitation machine, which is how a § 14a limit reaches the house:
+
+```mermaid
+stateDiagram-v2
+  [*] --> init : restart
+  init --> unlimited_controlled : heartbeat resumes, no limit
+  init --> limited : heartbeat resumes, a limit is in force
+  unlimited_controlled --> limited : the Energy Guard writes a limit
+  limited --> unlimited_controlled : released, or its duration expires
+  unlimited_controlled --> failsafe : heartbeat missed for 120 s
+  limited --> failsafe : heartbeat missed for 120 s
+  failsafe --> limited : contact returns, a limit is in force
+  failsafe --> unlimited_controlled : contact returns
+  failsafe --> unlimited_autonomous : FailsafeDurationMinimum expires
+  unlimited_autonomous --> unlimited_controlled : contact returns
+```
+
+A restart comes back **limited**, not free `[LPC-901/1]`; and the Failsafe
+Duration Minimum is a *release valve* rather than a safety timer `[LPC-922]`,
+because a broken control box must not block a household for ever. That last one
+is what an implementation written from intuition gets wrong, and it has a test
+named after it.
+
 📍 **Every limit is measured where its rule measures it.** § 14a bounds the
 netzwirksamer Leistungsbezug — what the controllable devices draw *from the
 grid* — so photovoltaic surplus and a discharging battery both raise the ceiling.

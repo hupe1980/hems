@@ -6,7 +6,7 @@
 //! box whose WAN has been down since Tuesday has stopped getting the weather.
 //!
 //! Refusing to forecast is not an option there, because the alternative to a bad
-//! plan is the fallback arbiter, which is worse (G3, D20). So there are two
+//! plan is the fallback arbiter, which is worse. So there are two
 //! forecasts that need nothing but the meter:
 //!
 //! * **seasonal naive** — tomorrow at 07:15 looks like the most recent day's

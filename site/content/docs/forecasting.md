@@ -1,7 +1,7 @@
 +++
 title = "Forecasting, and being wrong"
 description = "What the box believes about tomorrow, how it learned it, and what it costs to be wrong about it — the number no other energy manager publishes."
-weight = 5
+weight = 7
 +++
 
 ## A forecast a controller can be judged against
@@ -46,6 +46,23 @@ because it moves *below* the planner's own grain.
 And all of it is a pure function of `(seed, instant)` — no generator state, no
 iteration order to depend on — so the day still replays to the last euro cent.
 Determinism was never the thing that had to go; being *told the answer* was.
+
+<pre class="mermaid">
+flowchart LR
+  G["solar geometry<br/>position · clear-sky · transposition<br/><i>exact, free, no service</i>"] --> M
+  W["cloud cover<br/>ICON-D2 via forecastd"] --> M["clear sky × (1 − cloud)"]
+  M --> C["<b>residual corrector</b><br/>multiplicative · by local hour<br/>~a fortnight, exponentially weighted"]
+  H["this roof's own meter"] --> C
+  C --> F["a median and a band<br/>whose width is the measured dispersion"]
+  F --> P["the planner"]
+  F --> S["CRPS · coverage,<br/>scored beside the money"]
+</pre>
+
+The three halves fail differently, which is why they are separated. **The
+geometry is exact, deterministic and free** — where the sun stands over a given
+roof at a given minute needs no weather service and is the same next January as
+it was last. The weather is neither. And the **roof itself** delivers less than
+its datasheet for reasons nobody wrote down.
 
 ## The soiling nobody mentions
 
@@ -166,36 +183,35 @@ Tuesday are one draw wearing ninety-six hats. `Calibration` therefore carries an
 *days*, and a test pins that the reference day cannot claim to be one whatever its
 coverage. The days themselves belong in `obsd`.
 
-`hemsd backtest --day summer --days 20` is what produces the days: the same day
+`hemsd backtest --day summer --days 20` — `just backtest summer 20`, and see
+[simulation](@/docs/simulation.md#one-day-cannot-answer-some-questions) — is what
+produces the days: the same day
 under twenty seeded weathers, each an episode, merged. It says the bands are the
 width they claim to be — 80 % coverage on the January day, 75 % on the June one,
 against a nominal 80 %.
 
-**A score whose denominator is the night cannot fail.** The number that used to
-stand here was 93 % against a nominal 80 %, and it was recorded as a defect in the
-band. It was arithmetic about how long a January night is: the score counted every
-quarter hour of the day, and in a dark one the model forecasts nothing and nothing
-happens — `0 [0 … 0]` against `0`, trivially inside its own band and trivially
-zero loss. Sixty-four such pairs in a denominator of ninety-six put a floor of
-67 % under the coverage figure however wrong the forecast was. Scored only where
-there was something to forecast, the same day covers 81 %.
+**A score whose denominator is the night cannot fail.** Counting every quarter
+hour of a January day puts a floor of 67 % under any coverage figure, however
+wrong the forecast was: in a dark quarter hour the model forecasts nothing and
+nothing happens — `0 [0 … 0]` against `0`, trivially inside its own band and
+trivially zero loss — and sixty-four of the day's ninety-six slots are like that.
 
-The test that should have caught it asserted the defect — *"every quarter hour of
-the day should have been scored"*. That is why the day report now prints
-`81 % of 32 lit` rather than `93 % covered`: how much of a day a score is about
-belongs on the line with the score.
+So a production score is computed only where there was something to forecast, and
+the report prints **how much of the day it is about** on the same line:
+`81 % of 32 lit` rather than a bare percentage. A denominator that cannot fail
+belongs beside the number it flatters.
 
-**The width of a band is a separate question from its middle.** Once the night
-came out, the June day *was* over-wide — and for a reason the old figure had
-hidden: sixty-six of its sixty-seven daylight quarter hours were sitting exactly
-on a constant width floor. A band that is the same ±12 % all day is not an
-uncertainty estimate. Each hour bucket now carries one multiplier per tail, moved
-by its own outcomes so that a tenth of them fall outside each side whatever shape
-the residual distribution has — adaptive conformal inference, two multiplications
-per observation — and the band comes out asymmetric, which is right: a roof can
-fall a long way below the clear-sky model and cannot rise far above it. The June
-day's CRPS fell from 84 W to 67 W and the capped day's from 137 W to 27 W, with
-no saving figure moving, because a deterministic plan reads only the median.
+**The width of a band is a separate question from its middle.** A band that is the
+same ±12 % all day is a constant, not an uncertainty estimate, and a coverage
+figure computed over the night hides that it is one.
+
+So each hour bucket carries **one multiplier per tail**, moved by its own outcomes
+so that a tenth of them fall outside each side whatever shape the residual
+distribution has — adaptive conformal inference, two multiplications per
+observation. The band comes out **asymmetric**, which is right: a roof can fall a
+long way below the clear-sky model and cannot rise far above it. It is worth 67 W
+of CRPS on the June day and 27 W on the capped one, and it moves no saving figure
+at all, because a deterministic plan reads only the median.
 
 **The box's history is generated by the same process the day is.** Six weeks of
 metering, produced by the same simulator, means the forecasts are scored against

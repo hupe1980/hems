@@ -1,8 +1,28 @@
 +++
 title = "The planner"
 description = "A receding-horizon mixed-integer linear program that prices battery wear instead of hiding it."
-weight = 4
+weight = 6
 +++
+
+A plan is made every quarter of an hour, covers the next twenty-four, and only
+its **first slot** is ever executed. Everything after that slot exists to price
+the consequences of it.
+
+<pre class="mermaid">
+flowchart LR
+  I["prices · forecasts<br/>site state · grid limits"] --> S["solve 96 slots<br/>MILP"]
+  S --> E["execute slot 0<br/>as a target + an envelope"]
+  S --> T["slots 1…95<br/>discarded"]
+  E --> A["the arbiter,<br/>once a second"]
+  A --> M["measurements"]
+  M --> I
+</pre>
+
+That is what makes several decisions on this page turn out the way they do: a
+[minimum runtime](#a-compressor-s-minimum-runtime-needs-the-compressor-s-own-state)
+that says nothing about slot 0 is enforced on no day, and a
+[commitment horizon](#the-commitment-horizon-the-tail-does-not-need-quarter-hours)
+may coarsen the tail without coarsening the decision.
 
 ## The formulation
 
@@ -507,7 +527,17 @@ and a weighted allocator handed it weights nothing.
 
 A mixed-integer program has no duals: its value function is not convex, and
 whatever a branch-and-bound solver reports at its final node is a dual of some
-relaxation. So the model is solved twice. The second solve pins the discrete
+relaxation. So the model is solved twice.
+
+<pre class="mermaid">
+flowchart LR
+  P1["<b>pass 1</b> — MILP<br/>microlp or HiGHS<br/>relative gap · time budget"] --> D["the discrete decisions:<br/>the charge point's on/off,<br/>a single-speed compressor's"]
+  D --> P2["<b>pass 2</b> — LP with those pinned<br/>always Clarabel<br/>objective scaled ×10⁵"]
+  P1 --> PLAN["the plan the arbiter executes"]
+  P2 --> DU["duals: a price per asset,<br/>and the § 14a ceiling's own"]
+  DU --> W["the guard's allocation weights"]
+</pre>
+ The second solve pins the discrete
 decisions at what the first chose — the charge point's on/off, the
 non-modulating heat pump's — and the linear program that remains has duals that
 are the marginal values *conditional on the decisions the plan made*. That is the

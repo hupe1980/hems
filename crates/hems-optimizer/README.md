@@ -9,6 +9,19 @@ measured, the hidden degradation can exceed the energy saving by an order of
 magnitude. hems charges throughput in euros per kilowatt-hour, half on each leg,
 so a full cycle pays it once.
 
+```mermaid
+flowchart LR
+  I["prices · forecasts<br/>site state · grid limits"] --> S["solve 96 slots<br/>MILP"]
+  S --> E["execute slot 0<br/>as a target + an envelope"]
+  S --> T["slots 1…95, discarded"]
+  S --> P2["re-solve with the discrete<br/>decisions pinned — Clarabel"]
+  P2 --> DU["a shadow price per asset,<br/>and one for the § 14a ceiling"]
+```
+
+Only the **first slot** is ever executed; everything after it exists to price the
+consequences of that slot. Several decisions below turn out the way they do
+because of it.
+
 - 💶 **One currency.** Carbon (€/kg), self-sufficiency (€/kWh imported), comfort
   (€ per kelvin-hour) and curtailment are *prices*, so the terms can honestly be
   added up. An objective that swapped the energy price for grams of CO₂ while
@@ -37,9 +50,11 @@ so a full cycle pays it once.
 
   The unusual part is that the evaluation which can *falsify* it ships too: a
   single simulated day pays a hedge's premium every time and makes its claim
-  never. `hemsd risk` says scenarios are worth €0,35 a day where a service is at
-  risk, cost €0,95 a day where nothing is, and that **no** policy improves the
-  worst day — so the default is one median.
+  never. `hemsd risk`, over twenty seeded weathers on each of two days, says scenarios
+  are worth about €0,15 a day where a service is at risk — and take the
+  undelivered charge from €0,07 to €0,01 — cost about €1,04 a day where nothing
+  is, and that **no** policy improves the worst day. So the default is one
+  median.
 - ❄️ **A compressor's minimum runtime remembers the compressor.** The rows that
   state it constrain a *transition*, so each needs the slot before it — and none
   of them says anything about slot 0, which is the only slot a receding horizon

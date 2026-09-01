@@ -319,8 +319,8 @@ fn string_literals(text: &str) -> Vec<String> {
 
 /// Every quantity, instant and date that can be serialised says how it travels.
 ///
-/// A quantity that becomes money or a Nachweis is `rust_decimal::Decimal` by
-/// principle P3, and the impl it inherits is not good enough for one: it reads
+/// A quantity that becomes money or a Nachweis is `rust_decimal::Decimal`, and
+/// the impl it inherits is not good enough for one: it reads
 /// with `deserialize_any`, which accepts a JSON *number* — a value that has
 /// already lost digits to an `f64` before it arrives — and which a format with
 /// no self-describing wire cannot answer at all. `postcard` and `bincode` are

@@ -43,7 +43,7 @@
 //! changed says nothing about the response to heating. [`identify`] returns
 //! `None` where the record is too short, where the heat input never moved, or
 //! where the fit is not clearly better than the prior it started from — and the
-//! planner then goes on using the prior, which is P5 in the one place where
+//! planner then goes on using the prior — refusing to answer in the one place where
 //! guessing is genuinely worse than admitting ignorance.
 
 use hems_core::prelude::{Rc2, ThermalState};

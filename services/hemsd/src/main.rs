@@ -114,7 +114,7 @@ enum Command {
         #[arg(long, env = "HEMS_OBSD_URL")]
         report_to: Option<String>,
         /// The secret the box and the fleet share, for the Standard Webhooks
-        /// signature over the report (D11).
+        /// signature over the report.
         ///
         /// Required with `--report-to`, because a fleet view that accepts an
         /// unsigned day is a fleet view anybody who can reach it may write to —
@@ -125,8 +125,8 @@ enum Command {
         /// Keep the day's § 14a evidence and quarter-hour registers in a local
         /// store at this path, `[A1 7.2]` and `[A1 7.3]`.
         ///
-        /// The box's **own** two years. G3 says the house is never worse off
-        /// when the cloud is gone, and a record that exists only once it has
+        /// The box's **own** two years. The house is never worse off when the
+        /// cloud is gone, and a record that exists only once it has
         /// been uploaded is an intention with a network dependency — so the box
         /// records first and forwards second, and what has not been
         /// acknowledged is the store's outbox.

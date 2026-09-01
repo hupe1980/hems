@@ -135,8 +135,8 @@ fn mean(values: &[f64]) -> f64 {
 ///
 /// The seeds are derived from the scenario's own seed rather than drawn, so the
 /// whole sweep is a pure function of the scenario and `days` — a back-test that
-/// gave different answers on two runs would be the very thing D23 exists to
-/// prevent, one level up.
+/// gave different answers on two runs would be the very thing determinism
+/// exists to prevent, one level up.
 ///
 /// # Errors
 /// When the household described by the scenario is not a valid site.

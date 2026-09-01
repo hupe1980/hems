@@ -1,12 +1,22 @@
 {% extends "base.html" %}
+
 {% block content %}
-{{ section.content | safe }}
-<div class="cards">
-{% for page in section.pages %}
-  <div class="card">
-    <h3><a href="{{ page.permalink }}">{{ page.title }}</a></h3>
-    <p>{{ page.description | default(value="") }}</p>
-  </div>
-{% endfor %}
+<div class="docs-shell">
+  {% set here = section.path %}
+  {% include "partials/docs-nav.html" %}
+  <article>
+    <h1>{{ section.title }}</h1>
+    {% if section.description %}<p class="lead">{{ section.description }}</p>{% endif %}
+    {{ section.content | safe }}
+    <ol class="cards">
+      {% for page in section.pages %}
+      <li class="card">
+        <span class="num">{{ loop.index }}</span>
+        <h3><a href="{{ page.permalink }}">{{ page.title }}</a></h3>
+        <p>{{ page.description | default(value="") }}</p>
+      </li>
+      {% endfor %}
+    </ol>
+  </article>
 </div>
 {% endblock %}

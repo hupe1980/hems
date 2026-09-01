@@ -44,6 +44,6 @@ Even the configuration overlay is a pure function of a lookup — `load_from`
 takes the environment as a closure — so a test never has to mutate the process
 environment to check that `HEMS_TARIFFD_LISTEN` beats the file.
 
-## Licence
+## License
 
-MIT or Apache-2.0, at your option.
+MIT OR Apache-2.0

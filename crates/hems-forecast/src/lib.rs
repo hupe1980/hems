@@ -16,8 +16,8 @@
 //! Every one of them is a **pure function of a record**: nothing here reads a
 //! clock, opens a socket or holds a model file. Where a model needs weather it
 //! takes it as an argument, and where it needs history it takes that too. That
-//! is P1, and it is what lets a whole simulated year of forecasting run as a
-//! unit test.
+//! is the whole of the sans-I/O promise here, and it is what lets a simulated
+//! year of forecasting run as a unit test.
 //!
 //! # The band is the product
 //!

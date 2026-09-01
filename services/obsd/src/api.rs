@@ -50,7 +50,7 @@ impl Observed {
 
     /// Whether this request may read `site` — or, for `None`, the whole fleet.
     ///
-    /// Writing is authenticated by a signature over the body (D80) and reading
+    /// Writing is authenticated by a signature over the body and reading
     /// by a bearer token, because they are different callers: a box has a secret
     /// it signs with, and a person or an internal service has a credential it
     /// presents.
@@ -79,7 +79,7 @@ pub fn router(observed: Observed) -> Router {
         .with_state(observed)
 }
 
-/// A box reporting one day, as a signed CloudEvent (D11).
+/// A box reporting one day, as a signed CloudEvent.
 ///
 /// Idempotent by date: a reconnecting box re-sending yesterday is correcting
 /// itself, not adding a day.

@@ -8,6 +8,18 @@ part most likely to be written by somebody who has never read the rest of it,
 against a device that behaves badly, in a hurry. So the contract is narrow on
 purpose.
 
+```mermaid
+sequenceDiagram
+  participant S as socket (hemsd)
+  participant D as Driver (sans-I/O)
+  participant R as registry
+  S->>D: on_bytes(&[u8], now)
+  Note over D: or on_timeout(now) when<br/>poll_deadline passes — which is<br/>where a failsafe is entered
+  D-->>R: poll_event() → Measured / GridLimit
+  D-->>S: poll_transmit() → bytes to send
+  R->>D: command(&Command, now)
+```
+
 - 🧊 **Sans-I/O.** No socket, no thread, no clock. A driver is handed the bytes
   that arrived and the time it is now, and answers with what it would like to
   send and when it would like to be woken. `hemsd` owns the socket.

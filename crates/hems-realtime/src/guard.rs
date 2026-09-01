@@ -1498,7 +1498,7 @@ mod tests {
 
     #[test]
     fn a_reduction_takes_power_from_where_it_is_worth_least() {
-        // The property §7 and D12 claim and the build could not deliver until
+        // The property the guard claims and the build could not deliver until
         // the planner priced assets separately: with one marginal value per
         // *slot*, every device was handed the same weight and the weighted
         // max-min allocator degenerated to plain max-min.
@@ -1700,7 +1700,7 @@ mod tests {
 
     #[test]
     fn a_nearly_empty_battery_lends_only_what_it_can_hold_for_a_whole_period() {
-        // The same bound D24 turned the backup reserve into: a store three
+        // The same bound the backup reserve is enforced with: a store three
         // minutes from its floor lends three minutes of power, not five
         // kilowatts. Without it the loan runs out mid-period and the wallbox
         // spends the rest of it over the ceiling.

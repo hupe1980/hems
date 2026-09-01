@@ -20,9 +20,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Pinned: `config.toml` uses the `[markdown.highlighting]` schema and the
+      # light/dark theme pair introduced in 0.23, so an older Zola fails to parse
+      # it and a newer one should be adopted deliberately.
       - uses: taiki-e/install-action@v2
         with:
-          tool: zola
+          tool: zola@0.23.4
       - run: cd site && zola build
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3

@@ -1,7 +1,7 @@
 //! What the box remembers, and what it still owes the fleet.
 //!
-//! `[A1 7.3]` documents a § 14a control event for **two years** and G3 says the
-//! house is never worse off when the cloud is gone, so the record has to be
+//! `[A1 7.3]` documents a § 14a control event for **two years**, and the house
+//! is never worse off when the cloud is gone, so the record has to be
 //! here. `histd` keeps the fleet's copy and answers across a portfolio; this one
 //! answers for one household, with the WAN cut.
 //!
@@ -25,7 +25,7 @@
 //!
 //! # One household, one process
 //!
-//! D1 makes the edge a single daemon, so there is no `site_id` here: a column
+//! The edge is a single daemon, so there is no `site_id` here: a column
 //! holding the same value in every row is a join key for a join nobody makes.
 //! The site's name belongs to the report that leaves the box, not to its own
 //! record.
@@ -90,7 +90,7 @@ pub enum StoreError {
 /// The schema, one numbered file per revision, applied in order.
 ///
 /// The layout is `mako`'s — `services/<daemon>/migrations/NNNN_*.sql`, a new
-/// file per change and never an edit to one already applied (G4). `mako` applies
+/// file per change and never an edit to one already applied. `mako` applies
 /// them with `sqlx::migrate!`; this is SQLite, so they are compiled in and the
 /// applied revision lives in SQLite's own `user_version`.
 const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_schema.sql"))];

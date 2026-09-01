@@ -384,7 +384,7 @@ pub fn solve(
 /// the last published auction, and a flat default out there makes the plan
 /// indifferent about when to act, which is the state of knowledge. So do the
 /// outdoor temperature (the last value given, then 10 °C) and the hot-water draw
-/// (no draw). See D67.
+/// (no draw).
 ///
 /// [`Slot`]: hems_core::prelude::Slot
 ///
@@ -1593,10 +1593,10 @@ fn charging<M: SolverModel>(
 /// `heat_pump_binary` pins the opening slots its minimum still owes. Anchoring
 /// that first transition also shrinks the search: a 96-slot heating day solves
 /// in about 1,0 s against 5,0 s, because a free first transition branches the
-/// length of the horizon (D65).
+/// length of the horizon.
 ///
 /// The rows are the pairwise ones rather than Rajan and Takriti's convex hull,
-/// which was built and measured at 6,9 s against 4,9 s here (D66).
+/// which was built and measured at 6,9 s against 4,9 s here.
 ///
 /// `hp_on` is shared by every scenario, so these are stated once rather than
 /// per future.

@@ -512,7 +512,7 @@ pub struct BuildingSim {
 /// The only configuration in which a planner's minimum runtime constrains
 /// anything, so the only one in which a day can be watched obeying it — and a
 /// constraint nobody can watch being obeyed is one nobody can watch being broken
-/// (D68). It refuses a change its minimum has not earned, the way the hardware
+/// It refuses a change its minimum has not earned, the way the hardware
 /// does, and counts its starts.
 ///
 /// # It counts in minutes and reports in slots

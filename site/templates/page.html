@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+
 {% block schema %}
 <script type="application/ld+json">
 {
@@ -13,20 +14,27 @@
 }
 </script>
 {% endblock %}
+
 {% block content %}
-<h1>{{ page.title }}</h1>
-{% if page.description %}<p class="lead">{{ page.description }}</p>{% endif %}
-{% if page.toc | length > 2 %}
-<nav class="toc" aria-label="On this page">
-  <strong>On this page</strong>
-  <ul>
-  {% for h in page.toc %}<li><a href="{{ h.permalink | safe }}">{{ h.title }}</a></li>{% endfor %}
-  </ul>
-</nav>
-{% endif %}
-{{ page.content | safe }}
-<nav class="pager" aria-label="Documentation">
-  <span>{% if page.lower %}<a rel="prev" href="{{ page.lower.permalink }}">← {{ page.lower.title }}</a>{% endif %}</span>
-  <span>{% if page.higher %}<a rel="next" href="{{ page.higher.permalink }}">{{ page.higher.title }} →</a>{% endif %}</span>
-</nav>
+<div class="docs-shell">
+  {% set here = page.path %}
+  {% include "partials/docs-nav.html" %}
+  <article>
+    <h1>{{ page.title }}</h1>
+    {% if page.description %}<p class="lead">{{ page.description }}</p>{% endif %}
+    {% if page.toc | length > 2 %}
+    <nav class="toc" aria-label="On this page">
+      <strong>On this page</strong>
+      <ul>
+      {% for h in page.toc %}<li><a href="{{ h.permalink | safe }}">{{ h.title }}</a></li>{% endfor %}
+      </ul>
+    </nav>
+    {% endif %}
+    {{ page.content | safe }}
+    <nav class="pager" aria-label="Documentation">
+      <span>{% if page.lower %}<a rel="prev" href="{{ page.lower.permalink }}"><span class="dir">Previous</span>← {{ page.lower.title }}</a>{% endif %}</span>
+      <span>{% if page.higher %}<a rel="next" href="{{ page.higher.permalink }}"><span class="dir">Next</span>{{ page.higher.title }} →</a>{% endif %}</span>
+    </nav>
+  </article>
+</div>
 {% endblock %}

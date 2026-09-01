@@ -989,7 +989,8 @@ mod tests {
 
     #[test]
     fn with_no_plan_the_store_covers_the_house_instead_of_the_grid() {
-        // G3 in one test. A box whose planner is gone still has to behave like
+        // "Never worse off without the cloud", in one test. A box whose planner
+        // is gone still has to behave like
         // every home battery ever sold: cover the house from the store rather
         // than buy the evening peak with a full battery sitting behind the
         // meter. Before this the fallback absorbed surplus and nothing else, so

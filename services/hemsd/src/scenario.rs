@@ -214,7 +214,7 @@ pub struct Scenario {
     pub community: Option<CommunityMembership>,
     /// Whether the planner runs at all.
     ///
-    /// `false` is the degraded mode of G3: no forecast, no prices, no solver —
+    /// `false` is the degraded mode: no forecast, no prices, no solver —
     /// the box on its own, doing what every home battery has always done. It is
     /// also the only mode in which switching a charge point's conductors earns
     /// anything, because surplus is an instantaneous quantity that cannot be
@@ -378,7 +378,7 @@ impl Scenario {
     ///
     /// What the box does on its own: cover the house from the roof and the
     /// store, absorb what is left into the car, and export the rest. It is the
-    /// degraded mode G3 promises, and it is the one place a switchable charge
+    /// degraded mode the box promises, and it is the one place a switchable charge
     /// point pays for itself — surplus arrives as an instantaneous quantity, and
     /// below 4,14 kW three conductors can do nothing with it at all.
     ///
@@ -387,8 +387,8 @@ impl Scenario {
     /// controlled experiments on the *surplus* — what a contactor is worth, and
     /// what the household's Ladelimit stops the fallback doing with it — and an
     /// appliance that eats a kilowatt-hour of exactly that surplus makes the day
-    /// measure two mechanisms and attribute the sum to one. The G3 fallback for
-    /// an appliance is covered by a test that loads one deliberately.
+    /// measure two mechanisms and attribute the sum to one. The no-plan fallback
+    /// for an appliance is covered by a test that loads one deliberately.
     #[must_use]
     pub fn summer_without_a_planner(config: HouseholdConfig) -> Self {
         Self {
@@ -418,7 +418,7 @@ impl Scenario {
     /// that is 4,8 kWh short and €24 out of pocket for it.
     ///
     /// The car's target is deliberately inside what the day can give: a box with
-    /// no planner surplus-charges and never imports for a deadline (D20), so a
+    /// no planner surplus-charges and never imports for a deadline, so a
     /// target beyond the roof measures the absence of a planner rather than the
     /// presence of a contactor.
     ///
@@ -458,12 +458,12 @@ impl Scenario {
     /// with something between one and three kilowatts.
     ///
     /// What it demonstrates is the **store lending its discharge** to the § 14a
-    /// budget (`[A1 2.3]`, D26): 5,4 kWh of headroom the connection point never
+    /// budget (`[A1 2.3]`): 5,4 kWh of headroom the connection point never
     /// saw, and a car that leaves full.
     ///
     /// It is *not* a phase-switching day, and the KPI says so — **zero
     /// switches**. A planner duty-cycles a quarter hour and reaches the same
-    /// average, which is the measurement behind D22; a contactor pays where
+    /// average; a contactor pays where
     /// there is no planner, which is the `autumn` day.
     #[must_use]
     pub fn winter_evening_deadline(config: HouseholdConfig) -> Self {
@@ -497,7 +497,7 @@ impl Scenario {
     ///
     /// Millions of German households have a heat pump and a wallbox and no
     /// battery, and they are the ones a 4,2 kW ceiling is hard on: there is no
-    /// discharge to lend the controllable devices headroom (`[A1 2.3]`, D26), so
+    /// discharge to lend the controllable devices headroom (`[A1 2.3]`), so
     /// the reduction has to be *shared* and somebody gets less than they wanted.
     ///
     /// That makes it the day the allocation weights decide something. On the
@@ -534,7 +534,7 @@ impl Scenario {
             // That window is the only time the guard's allocator actually
             // *decides* anything: the rest of the time the planner has already
             // solved the split under the same ceiling and the arbiter follows
-            // it. It is the case D3 exists for — an optimiser can be infeasible,
+            // it. It is the case the guard exists for — an optimiser can be infeasible,
             // a guard cannot.
             grid_event: Some((
                 Duration::minutes(17 * 60 + 7),
@@ -1000,7 +1000,7 @@ pub struct DayResult {
     /// The quantity § 9 EEG limits, in the resolution it limits it at. A
     /// quarter-hour average and not an instantaneous peak, because the 60 % cap
     /// is a *settlement* limit read off meter registers rather than a control
-    /// instruction (D27) — and a controller that chased the instantaneous value
+    /// instruction — and a controller that chased the instantaneous value
     /// would curtail a roof all afternoon to avoid a one-minute transient nobody
     /// meters.
     ///
@@ -1580,7 +1580,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                         // arbiter's, and it earns its keep exactly where the
                         // guard has cut the charge point below what three
                         // conductors can start on: a § 14a reduction, a circuit
-                        // limit, or a surplus with no plan behind it (D22).
+                        // limit, or a surplus with no plan behind it.
                         min_charge: evse_asset.min_power(PhaseMode::Three),
                         efficiency: vehicle.efficiency,
                         arrival: (arrival > Slot::containing(now)).then_some(arrival),
@@ -1720,7 +1720,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                         }
                         match plan.as_ref().and_then(|p| p.slot_at(now)) {
                             Some(sp) => sp.target(id).is_some_and(|t| t.power > Power::ZERO),
-                            // ── G3: no plan, and the dishes still have to be
+                            // ── no plan, and the dishes still have to be
                             // washed ──
                             //
                             // Waiting for a plan that is not coming is what this
@@ -2595,10 +2595,10 @@ fn baseline_cost(
     // How much this wallbox will still push. It stops at the **target** the
     // household asked for, and that is a known asymmetry rather than a
     // considered choice: the managed household may charge on past it out of a
-    // surplus and is credited for the excess (`vehicle_eur`, D52), and this one
-    // never can, so only one side of the comparison can ever earn that entry.
-    // It is recorded in RISKS.md as R29, with the measured size and the reason
-    // the obvious repairs are worse than the defect.
+    // surplus and is credited for the excess (`vehicle_eur`), and this one never
+    // can, so only one side of the comparison can ever earn that entry. The
+    // asymmetry is small, and it can only ever *understate* the saving — which is
+    // the safe direction, and the reason the obvious repairs are worse than it.
     let mut car_remaining = scenario.ev.map_or(Energy::ZERO, |e| {
         (e.energy_target - e.energy_now).max(Energy::ZERO)
     });

@@ -63,8 +63,7 @@ Resource Manager that re-mints its IDs on every reconnect invalidates every
 description the manager cached, and a manager replaying a ten-minute-old plan
 addresses modes that no longer exist. hems derives them (UUIDv5) from the
 asset's own identity, so a restart changes nothing — every description, the SG
-Ready heat pump's included, which was the one that generated them until the fifth
-audit found it.
+Ready heat pump's included.
 
 And one that carries real money: `consequence_type` is `DEFER` for a wallbox and
 `VANISH` for an inverter. Curtailed sunlight does not come back later. That single
@@ -105,10 +104,10 @@ pump, hot-water tank, dishwasher, roof), and a test pins them.
 
 Counting *descriptions built* rather than assets whose control type is not
 `NotControllable` is the whole point. The second number goes up when a device is
-added and never notices that no `describe_*` was ever written for it, which is
-how the hot-water tank sat inside it for four versions with nothing to send. A
-gap now says so out loud: `6 resources, 1 it cannot express`.
+added and never notices that no `describe_*` was ever written for it, so a device
+can sit inside the count with nothing to send. A gap says so out loud:
+`6 resources, 1 it cannot express`.
 
 ## License
 
-Apache-2.0 OR MIT.
+MIT OR Apache-2.0

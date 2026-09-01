@@ -111,7 +111,7 @@ fn events(
 ///
 /// Decimal **strings**, not numbers. A JSON number is a `double` to every reader
 /// that has ever parsed one, and a settlement quantity that has been through one
-/// is a settlement quantity nobody can reproduce (P3).
+/// is a settlement quantity nobody can reproduce.
 fn quarter_hour(q: &QuarterHour) -> Value {
     json!({
         "slot_start": q.slot.start().unix_timestamp(),

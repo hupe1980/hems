@@ -488,7 +488,8 @@ fn the_hot_water_tank_is_a_store_and_the_plan_uses_it_as_one() {
 
 #[test]
 fn without_a_planner_the_house_still_runs_off_its_own_roof() {
-    // G3, measured. No forecast, no prices, no solver: the box on its own does
+    // The house is never worse off without the cloud, measured. No forecast, no
+    // prices, no solver: the box on its own does
     // what every home battery has always done — cover the house from the roof
     // and the store, absorb what is left, export the rest.
     let r = run(&Scenario::summer_without_a_planner(
@@ -656,7 +657,7 @@ fn the_days_own_generation_is_shared_over_a_forty_two_c_community() {
         "and some of it reached the members: {shared}"
     );
 
-    // And the two contracts genuinely differ, which is D33: applying the key
+    // And the two contracts genuinely differ: applying the key
     // once and capping each member strands generation on whoever happened to be
     // away; re-offering it shares strictly more. Both are defensible, they give
     // different answers, and § 42c Abs. 3 Nr. 2 makes it the community's choice
@@ -754,7 +755,7 @@ fn a_day_shown_the_weather_in_advance_says_so_about_itself() {
 fn the_reference_day_is_not_run_on_perfect_foresight() {
     // A simulated day whose forecast *is* the series the simulator is about to
     // run cannot tell a good planner from one that was shown the answer, and the
-    // arbiter's energy tracking (D19) — built to absorb forecast error — is
+    // arbiter's energy tracking — built to absorb forecast error — is
     // never exercised because the error is identically zero.
     //
     // A test that only checked "the day saves money" would pass either way. This
@@ -847,7 +848,7 @@ fn a_household_with_no_store_shares_a_reduction_that_arrives_off_the_grid() {
     // starts exactly on a quarter hour lets the planner re-solve under the new
     // ceiling immediately, so the guard never has to decide anything; the window
     // between the command and the next re-plan is the only time it does, and it
-    // is the case D3 exists for.
+    // is the case the guard exists for.
     let r = run(&Scenario::winter_evening_no_store(
         &HouseholdConfig::default(),
     ))
@@ -1198,7 +1199,7 @@ fn a_household_with_no_shiftable_appliance_still_plans() {
 
 #[test]
 fn a_box_with_no_planner_still_washes_up() {
-    // G3: the house is never worse off when the planner is gone. A shiftable
+    // The house is never worse off when the planner is gone. A shiftable
     // appliance is the one device whose whole instruction is "start", so a box
     // with no plan that simply never sends it leaves the household with dirty
     // dishes and — because the comparison ran the machine — a *negative* saving.
@@ -1350,8 +1351,8 @@ fn a_forty_two_c_community_moves_the_day_and_the_baseline_is_in_it_too() {
 
 #[test]
 fn the_day_the_household_would_be_asked_about_survives_the_process() {
-    // `[A1 7.3]` keeps a § 14a control event for **two years**, and G3 says the
-    // house is never worse off when the cloud is gone. Put together, those mean
+    // `[A1 7.3]` keeps a § 14a control event for **two years**, and the house is
+    // never worse off when the cloud is gone. Put together, those mean
     // the record has to exist on the box: one that only exists once it has been
     // uploaded is an intention with a network dependency, and the day a network
     // operator asks about is exactly the day the link was down.

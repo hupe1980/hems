@@ -10,7 +10,7 @@
 //! # What it deliberately is not
 //!
 //! It is **not** `mako-service`. Extracting that was considered and rejected
-//! (D8): its OIDC layer carries a `mako_roles` claim and a `Sparte` grant, and
+//! its OIDC layer carries a `mako_roles` claim and a `Sparte` grant, and
 //! its Cedar schema is built on market roles a household energy manager does not
 //! have. What was left after removing them was five domain-free modules, and
 //! copying five domain-free modules is cheaper than maintaining a diff guard
@@ -23,7 +23,7 @@
 //! # Sans-I/O ends here
 //!
 //! Every domain crate in this workspace takes time as a parameter and opens no
-//! socket (P1, P2). This crate is where that stops being true, and it is the
+//! socket. This crate is where that stops being true, and it is the
 //! only shared place it does: `hems-core`, `hems-grid`, `hems-optimizer` and the
 //! rest stay testable in a millisecond because the clock and the socket live
 //! here instead.

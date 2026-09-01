@@ -5,7 +5,7 @@
 //! A body works while there is one message on one link. With two, a receiver has
 //! to answer three questions the body cannot: *what is this*, *who sent it*, and
 //! *have I already seen it*. Answering them per endpoint is how a fleet ends up
-//! with four conventions and no vocabulary, which is what D11 chose CloudEvents
+//! with four conventions and no vocabulary, which is why the envelope is CloudEvents
 //! to avoid.
 //!
 //! **Structured** mode rather than binary: the whole event is one JSON document,

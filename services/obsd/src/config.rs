@@ -19,7 +19,7 @@ pub struct Settings {
     /// A box reports once a day, so two days is a box that has missed one and
     /// then missed another — which is a fault rather than a late night.
     pub silent_after_s: u64,
-    /// The secrets a box's report may be signed with, D11.
+    /// The secrets a box's report may be signed with.
     ///
     /// A **list** rather than one, because rotation is the reason a signature
     /// scheme has a version prefix: an operator publishes a new secret, both are
@@ -40,8 +40,8 @@ pub struct Settings {
     ///
     /// `/v1/fleet` and `/v1/sites/{site}` carry what every household spent,
     /// saved and drew, and the named list of those that did not respect a
-    /// network operator's reduction. Writing is authenticated by a signature
-    /// (D80); reading is a different question with a different caller — a
+    /// network operator's reduction. Writing is authenticated by a signature;
+    /// reading is a different question with a different caller — a
     /// person or an internal service — and needs its own credential.
     ///
     /// Empty means nothing is served, for the same reason an empty

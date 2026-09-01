@@ -3,7 +3,7 @@ title = "hems"
 description = "The open-source home energy management platform for the German market: § 14a EnWG, § 9 EEG, MiSpeL and Modul 3 as executable, cited rules; a guard the optimiser cannot argue with; EEBUS and S2 native; written in Rust."
 default_language = "en"
 compile_sass = false
-build_search_index = false
+build_search_index = true
 generate_feeds = true
 feed_filenames = ["atom.xml"]
 
@@ -12,18 +12,33 @@ smart_punctuation = true
 # Deep links to every heading: a documentation page whose sections cannot be
 # linked to is one nobody links to.
 insert_anchor_links = "heading"
+# GitHub-style callouts: `> [!NOTE]` becomes a styled aside.
+github_alerts = true
+
+# `css` rather than a baked-in theme, so the same page can be highlighted for a
+# reader in light mode and a reader in dark mode without shipping two of it.
+[markdown.highlighting]
+style = "class"
+light_theme = "ayu-light"
+dark_theme = "ayu-dark"
+
+[search]
+include_title = true
+include_description = true
+include_path = true
 
 [extra]
 repository = "https://github.com/hupe1980/hems"
 tagline    = "open-source home energy management for the German grid"
+
 # The landing page's five numbers. They are here rather than in the template so
 # that changing one is a one-line diff against the thing that produced it:
-# `cargo xtask check-citations`, `cargo test --workspace`, the crate list, and
-# `just demo-all`.
-stat_rules   = "279"
-stat_tests   = "452"
+# `cargo xtask check-citations`, `cargo test --workspace --all-features`, the
+# `just purity` crate list, `just demo-all`, and the planner's own horizon.
+stat_rules   = "328"
+stat_tests   = "727"
 stat_crates  = "10"
 stat_days    = "7"
-stat_horizon = "192"
+stat_horizon = "96"
 
-keywords   = "HEMS, home energy management, § 14a EnWG, EEBUS, S2, EN 50491-12-2, Rust, model predictive control, § 9 EEG, Solarspitzengesetz, MiSpeL, dynamic tariff, § 41a EnWG"
+keywords = "HEMS, home energy management, § 14a EnWG, EEBUS, S2, EN 50491-12-2, Rust, model predictive control, § 9 EEG, Solarspitzengesetz, MiSpeL, § 42c EnWG, dynamic tariff, § 41a EnWG, SunSpec, Modbus"

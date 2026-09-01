@@ -26,7 +26,7 @@ use crate::{Db, Store, StoreError};
 /// Off the runtime, a single connection still serialises them: eight exports put
 /// a box's evidence write 2,7 s behind. SQLite in WAL mode allows many readers
 /// and one writer, so a read opens its own connection through [`Db`] and only
-/// writes share one (D87).
+/// writes share one.
 #[derive(Clone)]
 pub struct History {
     db: Db,
