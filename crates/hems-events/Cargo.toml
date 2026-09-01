@@ -1,6 +1,6 @@
 [package]
 name        = "hems-events"
-description = "The compile-time catalogue of every CloudEvents type the hems workspace emits — one list, checked by a workspace guard, so an event nobody consumes and a consumer of an event nobody emits are both build failures"
+description = "Every CloudEvents type the hems workspace emits, the envelope they travel in, and the Standard Webhooks signature that says a box sent one — a compile-time catalogue checked by a workspace guard, so an event nobody consumes and a consumer of an event nobody emits are both build failures"
 keywords    = ["energy", "cloudevents", "hems", "events"]
 categories  = ["science"]
 readme      = "README.md"
@@ -12,3 +12,10 @@ repository.workspace   = true
 rust-version.workspace = true
 
 [dependencies]
+base64     = { workspace = true }
+hmac       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+sha2       = { workspace = true }
+thiserror  = { workspace = true }
+time       = { workspace = true }

@@ -78,6 +78,7 @@ fn prices(h: Horizon, ct: &[i64]) -> PriceStack {
         // lose money, not spotting an arbitrage.
         feed_in: FeedIn::eeg(Decimal::new(4, 0))
             .under_para51_from(Some(time::macros::date!(2020 - 01 - 01))),
+        sharing: None,
         standing_charge_eur_per_year: Decimal::ZERO,
     };
     PriceStack::build(&tariff, h)
@@ -1840,4 +1841,423 @@ fn a_settled_compressor_is_free_and_a_modulating_unit_has_no_memory_at_all() {
         slots_in_state: 0,
     };
     assert_eq!(modulating.committed(), None);
+}
+
+// ── The commitment horizon ───────────────────────────────────────────────────
+
+/// Whether the compressor is running in each slot, read off a solved plan.
+fn compressor_track(solved: &hems_optimizer::Solved) -> Vec<bool> {
+    solved
+        .flows
+        .iter()
+        .map(|f| f.heat_pump > Power::new(1.0))
+        .collect()
+}
+
+#[test]
+fn a_blocked_tail_still_obeys_the_minimum_runtime() {
+    // Coarsening is a *restriction* of the feasible set, never a relaxation, so
+    // no constraint the model states can be escaped by it. The minimum runtime
+    // is the one that would be most obviously embarrassing to lose, because
+    // `minimum_runtime` now skips the rows a shared variable makes trivial —
+    // and "trivial" has to mean "already implied", not "not built".
+    let h = horizon(48);
+    let p = prices(h, &[10, 40, 10, 40]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-2.0; 48];
+    let mut t = thermal(21.0, false);
+    t.heat_pump.min_on_slots = 3;
+    t.heat_pump.min_off_slots = 3;
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &names(),
+        T0,
+    )
+    .unwrap();
+
+    // Every run of equal states, except the one the horizon cuts off at each
+    // end, has to be at least three slots long.
+    let on = compressor_track(&solved);
+    let mut runs: Vec<(bool, usize)> = Vec::new();
+    for state in on {
+        match runs.last_mut() {
+            Some((s, n)) if *s == state => *n += 1,
+            _ => runs.push((state, 1)),
+        }
+    }
+    for (state, length) in runs.iter().skip(1).take(runs.len().saturating_sub(2)) {
+        assert!(
+            *length >= 3,
+            "a {} run of {length} slots against a minimum of three: {runs:?}",
+            if *state { "running" } else { "idle" }
+        );
+    }
+}
+
+#[test]
+fn the_fine_head_is_where_every_executed_slot_lives() {
+    // A receding horizon executes the first slot and throws the rest away, so
+    // the head is the only part a coarser tail may not touch. `fine()` decides
+    // every slot on its own; the default blocks the tail — and the two have to
+    // agree about the slots that will actually be commanded.
+    //
+    // The price steps on the **hour**, which is where a day-ahead curve steps
+    // and where the blocks are anchored. That is the whole claim: an hourly
+    // block over an hourly price throws nothing away. What it costs when the
+    // price moves faster than the block is the next test.
+    let h = horizon(48);
+    let p = prices(h, &[10, 10, 10, 10, 40, 40, 40, 40]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-2.0; 48];
+    let t = thermal(20.5, false);
+
+    let blocked = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    let fine = solve(
+        &Problem::new(h, &p, &pv, &load)
+            .with_thermal(t, &outdoor)
+            .with_commitment_horizon(hems_optimizer::CommitmentHorizon::fine()),
+        &names(),
+        T0,
+    )
+    .unwrap();
+
+    assert_eq!(
+        compressor_track(&blocked)[0],
+        compressor_track(&fine)[0],
+        "the slot the arbiter is about to commit is the same either way"
+    );
+    // And the price of the coarser tail is small enough to be worth what it
+    // buys. Both plans are feasible over the same horizon, so the blocked one
+    // can only be worse, and this says by how much.
+    let cost = |s: &hems_optimizer::Solved| -> f64 {
+        s.plan
+            .expected_cost
+            .as_ref()
+            .map_or(0.0, hems_core::prelude::CostBreakdown::total)
+    };
+    // And the price of the coarser tail is bounded rather than assumed. The
+    // blocked plan is feasible for the fine model too, so it can only be worse,
+    // and the gap is what an hour of commitment costs: the tail can no longer
+    // idle for part of an hour, only for all of it. On the reference winter day
+    // it is worth a fraction of a cent against ten minutes of solver time.
+    let (blocked_eur, fine_eur) = (cost(&blocked), cost(&fine));
+    assert!(
+        blocked_eur <= fine_eur * 1.03,
+        "blocking the tail cost {blocked_eur:.4} € against {fine_eur:.4} €"
+    );
+}
+
+#[test]
+fn a_price_that_moves_faster_than_the_block_is_what_blocking_costs() {
+    // The honest other half, stated as a test so nobody has to discover it: a
+    // block can only be free where the thing it is coarsening is constant
+    // across it. Alternate the price every quarter hour — four times the
+    // resolution the blocks are cut at — and the coarse plan is measurably
+    // worse, because the fine one is switching the compressor on every cheap
+    // slot and the coarse one cannot.
+    //
+    // It is not an argument against the default. It is the argument for
+    // `CommitmentHorizon::fine()` being reachable, and for the blocks being
+    // anchored to the clock the tariff steps on rather than to the plan.
+    let h = horizon(48);
+    let p = prices(h, &[10, 40]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-2.0; 48];
+    let t = thermal(20.5, false);
+
+    let cost = |horizon: hems_optimizer::CommitmentHorizon| -> f64 {
+        solve(
+            &Problem::new(h, &p, &pv, &load)
+                .with_thermal(t, &outdoor)
+                .with_commitment_horizon(horizon),
+            &names(),
+            T0,
+        )
+        .unwrap()
+        .plan
+        .expected_cost
+        .as_ref()
+        .map_or(0.0, hems_core::prelude::CostBreakdown::total)
+    };
+    let fine = cost(hems_optimizer::CommitmentHorizon::fine());
+    let blocked = cost(hems_optimizer::CommitmentHorizon::default());
+    assert!(
+        blocked > fine,
+        "a quarter-hourly price is where a block costs something: \
+         {blocked:.4} € against {fine:.4} €"
+    );
+    // …and a half-hourly block recovers most of it, which is the knob to reach
+    // for on a tariff that really does move every quarter hour.
+    let half = cost(hems_optimizer::CommitmentHorizon {
+        fine_slots: 8,
+        block_slots: 2,
+    });
+    assert!(half < blocked, "{half:.4} € against {blocked:.4} €");
+}
+
+#[test]
+fn blocking_never_swallows_a_committed_slot() {
+    // `heat_pump_binary` pins the slots the compressor's own history has
+    // already decided (D65). Pinning the *start* of a block would pin the whole
+    // block, so the fine head has to be at least as long as anything the unit
+    // still owes — which is what `fine_for` guarantees and what this checks
+    // through the plan rather than through the arithmetic.
+    let h = horizon(32);
+    // Dear now, cheap immediately after: a plan with a free hand would stop the
+    // compressor at once.
+    let p = prices(h, &[90, 90, 5, 5, 5, 5, 5, 5]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-2.0; 32];
+    let mut t = thermal(22.5, false);
+    t.heat_pump.min_on_slots = 6;
+    t.heat_pump.min_off_slots = 2;
+    // Running, and one slot into a six-slot minimum: five are still owed.
+    t.heat_pump.compressor = CompressorState {
+        running: true,
+        slots_in_state: 1,
+    };
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    let on = compressor_track(&solved);
+    assert!(
+        on[..5].iter().all(|running| *running),
+        "the five slots the compressor still owes are not decisions: {on:?}"
+    );
+}
+
+#[test]
+fn a_modulating_unit_is_untouched_by_the_commitment_grid() {
+    // The grid coarsens a *binary*, and a modulating unit has none. Its plan
+    // must be identical whatever the grid says, or the knob has leaked into the
+    // configuration every household actually runs.
+    let h = horizon(48);
+    let p = prices(h, &[10, 40, 10, 40]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-2.0; 48];
+    let t = thermal(21.0, true);
+
+    let a = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    let b = solve(
+        &Problem::new(h, &p, &pv, &load)
+            .with_thermal(t, &outdoor)
+            .with_commitment_horizon(hems_optimizer::CommitmentHorizon::fine()),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    for (x, y) in a.flows.iter().zip(&b.flows) {
+        assert!(
+            (x.heat_pump.get() - y.heat_pump.get()).abs() < 1e-6,
+            "{x:?} against {y:?}"
+        );
+    }
+}
+
+// ── § 42c energy sharing ─────────────────────────────────────────────────────
+
+/// The same price stack, inside a community that sells at `ct_per_kwh` net.
+fn prices_in_community(h: Horizon, ct: &[i64], community_ct: i64) -> PriceStack {
+    let spot: BTreeMap<Slot, Decimal> = h
+        .slots()
+        .enumerate()
+        .map(|(i, s)| (s, Decimal::new(ct[i % ct.len()], 0)))
+        .collect();
+    let tariff = Tariff {
+        energy: EnergyPrice::Dynamic {
+            spot,
+            markup_ct_per_kwh: Decimal::ZERO,
+            fallback_ct_per_kwh: Decimal::new(20, 0),
+        },
+        network: NetworkCharge::None {
+            arbeitspreis: Decimal::ZERO,
+        },
+        levies: Levies {
+            stromsteuer: Decimal::ZERO,
+            kwkg: Decimal::ZERO,
+            para19: Decimal::ZERO,
+            offshore: Decimal::ZERO,
+            konzessionsabgabe: Decimal::ZERO,
+            vat_rate: Decimal::ZERO,
+        },
+        feed_in: FeedIn::eeg(Decimal::new(4, 0))
+            .under_para51_from(Some(time::macros::date!(2020 - 01 - 01))),
+        sharing: Some(hems_tariff::tariff::SharingTariff::at(Decimal::new(
+            community_ct,
+            0,
+        ))),
+        standing_charge_eur_per_year: Decimal::ZERO,
+    };
+    PriceStack::build(&tariff, h)
+}
+
+#[test]
+fn a_community_share_moves_the_flexible_load_into_the_neighbours_daylight() {
+    // The whole behavioural point of § 42c, and the thing `hems-grid::sharing`
+    // could settle but the planner could not act on. The household's own roof is
+    // dark; the community's is not, and its generation is offered in slots 4..8
+    // only. The tank has a whole horizon to heat in and every reason to do it
+    // there.
+    let h = horizon(16);
+    // Flat energy price, so the *only* thing that can move the load is the
+    // community share. Anything that shifted here without § 42c would be
+    // shifting for a reason this test did not put in.
+    let p = prices_in_community(h, &[30], 5);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let share: Vec<f64> = (0..16)
+        .map(|k| if (4..8).contains(&k) { 3000.0 } else { 0.0 })
+        .collect();
+    let tank = DhwModel {
+        stored_now: Energy::from_kwh(0.5),
+        ..DhwModel::tank(Energy::from_kwh(5.0), Power::from_kw(2.0))
+    };
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load)
+            .with_dhw(tank, &[0.0; 16])
+            .in_community(&share),
+        &names(),
+        T0,
+    )
+    .unwrap();
+
+    let inside: f64 = (4..8).map(|k| solved.flows[k].dhw.get()).sum();
+    let outside: f64 = (0..16)
+        .filter(|k| !(4..8).contains(k))
+        .map(|k| solved.flows[k].dhw.get())
+        .sum();
+    assert!(
+        inside > outside,
+        "the tank should heat inside the community's window: {inside:.0} W in, \
+         {outside:.0} W out"
+    );
+    // And the allocation is reported, because a discount the household is not
+    // shown is a discount nobody can check.
+    let allocated: f64 = solved.flows.iter().map(|f| f.shared_import.get()).sum();
+    assert!(allocated > 0.0, "nothing was allocated at all");
+}
+
+#[test]
+fn a_member_is_never_allocated_more_than_it_drew_or_more_than_its_share() {
+    // The two caps that make this an allocation of *consumption* rather than a
+    // paper transfer — the same pair `hems_grid::sharing` settles after the fact.
+    let h = horizon(12);
+    let p = prices_in_community(h, &[30], 5);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 400.0);
+    let share = vec![9000.0; 12];
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load).in_community(&share),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    for (k, f) in solved.flows.iter().enumerate() {
+        assert!(
+            f.shared_import <= f.grid_import + Power::new(1e-6),
+            "slot {k}: allocated {} against an import of {}",
+            f.shared_import,
+            f.grid_import
+        );
+        assert!(
+            f.shared_import.get() <= share[k] + 1e-6,
+            "slot {k}: allocated more than the Aufteilungsschlüssel offered"
+        );
+    }
+}
+
+#[test]
+fn a_community_dearer_than_the_supplier_is_priced_at_no_advantage() {
+    // The concave case, and the one an optional-discount model would get wrong
+    // in the unsafe direction. A community that charges more than the supplier
+    // cannot be declined — the Aufteilungsschlüssel applies whatever anybody
+    // prefers — so the honest answer is to claim no advantage from it rather
+    // than to invent one, and above all not to let the plan believe it can opt
+    // out. Nothing is allocated, and the plan is the one it would have made
+    // without a community at all.
+    let h = horizon(12);
+    let dear = prices_in_community(h, &[20], 40);
+    let plain = prices(h, &[20]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 400.0);
+    let share = vec![9000.0; 12];
+
+    let with_community = solve(
+        &Problem::new(h, &dear, &pv, &load).in_community(&share),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    let without = solve(&Problem::new(h, &plain, &pv, &load), &names(), T0).unwrap();
+
+    assert!(
+        with_community
+            .flows
+            .iter()
+            .all(|f| f.shared_import == Power::ZERO),
+        "a dearer community must not look like a discount"
+    );
+    for (a, b) in with_community.flows.iter().zip(&without.flows) {
+        assert!((a.grid_import.get() - b.grid_import.get()).abs() < 1e-6);
+    }
+}
+
+#[test]
+fn the_baseline_is_in_the_same_community_as_the_plan() {
+    // A household joins a community and then does nothing about it: the
+    // Aufteilungsschlüssel still allocates it whatever its unmanaged draw
+    // overlaps. Crediting the plan with the *membership* rather than with the
+    // shifting is the same asymmetry as measuring a saving against a household
+    // that ignored the network operator — so the baseline's own bill has to fall
+    // when a community appears.
+    let h = horizon(16);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 300.0);
+    let share = vec![2000.0; 16];
+    let tank = DhwModel {
+        stored_now: Energy::from_kwh(0.5),
+        ..DhwModel::tank(Energy::from_kwh(5.0), Power::from_kw(2.0))
+    };
+    let baseline = |stack: &PriceStack, community: &[f64]| -> f64 {
+        solve(
+            &Problem::new(h, stack, &pv, &load)
+                .with_dhw(tank, &[0.0; 16])
+                .in_community(community),
+            &names(),
+            T0,
+        )
+        .unwrap()
+        .plan
+        .baseline_cost
+        .as_ref()
+        .map_or(0.0, hems_core::prelude::CostBreakdown::total)
+    };
+    let plain = prices(h, &[30]);
+    let community = prices_in_community(h, &[30], 5);
+    assert!(
+        baseline(&community, &share) < baseline(&plain, &[]) - 1e-6,
+        "the unmanaged household is allocated too"
+    );
 }

@@ -24,13 +24,12 @@ planning cooked the reference house to 64 °C and reported it as a saving; and a
 counting its starts and the time it held on against a command. A simulator that
 agrees with its controller flatters it and hides exactly the bugs worth finding.
 
-That last one is the clearest case in the workspace. The planner had modelled a
-minimum runtime for the life of the project — implemented, documented, cited and
-unit-tested — and every reference day ran a *modulating* unit, so nothing that
-ran a day could tell whether it was obeyed. It was not: the constraint's rows
-need the slot before them, and a receding horizon executes only the slot that has
-none. A constraint no simulator can be watched obeying is a constraint no
-simulator can be watched breaking.
+That last one is the clearest case in the workspace. A minimum runtime can be
+implemented, documented, cited and unit-tested and still be enforced on no day,
+because its rows need the slot before them and a receding horizon executes only
+the slot that has none. A constraint no simulator can be watched obeying is a
+constraint no simulator can be watched breaking, so the simulator runs a
+compressor that can cycle.
 
 **And the day is not the day that was forecast.** `weather::Realisation` is a
 seeded process — four octaves of value noise on the cloud cover at about four

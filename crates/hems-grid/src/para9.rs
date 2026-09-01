@@ -88,11 +88,11 @@ pub const LEGACY_CAP_FRACTION: f64 = 0.70;
 /// the comparison has to be strict. The same care as
 /// [`crate::para14a::FALLGRUPPE_THRESHOLD`]'s *"mehr als 4,2 kW"*.
 ///
-/// There is deliberately **no lower bound**. The 2 kW that used to be one here
-/// belongs to the Steckersolargerät exemption of § 9 Abs. 2 S. 4 (see
-/// [`STECKERSOLAR_MAX_DC`]), which is a statement about a kind of installation
-/// and not a size class — and reading it as a floor exempted every small roof
-/// array from a cap the statute puts on it.
+/// There is deliberately **no lower bound**. The 2 kW belongs to the
+/// Steckersolargerät exemption of § 9 Abs. 2 S. 4 (see [`STECKERSOLAR_MAX_DC`]),
+/// which is a statement about a kind of installation and not a size class —
+/// read as a floor it exempts every small roof array from a cap the statute puts
+/// on it.
 pub const CAP_MAX_SIZE_EXCLUSIVE: Power = Power::new_const(100_000.0);
 
 /// The installed power a Steckersolargerät may have and stay outside

@@ -1,4 +1,5 @@
-//! Every CloudEvents `type` the workspace emits, in one place.
+//! Every CloudEvents `type` the workspace emits, the envelope one travels in,
+//! and the signature that says which box sent it.
 //!
 //! An event type is an interface. Spelling one differently in the emitter and
 //! the consumer produces a system that runs, logs nothing unusual, and quietly
@@ -15,17 +16,23 @@
 //! 1.0 recommends, and past tense because an event is something that has already
 //! happened. `de.hems.grid.lpc.limit.received`, not `de.hems.grid.set_limit`.
 //!
-//! # Nothing emits these yet
+//! # One of them is on a wire, and the rest are not yet
 //!
-//! Every crate in the workspace is sans-I/O, so there is no bus for an event to
-//! travel on until `hemsd` grows one. `cargo xtask check-events` therefore
-//! reports zero references today, and that is the honest state: this is the
-//! agreed vocabulary, written down before the first emitter rather than
-//! reverse-engineered from six of them.
+//! [`SITE_DAY_REPORTED`] is what a box sends `obsd` at the end of a day — the
+//! only link between the edge and the fleet that exists — and it travels as a
+//! CloudEvent in [`envelope`], signed with [`webhook`]. The rest of the
+//! catalogue is the agreed vocabulary, written down before its first emitter
+//! rather than reverse-engineered from six of them; it arrives with the driver
+//! loop and the local bus `hemsd` still has to grow.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
-#![no_std]
+
+pub mod envelope;
+pub mod webhook;
+
+pub use envelope::{EnvelopeError, Event};
+pub use webhook::{Signed, WebhookError};
 
 // ── Grid ────────────────────────────────────────────────────────────────────
 
@@ -66,6 +73,13 @@ pub const SITE_PLAN_FAILED: &str = "de.hems.site.plan.failed";
 pub const SITE_SETPOINT_ISSUED: &str = "de.hems.site.setpoint.issued";
 /// The measured grid power and the sum of the assets disagree.
 pub const SITE_BALANCE_DIVERGED: &str = "de.hems.site.balance.diverged";
+/// A box reported what one local day came to, `hems_core::report::DayKpis`.
+///
+/// The one event on a wire today: `hemsd --report-to` sends it to `obsd`. It is
+/// keyed on the **local day** rather than on the moment it was sent, so a box
+/// that comes back after an outage and re-sends yesterday is correcting itself
+/// rather than adding a day.
+pub const SITE_DAY_REPORTED: &str = "de.hems.site.day.reported";
 
 // ── Devices ─────────────────────────────────────────────────────────────────
 
@@ -113,6 +127,7 @@ pub const ALL: &[&str] = &[
     SITE_PLAN_FAILED,
     SITE_SETPOINT_ISSUED,
     SITE_BALANCE_DIVERGED,
+    SITE_DAY_REPORTED,
     DEVICE_DISCOVERED,
     DEVICE_PAIRED,
     DEVICE_LOST,

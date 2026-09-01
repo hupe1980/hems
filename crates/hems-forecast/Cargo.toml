@@ -15,6 +15,11 @@ rust-version.workspace = true
 hems-core = { workspace = true }
 metering  = { workspace = true }
 serde     = { workspace = true, optional = true }
+# Reading somebody else's weather model. A pure parser — a `&str` in, a series
+# out — so `hems-forecast` stays a domain crate that does no I/O: the fetching
+# lives in `forecastd`, and the parser is tested against a captured body.
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
 time      = { workspace = true }
 
 [features]

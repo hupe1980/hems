@@ -1,0 +1,29 @@
+[package]
+name        = "forecastd"
+description = "The fleet's weather service: ICON-D2 through Open-Meteo, turned into the irradiance and temperature a household's own array model and heat pump are planned against"
+publish     = false
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core     = { workspace = true }
+hems-forecast = { workspace = true }
+hems-service  = { workspace = true }
+
+anyhow     = { workspace = true }
+axum       = { workspace = true }
+clap       = { version = "4", features = ["derive", "env"] }
+reqwest    = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+time       = { workspace = true }
+tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tracing    = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }

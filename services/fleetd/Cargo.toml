@@ -1,0 +1,31 @@
+[package]
+name        = "fleetd"
+description = "Enrolment, versioned configuration and signed releases: the service a household box is adopted by, told what to run, and offered updates whose integrity it can check without trusting the server that offered them"
+publish     = false
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-service = { workspace = true }
+
+anyhow        = { workspace = true }
+axum          = { workspace = true }
+clap          = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = { workspace = true }
+getrandom     = { workspace = true }
+hex           = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+sha2          = { workspace = true }
+thiserror     = { workspace = true }
+time          = { workspace = true }
+tokio         = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+toml          = { workspace = true }
+tracing       = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }

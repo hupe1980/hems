@@ -709,11 +709,20 @@ impl Guard {
     /// the cap and still feed in exactly the cap.
     ///
     /// *All* measured consumption counts, the controllable devices included,
-    /// which is deliberately a different reading from the § 14a budget. § 14a is
-    /// a control instruction with a five-minute response presumption
-    /// `[A1 4.2]`, so the guard may never be over it even for a tick; the 60 %
-    /// cap is a **settlement** limit read off quarter-hour registers, so the
-    /// quantity to control is the average over the quarter hour.
+    /// which is deliberately a different reading from the § 14a budget — and the
+    /// difference is in *what each rule measures*, not in how fast it is
+    /// measured. § 14a bounds the netzwirksamer Leistungsbezug of the
+    /// **controllable devices** `[A1 2.3]`, so a dishwasher's draw is not
+    /// headroom for a wallbox. § 9 Abs. 2 EEG bounds the Einspeiseleistung **at
+    /// the Verknüpfungspunkt**, so everything the house is using is headroom,
+    /// whoever is using it.
+    ///
+    /// Both are limits on a *power*, and both are enforced here on every tick.
+    /// Reading the 60 % cap as a quarter-hour average instead — which the
+    /// quarter-hour register in the day report might suggest — would let the
+    /// roof cross the statutory ceiling for minutes at a time on the strength of
+    /// a forecast about the rest of the slot. The register is a diagnostic; the
+    /// statute says Leistung.
     ///
     /// Runs before the § 14a block because it narrows *floors* while that one
     /// narrows *ceilings*, so [`Guard::lend_generation`] sees a discharge bound

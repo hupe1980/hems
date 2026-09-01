@@ -1,0 +1,30 @@
+[package]
+name        = "histd"
+description = "The history service: the two years of § 14a evidence the Festlegung requires, the quarter-hour registers MiSpeL and § 42c settle from, and the Data Act export a household is entitled to"
+publish     = false
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+hems-core    = { workspace = true }
+hems-grid    = { workspace = true }
+hems-service = { workspace = true }
+rusqlite     = { workspace = true }
+
+anyhow       = { workspace = true }
+axum         = { workspace = true }
+clap         = { version = "4", features = ["derive", "env"] }
+rust_decimal = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+time         = { workspace = true }
+tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
+tracing      = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }

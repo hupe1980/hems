@@ -1,0 +1,31 @@
+[package]
+name        = "hems-service"
+description = "The shell every hems daemon shares — configuration from a file and the environment, structured logging, a health and readiness surface, and a shutdown that finishes what it started"
+keywords    = ["energy", "daemon", "hems", "service"]
+categories  = ["network-programming"]
+readme      = "README.md"
+version.workspace      = true
+authors.workspace      = true
+edition.workspace      = true
+license.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+
+[dependencies]
+
+anyhow             = { workspace = true }
+ed25519-dalek      = { workspace = true }
+hex                = { workspace = true }
+sha2               = { workspace = true }
+axum               = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+thiserror          = { workspace = true }
+time               = { workspace = true }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+toml               = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }

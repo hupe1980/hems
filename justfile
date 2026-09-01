@@ -83,7 +83,7 @@ doc:
 demo day="winter":
     cargo run -p hemsd -- simulate --day {{ day }}
 
-# 🏠 Every day, and the five comparisons worth seeing
+# 🏠 Every day, and the six comparisons worth seeing
 demo-all:
     @just demo winter
     @just demo summer
@@ -103,11 +103,14 @@ demo-all:
     cargo run -q -p hemsd -- simulate --day capped --imsys
     @echo "  ── the shared reduction with every asset weighted the same ──"
     cargo run -q -p hemsd -- simulate --day shared --uniform-weights
+    @echo "  ── the same winter day inside a § 42c sharing community ──"
+    cargo run -q -p hemsd -- simulate --day winter --sharing
 
-# A modulating heat pump is a linear program; a single-speed one is ninety-six
-# binaries in every one of ninety-six re-plans, and most of them exhaust the
-# solver's budget. Fourteen minutes against nine seconds — which is why it is
-# not in `demo-all` and not in CI.
+# A modulating heat pump is a linear program; a single-speed one is a binary per
+# slot in every one of ninety-six re-plans. Committing the tail per clock hour
+# rather than per quarter hour (D78) took the day from 13:19 to 2:12 for a plan
+# that costs the same to the cent — but two minutes against nine seconds is
+# still why it is not in `demo-all` and not in CI.
 #
 # It is also the only configuration in which a minimum runtime constrains
 # anything, so it is the only one that can show the constraint being obeyed.
@@ -149,6 +152,40 @@ release-check:
 # 🔒 Minimum supported Rust version
 msrv:
     cargo +{{ msrv }} check --workspace --all-features
+
+# The fleet, on loopback, so a `readyz` and a `/v1/fleet` are one command away.
+# Each daemon is independent — none of them needs the others to start — so this
+# is a convenience rather than a topology.
+#
+# The secret is on both sides because the report is a **signed** CloudEvent
+# (D11): `obsd` refuses an unsigned day, since the thing being written is the
+# list of households that did not respect a network operator's reduction. A
+# demonstration secret in a justfile is a demonstration secret; a real one comes
+# from the enrolment.
+#
+# 🛰️ One box reporting a day into the fleet view
+fleet-demo day="winter":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    cargo build -q -p obsd -p hemsd
+    conf="$(mktemp -t obsd-demo-XXXXXX.toml)"
+    # The secret is a *reference*: `obsd` reads it from the environment, so the
+    # credential is not in the file even in a demonstration (D82).
+    printf 'webhook_secrets = ["env:HEMS_OBSD_WEBHOOK_SECRET"]\noperator_tokens = ["env:HEMS_OBSD_OPERATOR_TOKEN"]\n' > "$conf"
+    HEMS_OBSD_WEBHOOK_SECRET=whsec_fleet-demo HEMS_OBSD_OPERATOR_TOKEN=tok-demo \
+        ./target/debug/obsd --config "$conf" &
+    obsd=$!
+    trap 'kill $obsd 2>/dev/null; rm -f "$conf"' EXIT
+    sleep 2
+    HEMS_OBSD_SECRET=whsec_fleet-demo \
+        ./target/debug/hemsd simulate --day {{ day }} --report-to http://127.0.0.1:8080
+    echo
+    echo "  ── the fleet view ──"
+    curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet
+    echo
+    echo "  ── readiness, which names every dependency and when it was last good ──"
+    curl -s localhost:8080/readyz
+    echo
 
 # 🌐 Serve the documentation site locally
 site:

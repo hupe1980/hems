@@ -273,3 +273,42 @@ The cost is that production is negative. What it buys is one invariant that hold
 everywhere and is testable: **the grid connection power equals the sum of the
 assets behind it**. A residual that is not near zero means a meter is missing or
 mis-signed, and the arbiter reports it rather than optimising against a fiction.
+
+
+## The fleet
+
+Five daemons around the box, and one shell they share.
+
+`hems-service` owns the forty lines every daemon has — configuration, logging, a
+health surface, a shutdown — and owns nothing about energy. Two of its decisions
+are load-bearing. **Live and ready are different questions**: an orchestrator
+restarts a process that fails `livez` and merely stops routing to one that fails
+`readyz`, so a daemon whose price source is down must not answer the first with
+the second. And the readiness body names **every dependency and when it was last
+good**, so the first click in an incident is also the last.
+
+| Service | What it owns | The decision worth knowing |
+|---|---|---|
+| `tariffd` | the five published day-ahead sources | a curve arrives twice and the two disagree, so the reconciliation is **written down**: a more trusted source always wins, then a finer publication, then the later observation. "Last write wins" gets the first one wrong |
+| `forecastd` | ICON-D2 through Open-Meteo | it serves the **sky**, not a forecast. The correction that turns modelled irradiance into what *this* roof makes is learned on the box from that box's meter, because it is a property of one roof |
+| `histd` | the fleet's copy of the two years of § 14a evidence, and the registers | retention is a **column**, so "what will you still have in eighteen months" is a query. Quantities are exact decimal strings, because a settlement that went through a `double` is one nobody can reproduce. Reads open their own connection: a household's export is 370 ms of SQLite, and behind one lock a box's evidence write waits 2,7 s for it |
+| `fleetd` | enrolment, configuration, releases | the box trusts a **key it was built with**, not a server. `fleetd` holds signatures and never a signing key, so a compromised `fleetd` can serve neither a configuration nor an update any box will accept |
+| `obsd` | what the fleet is actually doing | it **counts** compliance rather than averaging it. One household in ten thousand that failed to respect a reduction is an incident with a name and a date; "99,99 %" reads as success. A day reaches it only as a **signed** CloudEvent — a list of who broke a grid rule that anybody can write to is not evidence |
+
+Three of those are the same idea from different angles: **a store beats a
+passthrough**. `tariffd` holds two days each way, `forecastd` keeps the last good
+run, and both compute readiness from what they still *cover* rather than from
+when the last request returned — so a WAN outage shorter than the horizon costs
+the household nothing at all.
+
+Nothing here is the trust anchor for anything. The § 14a limit comes off a wire
+from a Steuerbox and the guard enforces it locally; the prices and the weather
+only ever make a plan *better*; and an update — like the box's own configuration
+— is verified against a key rather than against a hostname. The house is never
+worse off when the cloud is gone.
+
+That last sentence has a storage half. `[A1 7.3]` keeps a control event for two
+years, so the box holds its **own** copy and forwards it second: what the fleet
+has not acknowledged is an outbox that grows, not a gap. A record that exists
+only once it has been uploaded is an intention with a network dependency, and the
+day a network operator asks about is the day the link was down.

@@ -303,6 +303,10 @@ pub struct Tariff {
     pub levies: Levies,
     /// What exporting earns.
     pub feed_in: FeedIn,
+    /// The membership of a § 42c energy-sharing community, if the household has
+    /// one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sharing: Option<SharingTariff>,
     /// The supplier's annual standing charge, euros.
     #[cfg_attr(feature = "serde", serde(default))]
     #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
@@ -319,8 +323,78 @@ impl Tariff {
             network: NetworkCharge::None { arbeitspreis },
             levies: Levies::default(),
             feed_in: FeedIn::NONE,
+            sharing: None,
             standing_charge_eur_per_year: Decimal::ZERO,
         }
+    }
+
+    /// The same tariff, inside an energy-sharing community.
+    #[must_use]
+    pub fn in_community(mut self, sharing: SharingTariff) -> Self {
+        self.sharing = Some(sharing);
+        self
+    }
+}
+
+/// What a § 42c allocation costs this household, as a *price*.
+///
+/// § 42c Abs. 3 Nr. 3 EnWG makes the price of the shared electricity a term of
+/// the written agreement between the members. What the household then pays for
+/// an allocated kilowatt-hour is that price **instead of its supplier's energy
+/// price** — and nothing else changes, because the electricity crosses the
+/// public grid to reach it:
+///
+/// ```text
+/// shared_import = VAT × (community_energy + network + levies)
+/// ```
+///
+/// against the supplier's `VAT × (energy + network + levies)`. Network charges,
+/// the Stromsteuer, the KWKG and § 19 levies, the Konzessionsabgabe and value
+/// added tax are all untouched by § 42c, and a model that forgot that would tell
+/// a household that joining a community makes its kilowatt-hours nearly free.
+/// It does not. On the reference winter day the community sells at **12 ct/kWh
+/// net** and the kilowatt-hour still arrives at the meter at **32,5 ct** —
+/// against 47,9 ct from the supplier — because 10 ct of network charge, 5,3 ct
+/// of levies and 19 % of value added tax do not care where the electron came
+/// from. That is a third off the allocated kilowatt-hours, which is a great
+/// deal and is not the ninety per cent somebody imagining "free solar from the
+/// neighbours" would price.
+///
+/// A community whose contract *also* carries a reduced Netzentgelt says so
+/// through [`SharingTariff::network_ct_per_kwh`], because that is a different
+/// agreement with a different counterparty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SharingTariff {
+    /// The community's own energy price, ct/kWh net, § 42c Abs. 3 Nr. 3.
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
+    pub energy_ct_per_kwh: Decimal,
+    /// A network working price that applies only to the allocated kilowatt-hours,
+    /// ct/kWh net.
+    ///
+    /// `None` — the ordinary case — leaves the household's own network charge in
+    /// place, which is what § 42c on its own does.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str_option"))]
+    pub network_ct_per_kwh: Option<Decimal>,
+}
+
+impl SharingTariff {
+    /// A community that sells its members electricity at `ct_per_kwh` net and
+    /// changes nothing else.
+    #[must_use]
+    pub const fn at(energy_ct_per_kwh: Decimal) -> Self {
+        Self {
+            energy_ct_per_kwh,
+            network_ct_per_kwh: None,
+        }
+    }
+
+    /// …and carries a network charge of its own for the allocated kilowatt-hours.
+    #[must_use]
+    pub const fn with_network_charge(mut self, ct_per_kwh: Decimal) -> Self {
+        self.network_ct_per_kwh = Some(ct_per_kwh);
+        self
     }
 }
 

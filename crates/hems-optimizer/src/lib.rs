@@ -20,8 +20,9 @@ pub mod shadow;
 pub mod solve;
 
 pub use model::{
-    BatteryModel, Commitment, DhwModel, EvSession, HeatPumpModel, Objective, PlanningLimits,
-    Problem, Quantile, Realisation, Risk, ScenarioSet, ShiftableRun, ThermalModel, TimedLimit,
+    BatteryModel, Commitment, CommitmentHorizon, DhwModel, EvSession, HeatPumpModel, Objective,
+    PlanningLimits, Problem, Quantile, Realisation, Risk, ScenarioSet, ShiftableRun, ThermalModel,
+    TimedLimit,
 };
 pub use shadow::Shadow;
 pub use solve::{AssetNames, Flows, SolveError, Solved, check_inputs, solve};

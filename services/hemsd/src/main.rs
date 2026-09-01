@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 use hemsd::{HouseholdConfig, Scenario};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "hemsd", version, about = "The hems edge daemon", long_about = None)]
@@ -104,6 +105,46 @@ enum Command {
         /// warm house get equal shares of a § 14a reduction.
         #[arg(long)]
         uniform_weights: bool,
+        /// Report the day to an `obsd` at this URL rather than only printing it.
+        ///
+        /// The fleet's own view of a household is a `DayKpis` — a dozen numbers
+        /// rather than the whole report — and this is the producer of it. Without
+        /// one, `obsd` is a service with no caller, which is the failure mode
+        /// this workspace keeps finding in itself.
+        #[arg(long, env = "HEMS_OBSD_URL")]
+        report_to: Option<String>,
+        /// The secret the box and the fleet share, for the Standard Webhooks
+        /// signature over the report (D11).
+        ///
+        /// Required with `--report-to`, because a fleet view that accepts an
+        /// unsigned day is a fleet view anybody who can reach it may write to —
+        /// and what they would be writing is the list of households that did not
+        /// respect a network operator's reduction.
+        #[arg(long, env = "HEMS_OBSD_SECRET")]
+        report_secret: Option<String>,
+        /// Keep the day's § 14a evidence and quarter-hour registers in a local
+        /// store at this path, `[A1 7.2]` and `[A1 7.3]`.
+        ///
+        /// The box's **own** two years. G3 says the house is never worse off
+        /// when the cloud is gone, and a record that exists only once it has
+        /// been uploaded is an intention with a network dependency — so the box
+        /// records first and forwards second, and what has not been
+        /// acknowledged is the store's outbox.
+        #[arg(long, env = "HEMS_STORE")]
+        store: Option<PathBuf>,
+        /// The site identifier to report under.
+        #[arg(long, default_value = "reference-household")]
+        site: String,
+        /// Put the household in a § 42c energy-sharing community: three roofs'
+        /// worth of neighbours' array, an equal third of the
+        /// Aufteilungsschlüssel, electricity at 12 ct/kWh net.
+        ///
+        /// § 42c EnWG has applied since 01.06.2026. The comparison is the point:
+        /// the same day run with and without it says what a community is worth
+        /// to a household that can *move* its load into the hours the community
+        /// is generating — which is the whole behavioural reason to join one.
+        #[arg(long)]
+        sharing: bool,
     },
 }
 
@@ -122,10 +163,12 @@ enum Risk {
     /// One median, and **three futures on the days that need them** — decided by
     /// how much slack the charging session has left.
     ///
-    /// `hemsd risk` measures it at within €0,03 of always planning against three
-    /// futures on the evening that needs them, and within €0,04 of the median on
-    /// the night that does not. Not the default, because that measurement is
-    /// four weathers on two days.
+    /// Over twenty seeded weathers on each of two days it comes within €0,04 of
+    /// always planning against three futures on the evening that needs them and
+    /// within €0,11 of the median on the day that does not — level with the
+    /// median in money over the two, and delivering the service the median
+    /// leaves short. Not the default, because it costs four times the solve to
+    /// do it, which is a household's trade rather than an inherited one.
     Adaptive,
 }
 
@@ -191,6 +234,11 @@ fn main() -> anyhow::Result<()> {
             perfect_foresight,
             risk,
             uniform_weights,
+            report_to,
+            report_secret,
+            store,
+            site,
+            sharing,
         } => {
             let mut config = HouseholdConfig::default();
             if let Some(wear) = wear_eur_per_kwh {
@@ -212,6 +260,13 @@ fn main() -> anyhow::Result<()> {
                 scenario.weather = hemsd::WeatherSpec::PERFECT;
             }
             scenario.per_asset_weights = !uniform_weights;
+            if sharing {
+                // Three roofs' worth of neighbours on the same street: the
+                // household's own array times three, an equal third of the key.
+                scenario.community = Some(hemsd::CommunityMembership::mehrfamilienhaus(
+                    scenario.config.pv_kwp * 3.0,
+                ));
+            }
             scenario.risk = risk.model();
             scenario.adaptive_risk = risk.adaptive();
             let result = hemsd::run(&scenario)?;
@@ -220,6 +275,28 @@ fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 print_report(&scenario, &result);
+            }
+            // Written **before** the report goes out. The order is the whole
+            // point: the household's own record must not depend on a fleet
+            // endpoint being up, and the day a network operator asks about is
+            // exactly the day the link was down.
+            if let Some(path) = store {
+                record_day(&path, &result, time::OffsetDateTime::now_utc())?;
+            }
+            if let Some(url) = report_to {
+                let secret = report_secret.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--report-to needs --report-secret (or HEMS_OBSD_SECRET): \
+                         the fleet will not take an unsigned day"
+                    )
+                })?;
+                report_day(
+                    &url,
+                    secret.as_bytes(),
+                    &site,
+                    &result.kpis(&site, scenario.date),
+                    time::OffsetDateTime::now_utc(),
+                )?;
             }
         }
         Command::Backtest { day, days, json } => {
@@ -298,6 +375,80 @@ fn main() -> anyhow::Result<()> {
             } else {
                 print_risk(&base, &rows);
             }
+        }
+    }
+    Ok(())
+}
+
+/// Keep the day's evidence and registers in the box's own store.
+///
+/// Written **before** anything is sent anywhere, and nothing is marked forwarded
+/// here: until a fleet client drains the outbox it grows, which is a number the
+/// box can report about itself.
+fn record_day(
+    path: &std::path::Path,
+    result: &hemsd::DayResult,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<()> {
+    let mut store = hemsd::store::Store::open(path)?;
+    store.put_quarter_hours(&result.quarter_hours, now)?;
+    for event in &result.evidence {
+        store.put_control_event(event)?;
+    }
+    let backlog = store.backlog()?;
+    println!(
+        "\n  kept in {}\n  …waiting for the fleet      {} events, {} quarter hours",
+        path.display(),
+        backlog.events,
+        backlog.quarter_hours
+    );
+    Ok(())
+}
+
+/// Send one day's KPIs to an `obsd`, as a signed CloudEvent.
+///
+/// A blocking POST from a command that has already finished: the day is over,
+/// there is nothing to overlap it with, and a `tokio` runtime spun up to send
+/// one request would be machinery for nothing. A failure is **reported and not
+/// fatal** — a box whose fleet endpoint is down has still managed its household
+/// correctly, and exiting non-zero would say otherwise.
+///
+/// # Why the message id is the site and the day
+///
+/// `obsd` is idempotent by date: a box that comes back after an outage and
+/// re-sends yesterday is correcting itself rather than adding a day. A random
+/// identifier would make the *same* correction a different message every time,
+/// so the identifier is derived from what the report is about, and the receiver
+/// de-duplicates on the same string the signature covers.
+fn report_day(
+    url: &str,
+    secret: &[u8],
+    site: &str,
+    kpis: &hems_core::report::DayKpis,
+    now: time::OffsetDateTime,
+) -> anyhow::Result<()> {
+    let event = hems_events::Event::new(
+        hems_events::SITE_DAY_REPORTED,
+        format!("hems://sites/{site}"),
+        format!("{site}:{}", kpis.date),
+        now,
+        kpis,
+    )
+    .about(kpis.date.to_string());
+    let body = event.to_bytes()?;
+    let signature = hems_events::webhook::sign(secret, &event.id, now, &body);
+    let endpoint = format!("{}/v1/days", url.trim_end_matches('/'));
+    // Checked before the day is built into a request, and it is the one failure
+    // here that is **fatal**: a fleet endpoint that is down costs a dashboard,
+    // and one that is plaintext costs the household's privacy every day until
+    // somebody notices.
+    hemsd::report::is_confidential(&endpoint)?;
+    match hemsd::report::post_event(&endpoint, body, &signature.headers()) {
+        Ok(status) => {
+            println!("\n  reported to {endpoint} — HTTP {status}");
+        }
+        Err(e) => {
+            eprintln!("\n  could not report to {endpoint}: {e}");
         }
     }
     Ok(())
@@ -520,6 +671,14 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
             format!("{:.1} kWh", r.cold_water_kwh),
         );
     }
+    // § 42c: only where there is a community, because a structural zero printed
+    // every day is how a number stops being read.
+    if scenario.community.is_some() {
+        row(
+            "allocated by the community",
+            format!("{:.1} kWh", r.shared_kwh),
+        );
+    }
     if r.pv_forecast.samples > 0 {
         println!();
         row(
@@ -551,6 +710,12 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
     }
     println!();
     row("electricity bill", format!("{:.2} €", r.cost.energy_eur));
+    if r.cost.sharing_eur.abs() > 0.005 {
+        row(
+            "…less the community's own",
+            format!("{:.2} €", r.cost.sharing_eur),
+        );
+    }
     row("battery life spent", format!("{:.2} €", r.cost.wear_eur));
     row(
         "comfort given up",
@@ -631,6 +796,19 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         "minutes without a plan",
         format!("{}", r.minutes_without_a_plan),
     );
+    // What the plan that opened the day thought the day would cost, against what
+    // it did. The seam between a forecast and a meter, in the currency everything
+    // else in this report is in — and structurally zero for as long as the
+    // planner was shown the answer, which is why it is worth printing.
+    if let Some(expected) = r.opening_plan_bill_eur {
+        row(
+            "the opening plan expected",
+            format!(
+                "{expected:.2} €, off by {:+.2}",
+                r.cost.billed_eur() - expected
+            ),
+        );
+    }
     if r.unmet_charge_kwh > 0.01 {
         row(
             "car left short by",

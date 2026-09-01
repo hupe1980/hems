@@ -142,6 +142,7 @@ mod tests {
             network,
             levies: Levies::household_2026(),
             feed_in: FeedIn::NONE,
+            sharing: None,
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

@@ -30,6 +30,11 @@ allow = [
     "MIT-0",
     "CC0-1.0",
     "0BSD",
+    # `webpki-roots`: Mozilla's CA root list, which is *data* rather than code
+    # and carries a data licence. It is here deliberately rather than reached for
+    # — the alternative is `rustls-native-certs`, and a distroless image has no
+    # system trust store to read, which is the whole point of building one.
+    "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
@@ -40,6 +45,20 @@ confidence-threshold = 0.9
 multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
+
+# One TLS crypto provider, named rather than inherited.
+#
+# `rustls` 0.23 defaults to `aws-lc-rs` and this workspace takes that default —
+# post-quantum key exchange, a FIPS mode if a network operator ever asks for one,
+# and pre-generated bindings for `aarch64-unknown-linux-musl`, which is the
+# gateway box. `ring` is the alternative and it is the one to reach for if a
+# target ever appears that `aws-lc` cannot be built for.
+#
+# Both at once is the state to avoid: `rustls` panics when two providers are
+# compiled in and neither is installed as the process default, and a household
+# box discovering that at the first fleet call is not where it should be found.
+# So the choice is a build failure to change rather than a resolution to notice.
+deny = [{ name = "ring", reason = "the TLS provider is aws-lc-rs; two providers in one binary is a runtime panic" }]
 
 [advisories]
 version = 2

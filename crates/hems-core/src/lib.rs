@@ -57,6 +57,7 @@ pub mod error;
 pub mod ids;
 pub mod measurement;
 pub mod plan;
+pub mod report;
 pub mod setpoint;
 pub mod site;
 pub mod slot;
@@ -77,6 +78,7 @@ pub mod prelude {
     pub use crate::ids::{AssetId, CircuitId, PlanId, SiteId};
     pub use crate::measurement::{Freshness, Measurement};
     pub use crate::plan::{AssetTarget, CostBreakdown, Plan, SlotPlan};
+    pub use crate::report::DayKpis;
     pub use crate::setpoint::{
         Authority, Command, FallbackCause, GuardRule, RealtimeCause, Reason, Setpoint, UserOverride,
     };

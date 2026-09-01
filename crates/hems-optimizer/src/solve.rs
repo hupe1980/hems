@@ -212,6 +212,8 @@ pub struct Flows {
     pub ev_charge: Power,
     /// Production thrown away.
     pub curtailed: Power,
+    /// The part of `grid_import` a § 42c community allocated to this member.
+    pub shared_import: Power,
     /// Electrical power drawn by the heat pump.
     pub heat_pump: Power,
     /// Electrical power drawn by the hot-water heater.
@@ -598,6 +600,8 @@ struct Vars<'a> {
     /// `1` where appliance `i` was not run at all — the soft half of its
     /// deadline. Integral for free: it is one minus a sum of binaries.
     sh_short: &'a [Variable],
+    /// Import that a § 42c community allocated to this member, watts.
+    shared: &'a [Variable],
 }
 
 /// Every decision variable of the model, owned.
@@ -627,6 +631,7 @@ struct Variables {
     dhw_short: Vec<Variable>,
     sh_start: Vec<Vec<Variable>>,
     sh_short: Vec<Variable>,
+    shared: Vec<Variable>,
 }
 
 impl Variables {
@@ -654,6 +659,7 @@ impl Variables {
             dhw_short: &self.dhw_short,
             sh_start: &self.sh_start,
             sh_short: &self.sh_short,
+            shared: &self.shared,
         }
     }
 }
@@ -753,11 +759,25 @@ fn shared_binaries(
         sh_start: Vec::with_capacity(problem.shiftable.len()),
         sh_short: Vec::with_capacity(problem.shiftable.len()),
     };
+    // How far ahead the compressor is decided slot by slot. Beyond it, a block
+    // of slots shares **one** variable rather than being tied together by
+    // equalities: an equality row still leaves branch and bound a column to open
+    // a node on, and the whole point is that there is nothing there to branch.
+    let blocks = problem.thermal.map(|t| {
+        problem
+            .commitment_horizon
+            .blocks(problem.horizon, &t.heat_pump)
+    });
     for k in 0..n {
         shared
             .ev_on
             .push(charge_point_binary(problem, vars, k, pins));
-        shared.hp_on.push(heat_pump_binary(problem, vars, k, pins));
+        let representative = blocks.as_ref().map_or(k, |b| b[k]);
+        shared.hp_on.push(if representative == k {
+            heat_pump_binary(problem, vars, k, pins)
+        } else {
+            shared.hp_on[representative]
+        });
     }
     shiftable_variables(problem, vars, &mut shared, pins);
     shared
@@ -793,12 +813,14 @@ fn recourse_variables(
         dhw_short: Vec::with_capacity(n),
         sh_start: Vec::with_capacity(problem.shiftable.len()),
         sh_short: Vec::with_capacity(problem.shiftable.len()),
+        shared: Vec::with_capacity(n),
     };
 
     let import_ceiling = problem
         .limits
         .import_ceiling
         .map_or(f64::INFINITY, Power::get);
+    let has_sharing = problem.has_community_share();
 
     for k in 0..n {
         let (pv, _load) = problem.forecasts_in(realisation, k);
@@ -812,6 +834,23 @@ fn recourse_variables(
             .map_or(f64::INFINITY, Power::get);
         v.g_in
             .push(vars.add(variable().min(0.0).max(import_ceiling)));
+        // The § 42c cheap block: import the community allocated to this member.
+        // Bounded by the share above and by the household's own import below
+        // (`sharing`), so it is exactly `min(share, g_in)` wherever the community
+        // is the cheaper of the two — which is the only case a linear program can
+        // represent, and the only case anybody signs a contract for.
+        //
+        // **Not declared at all** where there is no community, rather than
+        // declared and pinned to zero. A pinned column is not free: it changes
+        // the order the backend sees the model in, and the reference winter day
+        // came back a cent different for it. A household outside a community
+        // gets the model byte for byte as it was before § 42c existed, which is
+        // what makes every figure measured before this still a figure about the
+        // same planner.
+        if has_sharing {
+            v.shared
+                .push(vars.add(variable().min(0.0).max(problem.community_share_at(k))));
+        }
         v.g_out
             .push(vars.add(variable().min(0.0).max(export_ceiling)));
         v.curtail.push(vars.add(variable().min(0.0).max(pv)));
@@ -1144,6 +1183,15 @@ fn scenario_cost(
             hems_tariff::SlotPrice::export_f64,
         );
         objective += (vars.g_in[k] * import_eur - vars.g_out[k] * export_eur) * SLOT_KWH_PER_W;
+        // § 42c: the part of that import the community allocated to this member
+        // is billed at the community's price instead of the supplier's, so it
+        // comes back off as a discount. Never negative — see
+        // `SlotPrice::sharing_discount_f64`, which is what keeps the cheap block
+        // convex and therefore linear.
+        let sharing_eur = price.map_or(0.0, hems_tariff::SlotPrice::sharing_discount_f64);
+        if let Some(shared) = vars.shared.get(k).filter(|_| sharing_eur > 0.0) {
+            objective -= *shared * sharing_eur * SLOT_KWH_PER_W;
+        }
         objective += vars.curtail[k] * problem.curtailment_penalty_eur_per_kwh * SLOT_KWH_PER_W;
         // Per watt-hour, not per watt: this is stored energy, not a flow.
         objective += vars.ev_short[k] * (problem.unmet_charge_eur_per_kwh / 1000.0);
@@ -1402,6 +1450,18 @@ fn balance<M: SolverModel>(
             == load - pv
     )));
 
+    // § 42c: a member can only be allocated electricity it actually drew. The
+    // other end of the cheap block is the variable's own upper bound — the
+    // community's generation times this member's Aufteilungsschlüssel — so
+    // between them the two say `shared = min(share, g_in)` at the optimum,
+    // without a binary and without a `min`.
+    //
+    // Stated only where a community offers something, so a household without one
+    // carries no row.
+    if let Some(shared) = vars.shared.get(k) {
+        model = model.with(constraint!(*shared <= vars.g_in[k]));
+    }
+
     // Power cannot be imported and exported at the same instant. Stating it as a
     // physical bound rather than a binary keeps the model a pure linear program —
     // which matters on a gateway box — and says something true: exported power
@@ -1557,16 +1617,30 @@ fn minimum_runtime<M: SolverModel>(
     let was_on = f64::from(u8::from(t.heat_pump.compressor.running));
 
     for k in 0..n {
+        // A slot that shares its decision with the one before it has no
+        // transition to constrain: substituting `on[k − 1] = on[k]` turns the
+        // minimum-on row into `on[j] ≥ 0` and the minimum-off row into
+        // `on[j] ≤ 1`, both of which are already bounds. Skipping them is exact
+        // and it is most of the rows once the tail is committed in blocks.
+        if k > 0 && on[k - 1] == on[k] {
+            continue;
+        }
         let previous: Expression = if k == 0 {
             Expression::from(was_on)
         } else {
             on[k - 1].into()
         };
+        // …and the same substitution empties a row whose *target* shares the
+        // decision being made, which is every slot inside `k`'s own block.
         for j in (k + 1)..(k + min_on).min(n) {
-            model = model.with(constraint!(on[j] >= on[k] - previous.clone()));
+            if on[j] != on[k] {
+                model = model.with(constraint!(on[j] >= on[k] - previous.clone()));
+            }
         }
         for j in (k + 1)..(k + min_off).min(n) {
-            model = model.with(constraint!(on[j] <= 1.0 - previous.clone() + on[k]));
+            if on[j] != on[k] {
+                model = model.with(constraint!(on[j] <= 1.0 - previous.clone() + on[k]));
+            }
         }
     }
     model
@@ -1852,6 +1926,17 @@ fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
                 hems_tariff::SlotPrice::export_f64,
             )
         } * SLOT_KWH_PER_W;
+        // The baseline is in the **same community**. A household joins one and
+        // then does nothing about it — the Aufteilungsschlüssel still allocates
+        // it whatever its unmanaged draw happens to overlap. Leaving that out
+        // would credit the plan with the membership rather than with the
+        // shifting, which is the same asymmetry as measuring a saving against a
+        // household that ignored the network operator.
+        if net > 0.0 {
+            cost.sharing_eur -= net.min(problem.community_share_at(k))
+                * price.map_or(0.0, hems_tariff::SlotPrice::sharing_discount_f64)
+                * SLOT_KWH_PER_W;
+        }
 
         // A thermostat is not free of discomfort either: it reheats only after
         // the house has already fallen through the band, and in a cold snap it
@@ -2216,6 +2301,7 @@ fn read_flows(solution: &impl Solution, vars: &Vars<'_>, appliances: &[Power], k
         battery_energy: hems_core::prelude::Energy::new(solution.value(vars.b_e[k]).max(0.0)),
         ev_charge: value(vars.ev[k]),
         curtailed: value(vars.curtail[k]),
+        shared_import: vars.shared.get(k).map_or(Power::ZERO, |v| value(*v)),
         heat_pump: value(vars.hp[k]),
         dhw: value(vars.dhw[k]),
         shiftable: appliances.iter().copied().sum(),
@@ -2249,6 +2335,14 @@ fn charge_the_report(
     );
     cost.energy_eur +=
         (f.grid_import.get() * import_eur - f.grid_export.get() * export_eur) * SLOT_KWH_PER_W;
+    // …less what the community's own generation paid for. Every term of the
+    // objective is a term of the report, and this one is a term the household
+    // is genuinely invoiced differently for — on a line of its own, because
+    // "what did belonging to the community buy" is a question the energy line
+    // cannot answer.
+    cost.sharing_eur -= f.shared_import.get()
+        * price.map_or(0.0, hems_tariff::SlotPrice::sharing_discount_f64)
+        * SLOT_KWH_PER_W;
     if let Some(b) = problem.battery {
         cost.wear_eur += (f.battery_charge.get() + f.battery_discharge.get())
             * (b.degradation_eur_per_kwh / 2.0)

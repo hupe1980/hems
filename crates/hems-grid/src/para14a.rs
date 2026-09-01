@@ -414,11 +414,13 @@ impl Participation {
 ///
 /// An **unknown** commissioning date yields
 /// [`Participation::UnknownAssumedControlled`]: the device takes part until
-/// somebody says otherwise. Reading silence as "old" —/// did — is the answer that quietly drops a device out of the § 14a group, and
-/// dropping a device out of the group is how a site exceeds a limit. It is also
-/// worse for the customer, because `P_min` grows with the number of devices. A
-/// device only leaves the group on a positive statement: an exemption, or a
-/// commissioning date before 2024 with a known legacy status.
+/// somebody says otherwise. Reading silence as "old" — the contractual answer,
+/// and the one this function gave first — is the answer that quietly drops a
+/// device out of the § 14a group, and dropping a device out of the group is
+/// how a site exceeds a limit. It is also worse for the customer, because
+/// `P_min` grows with the number of devices. A device only leaves the group on
+/// a positive statement: an exemption, or a commissioning date before 2024 with
+/// a known legacy status.
 #[must_use]
 pub fn participation(
     commissioned_at: Option<Date>,

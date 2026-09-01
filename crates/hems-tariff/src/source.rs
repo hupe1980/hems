@@ -99,7 +99,11 @@ pub enum PriceBasis {
 }
 
 /// Where a series came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Ordered so a `BTreeMap` can be keyed by it — `tariffd` holds one endpoint and
+/// one schedule per source, and a map with a defined iteration order is what
+/// makes a poll round the same round twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Source {

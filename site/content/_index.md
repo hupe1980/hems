@@ -23,6 +23,8 @@ Most energy managers treat that as paperwork. hems treats it as computation.
 <div class="card"><h3>Works without the cloud</h3><p>Guard, arbiter, planner and solar model take time as a parameter. A winter day with a grid event is a unit test that runs in milliseconds — and a device the manager can only <em>limit</em> is handed back to its own thermostat rather than held at zero.</p></div>
 <div class="card"><h3>A price per device, not per hour</h3><p>The plan carries the shadow price of each store's own state equation — what the household loses if <em>this</em> device is held back — so "a reduction takes power from where it is worth least" is a decision rather than a sentence. It also prices the § 14a ceiling itself: what relief from a network operator is worth to <em>this</em> household, €3,93/kWh in a house with no store whose car is about to leave short. Aggregators price every household at "30&nbsp;% of nominal".</p></div>
 <div class="card"><h3>The forecast is allowed to be wrong</h3><p>The simulated day runs a seeded realisation the planner is never shown — a cloud at 12:19, a milder afternoon, a roof that delivers 90&nbsp;% of its datasheet — and the planner gets only what six weeks of the box's own metering could have taught it. Every day scores its own forecasts beside the money. <code>--perfect-foresight</code> gives the counterfactual, and on the winter day it is worth <strong>60&nbsp;% of the saving</strong>.</p></div>
+<div class="card"><h3>The fleet is not the trust anchor</h3><p>Prices and weather are fetched, stored and only ever make a plan <em>better</em>; the § 14a limit comes off a wire and is enforced locally. An update <em>and the box's own configuration</em> are verified against an Ed25519 key the box was <em>built</em> with, and the fleet server holds signatures and never a signing key — so a compromised one can serve neither a manifest nor a configuration any box will accept. That is what the CRA's integrity requirement means rather than “we use HTTPS”.</p></div>
+<div class="card"><h3>Compliance is counted, not averaged</h3><p>One household in ten thousand that failed to respect a network operator's reduction is an incident with a name and a date. The same fact as “99,99&nbsp;% compliance” reads as success, so the fleet view carries breaches as a list of findings and never as a rate — and a day only reaches it as a <em>signed</em> CloudEvent, because a list of who broke a grid rule that anybody can write to is not evidence of anything.</p></div>
 <div class="card"><h3>The baseline obeys the same law</h3><p>The household the saving is measured against is not an unregulated one. Its Steuerbox turns each device down on its own <code>[A1 4.4.a]</code> and its roof is capped by § 9 EEG, because a comparison against a household nobody is allowed to be is an advertisement rather than a measurement.</p></div>
 </div>
 
@@ -34,37 +36,55 @@ $ cargo run -p hemsd -- simulate --day winter
   2026-01-15 — with a § 14a reduction
 
   produced                                  8.4 kWh
+  household consumption                    11.0 kWh
   charged into the car                     21.7 kWh
   heat pump                                26.1 kWh
   hot water                                 3.1 kWh
   dishwasher                         1.1 kWh, 75 min later
+  battery throughput                       15.5 kWh
+  imported                                 55.7 kWh
+  exported                                  0.3 kWh
+  curtailed                                 0.0 kWh
+  peak feed-in, per quarter hour     0.12 of 5.88 kW
   self-sufficiency                             13 %
+  wallbox on one conductor           0 min (0 switches)
+
+  indoor temperature                 19.9 – 23.1 °C
+  outside the comfort band                 0.12 K·h
+  hot-water tank, emptiest                24 % full
 
   roof, as the box learned it        90 % of the model
-  production forecast, CRPS          65 W (93 % covered)
+  production forecast, CRPS          192 W (81 % of 32 lit)
   load forecast, CRPS                18 W (85 % covered)
 
-  electricity bill                          21.06 €
+  electricity bill                          21.08 €
   battery life spent                         0.62 €
   comfort given up                           0.19 €
+  borrowed from the stores                   0.14 €
   cost of the day                           22.02 €
   without optimisation                      24.12 €
-  saved                                      2.10 €
-  …of it on the bill                         3.41 €
+  saved                                      2.09 €
+  …of it on the bill                         3.39 €
 
   § 14a limit in force                       90 min
   …against a minimum of                     10.5 kW
   …covered by the store                     1.4 kWh
   control events recorded            1 (93 samples)
+  self-restraint records                          1
   slowest reaction                   0 s, commanded
   minutes without a plan                          0
+  the opening plan expected          20.05 €, off by +1.03
+  without an Energy Guard                     3 min
   limit respected throughout                    yes
 
   described in S2                       6 resources
+  dearest asset vs cheapest                      2×
   relief from § 14a was worth            0.00 €/kWh
+  Modul 2 pays above                     2417 kWh/a
+  …on this day it would have         -3.97 € on the energy
 ```
 
-Eight lines in that table are not in anybody else's:
+Nine lines in that table are not in anybody else's:
 
 | Line | What it means |
 |---|---|
@@ -75,6 +95,7 @@ Eight lines in that table are not in anybody else's:
 | **…covered by the store** | `[A1 2.3]` in one number — kilowatt-hours the battery lent the controllable devices during the reduction, which never crossed the connection point and which the Festlegung therefore does not count. |
 | **slowest reaction** | whether the household had to be *commanded* into the reduction or was **already below** it. Both satisfy `[A1 4.2]`; a record that cannot tell them apart reports a compliant quiet house as one that took minutes to react. |
 | **minutes without a plan** | the arbiter drops a plan older than its tolerance. A planner re-solving more slowly than that leaves the house on the fallback for part of every cycle, silently, at about €1,50 a day. |
+| **the opening plan expected** | the plan made at midnight covers exactly the ninety-six slots of the day, so its expected bill and the day's actual bill are the same question asked of a forecast and of a meter. It is *not* "what forecast error cost": with `--perfect-foresight` the winter day is €2,46 out in the **other** direction, because the opening plan does not know the car is coming and because ninety-five later plans each see a horizon it could not. A number worth printing is one whose answer is not the one anybody expects. |
 | **relief from § 14a was worth** | the shadow price of the network operator's own ceiling: what a kilowatt-hour of relief is worth to *this* household. Nothing here, because the store lends the headroom `[A1 2.3]` allows; €3,93 on the same evening in a house with no store whose car would otherwise leave short. |
 
 And the three forecast lines are the evidence for the three money lines. *90 % of

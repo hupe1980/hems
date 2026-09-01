@@ -13,16 +13,22 @@
 #![allow(
     clippy::module_name_repetitions,
     clippy::must_use_candidate,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    // Domain nouns — MiSpeL, SQLite, Nachweis, ENTSO-E — are capitalised because
+    // that is how they are spelled, not because they are identifiers. The same
+    // allowance the domain crates carry.
+    clippy::doc_markdown
 )]
 
 pub mod backtest;
 pub mod drivers;
 pub mod forecasting;
+pub mod report;
 pub mod scenario;
 pub mod site;
+pub mod store;
 
 pub use backtest::{Spread, spread_over_days};
 pub use forecasting::{Learned, Weather, WeatherSpec};
-pub use scenario::{DayResult, EvPlan, Scenario, run};
+pub use scenario::{CommunityMembership, DayResult, EvPlan, Scenario, run};
 pub use site::{Household, HouseholdConfig};

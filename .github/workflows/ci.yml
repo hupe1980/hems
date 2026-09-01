@@ -112,8 +112,12 @@ jobs:
       - run: cargo run -p hemsd -- simulate --day deadline
       - run: cargo run -p hemsd -- simulate --day shared
       - run: cargo run -p hemsd -- simulate --day offline
+      - run: cargo run -p hemsd -- simulate --day autumn
       - run: cargo run -p hemsd -- simulate --day capped
       - run: cargo run -p hemsd -- simulate --day capped --imsys
+      # § 42c: the day the community term has a caller. A rule module nobody
+      # invokes is not a feature, and no property test catches one.
+      - run: cargo run -p hemsd -- simulate --day winter --sharing
 
   doc:
     name: Documentation

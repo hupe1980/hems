@@ -856,6 +856,26 @@ pub struct Problem<'a> {
     /// read as "no draw after this", which is the reading that stops a missing
     /// forecast from inventing demand.
     pub dhw_draw: &'a [f64],
+    /// How much of the community's generation this member may be allocated in
+    /// each slot, in watts — the § 42c share.
+    ///
+    /// The community's own generation times this member's Aufteilungsschlüssel
+    /// (§ 42c Abs. 3 Nr. 2), which `hems_grid::sharing` settles exactly after the
+    /// fact and which is a **forecast** here like any other. A short slice is
+    /// read as "nothing to share after this", which is the reading that stops a
+    /// missing forecast from inventing a neighbour's roof.
+    ///
+    /// The allocation is capped at what the member actually draws, so it can only
+    /// ever discount **grid import** — the electricity reaches it over the public
+    /// grid, and a kilowatt-hour the household made on its own roof was never
+    /// allocated to it. What the planner does with that is the whole behavioural
+    /// point of joining a community: move the flexible load into the quarter
+    /// hours where the share is, because that is where a kilowatt-hour is
+    /// cheaper.
+    ///
+    /// The price of an allocated kilowatt-hour is a *price* and lives in the
+    /// tariff ([`hems_tariff::SlotPrice::shared_import_ct`]).
+    pub community_share: &'a [f64],
     /// Outdoor temperature in each slot, °C.
     ///
     /// Drives the heat loss and the coefficient of performance. A short slice is
@@ -902,7 +922,7 @@ pub struct Problem<'a> {
     /// stored energy has no value after the horizon ends, so selling it at any
     /// price beats keeping it. That is an artefact of where the horizon happens
     /// to stop, not a decision anybody wants, and in a receding-horizon
-    /// controller it repeats every five minutes.
+    /// controller it repeats at every re-plan.
     ///
     /// `1.0` values the remaining charge at what it would cost to buy back.
     /// Below 1 makes the plan slightly keener to sell, above 1 keener to hold.
@@ -912,8 +932,8 @@ pub struct Problem<'a> {
     /// The model has binaries — a charge point below 6 A is idle, an on/off heat
     /// pump is on or off — so proving optimality can cost far more time than the
     /// last fraction of a percent is worth. A household plan is re-made every
-    /// five minutes against forecasts that are wrong by more than this; spending
-    /// a minute to close a 0,2 % gap is spending it on nothing.
+    /// quarter of an hour against forecasts that are wrong by more than this;
+    /// spending a minute to close a 0,2 % gap is spending it on nothing.
     ///
     /// Honoured by the HiGHS backend. `microlp` has no equivalent knob and
     /// always solves to optimality.
@@ -960,6 +980,157 @@ pub struct Problem<'a> {
     /// [`Problem::mip_gap`] is not affected: it is a property of the search, not
     /// of the clock.
     pub solve_budget_s: f64,
+    /// How finely the compressor's on/off decision is made across the horizon.
+    ///
+    /// Only reads for a **non-modulating** heat pump; a modulating one has no
+    /// binary to coarsen. See [`CommitmentHorizon`].
+    pub commitment_horizon: CommitmentHorizon,
+}
+
+/// How far ahead a compressor is committed slot by slot, and how coarsely after
+/// that.
+///
+/// # The problem it solves
+///
+/// A single-speed heat pump is one binary per slot, and a two-day horizon at
+/// quarter-hour resolution is ninety-six of them — in every one of ninety-six
+/// re-plans. That is a genuine mixed-integer problem and it took **ten minutes
+/// and fifty-two seconds** of solver time to plan one simulated day, against
+/// nine seconds for the same day on a modulating unit. Three numerical
+/// approaches were measured and none of them closed the gap: the tighter
+/// Rajan–Takriti rows (D66), the warm start (D71) and pinning the slots the
+/// compressor's own history has already decided (D65).
+///
+/// # Why coarsening the tail is exact where it matters
+///
+/// A receding-horizon controller executes the **first** slot of a plan and
+/// throws the rest away. The tail exists to price the consequences of the first
+/// slot — the house it leaves behind, the store it leaves full — and a
+/// consequence measured to the hour is the same consequence measured to the
+/// quarter hour, because the building's slow mass has a time constant of days
+/// and its fast one of thirteen minutes. What the tail does *not* need is the
+/// power to say which quarter of an hour, thirty hours from now, a compressor
+/// starts in: that decision will be re-made a hundred and twenty times before it
+/// is executed.
+///
+/// So the decision is made slot by slot over [`CommitmentHorizon::fine_slots`]
+/// and per block of [`CommitmentHorizon::block_slots`] after that — the same
+/// construction utility-scale unit commitment uses, where the day ahead is
+/// hourly and the week after it is not. The **continuous** power stays per slot
+/// throughout, so a blocked hour is still free to modulate between the unit's
+/// floor and its rating; what a block fixes is only whether the compressor is
+/// running at all.
+///
+/// The head stays fine, which is where every property that has to hold holds:
+/// the minimum runtime across the re-plan boundary (D65), the § 14a ceiling that
+/// arrives at teatime, the comfort band this afternoon.
+///
+/// # It cannot make a plan unlawful
+///
+/// Blocking only ever *removes* schedules from the feasible set — it is a
+/// restriction, never a relaxation — so no constraint the model states can be
+/// escaped by coarsening. The cost is optimality in the tail, and it is
+/// measured on the reference day rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CommitmentHorizon {
+    /// How many slots at the head of the horizon are decided one by one.
+    ///
+    /// Must cover everything the head has to be able to say: the slots the
+    /// compressor's own history has already committed, and enough of the
+    /// afternoon for a minimum runtime to be scheduled rather than inherited.
+    /// [`CommitmentHorizon::fine_for`] raises it where a unit's own minimum
+    /// needs more.
+    pub fine_slots: usize,
+    /// How many slots share one decision after that. `1` is no blocking at all:
+    /// every slot is its own decision, which is [`CommitmentHorizon::fine`].
+    pub block_slots: usize,
+}
+
+impl Default for CommitmentHorizon {
+    /// Two hours slot by slot, then one decision per hour.
+    ///
+    /// Eight fine slots is longer than any household compressor's minimum
+    /// runtime and longer than the twenty minutes a plan survives
+    /// (`ArbiterConfig::max_plan_age`), so every slot that will actually be
+    /// executed under this plan is a fine one. Four-slot blocks are the hour the
+    /// day-ahead auction is still quoted in, and they are at least as long as
+    /// the minimum on- and off-times, so a block can never ask a compressor for
+    /// a run it is not allowed to make.
+    fn default() -> Self {
+        Self {
+            fine_slots: 8,
+            block_slots: 4,
+        }
+    }
+}
+
+impl CommitmentHorizon {
+    /// Every slot decided on its own — the model as it was before blocking
+    /// existed, and what a reproducibility run or a benchmark asks for.
+    #[must_use]
+    pub const fn fine() -> Self {
+        Self {
+            fine_slots: usize::MAX,
+            block_slots: 1,
+        }
+    }
+
+    /// The fine head this configuration needs for `unit`.
+    ///
+    /// A compressor whose minimum runtime is longer than the configured head
+    /// gets a head long enough to hold it, so the slots
+    /// [`HeatPumpModel::committed`] pins are never inside a block — pinning a
+    /// block start would pin the whole block, which would be a plan constrained
+    /// by an accident of arithmetic.
+    #[must_use]
+    pub fn fine_for(&self, unit: &HeatPumpModel) -> usize {
+        self.fine_slots
+            .max(unit.min_on_slots)
+            .max(unit.min_off_slots)
+            .max(unit.committed().map_or(0, |(_, left)| left))
+    }
+
+    /// Which slot each slot of `horizon` shares its compressor decision with.
+    ///
+    /// The identity over the fine head, and the start of each block after it —
+    /// so a caller declares one variable where `blocks[k] == k` and reuses that
+    /// variable everywhere else.
+    ///
+    /// # The blocks are aligned to the clock, not to the plan
+    ///
+    /// A block that started wherever the fine head happened to end would slide
+    /// by one slot at every re-plan, and would therefore straddle the hour the
+    /// tariff steps at three times out of four. Anchoring them to the local
+    /// quarter-hour index instead puts every boundary on the boundary the price
+    /// already has, which is where the decision the block is coarsening actually
+    /// lives: on the reference days the day-ahead curve is constant within the
+    /// hour, so an hourly block throws nothing away at all.
+    ///
+    /// It also makes consecutive plans agree about *where* the blocks are, which
+    /// is what lets the previous plan's commitment warm-start the next one
+    /// ([`Commitment`]) instead of being a hint about a partition that has
+    /// moved.
+    #[must_use]
+    pub fn blocks(&self, horizon: Horizon, unit: &HeatPumpModel) -> Vec<usize> {
+        let mut out: Vec<usize> = (0..horizon.len).collect();
+        let block = self.block_slots.max(1);
+        if block == 1 || unit.modulating {
+            return out;
+        }
+        let fine = self.fine_for(unit);
+        let mut start = fine;
+        for (k, representative) in out.iter_mut().enumerate().skip(fine) {
+            if horizon
+                .get(k)
+                .is_some_and(|s| (s.index_in_local_day() as usize).is_multiple_of(block))
+            {
+                start = k;
+            }
+            *representative = start;
+        }
+        out
+    }
 }
 
 /// How the plan is asked to treat the fact that the forecast is wrong.
@@ -1222,6 +1393,7 @@ impl<'a> Problem<'a> {
             dhw: None,
             shiftable: Vec::new(),
             dhw_draw: &[],
+            community_share: &[],
             outdoor_c: &[],
             limits: PlanningLimits::default(),
             objective: Objective::cost(),
@@ -1233,7 +1405,15 @@ impl<'a> Problem<'a> {
             shadow_prices: true,
             warm_start: None,
             solve_budget_s: 10.0,
+            commitment_horizon: CommitmentHorizon::default(),
         }
+    }
+
+    /// Decide the compressor on this grid rather than the default one.
+    #[must_use]
+    pub const fn with_commitment_horizon(mut self, horizon: CommitmentHorizon) -> Self {
+        self.commitment_horizon = horizon;
+        self
     }
 
     /// Start the search from what the previous plan committed.
@@ -1282,6 +1462,39 @@ impl<'a> Problem<'a> {
     #[must_use]
     pub fn dhw_draw_at(&self, k: usize) -> f64 {
         self.dhw_draw.get(k).copied().unwrap_or(0.0).max(0.0)
+    }
+
+    /// Plan inside a § 42c energy-sharing community, with the share it offers.
+    ///
+    /// The prices come from the [`PriceStack`], which is where a price belongs;
+    /// this is the *quantity*.
+    #[must_use]
+    pub fn in_community(mut self, share_w: &'a [f64]) -> Self {
+        self.community_share = share_w;
+        self
+    }
+
+    /// The § 42c share available in slot `k`, watts.
+    #[must_use]
+    pub fn community_share_at(&self, k: usize) -> f64 {
+        self.community_share.get(k).copied().unwrap_or(0.0).max(0.0)
+    }
+
+    /// Whether any slot of this horizon has a community share worth modelling.
+    ///
+    /// A household that is not in a community, and one whose community has a
+    /// dark day, both get the model exactly as it was before § 42c existed —
+    /// no column, no row.
+    #[must_use]
+    pub fn has_community_share(&self) -> bool {
+        (0..self.horizon.len).any(|k| {
+            self.community_share_at(k) > 0.0
+                && self
+                    .prices
+                    .slots
+                    .get(k)
+                    .is_some_and(|p| p.sharing_discount_f64() > 0.0)
+        })
     }
 
     /// Add an appliance waiting to run a programme.

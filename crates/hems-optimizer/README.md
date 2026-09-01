@@ -48,11 +48,11 @@ so a full cycle pays it once.
   individual plan feasible. `CompressorState` makes `on[−1]` a fact, and the
   slots the unit still owes are pinned rather than branched; anchoring the first
   transition also took a 96-slot heating day from 5,0 s to about 1,0 s.
-- 🚫 **A plan whose inputs do not describe its horizon is refused.** A forecast
-  with no band for a slot used to be read as zero — the roof dark *and* the house
-  empty, wrong in both directions at once — and a price stack was indexed by
-  position without checking it was the right hours. Both are now errors rather
-  than confident, ordinary-looking plans.
+- 🚫 **A plan whose inputs do not describe its horizon is refused.** Reading a
+  slot with no band as zero says the roof is dark *and* the house is empty, wrong
+  in both directions at once; a price stack indexed by position without checking
+  its hours optimises somebody else's day. Both are errors rather than confident,
+  ordinary-looking plans.
 - ⚖️ **Grid rules are hard constraints, per slot** — § 14a on the netzwirksamer
   Leistungsbezug (a discharging store raises it; a ninety-minute reduction is not
   an all-day one), § 9 EEG on feed-in, the connection on import.

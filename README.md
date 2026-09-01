@@ -6,6 +6,7 @@
 </p>
 
 <p align="center">
+  <a href="https://hupe1980.github.io/hems"><img alt="Documentation" src="https://img.shields.io/badge/docs-hupe1980.github.io%2Fhems-blue"></a>
   <a href="https://github.com/hupe1980/hems/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/hupe1980/hems/actions/workflows/ci.yml/badge.svg"></a>
   <a href="#-licence"><img alt="License" src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue"></a>
   <img alt="Rust" src="https://img.shields.io/badge/rust-1.94+-orange?logo=rust">
@@ -15,7 +16,7 @@
 ---
 
 > 🚧 **Pre-alpha.** The control stack is real, tested and simulated end to end.
-> The protocol drivers are not written yet — see [Status](#-status).
+> Nothing talks to household hardware yet — see [Status](#-status).
 
 A household with a roof, a battery, a car, a heat pump and a hot-water tank is
 now a small power station with legal obligations. Since 2024 the network operator
@@ -23,563 +24,48 @@ may turn its controllable devices down (§ 14a EnWG); since 2025 new photovoltai
 may feed in only 60 % of their installed power until an intelligent meter arrives
 (§ 9 EEG), every supplier has to offer a tariff that changes every quarter hour
 (§ 41a EnWG), and — once the smart meter has been in a year — nothing is earned
-while the price is negative (§ 51 EEG); from
-2026 storage has to account for where its energy came from (MiSpeL) and
-neighbours may share electricity (§ 42c EnWG).
+while the price is negative (§ 51 EEG); from 2026 storage has to account for
+where its energy came from (MiSpeL) and neighbours may share electricity
+(§ 42c EnWG).
 
 **hems is the energy manager that treats those as computation rather than
 paperwork.** Every rule names the document it comes from, is executable, and is
 tested against the worked examples in that document.
 
-## 💡 Seven things that make it different
+## 📚 Documentation
 
-### 1. The grid limit is a proven property, not a code path
+The full argument lives at **[hupe1980.github.io/hems](https://hupe1980.github.io/hems)**.
+This file is the front door.
 
-`[BK6-22-300 Anlage 1 Ziff. 4.6 S. 3]` requires that a network operator's
-reduction beats market-driven control. In hems that is a **guard plane** the
-optimiser cannot reach around: every layer may only *narrow* an interval, and
-the guard narrows last.
-
-```rust
-// From crates/hems-realtime — a 1000-round property test over random
-// households, measurements, plans and user overrides:
-assert!(netzwirksam <= ceiling, "the § 14a promise, checked not asserted");
-```
-
-The same mechanism carries every other limit that is **shared** rather than
-per-device: the main fuse, each sub-distribution board, and the 4,6 kVA of
-unbalanced load VDE-AR-N 4100 allows. Bounding each asset by the connection *on
-its own* is the mistake that looks right — 11 kW of wallbox, 8 kW of heat pump
-and 5 kW of battery each fit under a 24 kW connection, and burn it together.
-
-And a device the drivers cannot hear from is assumed to be drawing its nameplate
-power, never nothing. Assuming nothing is how a manager hands away a budget it
-has already spent.
-
-A limit is measured where the rule measures it. § 14a limits the
-**netzwirksamer Leistungsbezug** — what the controllable devices draw *from the
-grid* — so a battery discharging into the wallbox is headroom the household owns
-and the Festlegung allows, and the guard lends it as far as the store can
-sustain, pinning the lender so the same tick cannot turn it back into a load. § 9
-EEG limits what leaves the **connection point**, so a house using 4 kW may
-produce 4 kW above the cap. Applying either of them per device — which is the
-obvious implementation and was ours — curtails a roof that was inside the law and
-leaves a car short on the one evening a battery exists for.
-
-### 2. Every cost is in the objective — and in the number you are shown
-
-A cost-only planner cycles a battery for a spread that does not cover the
-damage. Measured, the hidden degradation can exceed the energy saving by an
-order of magnitude ([arXiv 2606.16051](https://arxiv.org/abs/2606.16051)). hems
-prices throughput in euros per kilowatt-hour and shows you the difference:
-
-```console
-$ just demo-all
-  ── the same winter day with battery wear priced at zero ──
-```
-
-Comfort, curtailment, carbon and self-sufficiency are priced the same way — as
-what the household is willing to pay to avoid one unit of each — so the terms
-can honestly be added up. An objective that swapped the energy price for grams of
-CO₂ while leaving wear in euros would be minimising a sum of two currencies.
-
-The same terms come back out in the **reported** saving, for the plan and for the
-baseline alike. Comparing electricity bills alone puts the saving back exactly
-where the wear term exists to stop it being: on the reference winter day that is
-€3,39 of bill against €2,09 of actual saving. The larger number is the one every
-other system quotes.
-
-The invariant is one line: **every term of the objective is a term of the
-report.** The charging deadline and the morning shower are priced *soft*, so a day
-nobody could have got through returns the best achievable schedule rather than
-none — and a soft cost that is spent but not charged is a discount the optimiser
-helps itself to. A plan that gives up two kilowatt-hours of charge buys two
-kilowatt-hours less electricity: energy nobody used is energy nobody bought.
-
-The ledger is closed on the stores too. A day that ends with an emptier battery
-than it began with has spent something it started with, and that is charged — the
-opposite case, ending with more, is deliberately *not* credited, because the
-baseline has no battery to store anything in and could never earn it. A saving
-figure may understate itself; it may not flatter itself.
-
-The **car** is the exception, and it has its own entry, because both households
-own the same one. Charge pushed into it *past* what the household asked for is a
-kilowatt-hour nobody buys later, so it is credited on both sides — and that
-worth stating plainly. Respecting the household's own
-Ladelimit **costs** money on the ledger; what it buys is lithium life, which this
-ledger does not price and the household is entitled to weigh for itself. Saying
-the limit paid for itself was a saving figure flattering a behaviour by leaving
-out what it produced.
-
-### 3. The forecast is allowed to be wrong
-
-A saving figure is a statement about a **controller**. A controller judged
-against a forecast it was handed as fact is not being judged at all — and a
-simulator whose forecast *is* the series it is about to run produces an upper
-bound no box in a real house can reach.
-
-So the simulator runs a seeded **realisation** — a cloud that passes at 12:19, an
-afternoon three kelvin milder than modelled, a shower that ran long, a roof
-delivering 90 % of its datasheet — and the planner gets only what a box could
-have known: the geometric model corrected by what *this* roof has been
-delivering, this household's own load profile by day type, its own charging
-sessions by weekday. The day still replays to the last cent; the planner has to
-be wrong about it first.
-
-What that costs is the most useful number the simulator produces:
-
-| Day | Saved | Saved, knowing the future | Premium |
-|---|---|---|---|
-| January, § 14a reduction, car to charge | **€2,09** | €5,25 | 60 % |
-| January evening, car arrives *as* the reduction starts | **€2,51** | €4,93 | 49 % |
-| June, more sun than the house can use | **€8,61** | €8,91 | 3 % |
-| May, § 9 EEG cap | **€1,31** | €1,53 | 14 % |
-
-```console
-$ cargo run -p hemsd -- simulate --day winter --perfect-foresight
-```
-
-The shape is the result: where surplus lasts all day the plan has slack and being
-wrong costs nothing; where a 20 kWh charging session has to be placed into the
-cheap hours *around* a reduction, more than half the headline saving was
-foresight. A HEMS quoting a saving without saying which of the two it measured is
-quoting the second.
-
-The box scores its own forecasts as it runs — pinball, coverage, bias, CRPS — and
-prints them beside the saving.
-
-### 4. And the forecast is a *distribution*, not a number
-
-The forecast publishes a band. A deterministic planner throws two thirds of it
-away and optimises against a median that will not happen. `Risk` reads it as
-three futures instead — **Swanson's rule** on the P10/P50/P90, weighted
-0,3 / 0,4 / 0,3, paired so the pessimistic future is dull *and* hungry, because a
-household's bad day is the correlated one. The first slot is decided once
-(non-anticipativity: the arbiter is about to commit it); everything after it is
-recourse. A **CVaR** term puts weight on the tail, linearised exactly.
-
-What is unusual is not the machinery — the literature has had it for twenty
-years — but that hems ships the **evaluation that can falsify it**. A single
-simulated day pays a hedge's premium every time and makes its claim never, so
-measured once, insurance is always a pure loss:
-
-```console
-$ just risk deadline
-  policy                mean     worst      best    unserved     solve
-  one median           2.35€     1.79€     2.99€       0.17€        9s
-  three futures        2.70€     1.77€     3.99€       0.00€      103s
-```
-
-Three findings, all of them measured and one of them awkward. Scenarios are worth
-**€0,35 a day where a service is at risk** and remove the charge the median plan
-leaves undelivered. They cost **€0,95 a day where nothing is** — an ordinary
-winter night with a battery, a tank and slack everywhere. And **no policy
-improves the worst day**: the hedge moves the mean and the shortfall, not the
-worst euro, which is the opposite of how "risk-aware" is usually sold.
-
-So the default is one median, and `--risk` is how a household that knows its car
-is tight buys the other behaviour.
-
-A calibrated band is a *precondition* for planning against scenarios, not an
-improvement to it. Scored only where there is something to forecast — a band of
-nothing against an outcome of nothing is midnight, not a forecast that came true
-— and with each hour's two tails calibrated against their own outcomes, the
-bands cover 80 % on the January day and 75 % on the June one over twenty
-weathers each.
-
-```console
-$ hemsd backtest --day winter --days 20
-
-  band               covered      CRPS     bias    scored     dark
-  production             80%      178W      17W       640     1280
-  household load         81%       21W      -5W      1920        0
-
-  calibrated — over enough independent days to say so.
-```
-
-A calibrated band is a **precondition** for planning against scenarios, not an
-improvement to it — which is why a coverage figure here counts **days** and not
-quarter hours. One Tuesday's ninety-six slots are one draw wearing ninety-six
-hats, and `hemsd backtest` is what produces days.
-
-### 5. A kilowatt-hour has a price, and it is different for each device
-
-"A reduction takes power from where it is worth least" needs a value **per
-device**. One marginal value per slot is the same number for everything in it and
-ranks nothing.
-
-The plan carries the **shadow price of each store's own state equation**: what
-the household loses if *this* device is held back, with the departure time, the
-comfort band, the wear and the reduction that will bind at teatime already in it.
-A mixed-integer program has no duals, so the model is solved a second time with
-the discrete decisions pinned — and that pass always runs on
-[Clarabel](https://clarabel.org), which is pure Rust. No C++ toolchain, and **no
-backend split**: a box built with the pure-Rust solver and one built with HiGHS
-agree about what a kilowatt-hour is worth.
-
-The same pass prices the § 14a ceiling itself:
-
-```console
-  relief from § 14a was worth            3.93 €/kWh
-```
-
-What a kilowatt-hour of relief from a network operator's limit is worth to *this*
-household, from its own plan. €3,93/kWh in a house with no store whose car will
-otherwise leave short; **nothing at all** on the same evening with a battery,
-because the store lends the controllable devices all the headroom `[A1 2.3]`
-allows and the operator's ceiling costs the household nothing. Aggregators price
-both at "30 % of nominal". A limit that costs nothing is a limit nobody should be
-compensated for, and saying so is half of what the number is for; it is what a
-§ 41e offer or an OpenADR bid should be built from.
-
-One limitation, measured rather than assumed: on the reference household the
-weights change no day's outcome, because the planner has usually already solved
-the split, the charge point's indivisible 6 A minimum eats most of the budget,
-and the hardware quantises the rest. `--uniform-weights` is the
-comparison and it prints the same numbers.
-
-### 6. It runs the house when the cloud is gone
-
-Guard, arbiter, planner, solar geometry and the price stack are all sans-I/O and
-have no clock: time is a parameter. A January day with a § 14a reduction, a
-Steuerbox that stops talking and a car that has to be full by seven is a **unit
-test that runs in milliseconds**.
-
-And when there is no plan at all — a cold start, a stale plan, a solver that
-timed out — the arbiter does what every home battery has always done: covers the
-house from the roof and the store rather than from the grid, in both directions —
-and starts the dishwasher when the sun is out, no later than the last moment that
-still finishes inside the window the household gave it. A box that waits for a
-plan that is not coming leaves the household with dirty dishes *and* a worse day
-than an appliance timer would have given them.
-`just demo offline` runs a whole June day that way: **100 % self-sufficiency,
-2,6 kWh imported, no planner at all.**
-
-It also knows the word *enough*. The charge point carries the household's own
-Ladelimit, and the fallback stops there — a surplus tracker without one keeps
-pushing production into a car that has already had what it was asked for, in
-preference to exporting it for money. The honest accounting is worth stating,
-because it is not the flattering one: the day's ledger values the charge that
-went into the car past its target, so stopping at the Ladelimit **costs** money.
-What it buys is lithium life, which the ledger does not price. The preference is
-the household's, the arithmetic is on the report, and neither is hidden.
-
-Which is not the same as holding everything at zero. A device an energy manager
-can only *limit* — an inverter, a heat pump, a hot-water tank — has controls of
-its own, so an absent instruction means "no limit", not "off". Reading it as
-"off", which is right for a battery and a charge point, lets the house go cold
-and hands out cold showers, while reporting a saving for both: energy nobody used
-is energy nobody bought.
-
-When there *is* a plan, it follows the plan's **energy** rather than its
-setpoint: "put 2,4 kWh into the battery during this quarter hour" survives a
-cloud at 12:19 and three minutes lost to a network operator's reduction; "charge
-at 9,6 kW" survives neither. And the plan has to be *younger* than the arbiter's
-tolerance for one: thirty-minute re-planning against a twenty-minute tolerance is
-ten minutes in every thirty spent quietly on the fallback, nothing fails, and the
-day costs €1,50 more.
-
-And where a rule belongs to a sibling crate, hems **calls it** rather than
-keeping a second copy. `P_min,14a`, the netzwirksamer Leistungsbezug, the
-Modul 3 calendar and its validation, the 4,6 kVA Unsymmetrieleistung and the
-allocation identity § 42b and § 42c settle on all live in
-[`metering`](https://github.com/hupe1980/metering), which owns *quantities* where
-hems owns *control*. Two enumerations of one regulation are two things that can
-disagree about it.
-
-### 7. Compliance is arithmetic, and it is written down
-
-`hems-grid` carries the two rule sets nobody else implements. **MiSpeL**
-(BK 618-25-02, in force 01.10.2026) separates which kilowatt-hour through a
-battery was green and which was grey — the Abgrenzungsoption's formulas (1)–(33)
-and the Pauschaloption's (P1)–(P15), in exact decimals, each numbered as the
-Festlegung numbers it. **§ 42c** energy sharing allocates a community's
-generation over its members quarter by quarter, capping each at what they
-actually used and cascading the remainder rather than stranding it on whoever
-happened to be away.
-
-The simulated day feeds its own quarter-hour meter registers straight into the
-MiSpeL bookkeeping, which is the integration that would otherwise never be made:
-a manager that decides when to charge from the grid but cannot say afterwards how
-much of its feed-in was grey has done half the job.
-
-**§ 9 EEG** is the same discipline applied to a rule everybody has heard of. A
-system commissioned from 25.02.2025 and below 100 kWp may feed in 60 % of its
-installed direct-current power until an intelligent metering system with a
-control device is *in operation* — a technical fact, not a signed contract, and
-the difference is a type rather than a comment.
-
-And the scope of that rule is three conditions of which only one is a size, which
-is why `hems-grid` spells it as a decision tree rather than a range. There is **no
-lower bound**: § 9 Abs. 2 S. 1 Nr. 3 reaches every system below 25 kW that draws
-the Einspeisevergütung, and the 2 kW everybody quotes is § 9 Abs. 2 S. 4, which
-exempts *Steckersolargeräte* — and only those, and only with at most 800 VA of
-inverter, behind a Letztverbraucher's Entnahmestelle. Read as a size class it
-exempts every small roof array from a cap the statute puts on it. The upper bound
-is **exclusive**, because from 100 kW up § 9 Abs. 2 S. 1 Nr. 1 demands remote
-reducibility and no percentage at all. And the date is a **window**, not a
-threshold: § 100 Abs. 3b disapplies the cap to systems commissioned between
-01.01.2023 and 24.02.2025, while one from 2019 still carries the obligation of the
-EEG version applicable to it — either a Rundsteuerempfänger or the old **70 %**
-limitation. Which of those, and whether an installation is a Steckersolargerät,
-are facts an installer declares; neither is derivable from a nameplate, and
-guessing either curtails a household for nothing or feeds it in above a statutory
-limit.
-
-`just demo capped` runs a clear **May** day on a 20 kWp roof — May, not June,
-because the cap is a fraction of *direct-current* power and what a roof delivers
-against it is decided by cell temperature — and prints the quarter-hour feed-in
-peak against the ceiling. The cap binds, for four quarter hours around solar
-noon, and what it costs is **0,2 kWh** of export.
-
-That is far less than "60 %" sounds, and the arithmetic is worth stating plainly
-because nobody else does: a German roof's clear-day peak is only about two thirds
-of its direct-current rating once system losses, soiling and a 50 °C cell are
-taken off, so a 60 % line clips the top tenth of the peak on the clearest days of
-the year — and a household with a store, a tank and a heat pump **absorbs** most
-of that rather than throwing it away. Three things inflate the figure
-several-fold if any of them is wrong: a June day rather than a May one, a planner
-shown the weather in advance, and a roof modelled at its datasheet rather than at
-what a three-year-old one delivers.
-
-Which household it costs is the number worth having, and it needs a baseline that
-is **also** capped — because § 9 EEG does not ask whether there is an energy
-manager behind the meter. `--imsys` lifts the cap on both: the managed
-household's own cost moves by **one cent**, the unmanaged one's by **twelve**.
-That ratio is the case for owning an energy manager under the Solarspitzengesetz,
-and it is invisible to anyone whose baseline ignores the law.
-
-## 🏠 One day, end to end
-
-```console
-$ cargo run -p hemsd -- simulate --day winter
-
-  2026-01-15 — with a § 14a reduction
-
-  produced                                  8.4 kWh
-  household consumption                    11.0 kWh
-  charged into the car                     21.7 kWh
-  heat pump                                26.1 kWh
-  hot water                                 3.1 kWh
-  dishwasher                         1.1 kWh, 75 min later
-  battery throughput                       15.5 kWh
-  imported                                 55.6 kWh
-  exported                                  0.3 kWh
-  curtailed                                 0.0 kWh
-  peak feed-in, per quarter hour     0.12 of 5.88 kW
-  self-sufficiency                             13 %
-  wallbox on one conductor           0 min (0 switches)
-
-  indoor temperature                 19.9 – 23.1 °C
-  outside the comfort band                 0.12 K·h
-  hot-water tank, emptiest                24 % full
-
-  roof, as the box learned it        90 % of the model
-  production forecast, CRPS          192 W (81 % of 32 lit)
-  load forecast, CRPS                18 W (85 % covered)
-
-  electricity bill                          21.06 €
-  battery life spent                         0.62 €
-  comfort given up                           0.19 €
-  borrowed from the stores                   0.15 €
-  cost of the day                           22.02 €
-  without optimisation                      24.12 €
-  saved                                      2.10 €
-  …of it on the bill                         3.41 €
-
-  § 14a limit in force                       90 min
-  …against a minimum of                     10.5 kW
-  …covered by the store                     1.4 kWh
-  control events recorded            1 (93 samples)
-  self-restraint records                          1
-  slowest reaction                   0 s, commanded
-  minutes without a plan                          0
-  without an Energy Guard                     3 min
-  limit respected throughout                    yes
-
-  described in S2                       6 resources
-  dearest asset vs cheapest                      2×
-  relief from § 14a was worth            0.00 €/kWh
-  Modul 2 pays above                     2417 kWh/a
-  …on this day it would have         -3.97 € on the energy
-```
-
-The baseline is the same day delivering the **same service** — the car still
-reaches its target, the house is still warm and the shower is still hot — with no
-battery, a wallbox that starts on plug-in, and a heat pump and a tank on ordinary
-thermostats. It also faces the **same weather**, down to the cloud at 12:19, and
-the **same law**: its Steuerbox turns each device down on its own `[A1 4.4.a]`
-while the reduction lasts, and its roof is capped by § 9 EEG. A baseline run
-against a different realisation prices two different Tuesdays and calls the
-difference a saving; a baseline free of the grid rules prices a household nobody
-is allowed to be.
-
-"…against a minimum of" is what `[A1 4.5.2]` owes *this* household:
-`4,2 kW + (n − 1) · GZF(n) · 4,2 kW`, so 10,5 kW once there is a wallbox, a heat
-pump and a battery behind the energy manager. The flat 4,2 kW is the **base** of
-that formula, not the whole of it — every reference day in this project used to
-command it, which is an instruction no operator may lawfully send, and the field
-that said so was written to the evidence record and printed nowhere.
-
-"…covered by the store" is `[A1 2.3]` in one number: the kilowatt-hours the
-battery lent the controllable devices during the reduction, which never crossed
-the connection point and which the Festlegung therefore does not count.
-
-The three forecast lines are the evidence for the three money lines. **"90 % of
-the model"** is the box having found, from six weeks of its own metering, that
-this roof delivers a tenth less than its geometry says — nothing told it, and a
-figure sitting at exactly 100 % would mean the corrector was not being fed.
-**CRPS** is the standard probabilistic-forecast score, in watts, so it can be put
-beside a published one; the percentage beside it is how often the outcome landed
-inside the 10–90 band, which should be near 80. A day that scored zero is a day
-the planner was told the answer.
-
-Note the last block before them. Ninety minutes is the network operator's
-reduction; the three minutes without an Energy Guard are the manager restraining
-*itself* while it waits to find out whether anything is controlling it
-(`[LPC-901]`). Both produce a record and both are kept, but they are counted
-apart — reporting the second as a § 14a event tells a household the operator
-intervened on a day when nobody did. "Slowest reaction" says whether the
-household had to be *commanded* into the reduction or was **already below** it:
-both satisfy `[A1 4.2]`, and a record that cannot tell them apart reports a
-compliant quiet house as one that took eight minutes to react. And "minutes
-without a plan" has to be zero:
-the arbiter drops a plan older than its tolerance, so a planner that re-solves
-more slowly than that leaves the house on the fallback for part of every cycle,
-silently.
-
-`just demo-all` runs seven days and five comparisons:
-
-| `just demo …` | What it shows | Saved |
-|---|---|---|
-| `winter` | a § 14a reduction at teatime, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €2,09 |
-| `summer` | more production than the house can use, and four negative quarter hours | €8,61 |
-| `deadline` | a car that arrives **as the reduction starts** and takes 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump — the store lends it 4,6 kWh, and the dishwasher waits for the cheap end of the night | €2,51 |
-| `shared` | the same evening on a household with **no store** — owed 7,56 kW rather than 10,5, because two controllable devices are not three — with the reduction arriving at **17:07** rather than on the re-planning grid. The only case where the guard, not the planner, decides who gets it | €1,28 |
-| `offline` | **the planner switched off** — the box on its own | €7,94 |
-| `autumn` | a September day, planner off, the surplus in the 1,4 – 4,1 kW band all afternoon: the day a switchable wallbox is the whole session | €2,72 |
-| `capped` | a clear May day on a 20 kWp roof against the § 9 EEG 60 % cap | €1,31 |
-
-and beside them, six comparisons that each isolate one mechanism:
-
-| Flag | What it isolates |
+| | |
 |---|---|
-| `--perfect-foresight` | the winter day with the future known in advance: €5,25 against €2,09 — what a saving quoted without a forecast measures |
-| `--wear-eur-per-kwh 0` | 18,7 kWh of battery throughput instead of 15,5, for €0,37 more saving on paper and none in the cell |
-| `--no-phase-switching` | on the **autumn** day: 0,2 kWh into the car against 13,1, and a car 4,8 kWh short of where it had to be. Not the June day — midsummer fills the car three-phase either way |
-| `--imsys` | the § 9 EEG cap lifted on both households: nothing to the managed one, twelve cents to the unmanaged one |
-| `--uniform-weights` | every asset weighted the same, which is what one marginal value per slot amounts to |
-| `--heat-pump-on-off` | a single-speed compressor instead of a modulating one — the only unit whose *cycling* is scheduled, so the only one whose minimum runtime constrains anything. The day reports its starts and how long it held on against a command. Slow on purpose: ninety-six extra binaries make every re-plan a genuine mixed-integer problem |
-| `--risk median\|expected\|hedged\|adaptive` | one future or three, and how much of the objective sits on the worst of them. `just risk` runs the sweep that says what each is worth |
+| [Getting started](https://hupe1980.github.io/hems/docs/getting-started/) | clone it, run the checks, watch a January day with a § 14a reduction |
+| [Architecture](https://hupe1980.github.io/hems/docs/architecture/) | three control planes, three cadences, one order of authority |
+| [The grid rules](https://hupe1980.github.io/hems/docs/grid-rules/) | § 14a, § 9 EEG, Modul 3, MiSpeL, § 42c — as code, with the citation for every number |
+| [The planner](https://hupe1980.github.io/hems/docs/optimizer/) | the receding-horizon MILP, and what a kilowatt-hour is worth per device |
+| [Forecasting](https://hupe1980.github.io/hems/docs/forecasting/) | what the box believes about tomorrow, and what being wrong costs |
+| [Flexibility](https://hupe1980.github.io/hems/docs/flexibility/) | S2 / EN 50491-12-2 as the internal model |
 
-And one command that is not a comparison between controllers but a check on the
-input they share:
-
-| Command | What it answers |
-|---|---|
-| `just backtest summer 20` | is the forecast **band** the width it claims to be? Twenty seeded weathers of one day, each an episode, scores merged — because one day's coverage figure is a coin toss reported to three significant figures |
-
-## 🧱 Architecture
-
-```mermaid
-flowchart LR
-    subgraph House["Customer premises"]
-        SB["FNN-Steuerbox<br/>EEBUS Energy Guard"]
-        DEV["PV · battery · wallbox<br/>heat pump · meters"]
-        HEMSD["<b>hemsd</b><br/>guard · arbiter · planner"]
-    end
-    subgraph Domain["Domain crates — no I/O, no clock"]
-        GRID["hems-grid<br/>§ 14a · § 9 EEG · Modul 3 · LPC"]
-        RT["hems-realtime<br/>guard · allocator · arbiter"]
-        DEVC["hems-device<br/>amperes · phases · SG Ready"]
-        FLEX["hems-flex<br/>S2 control types · descriptions"]
-        OPT["hems-optimizer<br/>MILP receding horizon"]
-        TAR["hems-tariff"]
-        FC["hems-forecast"]
-    end
-    SB -->|"LPC limit"| HEMSD
-    HEMSD <--> DEV
-    HEMSD --> GRID & RT & OPT
-    RT --> DEVC
-    DEVC -.-> FLEX
-    OPT --> TAR & FC
-```
-
-Three control planes, at three cadences, with a fixed order of authority:
-
-| Plane | Cadence | Authority | Crate |
-|---|---|---|---|
-| **Guard** | every tick | absolute — `[A1 4.6]` | `hems-grid` + `hems-realtime::guard` |
-| **Arbiter** | ~1 s | inside the guard's bounds | `hems-realtime::arbiter` |
-| **Planner** | 15-min slots, re-planned every 15 min or on event | advisory | `hems-optimizer` |
-
-## 📦 Crates
-
-| Crate | What it is | I/O |
-|---|---|---|
-| [`hems-core`](crates/hems-core) | Domain model: one sign convention, the quarter-hour grid, assets, circuits, setpoints that must name a reason, the building as an exactly discretised RC model, the hot-water tank as a store, an appliance's programme as the shape it draws | none |
-| [`hems-grid`](crates/hems-grid) | § 14a EnWG, the EEBUS LPC/LPP state machine, § 9 EEG, Modul 3, MiSpeL flow bookkeeping, § 42c sharing, the two-year evidence record — all cited, and the ones `metering` owns are called rather than copied | none |
-| [`hems-tariff`](crates/hems-tariff) | The price stack; parsers for what ENTSO-E, SMARD, aWATTar, Tibber and Energy-Charts publish; an advisor that compares Modul 1/2/3 against a household's own history | none |
-| [`hems-forecast`](crates/hems-forecast) | Solar geometry and a physical photovoltaic model, an online residual corrector that learns what *this* roof delivers, load profiles by day type, charging-session statistics by weekday, RC identification of the building from its own record, naive fallbacks, and the metrics that score all of it | none |
-| [`hems-optimizer`](crates/hems-optimizer) | Receding-horizon MILP: cost, wear, comfort, hot water, shiftable appliances placed rather than smeared, grid limits per slot as hard constraints | none |
-| [`hems-realtime`](crates/hems-realtime) | The guard plane, fair allocation of a limited budget, the one-second arbiter | none |
-| [`hems-device`](crates/hems-device) | What a wanted power becomes on real hardware: amperes, phase counts, SG Ready contacts | none |
-| [`hems-flex`](crates/hems-flex) | The household's flexibility in S2 (EN 50491-12-2): which control type each asset is, every description a whole site would send — the same wallbox is a store with a car on it and an envelope without one — and what an instruction means | none |
-| [`hems-sim`](crates/hems-sim) | Battery, charge point, inverter, building, hot-water tank, a dishwasher that will not be paused, and Steuerbox simulators on virtual time — each with at least one way of saying no — and a seeded weather realisation, so the day that happens is not the day that was forecast | none |
-| [`hems-events`](crates/hems-events) | The CloudEvents catalogue, enforced by a workspace guard | none |
-| [`hemsd`](services/hemsd) | The edge daemon | tokio |
-
-## 📐 What the rules are taken from
-
-Every regulatory number in the code carries the document and clause it comes
-from, in a doc comment: `[BK6-22-300 A1 4.5.2]`, `[LPC-031]`. `cargo xtask
-check-citations` resolves all 279 of them against an index of primary sources and
-**fails the build** if one names a document the index does not carry. A rule
-without a citation does not compile.
-
-Its sibling `cargo xtask check-wire` does the same for the *quantities*. Every
-value that becomes money or a Nachweis is a `rust_decimal::Decimal`, and the impl
-one inherits reads with `deserialize_any` — so it accepts a JSON number that has
-already lost digits to an `f64`, and no format without a self-describing wire can
-read it back. The one-line fix is a Cargo feature, and a library may not use one:
-features are global to a build graph, so setting it would decide how every
-`Decimal` deserialises in a crate that never named hems. Each of the 100
-quantities, instants and dates therefore names its own form, and the guard fails
-the build when one forgets.
-
-| Rule | Source |
-|---|---|
-| Which devices are controllable, and the per-Fallgruppe summation | BK6-22-300 Anlage 1 Ziff. 2.4 |
-| The minimum power a network operator may not go below, and the Gleichzeitigkeitsfaktor table | Ziff. 4.5 |
-| Netzwirksamer Leistungsbezug — why photovoltaic surplus lifts the ceiling | Ziff. 2.3 |
-| Transitional regimes to 2028 | Ziff. 10 |
-| The five-state limitation machine: heartbeat 60 s, failsafe after 120 s, release after 2–24 h | EEBUS LPC TS §§ 2.2–2.3 |
-| The 60 % feed-in cap, what lifts it, and the EEBUS feed-in factor | § 9 Abs. 1–2 EEG (Solarspitzengesetz), `[MGCP-011]` |
-| HT/NT/ST windows and their validity rules | BDEW AWH Modul 3 V1.1 |
-| Which kilowatt-hour through a battery was green | MiSpeL Anlage 1 formulas (1)–(33), Anlage 2 (P1)–(P15) |
-| Allocating a community's generation quarter by quarter | § 42c EnWG Abs. 1, 3, 4 |
-
-## 🚀 Getting started
+## 🚀 Try it
 
 ```console
 $ git clone https://github.com/hupe1980/hems && cd hems
+$ just demo-all    # seven simulated days end to end, and the comparisons worth seeing
 $ just ci          # fmt, clippy, purity, tests, guards, licences, docs
-$ just demo-all    # seven days end to end, and five comparisons worth seeing
+$ just fleet-demo  # a box reporting its day into the fleet view
 ```
 
-Released builds of the daemon are on the
+Rust 1.94 and [`just`](https://just.systems). Nothing else: the default solver is
+pure Rust, so there is no C++ toolchain and no system library to install.
+
+Released builds are on the
 [releases page](https://github.com/hupe1980/hems/releases) for
 `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, each built natively,
 smoke-tested against a simulated day before it ships, and accompanied by a
-CycloneDX SBOM, `SHA256SUMS` and a signed build-provenance attestation:
-
-```console
-$ gh attestation verify hemsd-*.tar.gz --repo hupe1980/hems
-```
-
-The binary also carries its own dependency list (`cargo auditable`), so
-`cargo audit bin hemsd` answers "what is in this thing" from an artefact found in
-the field rather than from a file shipped beside it.
+CycloneDX SBOM, `SHA256SUMS` and a signed build-provenance attestation
+(`gh attestation verify hemsd-*.tar.gz --repo hupe1980/hems`). The binary carries
+its own dependency list (`cargo auditable`), so `cargo audit bin hemsd` answers
+"what is in this thing" from an artefact found in the field.
 
 Or use a crate on its own — they are independent and none of them does any I/O:
 
@@ -598,6 +84,161 @@ assert!((minimum_power(&devices, ControlMode::Ems).kw() - 7.56).abs() < 1e-9);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## 🏠 One day, end to end
+
+
+```console
+$ cargo run -p hemsd -- simulate --day winter
+
+  2026-01-15 — with a § 14a reduction
+
+  produced                                  8.4 kWh
+  household consumption                    11.0 kWh
+  charged into the car                     21.7 kWh
+  heat pump                                26.1 kWh
+  hot water                                 3.1 kWh
+  dishwasher                         1.1 kWh, 75 min later
+  battery throughput                       15.5 kWh
+  imported                                 55.7 kWh
+  exported                                  0.3 kWh
+  curtailed                                 0.0 kWh
+  peak feed-in, per quarter hour     0.12 of 5.88 kW
+  self-sufficiency                             13 %
+  wallbox on one conductor           0 min (0 switches)
+
+  indoor temperature                 19.9 – 23.1 °C
+  outside the comfort band                 0.12 K·h
+  hot-water tank, emptiest                24 % full
+
+  roof, as the box learned it        90 % of the model
+  production forecast, CRPS          192 W (81 % of 32 lit)
+  load forecast, CRPS                18 W (85 % covered)
+
+  electricity bill                          21.08 €
+  battery life spent                         0.62 €
+  comfort given up                           0.19 €
+  borrowed from the stores                   0.14 €
+  cost of the day                           22.02 €
+  without optimisation                      24.12 €
+  saved                                      2.09 €
+  …of it on the bill                         3.39 €
+
+  § 14a limit in force                       90 min
+  …against a minimum of                     10.5 kW
+  …covered by the store                     1.4 kWh
+  control events recorded            1 (93 samples)
+  self-restraint records                          1
+  slowest reaction                   0 s, commanded
+  minutes without a plan                          0
+  the opening plan expected          20.05 €, off by +1.03
+  without an Energy Guard                     3 min
+  limit respected throughout                    yes
+
+  described in S2                       6 resources
+  dearest asset vs cheapest                      2×
+  relief from § 14a was worth            0.00 €/kWh
+  Modul 2 pays above                     2417 kWh/a
+  …on this day it would have         -3.97 € on the energy
+```
+
+
+Four lines there are not in anybody else's table, and the
+[planner page](https://hupe1980.github.io/hems/docs/optimizer/) argues each:
+
+- **without optimisation** — the same day delivering the **same service** with no
+  battery, a wallbox that starts on plug-in and ordinary thermostats, against the
+  **same weather** and under the **same grid rules**. A saving computed any other
+  way flatters itself.
+- **saved / …of it on the bill** — €2,09 against €3,39. The saving counts the
+  battery life, the comfort and the service the plan spent; the bill is the
+  flattering number every other system quotes.
+- **…covered by the store** — `[A1 2.3]` in one number: kilowatt-hours the
+  battery lent the controllable devices during the reduction, which never crossed
+  the connection point.
+- **relief from § 14a was worth** — the shadow price of the network operator's own
+  ceiling. Zero here, because the store lends the headroom; €3,93/kWh on the same
+  evening in a house without one.
+
+The three forecast lines are the evidence for the money lines: the planner is
+given only what six weeks of the box's own metering could have taught it, and
+`--perfect-foresight` shows what a saving quoted without that measures — **€5,25
+against €2,09** on this day.
+
+## 💡 What makes it different
+
+Seven claims, each argued on the site rather than here.
+
+1. **The grid limit is a proven property, not a code path.** `[A1 4.6 S. 3]`
+   requires a network operator's reduction to beat market control, so it lives in
+   a guard plane the optimiser cannot reach around — checked by a 1000-round
+   property test over random households, not by a code path somebody remembered.
+   ([architecture](https://hupe1980.github.io/hems/docs/architecture/))
+2. **Every cost the optimiser may spend is a cost the report charges** — battery
+   wear, comfort, curtailed production, and the service the plan decided not to
+   deliver. A plan that leaves the car two kilowatt-hours short buys two
+   kilowatt-hours less electricity, and the bill alone would call that a saving.
+   ([planner](https://hupe1980.github.io/hems/docs/optimizer/))
+3. **The forecast is allowed to be wrong.** The simulated day runs a seeded
+   realisation the planner never sees, and every day scores its own forecasts
+   beside the money.
+   ([forecasting](https://hupe1980.github.io/hems/docs/forecasting/))
+4. **It can plan against a distribution rather than a number** — three futures
+   from the published band, the first slot decided once and everything after it
+   recourse, with the evaluation that can *falsify* it shipped alongside.
+   ([planner](https://hupe1980.github.io/hems/docs/optimizer/))
+5. **A kilowatt-hour has a price, and it differs per device.** The plan carries
+   the dual of each store's own state equation, so "a reduction takes power from
+   where it is worth least" is a decision rather than a sentence.
+   ([planner](https://hupe1980.github.io/hems/docs/optimizer/))
+6. **It runs the house when the cloud is gone.** Guard, arbiter and planner take
+   time as a parameter, so a winter day with a § 14a event is a unit test — and a
+   device the manager can only *limit* is handed back to its own thermostat
+   rather than held at zero.
+   ([architecture](https://hupe1980.github.io/hems/docs/architecture/))
+7. **Compliance is arithmetic, and it is written down.** MiSpeL's
+   Abgrenzungsoption (1)–(33) and Pauschaloption (P1)–(P15), § 42c's quarter-hourly
+   allocation, Modul 3 windows and the two years of § 14a evidence — in exact
+   decimals, with the Festlegung's own numbering.
+   ([grid rules](https://hupe1980.github.io/hems/docs/grid-rules/))
+
+## 📐 What the rules are taken from
+
+Every regulatory number carries the document and clause it comes from —
+`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
+all 328 of them against an index of primary sources, **failing the build** if one
+names a document the index does not carry. `cargo xtask check-wire` does the same
+for the 121 quantities and instants, each of which has to say how it travels.
+
+The documents are third-party copyrighted publications and are not redistributed;
+the index records the retrieval URL of each.
+
+## 📦 Crates
+
+| Crate | What it is | I/O |
+|---|---|---|
+| [`hems-core`](crates/hems-core) | Domain model: one sign convention, the quarter-hour grid, assets, circuits, setpoints that must name a reason, the building as an exactly discretised RC model, the hot-water tank as a store, an appliance's programme as the shape it draws | none |
+| [`hems-grid`](crates/hems-grid) | § 14a EnWG, the EEBUS LPC/LPP state machine, § 9 EEG, Modul 3, MiSpeL flow bookkeeping, § 42c sharing, the two-year evidence record — all cited, and the ones `metering` owns are called rather than copied | none |
+| [`hems-tariff`](crates/hems-tariff) | The price stack; parsers for what ENTSO-E, SMARD, aWATTar, Tibber and Energy-Charts publish; an advisor that compares Modul 1/2/3 against a household's own history | none |
+| [`hems-forecast`](crates/hems-forecast) | Solar geometry and a physical photovoltaic model, an online residual corrector that learns what *this* roof delivers, load profiles by day type, charging-session statistics by weekday, RC identification of the building from its own record, naive fallbacks, and the metrics that score all of it | none |
+| [`hems-optimizer`](crates/hems-optimizer) | Receding-horizon MILP: cost, wear, comfort, hot water, shiftable appliances placed rather than smeared, grid limits per slot as hard constraints | none |
+| [`hems-realtime`](crates/hems-realtime) | The guard plane, fair allocation of a limited budget, the one-second arbiter | none |
+| [`hems-device`](crates/hems-device) | What a wanted power becomes on real hardware: amperes, phase counts, SG Ready contacts | none |
+| [`hems-flex`](crates/hems-flex) | The household's flexibility in S2 (EN 50491-12-2): which control type each asset is, every description a whole site would send — the same wallbox is a store with a car on it and an envelope without one — and what an instruction means | none |
+| [`hems-sim`](crates/hems-sim) | Battery, charge point, inverter, building, hot-water tank, a dishwasher that will not be paused, and Steuerbox simulators on virtual time — each with at least one way of saying no — and a seeded weather realisation, so the day that happens is not the day that was forecast | none |
+| [`hems-events`](crates/hems-events) | The CloudEvents catalogue, enforced by a workspace guard | none |
+| [`hems-service`](crates/hems-service) | The shell every daemon shares: configuration from a file then the environment, a **`Secret`** whose configured value may be an `env:` or `file:` reference rather than the credential itself, **live and ready as separate questions**, a bounded shutdown, and Ed25519 verification of a release *and of the box's own configuration* — whose trust anchor is a key the box was built with, not the server that offered it | tokio, axum |
+
+## 🛰️ Daemons
+
+| Service | What it does | State |
+|---|---|---|
+| [`hemsd`](services/hemsd) | The house: guard, arbiter, planner and evidence recorder against a simulated site, keeping the household's own two years of § 14a evidence locally with an outbox for the fleet | ⏳ no hardware yet |
+| [`tariffd`](services/tariffd) | Fetches the five published day-ahead sources, reconciles a curve that arrives twice under a written trust order, and keeps two days each way so a WAN outage never costs a plan | ✅ |
+| [`forecastd`](services/forecastd) | ICON-D2 through Open-Meteo at quarter-hour resolution. Serves the **sky**, never a finished forecast — the correction for *this* roof is the box's, because it is a property of one roof | ✅ |
+| [`histd`](services/histd) | The fleet's record: the two years of § 14a evidence `[A1 7.3]`, the quarter-hour registers a settlement is computed from, and both exports — the operator's Nachweis and the household's Data Act Article 4 document, each authorised per site, because Article 4 is a right of the *user* and a fleet token is not a household | ✅ |
+| [`fleetd`](services/fleetd) | Single-use enrolment, and **signed** configuration and releases it holds signatures for and never a key — so a `fleetd` an attacker owns can serve neither a configuration nor an update any box will accept | ✅ |
+| [`obsd`](services/obsd) | The fleet view: averages what is an average, and **counts** what is a count — every § 14a breach as a named finding, never as a percentage. A day reaches it over TLS and only as a **signed** CloudEvent, because a list of who broke a grid rule that anybody can write to is not evidence | ✅ |
+
 ## 📊 Status
 
 | Milestone | State |
@@ -609,20 +250,25 @@ assert!((minimum_power(&devices, ControlMode::Ems).kw() - 7.56).abs() < 1e-9);
 | **M4d** the event loop: a task per driver that connects, reads, writes and reconnects; and a site loaded from configuration | ⏳ next |
 | **M5a** `hems-drv/eebus`: the LPC/LPP **Controllable System** on the [`eebus`](https://crates.io/crates/eebus) crate — a whole § 14a day in virtual time | ✅ done |
 | **M5b** the SHIP/SPINE transport under it (TLS, SKI pairing, trust store); conformance harness; the ElaadNL interoperability event | ⏳ |
-| **M6** fleet: `fleetd`, `tariffd`, `forecastd`, `histd`, `obsd`, `portald`; OTA; Data Act export | 📐 designed |
+| **M6a–f** the fleet: `hems-service` (the shell), `tariffd` (prices fetched), `forecastd` (ICON-D2), `histd` (the two years, and the Data Act export), `fleetd` (enrolment and signed releases), `obsd` (the fleet view) | ✅ done |
+| **M6g** `portald`, the `meterstore` tier of `histd`, GDPR erasure, RAUC A/B images and OTA campaigns | 📐 designed |
 | **M7** `flexd` (OpenADR 3.1, § 41e) and `hems-bridge-mako` — the MiSpeL and § 42c *exports*, since the arithmetic already shipped in M3.8 | 📐 designed |
 | **M8** EEBUS CEM role for devices, S2 adapter, V2H/V2G (OCPP 2.1 BPT + `iso15118`), `agentd` | 📐 designed |
 | **M9** Matter DEM, the CLS/aEMT path, a `hemstest` Python toolkit | 📐 designed |
 
-Nothing here talks to hardware yet: `hems-sim` stands in for every device, and
-the drivers are M4/M5. What is real is the control stack and the rules, and they
-are real all the way down — the simulated days run the same guard, arbiter and
-planner a box would.
+Nothing here talks to household hardware yet: `hems-sim` stands in for every
+device, and the drivers are M4/M5. What is real is the control stack, the rules
+and now the fleet — prices and weather are fetched rather than supplied, the
+§ 14a evidence is stored for its two years rather than dying with the process,
+and a box is enrolled, offered a configuration and an update it verifies against
+a key it was built with, and reports its day as a signed event a fleet view will
+not take unsigned. The simulated days run the same guard, arbiter and planner a
+box would.
 
-537 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+727 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (287 citations across five document
-families, each resolving to a document the index carries; 104 quantities,
+clock, the whole suite, the workspace guards (328 citations across five document
+families, each resolving to a document the index carries; 121 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
 Three of them are worth naming because of what they guard against. One asserts
@@ -644,9 +290,13 @@ Unsymmetrieleistung, the allocation identity § 42b/c settle on), [`eebus`](http
 [`ocpp-kit`](https://github.com/hupe1980/ocpp-kit), [`iso15118`](https://github.com/hupe1980/iso15118)
 and [`mako`](https://github.com/hupe1980/mako) (the market side).
 
-The embedded time-series store on the box and the fleet-side one are separate
-crates that are not published yet; hems does not depend on either today, because
-`hemsd` has no persistence at all (see [Status](#-status)).
+The embedded time-series store on the box (`chronix`) and the fleet-side one
+(`meterstore`) are separate crates hems does not depend on yet: the box keeps its
+§ 14a record in an embedded SQLite, and the *measurement series* is what `chronix`
+is for. That split is the answer to *what runs where*: the edge is **one**
+process, `hemsd`, because the § 14a failsafe is a sixty-second heartbeat and a
+two-hour minimum and an IPC hop inside that path buys nothing — so the box's
+stores are embedded, and every other daemon in the table above is cloud.
 
 ## 📄 Licence
 

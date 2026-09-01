@@ -439,6 +439,7 @@ pub fn tariff_for(site: &Site, prices_ct: &[i64], horizon: Horizon) -> Tariff {
                 .as_ref()
                 .and_then(hems_grid::para9::para51_applies_from),
         ),
+        sharing: None,
         standing_charge_eur_per_year: Decimal::new(120, 0),
     }
 }

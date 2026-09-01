@@ -35,10 +35,15 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::doc_markdown,
-    clippy::similar_names
+    clippy::similar_names,
+    // A coverage ratio is two counts of quarter hours: the largest either can
+    // reach is a few hundred, and the same allowance is on `hems-optimizer` and
+    // `hems-forecast` for the same reason.
+    clippy::cast_precision_loss
 )]
 
 pub mod advisor;
+pub mod cache;
 pub mod levies;
 pub mod source;
 pub mod stack;

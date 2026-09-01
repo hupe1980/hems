@@ -451,6 +451,48 @@ a difference rather than an accumulation. A settlement that loses a millionth
 loses it into nobody's account, and the loss is invisible until somebody
 reconciles a year.
 
+### And the plan acts on it
+
+Settling an allocation after the fact is half of § 42c. The other half is that a
+household in a community should **move its flexible load into the quarter hours
+the community is generating**, which is the whole behavioural reason to join one.
+
+What § 42c changes is *which energy price applies to the kilowatt-hours the
+Aufteilungsschlüssel allocated*, and the allocation is capped at what the member
+actually drew. So a slot costs
+
+```text
+shared_price · min(share, g_in)  +  import_price · (g_in − min(share, g_in))
+```
+
+— a **cheap block first**, which is convex exactly while the community is the
+cheaper of the two. A convex cheap-block price needs one bounded column and one
+row rather than a binary: the allocation is at most the share the key offers, at
+most what the household drew, and it comes off the bill.
+
+Where a community is *dearer* than the supplier the same function is concave, and
+a model that treated the discount as optional would let the plan believe it could
+decline an allocation it cannot — the key applies whatever anybody prefers. So
+the discount floors at zero and the plan claims no advantage rather than
+inventing one.
+
+The price lives in the tariff, because a price is: § 42c replaces the supplier's
+**energy component** and nothing else, since the electricity reaches the member
+over the public grid. On the reference winter day a community selling at
+12 ct/kWh net still delivers a **32,5 ct** kilowatt-hour against the supplier's
+**47,9** — a third off, and not the ninety per cent that "free solar from the
+neighbours" suggests. Network charges, the Stromsteuer, the Konzessionsabgabe and
+19 % value added tax do not care where the electron came from.
+
+`hemsd simulate --day winter --sharing` runs the comparison, and the **baseline
+is in the same community**: a household joins one and then does nothing about it,
+and the key allocates it anyway. Leaving the baseline outside would report the
+value of the *membership* as though the planner had produced it. On the reference
+winter day membership alone is worth **€0,88** to a household that does nothing,
+and the planner's shifting adds **€0,19** on top; the day settles **14,5 kWh**
+through the community, from its own quarter-hour registers and through the same
+allocation a Nachweis would use.
+
 Whether a delivery point may take part at all is a metering question
 (Zählerstandsgangmessung *or* quarter-hourly registrierende Leistungsmessung,
 § 42c Abs. 1), and it lives in `metering::sharing`. hems consumes that decision

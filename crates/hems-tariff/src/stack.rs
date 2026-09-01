@@ -39,6 +39,23 @@ pub struct SlotPrice {
     /// Grams of CO₂ per kilowatt-hour drawn, where a source provides it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub co2_g_per_kwh: Option<f64>,
+    /// What a kilowatt-hour **allocated by a § 42c community** costs here,
+    /// gross, ct/kWh — `None` where the household is not in one.
+    ///
+    /// The same stack as [`SlotPrice::import_ct`] with the community's energy
+    /// price in place of the supplier's, so the two are directly comparable and
+    /// the difference is the whole of what membership is worth per kilowatt-hour.
+    /// It is normally a *little* below the import price rather than a lot: the
+    /// energy component is under a third of a German retail bill and § 42c
+    /// changes nothing else, because the electricity crosses the public grid.
+    ///
+    /// How *many* kilowatt-hours are allocated is not a price and does not live
+    /// here — it is the community's generation times this member's
+    /// Aufteilungsschlüssel, capped at what the member actually draws
+    /// (`hems_grid::sharing`), and the planner takes it as a forecast.
+    #[cfg_attr(feature = "serde", serde(default))]
+    #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str_option"))]
+    pub shared_import_ct: Option<Decimal>,
 }
 
 impl SlotPrice {
@@ -52,6 +69,29 @@ impl SlotPrice {
     #[must_use]
     pub fn export_f64(&self) -> f64 {
         self.export_ct.to_f64().unwrap_or(0.0) / 100.0
+    }
+
+    /// What a § 42c allocation saves here, €/kWh — zero where there is no
+    /// community, and **never negative**.
+    ///
+    /// The floor at zero is what keeps the planner's sharing term a *convex*
+    /// piece of its objective. An allocation is cheap-block-first pricing, which
+    /// a linear program represents exactly while the cheap block really is
+    /// cheaper; a community that charged its members more than their supplier
+    /// would make the same function concave, and a plan that modelled it as an
+    /// optional discount would quietly assume it could decline the allocation.
+    /// It cannot — the Aufteilungsschlüssel applies whatever anyone prefers — so
+    /// the honest answer for that contract is to price it at no advantage and
+    /// say so, rather than to invent one.
+    #[must_use]
+    pub fn sharing_discount_f64(&self) -> f64 {
+        self.shared_import_ct
+            .map_or(Decimal::ZERO, |shared| {
+                (self.import_ct - shared).max(Decimal::ZERO)
+            })
+            .to_f64()
+            .unwrap_or(0.0)
+            / 100.0
     }
 
     /// What drawing `energy` in this slot costs, in euros.
@@ -193,6 +233,17 @@ pub fn price_at(tariff: &Tariff, slot: Slot) -> SlotPrice {
         negative_price_hour: negative,
         price_known,
         co2_g_per_kwh: None,
+        // § 42c changes which energy price applies to the allocated
+        // kilowatt-hours and nothing else: the electricity reaches the member
+        // over the public grid, so the network charge, the levies and the value
+        // added tax are the household's own unless the community's contract says
+        // otherwise.
+        shared_import_ct: tariff.sharing.map(|s| {
+            let network = s.network_ct_per_kwh.unwrap_or(network_ct);
+            tariff
+                .levies
+                .gross(s.energy_ct_per_kwh + network + levies_ct)
+        }),
     }
 }
 
@@ -221,6 +272,7 @@ mod tests {
             levies: Levies::household_2026(),
             feed_in: FeedIn::eeg(Decimal::new(786, 2))
                 .under_para51_from(Some(time::macros::date!(2026 - 01 - 01))),
+            sharing: None,
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

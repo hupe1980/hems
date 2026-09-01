@@ -231,6 +231,24 @@ pub struct CostBreakdown {
     /// plan does would be the same mistake pointing the other way.
     #[cfg_attr(feature = "serde", serde(default))]
     pub unserved_eur: f64,
+    /// What a § 42c energy-sharing community took off the bill — a **credit**,
+    /// so it is negative or zero.
+    ///
+    /// Kept as an entry of its own rather than folded into
+    /// [`CostBreakdown::energy_eur`] because it answers a question the energy
+    /// line cannot: *what did belonging to the community buy?* A household
+    /// deciding whether to join one, or an operator setting the Aufteilungs-
+    /// schlüssel, needs the number on its own — and it belongs in
+    /// [`CostBreakdown::billed_eur`] as well as in the total, because unlike
+    /// wear and comfort it really is on the invoice.
+    ///
+    /// The **baseline is in the same community**, so the saving a report shows
+    /// is the value of *shifting load into the community's generation*, not the
+    /// value of the membership. Crediting the plan with the membership would be
+    /// the same asymmetry as measuring it against a household that ignored the
+    /// network operator.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub sharing_eur: f64,
 }
 
 impl CostBreakdown {
@@ -254,6 +272,7 @@ impl CostBreakdown {
             + self.stored_eur
             + self.vehicle_eur
             + self.unserved_eur
+            + self.sharing_eur
     }
 
     /// Everything except the terms that are preferences rather than bills.
@@ -265,7 +284,7 @@ impl CostBreakdown {
     /// midnight is real, and it is not on anybody's bill.
     #[must_use]
     pub fn billed_eur(&self) -> f64 {
-        self.energy_eur
+        self.energy_eur + self.sharing_eur
     }
 }
 

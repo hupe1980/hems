@@ -1286,3 +1286,167 @@ fn a_days_forecast_scores_are_one_episode_and_never_claim_calibration() {
         "nor the load forecast"
     );
 }
+
+#[test]
+fn a_forty_two_c_community_moves_the_day_and_the_baseline_is_in_it_too() {
+    // The other half of § 42c, and the one that was missing for four versions:
+    // `hems-grid::sharing` could *settle* an allocation and the planner had no
+    // term that valued one, so a household could belong to a community and its
+    // box would never once move a kilowatt-hour to catch the neighbours' roof.
+    //
+    // Three things have to hold at once, and only running the day can show them.
+    let plain = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    let mut with_community = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    with_community.community = Some(hemsd::CommunityMembership::mehrfamilienhaus(
+        with_community.config.pv_kwp * 3.0,
+    ));
+    let shared = run(&with_community).unwrap();
+
+    // 1. The module is *reached*. A structural zero here is the failure mode
+    //    this workspace keeps finding in itself — a rule implemented, cited,
+    //    tested and called by nothing.
+    assert!(
+        shared.shared_kwh > 1.0,
+        "the community allocated {:.2} kWh — is anything calling it?",
+        shared.shared_kwh
+    );
+    assert_eq!(
+        plain.shared_kwh, 0.0,
+        "and nothing where there is no community"
+    );
+
+    // 2. The credit is real money and it is on its own line, so a household can
+    //    see what membership bought rather than having it hidden in the bill.
+    assert!(
+        shared.cost.sharing_eur < -0.5,
+        "credit of {:.2} € against {:.1} kWh allocated",
+        shared.cost.sharing_eur,
+        shared.shared_kwh
+    );
+
+    // 3. **The baseline is in the same community.** A household joins one and
+    //    then does nothing about it; the Aufteilungsschlüssel allocates it
+    //    anyway. If the baseline were left outside, the saving would be the
+    //    value of the *membership* rather than of the shifting — the same
+    //    asymmetry as measuring against a household that ignored the network
+    //    operator, and a much more flattering one.
+    assert!(
+        shared.baseline.total() < plain.baseline.total() - 0.1,
+        "the unmanaged member is allocated too: {:.2} € against {:.2} €",
+        shared.baseline.total(),
+        plain.baseline.total()
+    );
+
+    // And what is left after that is what the *planner* adds: it moves flexible
+    // load into the quarter hours the community is generating, which is the
+    // whole behavioural reason to join one.
+    assert!(
+        shared.saving_eur() > plain.saving_eur(),
+        "shifting into the community's window is worth something: {:.2} € against {:.2} €",
+        shared.saving_eur(),
+        plain.saving_eur()
+    );
+}
+
+#[test]
+fn the_day_the_household_would_be_asked_about_survives_the_process() {
+    // `[A1 7.3]` keeps a § 14a control event for **two years**, and G3 says the
+    // house is never worse off when the cloud is gone. Put together, those mean
+    // the record has to exist on the box: one that only exists once it has been
+    // uploaded is an intention with a network dependency, and the day a network
+    // operator asks about is exactly the day the link was down.
+    //
+    // Counting the evidence and keeping it are different things, and only the
+    // second one survives a restart. This is the test that tells them apart.
+    let r = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    assert!(
+        !r.evidence.is_empty(),
+        "a day with a reduction has a record of it"
+    );
+    assert_eq!(
+        r.evidence.len(),
+        r.control_events + r.failsafe_events,
+        "the record carries every event the counts were taken from"
+    );
+    assert_eq!(
+        r.evidence.iter().map(|e| e.samples.len()).sum::<usize>(),
+        r.evidence_samples,
+        "and every sample of the compliance trace [A1 7.2] asks for"
+    );
+
+    let path = std::env::temp_dir().join(format!("hems-day-{}.sqlite", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut store = hemsd::store::Store::open(&path).unwrap();
+        for quarter in &r.quarter_hours {
+            store
+                .put_quarter_hour(quarter, r.quarter_hours[0].slot.start())
+                .unwrap();
+        }
+        for event in &r.evidence {
+            store.put_control_event(event).unwrap();
+        }
+    }
+
+    // A second `Store`, as a second process would open it.
+    let store = hemsd::store::Store::open(&path).unwrap();
+    let kept = store.control_events().unwrap();
+    assert_eq!(kept.len(), r.evidence.len());
+    assert_eq!(
+        kept.iter().map(|s| s.event.clone()).collect::<Vec<_>>(),
+        r.evidence,
+        "the record read back is the record that was written, to the last sample"
+    );
+    assert_eq!(
+        store.quarter_hours().unwrap().len(),
+        96,
+        "and the day's own registers, which is what MiSpeL and § 42c settle from"
+    );
+
+    // Nothing has been forwarded, so everything is still owed to the fleet.
+    assert_eq!(
+        store.backlog().unwrap(),
+        hemsd::store::Backlog {
+            events: r.evidence.len(),
+            quarter_hours: 96
+        },
+        "a box that has not reached the fleet has a backlog, not a gap"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_day_is_never_reported_across_a_network_in_the_clear() {
+    // What crosses this link is what the household consumed and when nobody was
+    // in. Loopback is how the demo works; anything else has to be TLS, and it is
+    // refused rather than warned about — a warning on a box nobody watches is a
+    // warning nobody reads.
+    for allowed in [
+        "http://127.0.0.1:8080/v1/days",
+        "http://localhost:8080/v1/days",
+        "http://[::1]:8080/v1/days",
+        "https://obsd.example/v1/days",
+    ] {
+        assert!(
+            hemsd::report::is_confidential(allowed).is_ok(),
+            "{allowed} should be allowed"
+        );
+    }
+    for refused in [
+        "http://obsd.example/v1/days",
+        "http://10.0.0.5:8080/v1/days",
+        "http://192.168.1.7/v1/days",
+    ] {
+        assert!(
+            hemsd::report::is_confidential(refused).is_err(),
+            "{refused} sends a household's day in the clear"
+        );
+    }
+}
+
+#[test]
+fn a_fleet_url_without_a_port_is_not_an_error() {
+    // `TcpStream::connect` wants an explicit port and an HTTP client does not:
+    // `https://obsd.example/v1/days` is the ordinary way anybody would write it.
+    assert!(hemsd::report::is_confidential("https://obsd.example/v1/days").is_ok());
+}

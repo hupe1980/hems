@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hems-core", "crates/hems-device", "crates/hems-drv", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-sim", "services/hemsd", "xtask"]
+members = ["crates/hems-core", "crates/hems-device", "crates/hems-drv", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-service", "crates/hems-sim", "services/fleetd", "services/forecastd", "services/hemsd", "services/histd", "services/obsd", "services/tariffd", "xtask"]
 
 [workspace.package]
 version      = "0.1.0"
@@ -68,7 +68,58 @@ hems-forecast  = { path = "crates/hems-forecast",  version = "0.1" }
 hems-optimizer = { path = "crates/hems-optimizer", version = "0.1" }
 hems-realtime  = { path = "crates/hems-realtime",  version = "0.1" }
 hems-events    = { path = "crates/hems-events",    version = "0.1" }
+hems-service   = { path = "crates/hems-service",   version = "0.1" }
 hems-sim       = { path = "crates/hems-sim",       version = "0.1" }
+
+# ── The fleet's own dependencies ────────────────────────────────────────────
+#
+# None of these may be reached by a crate in the `purity` list: a domain crate
+# that opens a socket or reads a clock stops being a winter day that runs as a
+# unit test. They live here so the six daemons agree about which versions they
+# are, and nowhere else.
+
+# The runtime. `hems-service` takes the narrow feature set a daemon shell needs;
+# a daemon that wants more asks for more.
+tokio        = { version = "1", default-features = false }
+# The HTTP surface. Axum rather than a framework with a router of its own,
+# because the three shared endpoints are the whole of what this workspace needs
+# from one and `Router::merge` is how a daemon adds its own without being able to
+# shadow them.
+axum         = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# The client half, on rustls rather than OpenSSL: a gateway box image with no
+# system OpenSSL is the point of a distroless build.
+#
+# The crypto provider underneath is **aws-lc-rs**, which is `rustls` 0.23's own
+# default and is taken deliberately rather than inherited: it is the provider
+# with post-quantum key exchange, which matters for a device whose service life
+# is measured in decades and whose traffic can be recorded today. `deny.toml`
+# bans `ring` so the choice is a build failure to change rather than a
+# resolution to notice — two providers in one binary is a runtime panic.
+reqwest      = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "json", "charset"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std", "ansi"] }
+# The box's own store. SQLite `bundled`, so a gateway image needs no system
+# library and a `cargo test` needs no server — and because `meterstore`, which is
+# the *fleet's* history, is PostgreSQL and Iceberg and is not something a
+# household box runs. The two tiers answer different questions and it is right
+# that they are different stores.
+rusqlite     = { version = "0.40", features = ["bundled", "time"] }
+# Signed updates. The CRA (Regulation (EU) 2024/2847, Annex I Part I § 2(c))
+# requires a product to ship security updates and to protect their integrity;
+# an unsigned firmware image on a device that controls a grid connection is the
+# whole of what that is about. Ed25519 because the signature is 64 bytes, the
+# public key is 32, and a gateway box verifies one in microseconds.
+ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "fast", "zeroize"] }
+sha2          = { version = "0.11", default-features = false, features = ["alloc"] }
+hex           = { version = "0.4", default-features = false, features = ["std"] }
+# The box→fleet link, signed. `hmac` over the `sha2` above rather than a
+# hand-rolled construction: HMAC is fifteen lines and every one of them is a
+# place to be wrong, and `Mac::verify_slice` is the constant-time comparison a
+# signature check has to have. `base64` because Standard Webhooks says base64.
+hmac          = { version = "0.13", default-features = false }
+base64        = { version = "0.22", default-features = false, features = ["std"] }
+# The operating system's own entropy, and nothing else. A credential derived from
+# a site name, a secret or a clock is a credential somebody can compute.
+getrandom     = { version = "0.3", default-features = false, features = ["std"] }
 
 # Dependencies are optimised even in a debug build.
 #

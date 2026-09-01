@@ -68,7 +68,7 @@ capacity. `just demo-all` shows the same day with the term set to zero.
 Without a terminal value the plan empties the battery into its own last slots,
 because energy that survives the horizon is worth nothing to a model that stops
 there. That is an artefact of where the horizon happens to stop, and in a
-receding-horizon controller it repeats every five minutes. hems values what is
+receding-horizon controller it repeats at every re-plan. hems values what is
 left at the mean import price over the horizon, discounted by what it costs to
 get back out.
 
@@ -252,15 +252,29 @@ insurance is always a pure loss. `hemsd risk` runs the day under several weather
 under each policy:
 
 ```console
-$ just risk deadline
+$ just risk deadline 20
   policy                mean     worst      best    unserved     solve
-  one median           2.35€     1.79€     2.99€       0.17€        9s
-  three futures        2.70€     1.77€     3.99€       0.00€      103s
+  one median           2.81€     1.78€     3.55€       0.07€      103s
+  three futures        2.96€     1.76€     3.92€       0.01€      517s
+  …and the tail        2.89€     1.67€     3.82€       0.01€      481s
+  only when at risk     2.92€     1.67€     3.93€       0.01€      467s
+
+  band               covered      CRPS    episodes
+  production             80%      178W          20
+  household load         81%       21W          20
+
+  a 10–90 band should cover 80 %. It does, over enough days to say so.
 ```
 
-Scenarios are worth **€0,35 a day where a service is at risk** and remove the
-charge the median plan leaves undelivered; they cost **€0,95 a day where nothing
-is**; and **no** policy improves the worst day. So the default is one median.
+Over twenty seeded weathers on each of two days, scenarios **pay where a service
+is at risk** — three futures beat the median on the mean, €2,96 against €2,81,
+and take the undelivered charge from €0,07 to €0,01. They **cost €1,04 a day
+where nothing is at risk**. And **no** policy improves the worst day: on the
+ordinary day the hedge takes it from €1,18 to €0,32. So the default is one
+median.
+
+Every one of those figures moved when the sweep grew from four weathers to
+twenty, which is the argument for owning the sweep rather than a footnote to it.
 
 A calibrated band is a *precondition* for planning against scenarios, not an
 improvement to it. Scored only where there is something to forecast — a band of
@@ -346,6 +360,42 @@ and the `2n` extra columns and `2n` extra rows cost more than it returns at a
 household's size, where the horizon is a hundred slots rather than a utility's
 thousands.
 
+### The commitment horizon: the tail does not need quarter hours
+
+Ninety-six binaries in each of ninety-six re-plans is a genuine mixed-integer
+problem, and the reference winter day on a single-speed compressor took
+**13:19** of solver time against nine seconds for the same day on a modulating
+unit. Three numerical attacks on that — the convex hull above, a warm start from
+the previous plan, pinning the slots the compressor's own history had already
+decided — each bought a fraction and none of them closed it.
+
+What closes it is structural, and it comes from the same unit-commitment
+literature: a receding horizon executes the **first** slot and throws the rest
+away. The tail exists to price that slot's consequences, and a consequence
+measured to the hour is the same consequence measured to the quarter hour,
+because the building fabric's time constant is days. So the compressor is decided
+slot by slot over a fine head — two hours by default — and **once per clock
+hour** after it.
+
+Three things make that sound rather than merely fast:
+
+* it is a **restriction** of the feasible set and never a relaxation, so nothing
+  the model states — the minimum runtime, the § 14a ceiling, the comfort band —
+  can be escaped by coarsening it;
+* the **continuous** power stays per slot, so a committed hour is still free to
+  modulate between the unit's floor and its rating. A block fixes only *whether*
+  the compressor runs;
+* the blocks are anchored to the **local clock**, not to where the fine head
+  happens to end, so they sit on the boundary the tariff already steps at and do
+  not slide by one slot at every re-plan.
+
+Measured on the reference winter day, back to back on the same machine:
+**13:19 → 2:12**, with the cost of the day identical to the cent — €22,57 either
+way — and one *fewer* compressor start.
+Where a block costs something is a price that moves faster than the block itself,
+and `CommitmentHorizon::fine()` decides every slot on its own for anyone who
+needs that, or wants the model every other figure here was measured against.
+
 ### The inputs have to describe the horizon
 
 Every input to a plan is indexed by slot, and a slot an input does not reach is
@@ -371,8 +421,8 @@ test suite against both.
 
 The model has binaries, so it also carries a **relative gap** (0,5 % by default)
 and a **time budget** (10 s), honoured by HiGHS. A household plan is re-made
-every five minutes against forecasts that are wrong by far more than half a per
-cent; spending a minute to prove the last fraction of it is spending a minute on
+every quarter of an hour against forecasts that are wrong by far more than half a
+per cent; spending a minute to prove the last fraction of it is spending a minute on
 nothing. When the budget runs out the best plan found so far is used, because a
 late plan is worse than a slightly suboptimal one — the arbiter falls back to
 self-consumption while it waits.
@@ -385,6 +435,62 @@ passed on its own and failed under a parallel test run. So a box in the field
 keeps the budget, and anything that has to be *reproducible* sets it to zero and
 waits. The relative gap is unaffected: it is a property of the search, not of the
 clock.
+
+## § 42c: the neighbours' roof as a cheap block of import
+
+Since 1 June 2026 a German household may share renewable electricity with its
+neighbours over the public grid. What is shared is an **allocation**: each
+quarter hour the community's generation is divided among its members by an
+Aufteilungsschlüssel, and each member's share is billed at the community's price
+instead of their supplier's.
+
+Settling that after the fact is bookkeeping. The interesting half is that a
+member should **move its flexible load into the quarter hours the community is
+generating** — and that is a planner question.
+
+The allocation is capped at what the member actually drew, so a slot costs
+
+```text
+shared_price · min(share, g⁺)  +  import_price · (g⁺ − min(share, g⁺))
+```
+
+which is a *cheap block first*. That function is **convex exactly while the
+community is the cheaper of the two**, and a convex cheap-block price is one
+bounded column and one row in the linear program rather than a binary:
+
+```text
+g_shared ≤ share[k]     the Aufteilungsschlüssel's own offer
+g_shared ≤ g⁺[k]        a member cannot be allocated what it did not draw
+```
+
+with the discount on the objective. The two bounds together say
+`g_shared = min(share, g⁺)` at the optimum, without anybody writing a `min`.
+
+Where a community charges *more* than the supplier the same function is concave,
+and an optional discount would let the plan believe it could decline an
+allocation it cannot — the key applies whatever anybody prefers. So the discount
+floors at zero and the plan claims no advantage rather than inventing one. The
+column is not declared at all outside a community, because even a column pinned
+to zero reorders the model, and the reference winter day came back a cent
+different for one.
+
+Two things are easy to get wrong here and both cost real money in the report.
+
+**Only the energy component changes.** § 42c does not exempt the Netzentgelt, the
+Stromsteuer, the Konzessionsabgabe or 19 % of value added tax, because the
+electricity reaches the member over the public grid. A community selling at
+12 ct/kWh net delivers a **32,5 ct** kilowatt-hour where the supplier delivers
+**47,9** — a third off, which is real money and is nothing like the ninety per
+cent "free solar from the neighbours" implies.
+
+**The baseline joins the same community.** A household signs up and then does
+nothing about it; the key allocates it anyway. On the reference winter day that
+membership is worth **€0,88** to a household with no energy manager. What the
+planner adds on top — moving the dishwasher from +75 minutes to +15 and the heat
+pump into the neighbours' daylight — is **€0,19**, and the day settles
+**14,5 kWh** through the community from its own quarter-hour registers. Reporting
+the €0,88 as a planner saving would be the same asymmetry as measuring against a
+household that ignored the network operator.
 
 ## What the plan carries
 

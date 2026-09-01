@@ -64,7 +64,8 @@ pub const UNMET_CHARGE_EUR_PER_KWH: f64 = 5.0;
 /// A third. Below it the car will be filled whatever the weather does and there
 /// is nothing to insure; above it, the evening the reference `deadline` day is
 /// built around — a car arriving *as* a § 14a reduction starts with three hours
-/// to take thirteen kilowatt-hours — and three futures are worth €0,35 a day.
+/// to take thirteen kilowatt-hours — and three futures beat the median on the
+/// mean there, €2,96 against €2,81 over twenty weathers.
 ///
 /// A threshold rather than a formula because the measurement behind it is four
 /// weathers on two days, which supports a sign and not a curve.
@@ -176,12 +177,13 @@ pub struct Scenario {
     /// something at stake.
     ///
     /// Measured on the reference days, and the measurement is the whole
-    /// argument. Planning against three futures **always** costs €0,95 a day on
-    /// an ordinary winter evening — where the household has a battery, a tank,
-    /// slack everywhere and nothing whatever to insure — and seven times the
-    /// solve. On the evening a car arrives *as* a § 14a reduction starts it is
-    /// worth €0,35 a day **and** removes the €0,17 of charge the median plan
-    /// leaves undelivered. Something has to decide which day it is.
+    /// argument. Over twenty seeded weathers on each of two days: planning
+    /// against three futures costs **€1,04 a day** on an ordinary winter day —
+    /// where the household has a battery, a tank, slack everywhere and nothing
+    /// whatever to insure — and seven times the solve. On the evening a car
+    /// arrives *as* a § 14a reduction starts it **beats** the median on the mean,
+    /// €2,96 against €2,81, and takes the undelivered charge from €0,07 to
+    /// €0,01. Something has to decide which day it is.
     ///
     /// The trigger is [`EvSession::tightness`] — a property of the session that
     /// needs no solve. The obvious alternative, asking the *plan* whether it
@@ -204,6 +206,12 @@ pub struct Scenario {
     /// and weights nothing. A named comparison, because the difference is what
     /// the mechanism is worth.
     pub per_asset_weights: bool,
+    /// The § 42c energy-sharing community this household belongs to, if any.
+    ///
+    /// A named comparison, like `risk` and `per_asset_weights`: the difference
+    /// between a household in a community and the same household outside one is
+    /// a *result*, and the only way to see it is to run the day both ways.
+    pub community: Option<CommunityMembership>,
     /// Whether the planner runs at all.
     ///
     /// `false` is the degraded mode of G3: no forecast, no prices, no solver —
@@ -212,6 +220,58 @@ pub struct Scenario {
     /// anything, because surplus is an instantaneous quantity that cannot be
     /// duty-cycled the way a planner duty-cycles a quarter hour.
     pub planner: bool,
+}
+
+/// What a § 42c energy-sharing community offers this household.
+///
+/// Since **01.06.2026** final customers inside one Bilanzierungsgebiet may use
+/// renewable electricity together over the public grid (§ 42c Abs. 1). What
+/// is shared is an **allocation**, not physics: each quarter hour the community's
+/// generation is divided among its consumers by an Aufteilungsschlüssel agreed in
+/// writing (§ 42c Abs. 3 Nr. 2), and each member's share is billed at the
+/// community's own price (Nr. 3) instead of at their supplier's.
+///
+/// The neighbours' roofs are modelled as one array under the **same sky** as
+/// this household's — same location, same tilt, same azimuth, a different
+/// rating. That is a stand-in: a real box is told the community's generation
+/// forecast by whoever operates the community, because the shade on somebody
+/// else's roof is not something this box can learn. What it is *not* is the
+/// household's own residual correction applied to a stranger's array, which
+/// would be learning about the wrong tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CommunityMembership {
+    /// The community's installed generation — the neighbours' roofs together.
+    pub kwp: Power,
+    /// This member's share of the Aufteilungsschlüssel, in `[0, 1]`,
+    /// § 42c Abs. 3 Nr. 2.
+    pub key: f64,
+    /// The community's own energy price, ct/kWh net, § 42c Abs. 3 Nr. 3.
+    ///
+    /// Net, and only the *energy* component: the electricity reaches the member
+    /// over the public grid, so its network charge, its levies and its value
+    /// added tax are unchanged. On the reference winter day 12 ct/kWh net still
+    /// arrives at the meter at 32,5 ct against the supplier's 47,9 — a third
+    /// off, which is worth having and is not the ninety per cent somebody
+    /// imagining free electricity from the neighbours would price.
+    pub price_ct: Decimal,
+}
+
+impl CommunityMembership {
+    /// A Mehrfamilienhaus community: three roofs' worth of array, an equal
+    /// third of the key, and electricity at 12 ct/kWh net.
+    ///
+    /// The shape § 42c was written for, and the numbers are deliberately
+    /// ordinary — a community that priced itself at nothing would make every
+    /// figure below a statement about the number rather than about the
+    /// mechanism.
+    #[must_use]
+    pub fn mehrfamilienhaus(kwp: Power) -> Self {
+        Self {
+            kwp,
+            key: 1.0 / 3.0,
+            price_ct: Decimal::new(12, 0),
+        }
+    }
 }
 
 /// The window a household will let a dishwasher run in: loaded after breakfast,
@@ -303,6 +363,7 @@ impl Scenario {
             // it than it arrived with — so the plan has to find the cheap hours
             // of the night *and* work around the § 14a reduction on the way.
             risk: hems_optimizer::Risk::default(),
+            community: None,
             adaptive_risk: false,
             dishwasher: Some(evening_wash()),
             ev: Some(EvPlan::overnight(
@@ -333,6 +394,7 @@ impl Scenario {
         Self {
             planner: false,
             risk: hems_optimizer::Risk::default(),
+            community: None,
             adaptive_risk: false,
             dishwasher: None,
             ..Self::summer_surplus(config)
@@ -370,6 +432,7 @@ impl Scenario {
     pub fn autumn_without_a_planner(config: HouseholdConfig) -> Self {
         Self {
             risk: hems_optimizer::Risk::default(),
+            community: None,
             adaptive_risk: false,
             dishwasher: None,
             date: time::macros::date!(2026 - 09 - 20),
@@ -416,6 +479,7 @@ impl Scenario {
             // with the car on the cable from midnight the plan simply charges it
             // in the cheap hours of the night and never meets the reduction.
             risk: hems_optimizer::Risk::default(),
+            community: None,
             adaptive_risk: false,
             dishwasher: Some(evening_wash()),
             ev: Some(EvPlan {
@@ -497,6 +561,7 @@ impl Scenario {
             per_asset_weights: true,
             prices_ct: summer_prices(),
             risk: hems_optimizer::Risk::default(),
+            community: None,
             adaptive_risk: false,
             dishwasher: Some(evening_wash()),
             ev: Some(EvPlan::overnight(
@@ -525,6 +590,7 @@ impl Scenario {
     pub fn summer_capped(config: &HouseholdConfig) -> Self {
         Self {
             risk: hems_optimizer::Risk::default(),
+            community: None,
             adaptive_risk: false,
             dishwasher: Some(evening_wash()),
             ev: None,
@@ -675,6 +741,51 @@ pub struct DayResult {
     pub exported_kwh: f64,
     /// Production, kWh.
     pub produced_kwh: f64,
+    /// What the plan made at midnight expected the day's **bill** to be, euros.
+    ///
+    /// The opening plan's horizon is exactly the ninety-six slots of the day, so
+    /// this and [`DayResult::cost`]'s own `billed_eur` are the same question
+    /// asked of a forecast and of a meter. `None` where no plan was made at all.
+    ///
+    /// # What the gap is made of, which is more than the weather
+    ///
+    /// It is tempting to read it as "what forecast error cost", and it is not:
+    /// it is the distance between one plan and the day that happened, and four
+    /// things move it.
+    ///
+    /// The **weather** the opening plan did not know. The **car**, which at
+    /// midnight is not plugged in, so the plan is given only what the box has
+    /// learned about when this household usually comes home. The **ninety-five
+    /// re-plans** after it, each of which sees a horizon running into the next
+    /// day that the opening plan could not — a receding-horizon controller is
+    /// entitled to beat its own opening projection and routinely does. And the
+    /// **arbiter**, which quantises a charge point to six amperes and a tank to
+    /// on or off.
+    ///
+    /// `--perfect-foresight` is what separates the first from the other three:
+    /// on the reference winter day the gap is **+€1,03** honestly and **−€2,46**
+    /// with the weather known in advance, so the weather is not even the largest
+    /// of the four. That is a number worth having precisely because it is not
+    /// the one anybody expects.
+    ///
+    /// # Why the bill and not the whole cost
+    ///
+    /// The plan's ledger and the day's ledger agree about the terms that are on
+    /// an invoice — energy, and what a § 42c community took off it — and
+    /// deliberately do not agree about the two that are not: the day charges what
+    /// it *borrowed from the stores* against its own opening state, and credits
+    /// charge pushed into the car past what the household asked for. Neither is a
+    /// term a plan can predict, because both are statements about where the day
+    /// ended relative to where it began. Comparing the billed halves is a
+    /// comparison; comparing the totals would be an argument about bookkeeping.
+    pub opening_plan_bill_eur: Option<f64>,
+    /// Kilowatt-hours a § 42c community allocated to this household over the
+    /// day, settled from its own meter registers.
+    ///
+    /// Zero where the household is not in a community — and a **structural**
+    /// zero is the thing this workspace keeps finding in itself, so the report
+    /// prints the line only where there is one to print.
+    pub shared_kwh: f64,
     /// Household consumption excluding the controllable devices, kWh.
     pub consumed_kwh: f64,
     /// Production thrown away because it could be neither used nor exported, kWh.
@@ -964,6 +1075,17 @@ pub struct DayResult {
     /// cannot say afterwards how much of its feed-in was grey has done half the
     /// job.
     pub quarter_hours: Vec<MispelQuarterHour>,
+    /// The day's § 14a control events, closed, each with its whole
+    /// minute-resolution compliance trace — `[A1 7.2]`.
+    ///
+    /// # Why the record and not only the counts
+    ///
+    /// Every other field here is a *number about* the evidence: how many events,
+    /// how many samples, whether the limit held. Those are what a fleet view and
+    /// a KPI table need. What a **network operator** asks for is the record
+    /// itself, and `[A1 7.3]` keeps it for two years — so the day has to carry
+    /// it out, which is what `--store` writes down.
+    pub evidence: Vec<hems_grid::ControlEvent>,
 }
 
 impl DayResult {
@@ -971,6 +1093,39 @@ impl DayResult {
     #[must_use]
     pub fn appliance_ran(&self) -> bool {
         self.appliance_kwh > 0.0
+    }
+
+    /// This day as the fleet is told about it.
+    ///
+    /// The narrow record `obsd` aggregates — a dozen numbers rather than every
+    /// field of this struct, because a fleet service coupled to an edge daemon's
+    /// internal report is a fleet service that cannot be deployed independently
+    /// of it. Both sides share [`hems_core::report::DayKpis`], so a renamed
+    /// field is a compile error rather than a dashboard that reads zero for six
+    /// weeks.
+    #[must_use]
+    pub fn kpis(&self, site: &str, date: time::Date) -> hems_core::report::DayKpis {
+        hems_core::report::DayKpis {
+            site: site.to_owned(),
+            date,
+            imported_kwh: self.imported_kwh,
+            exported_kwh: self.exported_kwh,
+            produced_kwh: self.produced_kwh,
+            self_sufficiency: self.self_sufficiency,
+            shared_kwh: self.shared_kwh,
+            cost: self.cost,
+            baseline: self.baseline,
+            respected_the_grid: self.grid_event_respected,
+            worst_overshoot_w: self.worst_overshoot_w,
+            minutes_without_a_plan: u32::try_from(self.minutes_without_a_plan).unwrap_or(u32::MAX),
+            control_events: self.control_events,
+            below_minimum_commanded: self.commanded_below_minimum,
+            pv_coverage: self.pv_forecast.coverage,
+            pv_crps: self.pv_forecast.crps,
+            load_coverage: self.load_forecast.coverage,
+            load_crps: self.load_forecast.crps,
+            foresight_was_perfect: self.foresight_is_perfect,
+        }
     }
 
     /// What the optimisation saved against the baseline, euros — every term
@@ -991,9 +1146,9 @@ impl DayResult {
 
 /// Run one day and report what happened.
 ///
-/// The control loop runs once a minute and the planner every half hour, which is
-/// the same shape a real box uses — fast enough to track a cloud, slow enough
-/// that a solver is affordable.
+/// The control loop runs once a minute and the planner every quarter of an hour,
+/// which is the same shape a real box uses — fast enough to track a cloud, slow
+/// enough that a solver is affordable.
 ///
 /// # Errors
 /// When the household described by the scenario is not a valid site — a
@@ -1097,8 +1252,20 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     );
 
     // ── Prices and forecasts ────────────────────────────────────────────────
-    let tariff = crate::site::tariff_for(site, &scenario.prices_ct, day);
+    let mut tariff = crate::site::tariff_for(site, &scenario.prices_ct, day);
+    // § 42c Abs. 3 Nr. 3: the community's own price replaces the supplier's
+    // energy component on the allocated kilowatt-hours, and nothing else.
+    if let Some(c) = scenario.community {
+        tariff = tariff.in_community(hems_tariff::tariff::SharingTariff::at(c.price_ct));
+    }
     let prices = PriceStack::build(&tariff, day);
+
+    // The neighbours' roofs, under the same sky as this one — and the meter that
+    // watches them. The *same* meter the unmanaged household is given, so the
+    // two sides of the comparison cannot disagree about what a quarter hour of
+    // community generation was. See [`CommunityMembership`] for why the
+    // neighbours are not given this household's own learned correction.
+    let mut community = CommunityMeter::for_scenario(scenario);
 
     // ── What the box knows, and what it is about to find out ────────────────
     //
@@ -1232,12 +1399,12 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             feed_in_rule: feed_in.map(|(_, r)| r),
         };
 
-        // Re-plan every half hour **or when something the plan assumed stops
-        // being true**. A plan made while the car still needed 3 kWh keeps
-        // asking for them after the car is full, and half an hour of that is a
-        // kilowatt-hour of the evening tariff bought for nothing. The design has
-        // always said "every five minutes or on event"; the car reaching its
-        // target is an event.
+        // Re-plan on [`REPLAN_PERIOD`] **or when something the plan assumed
+        // stops being true**. A plan made while the car still needed 3 kWh keeps
+        // asking for them after the car is full, and a quarter of an hour of
+        // that is most of a kilowatt-hour of the evening tariff bought for
+        // nothing. The design has always said "every 15 min or on event"; the
+        // car reaching its target is an event.
         let car_finished = scenario
             .ev
             .zip(evse.vehicle.as_ref())
@@ -1250,6 +1417,10 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             let horizon = Horizon::new(now, 96);
             let horizon_prices = PriceStack::build(&tariff, horizon);
             let horizon_draw: Vec<f64> = horizon.slots().map(|s| hot_water_draw(s).get()).collect();
+            // What the community expects to be able to allocate this member, slot
+            // by slot. Zero-length where the household is not in one, which is
+            // what leaves the model exactly as it was.
+            let horizon_share: Vec<f64> = community.forecast(&weather, site.location, horizon);
             // The temperature the planner plans against: the diurnal shape,
             // without the day's own error, aligned with *this* horizon. Per slot
             // because a heat pump's coefficient of performance is linear in it —
@@ -1312,7 +1483,8 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     },
                     &horizon_draw,
                 )
-                .with_limits(planning_limits(&limits, lpc.limit_ends_at(), site));
+                .with_limits(planning_limits(&limits, lpc.limit_ends_at(), site))
+                .in_community(&horizon_share);
 
             // The dishwasher, while there is still a decision to make about it.
             // Once it is running the decision is spent — a programme cannot be
@@ -1490,6 +1662,20 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     // schedule gives it an incumbent to prune against from the
                     // first node instead of rediscovering the day.
                     last_commitment = Some((Slot::containing(now), solved.commitment));
+                    // What the plan that **opens** the day expects the day's
+                    // bill to be. Its horizon is exactly the ninety-six slots of
+                    // the day, so the two are the same question asked twice: once
+                    // of a forecast and once of a meter. The gap between them is
+                    // the seam nothing else in the workspace can see, and it only
+                    // became a meaningful number when the plan and the day
+                    // stopped being given the same weather.
+                    if now == start {
+                        result.opening_plan_bill_eur = solved
+                            .plan
+                            .expected_cost
+                            .as_ref()
+                            .map(hems_core::prelude::CostBreakdown::billed_eur);
+                    }
                     plan = Some(solved.plan);
                 }
                 Err(_) => plan = None,
@@ -1796,6 +1982,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             });
             let kwh = |p: Power| Decimal::try_from(p.kw() * hours).unwrap_or_default();
             register.grid_draw += kwh(grid.inflow());
+            community.observe(&weather, site.location, now, hours, slot, grid.inflow());
             register.grid_feed_in += kwh(grid.outflow());
             register.device_consumption += kwh(battery_actual.inflow() + evse_actual.inflow());
             register.device_generation += kwh(battery_actual.outflow() + evse_actual.outflow());
@@ -1945,6 +2132,9 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         .filter_map(hems_grid::ControlEvent::worst_overshoot)
         .map(Power::get)
         .fold(0.0, f64::max);
+    // The record itself, not only the numbers taken off it. `[A1 7.3]` keeps it
+    // for two years and `hemsd --store` is what writes it down.
+    result.evidence = evidence.closed().to_vec();
 
     // Close the ledger on the stores. The objective values what it leaves behind
     // (`terminal_value_factor`); a day that counted the purchase and not the
@@ -1973,6 +2163,9 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             -(v.stored - ev.energy_target).max(Energy::ZERO).kwh() * mean_import
         });
     result.baseline = baseline_cost(scenario, &weather, &array, &prices, site, site.location);
+
+    // ── § 42c: what the community actually allocated this member ────────────
+    (result.shared_kwh, result.cost.sharing_eur) = community.settle(&prices);
 
     result.quarter_hours = registers.into_values().collect();
     // The § 9 EEG quantity, at the resolution § 9 EEG measures it: the largest
@@ -2259,6 +2452,131 @@ fn unmanaged_heat_pump(
     )
 }
 
+/// The two quarter-hour series a § 42c settlement needs: what the neighbours'
+/// roofs made, and what this member drew.
+///
+/// It exists so the managed day and the unmanaged one accumulate them the same
+/// way. Two copies of "sum a minute into a quarter hour" is two places for the
+/// two sides of a comparison to stop agreeing about what a quarter hour is.
+#[derive(Debug, Default)]
+struct CommunityMeter {
+    membership: Option<CommunityMembership>,
+    neighbours: Option<ArrayModel>,
+    generation: std::collections::BTreeMap<Slot, Decimal>,
+    draw: std::collections::BTreeMap<Slot, Decimal>,
+}
+
+impl CommunityMeter {
+    /// A meter for the community this scenario's household belongs to, or an
+    /// inert one where it belongs to none.
+    fn for_scenario(scenario: &Scenario) -> Self {
+        Self {
+            membership: scenario.community,
+            neighbours: scenario
+                .community
+                .map(|c| ArrayModel::new(c.kwp, c.kwp * 0.8, 35.0, 180.0)),
+            ..Self::default()
+        }
+    }
+
+    /// Add one control period.
+    fn observe(
+        &mut self,
+        weather: &Weather,
+        location: GeoPoint,
+        now: OffsetDateTime,
+        hours: f64,
+        slot: Slot,
+        drawn: Power,
+    ) {
+        let Some(neighbours) = self.neighbours.as_ref() else {
+            return;
+        };
+        let kwh = |p: Power| Decimal::try_from(p.kw() * hours).unwrap_or_default();
+        *self.generation.entry(slot).or_default() +=
+            kwh(weather.production_at(neighbours, location, now));
+        *self.draw.entry(slot).or_default() += kwh(drawn);
+    }
+
+    /// What the community expects to be able to allocate this member over
+    /// `horizon`, slot by slot, in watts — the planner's input.
+    ///
+    /// Empty where the household is not in a community, which is what leaves the
+    /// model exactly as it was before § 42c existed: no column, no row.
+    fn forecast(&self, weather: &Weather, location: GeoPoint, horizon: Horizon) -> Vec<f64> {
+        let (Some(c), Some(neighbours)) = (self.membership, self.neighbours.as_ref()) else {
+            return Vec::new();
+        };
+        horizon
+            .slots()
+            .map(|s| {
+                weather.modelled_production(neighbours, location, s).get() * c.key.clamp(0.0, 1.0)
+            })
+            .collect()
+    }
+
+    /// The kilowatt-hours allocated and the credit they earned.
+    fn settle(&self, prices: &PriceStack) -> (f64, f64) {
+        self.membership.map_or((0.0, 0.0), |c| {
+            settle_sharing(c, prices, &self.generation, &self.draw)
+        })
+    }
+}
+
+/// What a § 42c community allocated one member over a day, and what it saved.
+///
+/// Settled from the day's own quarter-hour meter registers through the same
+/// arithmetic a Nachweis would use — `hems_grid::sharing`, which is `metering`'s
+/// allocation with the § 42c cascade on top — rather than from the plan's idea
+/// of it. The plan is a forecast; this is what happened, and the difference
+/// between them is a seam worth being able to see.
+///
+/// The other two members are ordinary households of the same size drawing the
+/// day's own load profile, and they matter: under a dynamic Aufteilungsschlüssel
+/// what a neighbour cannot use is re-offered (§ 42c Abs. 3 Nr. 2), so a
+/// community whose other members were assumed to consume nothing would hand this
+/// household the whole roof and overstate the benefit threefold.
+///
+/// Returns the kilowatt-hours allocated and the credit they earned, which is
+/// **negative** because it comes off a bill.
+fn settle_sharing(
+    membership: CommunityMembership,
+    prices: &PriceStack,
+    generation: &std::collections::BTreeMap<Slot, Decimal>,
+    draw: &std::collections::BTreeMap<Slot, Decimal>,
+) -> (f64, f64) {
+    let key = Decimal::try_from(membership.key.clamp(0.0, 1.0)).unwrap_or_default();
+    let others = ((Decimal::ONE - key) / Decimal::TWO).max(Decimal::ZERO);
+    let community = hems_grid::sharing::Community::new(
+        "11YDE-VE-------2",
+        vec![
+            hems_grid::sharing::Member::new("DE0001111111111111111111111111111", key),
+            hems_grid::sharing::Member::new("DE0002222222222222222222222222222", others),
+            hems_grid::sharing::Member::new("DE0003333333333333333333333333333", others),
+        ],
+    );
+    let (mut kwh, mut credit) = (0.0, 0.0);
+    for (slot, drawn) in draw {
+        let neighbour = Decimal::try_from(household_load(*slot).kw() * 0.25).unwrap_or_default();
+        let Ok(allocation) = hems_grid::sharing::allocate_by(
+            &community,
+            *slot,
+            generation.get(slot).copied().unwrap_or_default(),
+            &[*drawn, neighbour, neighbour],
+            hems_grid::sharing::Aufteilung::Dynamisch,
+        ) else {
+            continue;
+        };
+        let mine = allocation.shares[0].shared.to_f64().unwrap_or(0.0);
+        kwh += mine;
+        credit -= mine
+            * prices
+                .at(*slot)
+                .map_or(0.0, hems_tariff::SlotPrice::sharing_discount_f64);
+    }
+    (kwh, credit)
+}
+
 fn baseline_cost(
     scenario: &Scenario,
     weather: &Weather,
@@ -2318,6 +2636,13 @@ fn baseline_cost(
         .dishwasher
         .clone()
         .map(hems_sim::ApplianceSim::new);
+    // The unmanaged household is in the **same § 42c community**. It joined and
+    // then did nothing about it: the Aufteilungsschlüssel still allocates it
+    // whatever its own draw happens to overlap. Leaving that out would credit
+    // the plan with the *membership* rather than with the shifting, which is the
+    // same asymmetry as measuring a saving against a household that ignored the
+    // network operator.
+    let mut community = CommunityMeter::for_scenario(scenario);
     let mut now = start;
 
     while now < start + Duration::days(1) {
@@ -2387,6 +2712,7 @@ fn baseline_cost(
             cost.energy_eur += grid.inflow().kw() * hours * price.import_f64()
                 - grid.outflow().kw() * hours * price.export_f64();
         }
+        community.observe(weather, location, now, hours, slot, grid.inflow());
         // A thermostat is not free of discomfort: it starts reheating only once
         // the house has already fallen through the band. Leaving that out would
         // credit the planner with comfort the baseline also delivered.
@@ -2407,6 +2733,7 @@ fn baseline_cost(
         .sum::<f64>()
         / prices.slots.len().max(1) as f64;
     cost.stored_eur = (tank_open - tank.stored).kwh() / tank.cop.max(f64::EPSILON) * mean_import;
+    cost.sharing_eur = community.settle(prices).1;
     // A window with nowhere to put the programme costs the same on both sides.
     // Charging only the plan for a wash nobody got would be the asymmetry this
     // whole function exists to avoid, pointing the other way.

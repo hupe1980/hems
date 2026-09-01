@@ -50,6 +50,7 @@ pub mod quantile;
 pub mod residual;
 pub mod session;
 pub mod solar;
+pub mod weather;
 
 pub use building::{Identified, ThermalSample, identify};
 pub use load::{DayType, LoadProfile};
@@ -59,3 +60,4 @@ pub use quantile::{Band, Forecast, PowerBand};
 pub use residual::{ResidualModel, SETTLED_SAMPLES};
 pub use session::{Session, SessionForecast, SessionHistory};
 pub use solar::{ArrayModel, SunPosition, clear_sky_ghi, sun_position};
+pub use weather::{WeatherError, WeatherPoint, WeatherSeries, open_meteo};
