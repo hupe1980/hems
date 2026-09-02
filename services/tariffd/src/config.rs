@@ -49,6 +49,13 @@ pub struct Settings {
     /// A fleet of boxes retrying a failed public API every fifteen seconds is a
     /// denial of service against somebody who is giving the data away.
     pub max_backoff_s: u64,
+    /// The Model Context Protocol surface, off by default.
+    ///
+    /// Open like the REST routes when it is switched on: a day-ahead auction
+    /// result is a published figure, not a household's data. What it costs is
+    /// the operator's own upstream quota, which is a rate-limiting question.
+    #[serde(default)]
+    pub mcp: hems_service::McpSettings,
     /// How many slots the readiness probe requires the cache to cover.
     ///
     /// Ninety-six is one day: a box asking for a 24-hour horizon can be answered
@@ -65,6 +72,7 @@ impl Default for Settings {
             poll_interval_s: 900,
             request_timeout_s: 20,
             max_backoff_s: 3600,
+            mcp: hems_service::McpSettings::default(),
             ready_slots: 96,
         }
     }

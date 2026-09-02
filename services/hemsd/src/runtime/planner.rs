@@ -231,6 +231,23 @@ struct Cached {
     sky_at: Option<OffsetDateTime>,
 }
 
+/// What the planner leaves for the control loop to read.
+///
+/// Two handles that travel together because they are read together: on each
+/// quarter-hour boundary the loop teaches the residual model against
+/// `modelled_pv` and scores itself against `bands`. Bundled so that adding the
+/// second one did not widen a signature that is already at the limit.
+#[derive(Clone)]
+pub struct Published {
+    /// The plane-of-array figure each slot's forecast was built from.
+    ///
+    /// The corrector has to be taught against the same modelled number the
+    /// forecast used, or it learns the cloud rather than the roof.
+    pub modelled_pv: Arc<RwLock<std::collections::BTreeMap<Slot, f64>>>,
+    /// The bands the standing plan was made against (D117).
+    pub bands: Arc<RwLock<crate::runtime::day::PublishedBands>>,
+}
+
 /// Plan, publish, sleep, repeat — until the process is asked to stop.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
@@ -239,7 +256,7 @@ pub async fn run(
     fleet: Fleet,
     plan: Arc<RwLock<Option<Plan>>>,
     prices: Arc<RwLock<Option<PriceStack>>>,
-    modelled_pv: Arc<RwLock<std::collections::BTreeMap<Slot, f64>>>,
+    published: Published,
     learned: Arc<Mutex<Learned>>,
     store: Option<Arc<Mutex<crate::store::Store>>>,
     health: Health,
@@ -263,13 +280,7 @@ pub async fn run(
         refresh(&fleet, &mut cached, now).await;
 
         match attempt(
-            &planner,
-            &registry,
-            &cached,
-            &prices,
-            &modelled_pv,
-            &learned,
-            now,
+            &planner, &registry, &cached, &prices, &published, &learned, now,
         )
         .await
         {
@@ -332,7 +343,7 @@ async fn attempt(
     registry: &Shared,
     cached: &Cached,
     prices_out: &Arc<RwLock<Option<PriceStack>>>,
-    modelled_pv: &Arc<RwLock<std::collections::BTreeMap<Slot, f64>>>,
+    published: &Published,
     learned: &Arc<Mutex<Learned>>,
     now: OffsetDateTime,
 ) -> Result<hems_optimizer::solve::Solved, Reason> {
@@ -367,7 +378,7 @@ async fn attempt(
     // Published for the control loop, which teaches the corrector against
     // exactly these figures on every slot boundary. Handing it a fresh
     // clear-sky number instead would teach it the weather rather than the roof.
-    *modelled_pv.write().await = modelled.iter().copied().collect();
+    *published.modelled_pv.write().await = modelled.iter().copied().collect();
 
     // ── What the house will use, and what it has ────────────────────────────
     let observed = {
@@ -398,6 +409,17 @@ async fn attempt(
         hems_forecast::naive::persistence(recent, horizon, 0.9)
     };
     drop(held);
+
+    // Published for the control loop, which scores each slot against the band
+    // the plan was actually made against once the slot has happened. Written
+    // here rather than derived later: a score of a band nobody planned against
+    // says nothing about the plan (D117).
+    *published.bands.write().await = pv
+        .slots
+        .iter()
+        .zip(load.slots.iter())
+        .map(|((slot, p), (_, l))| (*slot, (*p, *l)))
+        .collect();
 
     // ── The battery, if its meter is telling us where it is ─────────────────
     let battery = battery_model(

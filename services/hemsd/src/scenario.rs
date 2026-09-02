@@ -741,9 +741,9 @@ pub struct DayResult {
     /// Kilowatt-hours a § 42c community allocated to this household over the
     /// day, settled from its own meter registers.
     ///
-    /// Zero where the household is not in a community — and a **structural**
-    /// zero is the thing this workspace keeps finding in itself, so the report
-    /// prints the line only where there is one to print.
+    /// Zero where the household is not in a community. A **structural** zero
+    /// reads exactly like a mechanism that ran and achieved nothing, so the
+    /// report prints the line only where there is one to print.
     pub shared_kwh: f64,
     /// Household consumption excluding the controllable devices, kWh.
     pub consumed_kwh: f64,
@@ -1072,17 +1072,26 @@ impl DayResult {
             produced_kwh: self.produced_kwh,
             self_sufficiency: self.self_sufficiency,
             shared_kwh: self.shared_kwh,
-            cost: self.cost,
-            baseline: self.baseline,
+            economics: Some(hems_core::report::Economics {
+                cost: self.cost,
+                // The simulator has one because it can re-run the day as an
+                // unmanaged house. A box on a wall cannot (D116).
+                baseline: self.baseline,
+            }),
             respected_the_grid: self.grid_event_respected,
             worst_overshoot_w: self.worst_overshoot_w,
             minutes_without_a_plan: u32::try_from(self.minutes_without_a_plan).unwrap_or(u32::MAX),
             control_events: self.control_events,
             below_minimum_commanded: self.commanded_below_minimum,
-            pv_coverage: self.pv_forecast.coverage,
-            pv_crps: self.pv_forecast.crps,
-            load_coverage: self.load_forecast.coverage,
-            load_crps: self.load_forecast.crps,
+            forecast: Some(hems_core::report::ForecastScores {
+                pv_coverage: self.pv_forecast.coverage,
+
+                pv_crps: self.pv_forecast.crps,
+
+                load_coverage: self.load_forecast.coverage,
+
+                load_crps: self.load_forecast.crps,
+            }),
             foresight_was_perfect: self.foresight_is_perfect,
         }
     }
@@ -2219,8 +2228,8 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     //
     // How far the plan moved it, against the household that pressed start as
     // soon as it was allowed to. A structural zero means the mechanism decided
-    // nothing, which is the failure this workspace keeps finding in itself and
-    // the reason the number is reported rather than inferred from the bill.
+    // nothing, and that is why the number is reported rather than inferred from
+    // the bill.
     // A machine nobody loaded is not a machine that failed to run, so the charge
     // hangs off the *window* rather than off the appliance: a household that
     // asked for nothing is owed nothing.

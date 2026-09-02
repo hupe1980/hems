@@ -1,7 +1,7 @@
 +++
 title = "Security and supply chain"
 description = "The box trusts a key it was built with, not a server. Secrets are references, authorisation is per site, and every release ships with an SBOM and a provenance attestation."
-weight = 12
+weight = 13
 +++
 
 A home energy manager holds a grid connection open, decides when a car charges,
@@ -65,9 +65,10 @@ injects secrets that way.
 So the **reference** is configured and the value is not:
 
 ```toml
-webhook_secrets = ["env:HEMS_OBSD_WEBHOOK_SECRET"]   # from the environment
-webhook_secrets = ["file:/run/secrets/webhook"]      # from a mounted file
-webhook_secrets = ["whsec_literal"]                  # the secret itself
+[webhook_secrets]                                    # one key per household
+haus-1 = ["env:HEMS_OBSD_SECRET_HAUS_1"]             # from the environment
+haus-2 = ["file:/run/secrets/haus-2"]                # from a mounted file
+haus-3 = ["whsec_literal"]                           # the secret itself
 ```
 
 An unresolvable reference is an **error**, never a fallback to the literal. A
@@ -118,17 +119,114 @@ irradiance over a location. Neither carries household data, and both are
 unauthenticated **on purpose**. Writing that down is what makes the difference
 between the two pairs read as a decision rather than an oversight.
 
+`fleetd`'s roster is not in that set. `/v1/fleet` says which households exist,
+which build each is on and which are unreachable right now — an inventory of who
+is worth attacking and which of them is unpatched — so it takes an operator's
+token. The rest of `fleetd` is a box's own read against its own credential.
+
+## Capabilities, and they narrow
+
+A principal here carries three things: a credential that says **who**, a set of
+**capabilities** that says what it may do, and a **site scope** that says which
+households.
+
+Capabilities are dotted patterns with two forms and no more — `hems.record.read`,
+or the family `hems.record.*`. The grammar stops there because a delegate must
+be provably no wider than its delegator, and containment has to be *decidable*:
+regex and negation make it undecidable in general. It is deliberately the shape
+[agentplane](https://github.com/hupe1980/agentplane) uses, because that is the
+runtime the advisory agent will be built on, and its principals have to compose
+with these rather than be translated into them.
+
+| Capability | What it opens |
+|---|---|
+| `hems.record.read` | one household's § 14a evidence — what a Nachweis is built from |
+| `hems.record.write` | writing that record. A box's own, and nothing else's |
+| `hems.export.read` | the Data Act Article 4 export |
+| `hems.fleet.read` | an answer about **every** household in scope — a summary, a roster |
+
+The reason this is a set and not a role: an agent must be able to hold **less**
+than whoever it acts for. An agent reading a Nachweis on an operator's behalf
+should not inherit the roster, and a role delegated to an agent is still that
+role. A capability set delegated to an agent is a subset, and the containment
+check is what makes "no wider than its delegator" something the compiler helps
+with rather than something a reviewer notices.
+
+## The fleet is a verb, not a missing site
+
+`hems.fleet.read` exists because the question *"may this caller read an answer
+about every household"* had no name, so four call sites each decided it for
+themselves — and one decided it wrong. `obsd`'s fleet summary asked
+`may_read(site: None)`, and `Option::is_none_or` is `true` for `None`, so **any**
+valid credential — including one household's own box token — read a summary
+naming every household that failed to respect a network operator's reduction.
+
+A box's credential does not hold that capability. An aggregate over every
+household is not any one household's data, however wide that household's own
+reach.
+
+## Tenancy is a field on the credential
+
+Every credential names the households it reaches: one site, a named tenant, or
+the explicit `"*"`. `"*"` is right for a single-tenant deployment — a Stadtwerk
+running hems for its own customers — and is a cross-tenant read in any other,
+which is why it is written down rather than being what happens when a field is
+missing. Aggregates are computed **within** the caller's scope rather than
+filtered afterwards, so a count is a count of what that caller may see.
+
+```toml
+[tenants]
+stadtwerke-nord = ["haus-1", "haus-2"]
+
+[[operators]]
+token  = "env:HEMS_HISTD_OPERATOR_NORD"
+tenant = "stadtwerke-nord"
+```
+
+A credential naming a tenant nothing defines stops the daemon. Resolving it to
+the empty set would start one that accepts the token and reads no household,
+which at the other end looks like a permissions problem and is a typo.
+
+## The agent surface authorises every call
+
+Every fleet daemon can mount a read-only MCP surface, and each tool authorises
+**the caller that reached it** against the same credentials the REST routes use
+— so a token cannot reach over `/mcp` what the REST route would refuse it. See
+[Agents](@/docs/agents.md).
+
+The alternative is worth naming, because it looks reasonable and is not. A
+surface given **one** authority at start-up — the daemon's own credential, say —
+would answer every caller as that principal, so a deployment that configured an
+operator's token would serve every household to anybody who could reach the
+port. The authorisation model would be sound; the caller would simply never
+reach it.
+
 ## The evidence record is what a signature protects
 
 `obsd`'s collector holds the list of households that did *not* respect a network
 operator's reduction. An unauthenticated write to it can put a compliant site on
 that list or take a breach off it, so a day reaches it only as a **signed
 CloudEvent** — Standard Webhooks over the message id, the timestamp and the exact
-bytes, so a captured request cannot be replayed, re-attributed or edited.
+bytes, so a captured request cannot be replayed or edited.
+
+**And each box signs with a key of its own.** A signature proves the bytes were
+not edited by somebody without the key; it proves *who sent them* only if no one
+else holds that key. Under one fleet-wide secret, any box could report a day
+attributed to any household — so verification says *which* key signed, and a
+report whose claimed site is not that key's site is refused. Two sites
+configured with one key are refused at start-up, because "who signed this" would
+have no answer.
 
 TLS is the other half and it is a different guarantee: the signature says the
 report is the one this box sent and has not been edited; TLS says nobody read it
 on the way. Plain `http` is allowed only to a loopback address.
+
+Because the timestamp is signed, a queued report cannot carry a signature made
+when it was queued — a receiver refuses one outside five minutes, which is what
+bounds a replay. So the box stores the **body** and signs at each attempt, under
+an id it derives from the site and the date. That id is stable, so a corrected
+day amends one report rather than adding a second, and `obsd` deduplicates on the
+same string the signature covers.
 
 ## The box's own identity
 

@@ -13,6 +13,13 @@ rust-version.workspace = true
 hems-core    = { workspace = true }
 hems-grid    = { workspace = true }
 hems-service = { workspace = true }
+# The Model Context Protocol surface at `/mcp`, on the socket this daemon
+# already binds. Read-only tools: an agent may read what an operator reads and
+# may move nothing.
+http           = { workspace = true }
+rmcp          = { workspace = true }
+schemars      = { workspace = true }
+tokio-util    = { workspace = true }
 rusqlite     = { workspace = true }
 
 anyhow       = { workspace = true }

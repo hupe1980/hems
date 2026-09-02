@@ -59,6 +59,11 @@ pub struct Settings {
     pub max_backoff_s: u64,
     /// How many quarter hours ahead must be covered before the service is ready.
     pub ready_slots: usize,
+    /// The Model Context Protocol surface, off by default.
+    ///
+    /// Open like the REST routes when it is switched on: a location's sky is public weather, not a household's data.
+    #[serde(default)]
+    pub mcp: hems_service::McpSettings,
 }
 
 /// Open-Meteo's forecast endpoint, with the variables and the time format this
@@ -79,6 +84,7 @@ impl Default for Settings {
             request_timeout_s: 20,
             max_backoff_s: 3600 * 4,
             ready_slots: 96,
+            mcp: hems_service::McpSettings::default(),
         }
     }
 }

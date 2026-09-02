@@ -1,0 +1,43 @@
+# agentd — the advisory plane.
+#
+#   agentd --config /etc/hems/agentd.toml
+#
+# It reads what the fleet has recorded and proposes; nothing it says moves a
+# watt. That is a property of the code rather than of this file — `Advice` is a
+# leaf type nothing consumes, and a specialist's authority is derived by
+# attenuation, which refuses to widen (D118).
+#
+# This file is parsed by a test in `lib.rs`, so an example that has drifted from
+# the struct it documents fails the build rather than misleading an operator.
+
+# The journal, and it is the **plan of record**: a run, its input, its answer and
+# every effect, append-only and hash-chained. "Why did the queue say that in
+# March" is a replay rather than an argument — so a path on an ephemeral
+# filesystem is a log that answers nothing.
+journal = "/var/lib/agentd/journal.redb"
+
+# Which operator's households the specialists read. "*" is every household this
+# deployment knows, which is right for a single tenant and is a cross-tenant read
+# in any other — so it is written down rather than being what happens when a
+# field is missing (D112).
+tenant = "*"
+
+# A shared deployment names each operator's households instead:
+#
+#   tenant = "stadtwerke-nord"
+#
+#   [tenants]
+#   stadtwerke-nord = ["haus-1", "haus-2"]
+#   stadtwerke-sued = ["haus-3"]
+
+# ── The shell ────────────────────────────────────────────────────────────────
+#
+# Flattened, as on every other cloud daemon: these keys sit at the top level
+# rather than under a table of their own.
+#
+# Loopback. What this daemon serves is a health surface; the findings go to
+# whatever an operator reads, and that is not built yet.
+listen = "127.0.0.1:7880"
+log_filter = "info,agentd=debug"
+log_json = false
+shutdown_grace_s = 3

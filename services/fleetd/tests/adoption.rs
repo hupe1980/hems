@@ -78,6 +78,20 @@ async fn start_with(
     std::net::SocketAddr,
     hems_service::shutdown::ShutdownTrigger,
 ) {
+    start_on(sites, std::path::Path::new(":memory:")).await
+}
+
+/// A daemon whose durable half is `store_path`.
+///
+/// Two of these in a row over one path is a restart, which is the only way to
+/// test the property the store exists for.
+async fn start_on(
+    sites: BTreeMap<String, SiteEntry>,
+    store_path: &std::path::Path,
+) -> (
+    std::net::SocketAddr,
+    hems_service::shutdown::ShutdownTrigger,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = listener.local_addr().unwrap();
     drop(listener);
@@ -86,14 +100,25 @@ async fn start_with(
         shutdown_grace_s: 2,
         ..hems_service::Settings::default()
     };
-    let registry = Arc::new(RwLock::new(Registry::new(sites)));
+    let store = fleetd::store::Store::open(store_path).unwrap();
+    let registry = Arc::new(RwLock::new(Registry::restore(
+        sites,
+        store.enrolments().unwrap(),
+        store.reports().unwrap(),
+    )));
+    let store = Arc::new(std::sync::Mutex::new(store));
     let releases = [("hemsd".to_owned(), release())].into_iter().collect();
     let (signal, trigger) = hems_service::Shutdown::channel();
     let server = hems_service::Server::new(
         hems_service::identity!(),
         settings,
         hems_service::Health::new(),
-        router(Fleet::new(registry, releases)),
+        router(Fleet::new(
+            registry,
+            releases,
+            hems_service::Credentials::default().with_operator(OPERATOR),
+            store,
+        )),
     );
     tokio::spawn(async move { server.run_until(signal).await.unwrap() });
     for _ in 0..200 {
@@ -170,7 +195,7 @@ async fn a_box_is_adopted_told_what_to_run_and_reports_back() {
     );
 
     // Before the box reports, the fleet does not claim it has converged.
-    let (_, body) = request(address, "GET", "/v1/fleet", None, None).await;
+    let (_, body) = request(address, "GET", "/v1/fleet", Some(OPERATOR), None).await;
     let states: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(states[0]["converged"], false);
 
@@ -183,9 +208,32 @@ async fn a_box_is_adopted_told_what_to_run_and_reports_back() {
     )
     .await;
     assert_eq!(status, 204);
-    let (_, body) = request(address, "GET", "/v1/fleet", None, None).await;
+    let (_, body) = request(address, "GET", "/v1/fleet", Some(OPERATOR), None).await;
     let states: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(states[0]["converged"], true);
+    trigger.trigger();
+}
+
+/// The credential an operator reads the roster with.
+const OPERATOR: &str = "tok-operator";
+
+#[tokio::test]
+async fn the_roster_is_not_public() {
+    // It lists every household this fleet has adopted, the version each is on
+    // and when it was last heard from — which is to say which households exist,
+    // which are running an old build and which are unreachable right now. A
+    // box's own enrolment credential does not read it either: that one says
+    // "I am this household", and this is about every household.
+    let (address, trigger) = start().await;
+
+    let (status, _) = request(address, "GET", "/v1/fleet", None, None).await;
+    assert_eq!(status, 401, "no credential, no roster");
+
+    let (status, _) = request(address, "GET", "/v1/fleet", Some("tok-nobody"), None).await;
+    assert_eq!(status, 401, "and not somebody else's either");
+
+    let (status, _) = request(address, "GET", "/v1/fleet", Some(OPERATOR), None).await;
+    assert_eq!(status, 200, "an operator's credential does");
     trigger.trigger();
 }
 
@@ -336,4 +384,82 @@ async fn the_offered_release_verifies_against_the_key_the_box_was_built_with() {
         404
     );
     trigger.trigger();
+}
+
+#[tokio::test]
+async fn a_restart_does_not_orphan_the_fleet() {
+    // The registry used to be entirely in memory, seeded from TOML. Restarting
+    // the daemon threw away every credential it had ever issued — and the box
+    // holding the other copy could not enrol again, because its single-use
+    // secret was spent. This is that property, and it is the reason `fleetd`
+    // has a database at all.
+    let file =
+        std::env::temp_dir().join(format!("hems-fleetd-restart-{}.sqlite", std::process::id()));
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+    }
+
+    let (address, trigger) = start_on(sites(), &file).await;
+    let (status, body) = request(
+        address,
+        "POST",
+        "/v1/enrol",
+        None,
+        Some(r#"{"site":"site-1","secret":"installer-secret"}"#),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let token = serde_json::from_str::<serde_json::Value>(&body).unwrap()["token"]
+        .as_str()
+        .expect("a minted credential")
+        .to_owned();
+
+    let (status, _) = request(
+        address,
+        "POST",
+        "/v1/config/running",
+        Some(&token),
+        Some(r#"{"config_version":"7"}"#),
+    )
+    .await;
+    assert_eq!(status, 204);
+    trigger.trigger();
+
+    // …and now the daemon comes back.
+    let (address, trigger) = start_on(sites(), &file).await;
+
+    let (status, body) = request(address, "GET", "/v1/config", Some(&token), None).await;
+    assert_eq!(
+        status, 200,
+        "the box's credential still works after a restart: {body}"
+    );
+
+    let (status, _) = request(
+        address,
+        "POST",
+        "/v1/enrol",
+        None,
+        Some(r#"{"site":"site-1","secret":"installer-secret"}"#),
+    )
+    .await;
+    assert_eq!(
+        status, 401,
+        "and the single-use secret is still spent — otherwise every enrolment \
+         secret an installer wrote down becomes live again on every deploy"
+    );
+
+    let (status, body) = request(address, "GET", "/v1/fleet", Some(OPERATOR), None).await;
+    assert_eq!(status, 200);
+    let roster: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        roster[0]["running_version"], "7",
+        "and the rollout answer survived too: a fleet that forgot it would \
+         report a completed rollout as untouched"
+    );
+    assert_eq!(roster[0]["converged"], true);
+
+    trigger.trigger();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+    }
 }

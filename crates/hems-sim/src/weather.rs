@@ -195,7 +195,7 @@ impl Realisation {
     /// The diurnal temperature shape alone — what the weather service said.
     ///
     /// A cosine with its minimum at 05:00 and its maximum at 17:00. Crude, and
-    /// far closer to a German day than the constant the scenarios used to pass.
+    /// far closer to a German day than a constant.
     #[must_use]
     pub fn forecast_outdoor_c(at: OffsetDateTime, mean_c: f64, swing_k: f64) -> f64 {
         let hours = Self::hours(at);

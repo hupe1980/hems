@@ -146,3 +146,44 @@ CREATE TABLE IF NOT EXISTS eebus_identity (
     trusted       TEXT    NOT NULL,
     created_at    INTEGER NOT NULL
 ) STRICT;
+
+-- ── Outbound events ─────────────────────────────────────────────────────────
+--
+-- A CloudEvent the box has produced and the fleet has not yet taken. The day
+-- report is the first of them.
+--
+-- The same argument as `control_event.forwarded_at`, applied to something the
+-- box does not otherwise keep: a day report that existed only as an in-flight
+-- POST was lost whenever `obsd` blinked, and the box had already thrown away
+-- the day it was built from. G3 says the house is never worse off when the
+-- cloud is gone, and a report that only survives a working WAN does not meet it.
+--
+-- What is stored is the **body**, not the signed request. A Standard Webhooks
+-- signature covers `id . timestamp . body` and a receiver refuses a timestamp
+-- outside five minutes, so a signature made when the row was written is
+-- worthless by the time a box back from an outage sends it. The signature is
+-- therefore made at each attempt, over the bytes kept here.
+CREATE TABLE IF NOT EXISTS outbound_event (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- The CloudEvent `id`, which is also the `webhook-id` a receiver
+    -- deduplicates on. UNIQUE because a re-sent day is a *correction* of the
+    -- same message and not a second one: `hemsd` derives it from the site and
+    -- the date for exactly that reason, and a queue that held two rows with one
+    -- id would send the same day twice and call it two.
+    event_id     TEXT    NOT NULL UNIQUE,
+    -- The CloudEvents `type`, so a drain can route without parsing the body.
+    event_type   TEXT    NOT NULL,
+    -- The exact bytes the signature will cover.
+    body         BLOB    NOT NULL,
+    created_at   TEXT    NOT NULL,
+    -- NULL until the fleet has taken it.
+    forwarded_at TEXT,
+    -- How many attempts have been made, and why the last one failed. Kept on
+    -- the row rather than in a log because "which of my reports is stuck, and
+    -- on what" is a question asked days later.
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT
+) STRICT;
+
+CREATE INDEX IF NOT EXISTS outbound_event_pending
+    ON outbound_event (created_at) WHERE forwarded_at IS NULL;

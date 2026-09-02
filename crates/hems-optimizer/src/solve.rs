@@ -122,11 +122,10 @@ pub enum SolveError {
     /// A forecast does not reach the end of the horizon.
     ///
     /// Refused rather than filled in, because the only honest filler is one
-    /// nobody has: a slot with no band was previously planned as **zero
-    /// production and zero load**, which is a confident lie in both directions.
-    /// It makes the roof dark and the house empty, so the plan defers every
-    /// flexible kilowatt-hour into hours it believes are free, and the day
-    /// arrives to find them ordinary.
+    /// nobody has. Treating a slot with no band as **zero production and zero
+    /// load** is a confident lie in both directions: it makes the roof dark and
+    /// the house empty, so the plan defers every flexible kilowatt-hour into
+    /// hours it believes are free, and the day arrives to find them ordinary.
     #[error(
         "the {series} forecast covers {covered} of the horizon's {slots} slots; \
          planning the rest would assume no sun and no household at all"

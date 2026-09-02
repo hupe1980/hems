@@ -33,6 +33,7 @@
 
 pub mod api;
 pub mod control;
+pub mod day;
 pub mod fleet;
 pub mod outbox;
 pub mod overrides;
@@ -270,24 +271,33 @@ pub async fn run(
     let overrides = overrides::Overrides::new();
     running.overrides = overrides.clone();
 
-    let (plan, prices, modelled_pv, learned) =
+    let (plan, prices, published, learned) =
         start_planner(settings, &running, store.clone(), health, shutdown).await?;
 
     // The record's last leg. The box has already kept its own copy, so this is
     // the fleet's convenience rather than the household's safety — which is why
     // a failure here is a retry and never a reason to stop controlling a house.
-    if let (Some(store), Some(outbox)) = (store.clone(), outbox::Outbox::new(&settings.histd)?) {
-        tokio::spawn(outbox::run(
-            outbox,
-            store,
-            std::time::Duration::from_secs(settings.histd.every_s.max(30)),
-            shutdown.clone(),
-        ));
-    } else if settings.histd.is_configured() {
-        tracing::warn!(
-            "a `histd` is configured and this box has no store, so there is \
-             nothing to forward"
-        );
+    let to_histd = outbox::Outbox::new(&settings.histd)?;
+    let to_obsd = outbox::Reporter::new(&settings.obsd)?;
+    match store.clone() {
+        Some(store) if to_histd.is_some() || to_obsd.is_some() => {
+            tokio::spawn(outbox::run(
+                to_histd,
+                to_obsd,
+                store,
+                std::time::Duration::from_secs(settings.histd.every_s.max(30)),
+                settings.histd.batch.max(1),
+                shutdown.clone(),
+            ));
+        }
+        _ => {
+            if settings.histd.is_configured() || settings.obsd.is_configured() {
+                tracing::warn!(
+                    "a fleet endpoint is configured and this box has no store, so \
+                     there is nothing to forward"
+                );
+            }
+        }
     }
 
     tokio::spawn(control::run(
@@ -303,7 +313,8 @@ pub async fn run(
             pv: running.household.pv.clone(),
             battery: running.household.battery.clone(),
             evse: running.household.evse.clone(),
-            modelled_pv,
+            modelled_pv: published.modelled_pv.clone(),
+            bands: published.bands.clone(),
         },
         control::Live {
             registry: Arc::clone(&running.registry),
@@ -442,7 +453,7 @@ async fn start_ship(
 type PlannerHandles = (
     Arc<tokio::sync::RwLock<Option<hems_core::prelude::Plan>>>,
     Arc<tokio::sync::RwLock<Option<hems_tariff::PriceStack>>>,
-    Arc<tokio::sync::RwLock<BTreeMap<hems_core::prelude::Slot, f64>>>,
+    planner::Published,
     Arc<Mutex<planner::Learned>>,
 );
 
@@ -455,7 +466,12 @@ async fn start_planner(
 ) -> anyhow::Result<PlannerHandles> {
     let plan = Arc::new(tokio::sync::RwLock::new(None));
     let prices = Arc::new(tokio::sync::RwLock::new(None));
-    let modelled_pv = Arc::new(tokio::sync::RwLock::new(BTreeMap::new()));
+    let published = planner::Published {
+        modelled_pv: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
+        // What the box forecast, kept so it can score itself once each slot has
+        // happened (D117).
+        bands: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
+    };
     // What the box remembered from before it was restarted. A fortnight of
     // observations is what makes a forecast worth having, and relearning it
     // every reboot is the difference between a box that plans on its first
@@ -479,7 +495,7 @@ async fn start_planner(
             "planner",
             "no forecastd is configured, so the box cannot plan",
         );
-        return Ok((plan, prices, modelled_pv, learned));
+        return Ok((plan, prices, published, learned));
     }
 
     health.bad("planner", "no plan has been produced yet");
@@ -495,13 +511,13 @@ async fn start_planner(
         fleet,
         Arc::clone(&plan),
         Arc::clone(&prices),
-        Arc::clone(&modelled_pv),
+        published.clone(),
         Arc::clone(&learned),
         store,
         health.clone(),
         shutdown.clone(),
     ));
-    Ok((plan, prices, modelled_pv, learned))
+    Ok((plan, prices, published, learned))
 }
 
 /// The roof as the solar model sees it.

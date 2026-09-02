@@ -135,7 +135,18 @@ pub fn sign(secret: &[u8], id: &str, at: OffsetDateTime, body: &[u8]) -> Signed 
     }
 }
 
-/// Whether `body` was signed by one of `secrets`, recently enough.
+/// Which of `secrets` signed `body`, if any signed it recently enough.
+///
+/// Returns the **index** into `secrets`, and the caller is expected to use it.
+/// A signature proves the bytes were not edited by somebody without the key; it
+/// proves nothing about *who* sent them unless each sender has a key of its own.
+/// A receiver that holds one fleet-wide secret and takes the sender's identity
+/// from the payload will believe whatever any holder of that secret writes —
+/// which, for `obsd`, is the named list of households that failed to respect a
+/// network operator's reduction.
+///
+/// So the index comes back, the caller maps it to an identity, and a report
+/// whose claimed site is not the site whose key signed it is refused (D114).
 ///
 /// # Errors
 /// [`WebhookError`], one variant per way it can fail, because "no secret
@@ -149,7 +160,7 @@ pub fn verify(
     body: &[u8],
     now: OffsetDateTime,
     tolerance: Duration,
-) -> Result<(), WebhookError> {
+) -> Result<usize, WebhookError> {
     if secrets.is_empty() {
         return Err(WebhookError::NoSecret);
     }
@@ -178,8 +189,13 @@ pub fn verify(
         return Err(WebhookError::NoSupportedScheme);
     }
 
-    let mut matched = false;
-    for secret in secrets {
+    // The **last** secret that verified, not the first, so the fold runs to the
+    // end whatever matches. `Option` rather than a `bool` because the caller
+    // needs to know *which* one: a shared secret authenticates the bytes and
+    // says nothing about the sender, and only the caller can map a key back to
+    // an identity.
+    let mut matched = None;
+    for (index, secret) in secrets.iter().enumerate() {
         for candidate in &offered {
             let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(candidate.trim())
             else {
@@ -189,16 +205,15 @@ pub fn verify(
             // one written here: a signature check compared with `==` leaks where
             // the two first differ, and that is a whole class of bug this
             // workspace should not be re-deriving.
-            matched |= tag(secret.as_ref(), id, timestamp, body)
+            if tag(secret.as_ref(), id, timestamp, body)
                 .verify_slice(&bytes)
-                .is_ok();
+                .is_ok()
+            {
+                matched = Some(index);
+            }
         }
     }
-    if matched {
-        Ok(())
-    } else {
-        Err(WebhookError::NotOurs)
-    }
+    matched.ok_or(WebhookError::NotOurs)
 }
 
 /// `HMAC-SHA256(secret, "<id>.<timestamp>.<body>")`, not yet finalised.
@@ -229,7 +244,7 @@ mod tests {
         sign(SECRET, "msg-1", NOW, BODY)
     }
 
-    fn check(s: &Signed, body: &[u8], now: OffsetDateTime) -> Result<(), WebhookError> {
+    fn check(s: &Signed, body: &[u8], now: OffsetDateTime) -> Result<usize, WebhookError> {
         verify(
             &[SECRET],
             &s.id,
@@ -423,5 +438,52 @@ mod tests {
 
     fn hex_of(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod which_key_signed_it {
+    use super::*;
+    use time::macros::datetime;
+
+    const NOW: OffsetDateTime = datetime!(2026-01-15 12:00:00 UTC);
+
+    #[test]
+    fn verification_says_which_secret_it_was() {
+        // The property `obsd` needs and could not ask for: a receiver holding one
+        // key per sender learns *who* signed, not merely that somebody with a
+        // key did. Without it, a fleet-wide secret lets any holder attribute a
+        // report to any household.
+        let secrets = [b"whsec-haus-1".as_slice(), b"whsec-haus-2".as_slice()];
+        let signed = sign(secrets[1], "haus-2:2026-01-15", NOW, b"{}");
+
+        let who = verify(
+            &secrets,
+            &signed.id,
+            &signed.timestamp.to_string(),
+            &signed.signature,
+            b"{}",
+            NOW,
+            DEFAULT_TOLERANCE,
+        )
+        .expect("one of them signed it");
+        assert_eq!(who, 1, "and it was the second");
+    }
+
+    #[test]
+    fn a_key_nobody_holds_verifies_nothing() {
+        let signed = sign(b"whsec-outsider", "haus-1:2026-01-15", NOW, b"{}");
+        assert!(matches!(
+            verify(
+                &[b"whsec-haus-1".as_slice()],
+                &signed.id,
+                &signed.timestamp.to_string(),
+                &signed.signature,
+                b"{}",
+                NOW,
+                DEFAULT_TOLERANCE,
+            ),
+            Err(WebhookError::NotOurs)
+        ));
     }
 }

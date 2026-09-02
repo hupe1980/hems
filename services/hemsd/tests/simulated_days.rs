@@ -1409,7 +1409,8 @@ fn the_day_the_household_would_be_asked_about_survives_the_process() {
         store.backlog().unwrap(),
         hemsd::store::Backlog {
             events: r.evidence.len(),
-            quarter_hours: 96
+            quarter_hours: 96,
+            outbound: 0,
         },
         "a box that has not reached the fleet has a backlog, not a gap"
     );
@@ -1450,4 +1451,152 @@ fn a_fleet_url_without_a_port_is_not_an_error() {
     // `TcpStream::connect` wants an explicit port and an HTTP client does not:
     // `https://obsd.example/v1/days` is the ordinary way anybody would write it.
     assert!(hemsd::report::is_confidential("https://obsd.example/v1/days").is_ok());
+}
+
+#[test]
+fn a_fleet_that_is_down_costs_a_delay_and_not_a_day() {
+    // `hemsd simulate --report-to` used to be one `POST`, and a failure printed
+    // a line to stderr. The day was gone — the box had already discarded what it
+    // was built from — so the one link between the edge and the fleet lost data
+    // whenever `obsd` restarted. G3 says the house is never worse off when the
+    // cloud is gone, and a report that only survives a working WAN does not meet
+    // it. This is the property that replaces that.
+    let path = std::env::temp_dir().join(format!(
+        "hems-outbound-{}-{}.sqlite",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let now = time::OffsetDateTime::now_utc();
+    {
+        let mut store = hemsd::store::Store::open(&path).unwrap();
+        store
+            .queue_event(
+                "haus-1:2026-01-14",
+                hems_events::SITE_DAY_REPORTED,
+                br#"{"specversion":"1.0"}"#,
+                now,
+            )
+            .unwrap();
+    }
+
+    // The process restarts — a reboot, an update, a power cut — and the day is
+    // still owed.
+    let mut store = hemsd::store::Store::open(&path).unwrap();
+    let pending = store.pending_outbound(10).unwrap();
+    assert_eq!(
+        pending.len(),
+        1,
+        "the day outlived the process that made it"
+    );
+    assert_eq!(pending[0].event_id, "haus-1:2026-01-14");
+    assert_eq!(
+        store.backlog().unwrap().outbound,
+        1,
+        "and it is visible as a backlog rather than as nothing at all — a fleet \
+         link that has been down for longer than anybody noticed is invisible in \
+         every other KPI, because the household was managed correctly throughout"
+    );
+
+    // What is stored is the body, never a signed request: the signature covers a
+    // timestamp `obsd` refuses after five minutes, so one made when the row was
+    // written would be stale by the time the box came back.
+    assert_eq!(pending[0].body, br#"{"specversion":"1.0"}"#);
+
+    store.mark_sent(&[pending[0].id], now).unwrap();
+    assert!(store.pending_outbound(10).unwrap().is_empty());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_box_closes_its_day_from_what_it_wrote_down() {
+    // The half of the edge→fleet link that had never existed: `obsd` was fed
+    // only by `hemsd simulate`, so it had never seen a household. This is the
+    // shape of what a box now queues at the end of a Berlin calendar day —
+    // built by reading back the rows the control loop wrote, so a restart at
+    // half past eleven still reports the whole day (D116).
+    let path = std::env::temp_dir().join(format!(
+        "hems-close-day-{}-{}.sqlite",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&path);
+
+    let day = time::macros::date!(2026 - 01 - 15);
+    let midnight = metering::calendar::day_start_utc(day);
+    {
+        let store = hemsd::store::Store::open(&path).unwrap();
+        for i in 0..96 {
+            let quarter = hems_grid::mispel::QuarterHour {
+                slot: hems_core::prelude::Slot::containing(
+                    midnight + time::Duration::minutes(15 * i),
+                ),
+                grid_draw: rust_decimal::Decimal::new(15, 2),
+                grid_feed_in: rust_decimal::Decimal::new(5, 2),
+                device_consumption: rust_decimal::Decimal::ZERO,
+                device_generation: rust_decimal::Decimal::new(10, 2),
+                storage_consumption: None,
+                storage_generation: None,
+                anzulegender_wert: rust_decimal::Decimal::new(786, 2),
+                spot_price: rust_decimal::Decimal::new(1250, 2),
+            };
+            store.put_quarter_hour(&quarter, midnight).unwrap();
+        }
+    }
+
+    // A fresh process, as after a restart, reading the day back out.
+    let store = hemsd::store::Store::open(&path).unwrap();
+    let kpis = hemsd::runtime::day::kpis(
+        &store,
+        "reference-household",
+        day,
+        hemsd::runtime::day::Unplanned::watching(),
+        &hemsd::runtime::day::Scored::default(),
+    )
+    .unwrap()
+    .expect("ninety-six registers is a day");
+
+    assert_eq!(kpis.site, "reference-household");
+    assert_eq!(kpis.date, day);
+    assert!((kpis.imported_kwh - 14.4).abs() < 1e-9, "96 × 0,15 kWh");
+    assert!((kpis.exported_kwh - 4.8).abs() < 1e-9);
+    assert!((kpis.produced_kwh - 9.6).abs() < 1e-9);
+    assert!(
+        kpis.self_sufficiency > 0.0 && kpis.self_sufficiency < 1.0,
+        "a house that both drew and produced: {}",
+        kpis.self_sufficiency
+    );
+
+    assert_eq!(
+        kpis.economics, None,
+        "a box meters; a baseline is a counterfactual and five of the six cost \
+         terms are modelled"
+    );
+    assert_eq!(kpis.forecast, None, "and it did not score its own bands");
+    assert!(
+        !kpis.is_measurable(),
+        "so a fleet counts it apart rather than averaging it in as a day that \
+         saved nothing"
+    );
+    assert!(kpis.respected_the_grid, "no event said otherwise");
+    assert_eq!(kpis.control_events, 0);
+
+    // And it travels as the same signed CloudEvent the simulator's day does.
+    let event = hems_events::Event::new(
+        hems_events::SITE_DAY_REPORTED,
+        "hems://sites/reference-household".to_owned(),
+        format!("reference-household:{day}"),
+        midnight,
+        &kpis,
+    );
+    let body = event.to_bytes().expect("a day serialises");
+    let back = hems_events::Event::<hems_core::report::DayKpis>::parse(
+        &body,
+        hems_events::SITE_DAY_REPORTED,
+    )
+    .expect("and `obsd` can read it back");
+    assert_eq!(back.data, kpis, "through the type both sides share");
+
+    let _ = std::fs::remove_file(&path);
 }

@@ -71,6 +71,132 @@ impl HistdSettings {
     }
 }
 
+/// Where the box's day report goes.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ObsdSettings {
+    /// `obsd`'s base URL. Absent means the household has no fleet view, which
+    /// is a deployment rather than a fault: the box manages the house either
+    /// way, and G3 says it is never worse off for the cloud being gone.
+    pub url: Option<String>,
+    /// The Standard Webhooks secret, or an `env:`/`file:` reference to it.
+    ///
+    /// Not a bearer token. What `obsd` holds is the list of households that did
+    /// *not* respect a network operator's reduction, so a report has to be
+    /// provably the one this box sent — a token says who is asking and a
+    /// signature says what was said.
+    pub secret: Option<Secret>,
+}
+
+impl ObsdSettings {
+    /// Whether anything is configured to report to.
+    #[must_use]
+    pub fn is_configured(&self) -> bool {
+        self.url.is_some()
+    }
+}
+
+/// The client that sends the box's own CloudEvents to `obsd`.
+pub struct Reporter {
+    client: reqwest::Client,
+    endpoint: String,
+    secret: Vec<u8>,
+}
+
+impl Reporter {
+    /// A reporter for a configured `obsd`, or `None` where there is none.
+    ///
+    /// # Errors
+    /// Where the secret cannot be resolved, or where a URL would send a
+    /// household's day across a network in the clear.
+    pub fn new(settings: &ObsdSettings) -> anyhow::Result<Option<Self>> {
+        let Some(url) = &settings.url else {
+            return Ok(None);
+        };
+        let Some(secret) = &settings.secret else {
+            anyhow::bail!("an `obsd` is configured with no secret, and it will refuse every day")
+        };
+        let endpoint = format!("{}/v1/days", url.trim_end_matches('/'));
+        // Checked at start-up rather than at the first send: a box that has been
+        // publishing a household's day in the clear for a month is not fixed by
+        // finding out on the thirtieth night.
+        crate::report::is_confidential(&endpoint)?;
+        Ok(Some(Self {
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .user_agent(concat!("hemsd/", env!("CARGO_PKG_VERSION")))
+                .build()?,
+            endpoint,
+            secret: secret.resolve_from_process()?.into_bytes(),
+        }))
+    }
+
+    /// Send whatever the store has queued, and mark what landed.
+    ///
+    /// Returns how many the fleet took. Three outcomes per row and they are
+    /// deliberately different: taken, kept for later, or given up on. See
+    /// [`crate::report::DeliveryError`].
+    ///
+    /// # Errors
+    /// Only where the store itself cannot be read or written.
+    pub async fn drain(
+        &self,
+        store: &Arc<Mutex<crate::store::Store>>,
+        batch: usize,
+        now: time::OffsetDateTime,
+    ) -> Result<usize, crate::store::StoreError> {
+        let pending = store.lock().await.pending_outbound(batch)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        let mut sent = Vec::new();
+        for event in &pending {
+            // Signed here, at the attempt, over the stored body. A signature
+            // made when the row was written carries a timestamp `obsd` refuses
+            // after five minutes, so a box back from an overnight outage would
+            // present a whole backlog of stale ones.
+            match crate::report::deliver(
+                &self.client,
+                &self.endpoint,
+                &self.secret,
+                &event.event_id,
+                &event.body,
+                now,
+            )
+            .await
+            {
+                Ok(()) => sent.push(event.id),
+                Err(e) if e.is_transient() => {
+                    // The fleet is down for all of them, so this is warned once
+                    // per round rather than once per row.
+                    tracing::warn!(error = %e, event = %event.event_id, "the fleet did not take a report; keeping it");
+                    store
+                        .lock()
+                        .await
+                        .mark_attempted(event.id, &e.to_string())?;
+                    break;
+                }
+                Err(e) => {
+                    // Read and refused. Retrying asks the same rejected
+                    // question again, so the row leaves the backlog with the
+                    // refusal on it and the next one is still tried.
+                    tracing::error!(error = %e, event = %event.event_id, "the fleet refused a report");
+                    store
+                        .lock()
+                        .await
+                        .abandon_event(event.id, &e.to_string(), now)?;
+                }
+            }
+        }
+        if sent.is_empty() {
+            return Ok(0);
+        }
+        store.lock().await.mark_sent(&sent, now)?;
+        Ok(sent.len())
+    }
+}
+
 /// The client that drains the outbox.
 pub struct Outbox {
     client: reqwest::Client,
@@ -164,10 +290,15 @@ impl Outbox {
 }
 
 /// Drain, sleep, repeat — until the process is asked to stop.
+///
+/// One loop for both destinations, because they fail together far more often
+/// than separately: what they share is the household's WAN.
 pub async fn run(
-    outbox: Outbox,
+    outbox: Option<Outbox>,
+    reporter: Option<Reporter>,
     store: Arc<Mutex<crate::store::Store>>,
     every: std::time::Duration,
+    batch: usize,
     shutdown: Shutdown,
 ) {
     let mut ticker = tokio::time::interval(every);
@@ -179,10 +310,19 @@ pub async fn run(
             _ = ticker.tick() => {}
         }
         let now = time::OffsetDateTime::now_utc();
-        match outbox.drain(&store, now).await {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(events = n, "the fleet acknowledged part of the backlog"),
-            Err(error) => tracing::error!(%error, "the box's own store could not be read"),
+        if let Some(outbox) = &outbox {
+            match outbox.drain(&store, now).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(events = n, "the fleet acknowledged part of the backlog"),
+                Err(error) => tracing::error!(%error, "the box's own store could not be read"),
+            }
+        }
+        if let Some(reporter) = &reporter {
+            match reporter.drain(&store, batch, now).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(reports = n, "the fleet took a day report"),
+                Err(error) => tracing::error!(%error, "the box's own store could not be read"),
+            }
         }
     }
 }

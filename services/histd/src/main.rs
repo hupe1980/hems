@@ -38,8 +38,11 @@ async fn main() -> anyhow::Result<()> {
     // Resolved once, here, so a reference to a secret that is not there stops
     // the daemon rather than starting one that answers nothing and says why only
     // in a `401`.
-    let credentials =
-        hems_service::Credentials::resolve(&settings.site_tokens, &settings.operator_tokens)?;
+    let credentials = hems_service::Credentials::resolve(
+        &settings.site_tokens,
+        &settings.tenants,
+        &settings.operators,
+    )?;
     if credentials.is_empty() {
         tracing::warn!(
             "no site or operator tokens are configured, so every request will be refused; \
@@ -56,11 +59,28 @@ async fn main() -> anyhow::Result<()> {
         signal.clone(),
     ));
 
+    // The two surfaces answer from the same store and from the same credentials,
+    // and each MCP call is authorised as its own caller — so a token cannot
+    // reach a site over `/mcp` that the REST route would refuse it.
+    let mut app = router(History::new(db.clone(), store, credentials.clone()));
+    if settings.mcp.enabled {
+        let auth = hems_service::McpAuth::per_caller(&settings.mcp, &credentials)?;
+        app = app.merge(histd::mcp_server::router(
+            Arc::new(histd::mcp_server::State {
+                db,
+                auth: auth.clone(),
+            }),
+            auth,
+            hems_service::mcp::cancel_on(&signal),
+        ));
+        tracing::info!("the Model Context Protocol surface is mounted at /mcp");
+    }
+
     Server::new(
         hems_service::identity!(),
         settings.service.clone(),
         health,
-        router(History::new(db, store, credentials)),
+        app,
     )
     .run_until(signal)
     .await?;

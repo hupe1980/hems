@@ -31,7 +31,15 @@ fn credentials() -> Credentials {
     ]
     .into_iter()
     .collect();
-    Credentials::resolve(&sites, &[Secret::literal(NETZ)]).unwrap()
+    Credentials::resolve(
+        &sites,
+        &std::collections::BTreeMap::new(),
+        &[hems_service::OperatorCredential {
+            token: Secret::literal(NETZ),
+            tenant: "*".into(),
+        }],
+    )
+    .unwrap()
 }
 
 fn event() -> ControlEvent {

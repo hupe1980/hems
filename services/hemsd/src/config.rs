@@ -61,6 +61,8 @@ pub struct Settings {
     pub fleet: FleetSettings,
     /// Where the box forwards its own two years, once it has kept them.
     pub histd: crate::runtime::outbox::HistdSettings,
+    /// Where the box reports how the day went.
+    pub obsd: crate::runtime::outbox::ObsdSettings,
     /// How the box presents itself on the EEBUS network, and whom it trusts.
     pub ship: crate::runtime::ship::ShipSettings,
     /// How fast the control planes run.

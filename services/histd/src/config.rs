@@ -28,8 +28,18 @@ pub struct Settings {
     /// could write the record of its own control actions is marking its own
     /// homework — and they may not read the Data Act export, which is the
     /// household's under Article 4 and not theirs.
+    /// Which households each tenant covers.
+    ///
+    /// A shared deployment hosting several operators names each one's
+    /// households here, and an operator credential names the tenant it belongs
+    /// to. A single-tenant deployment leaves this empty and writes
+    /// `tenant = "*"` on its credential, which is the same reach stated out
+    /// loud rather than arrived at by omission (D112).
     #[serde(default)]
-    pub operator_tokens: Vec<hems_service::Secret>,
+    pub tenants: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The operator credentials, each scoped to a tenant.
+    #[serde(default)]
+    pub operators: Vec<hems_service::OperatorCredential>,
     /// Where the database lives.
     ///
     /// `:memory:` is honoured and is what the tests use. A box uses a path on
@@ -41,6 +51,13 @@ pub struct Settings {
     /// Daily. `[A1 7.3]`'s two years are not a number anybody is racing, and a
     /// gateway box has better things to do than sweep a table every minute.
     pub retention_sweep_s: u64,
+    /// The Model Context Protocol surface, off by default.
+    ///
+    /// It holds a household's data, so a token is **required** when it is
+    /// switched on and the surface answers as whatever authority that token
+    /// already carries here — an operator, or one site.
+    #[serde(default)]
+    pub mcp: hems_service::McpSettings,
 }
 
 impl Default for Settings {
@@ -48,9 +65,11 @@ impl Default for Settings {
         Self {
             service: hems_service::Settings::default(),
             site_tokens: std::collections::BTreeMap::new(),
-            operator_tokens: Vec::new(),
+            tenants: std::collections::BTreeMap::new(),
+            operators: Vec::new(),
             database: PathBuf::from("hems-history.sqlite"),
             retention_sweep_s: 24 * 3600,
+            mcp: hems_service::McpSettings::default(),
         }
     }
 }

@@ -27,6 +27,52 @@ use time::Date;
 
 use crate::plan::CostBreakdown;
 
+/// How one day's forecasts scored against what actually happened.
+///
+/// Reported rather than judged locally, because one day is close to **one
+/// draw**: forecast error is correlated across a day, so ninety-six quarter
+/// hours of one Tuesday are nearly one observation. Only a fleet's merge of many
+/// days is a calibration figure, which is why these travel as a group that is
+/// either present or absent — a day that was not scored contributes nothing
+/// rather than contributing a zero.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct ForecastScores {
+    /// The production band's coverage on this day, in `[0, 1]`.
+    pub pv_coverage: f64,
+    /// The production band's CRPS, watts.
+    pub pv_crps: f64,
+    /// The load band's coverage.
+    pub load_coverage: f64,
+    /// The load band's CRPS, watts.
+    pub load_crps: f64,
+}
+
+/// What a day cost, and what it would have cost with no energy manager.
+///
+/// **Both or neither.** A cost with no baseline is a number with nothing to
+/// compare it against, and a baseline is only comparable to a cost the same
+/// model produced. Keeping them together makes the third state — a cost that
+/// looks complete beside a missing counterfactual — unrepresentable.
+///
+/// Only a **simulator** has these. Five of `CostBreakdown`'s six terms are
+/// modelled rather than metered — battery wear, curtailment, discomfort, energy
+/// borrowed from the stores, charge delivered past what was asked for — and the
+/// baseline is a counterfactual that has to be re-run. A box on a wall meters
+/// its energies and its compliance and reports those; it does not publish a
+/// figure about its own product that no meter saw (D116).
+#[derive(Debug, Clone, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct Economics {
+    /// What the day cost, in the currency every term of the objective is in.
+    pub cost: CostBreakdown,
+    /// What the same day would have cost with no energy manager, under the same
+    /// weather and the same grid rules.
+    pub baseline: CostBreakdown,
+}
+
 /// One site's day, as the fleet is told about it.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -51,12 +97,12 @@ pub struct DayKpis {
     #[cfg_attr(feature = "serde", serde(default))]
     pub shared_kwh: f64,
 
-    // ── Money ───────────────────────────────────────────────────────────────
-    /// What the day cost, in the currency every term of the objective is in.
-    pub cost: CostBreakdown,
-    /// What the same day would have cost with no energy manager, under the same
-    /// weather and the same grid rules.
-    pub baseline: CostBreakdown,
+    // ── Money, where a model produced it ────────────────────────────────────
+    /// What the day cost and what it would have cost unmanaged.
+    ///
+    /// `None` from a box: see [`Economics`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub economics: Option<Economics>,
 
     // ── Compliance: the three that must be zero ─────────────────────────────
     /// Whether every § 14a instruction was respected throughout.
@@ -83,19 +129,14 @@ pub struct DayKpis {
     pub below_minimum_commanded: bool,
 
     // ── Forecast ────────────────────────────────────────────────────────────
-    /// The production band's coverage on this day, in `[0, 1]`.
+    /// How the day's own forecasts scored, where the box scored them.
     ///
-    /// One day is close to **one draw** — forecast error is correlated across a
-    /// day — so a single day's figure means almost nothing and only the fleet's
-    /// merge of many does. That is the whole reason it is reported rather than
-    /// judged locally.
-    pub pv_coverage: f64,
-    /// The production band's CRPS, watts.
-    pub pv_crps: f64,
-    /// The load band's coverage.
-    pub load_coverage: f64,
-    /// The load band's CRPS, watts.
-    pub load_crps: f64,
+    /// `None` is a day nobody scored, and it is **not** a day that scored zero.
+    /// A fleet merges these as episodes, so a box that reported an unmeasured
+    /// coverage as `0.0` would drag every calibration figure toward zero while
+    /// looking like it had contributed a measurement (D116).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub forecast: Option<ForecastScores>,
     /// Whether the planner was shown the weather in advance.
     ///
     /// A day with perfect foresight is an upper bound rather than a result, and
@@ -121,17 +162,13 @@ impl Default for DayKpis {
             produced_kwh: 0.0,
             self_sufficiency: 0.0,
             shared_kwh: 0.0,
-            cost: CostBreakdown::default(),
-            baseline: CostBreakdown::default(),
+            economics: None,
             respected_the_grid: true,
             worst_overshoot_w: 0.0,
             minutes_without_a_plan: 0,
             control_events: 0,
             below_minimum_commanded: false,
-            pv_coverage: 0.0,
-            pv_crps: 0.0,
-            load_coverage: 0.0,
-            load_crps: 0.0,
+            forecast: None,
             foresight_was_perfect: false,
         }
     }
@@ -139,24 +176,33 @@ impl Default for DayKpis {
 
 impl DayKpis {
     /// What the energy manager saved, in the currency every term is in.
+    ///
+    /// `None` on a day nobody modelled — which is every day from real hardware.
     #[must_use]
-    pub fn saving_eur(&self) -> f64 {
-        self.baseline.total() - self.cost.total()
+    pub fn saving_eur(&self) -> Option<f64> {
+        self.economics
+            .as_ref()
+            .map(|e| e.baseline.total() - e.cost.total())
     }
 
     /// The same on the electricity bill alone — the flattering number.
     #[must_use]
-    pub fn bill_saving_eur(&self) -> f64 {
-        self.baseline.billed_eur() - self.cost.billed_eur()
+    pub fn bill_saving_eur(&self) -> Option<f64> {
+        self.economics
+            .as_ref()
+            .map(|e| e.baseline.billed_eur() - e.cost.billed_eur())
     }
 
     /// Whether this day is one a fleet may put in a saving figure.
     ///
-    /// A day the planner was shown the answer to is an upper bound, and mixing
-    /// it into an average produces a number that is true of nothing.
+    /// Two ways it is not. A day the planner was shown the answer to is an
+    /// **upper bound**, and mixing it into an average produces a number no
+    /// household can reach. A day with no economics has nothing to be a saving
+    /// *of* — which is every day a real box reports, and is why the fleet counts
+    /// those rather than averaging them in as days that saved nothing.
     #[must_use]
     pub const fn is_measurable(&self) -> bool {
-        !self.foresight_was_perfect
+        self.economics.is_some() && !self.foresight_was_perfect
     }
 
     /// Whether anything on this day is worth somebody looking at.
@@ -176,15 +222,17 @@ mod tests {
             site: "site-1".into(),
             date: date!(2026 - 01 - 15),
             respected_the_grid: true,
-            cost: CostBreakdown {
-                energy_eur: 21.08,
-                wear_eur: 0.62,
-                ..CostBreakdown::default()
-            },
-            baseline: CostBreakdown {
-                energy_eur: 24.12,
-                ..CostBreakdown::default()
-            },
+            economics: Some(Economics {
+                cost: CostBreakdown {
+                    energy_eur: 21.08,
+                    wear_eur: 0.62,
+                    ..CostBreakdown::default()
+                },
+                baseline: CostBreakdown {
+                    energy_eur: 24.12,
+                    ..CostBreakdown::default()
+                },
+            }),
             ..DayKpis::default()
         }
     }
@@ -192,8 +240,8 @@ mod tests {
     #[test]
     fn the_saving_carries_what_the_plan_spent_and_the_bill_does_not() {
         let d = day();
-        assert!((d.saving_eur() - 2.42).abs() < 1e-9);
-        assert!((d.bill_saving_eur() - 3.04).abs() < 1e-9);
+        assert!((d.saving_eur().unwrap() - 2.42).abs() < 1e-9);
+        assert!((d.bill_saving_eur().unwrap() - 3.04).abs() < 1e-9);
         assert!(d.saving_eur() < d.bill_saving_eur(), "wear is real");
     }
 
@@ -219,5 +267,69 @@ mod tests {
         let mut d = day();
         d.below_minimum_commanded = true;
         assert!(d.needs_attention(), "the entitlement is the customer's");
+    }
+}
+
+#[cfg(test)]
+mod a_day_a_box_can_actually_report {
+    use super::*;
+    use time::macros::date;
+
+    /// What a box on a wall has: what happened, and no counterfactual.
+    fn measured() -> DayKpis {
+        DayKpis {
+            site: "haus-1".into(),
+            date: date!(2026 - 01 - 15),
+            imported_kwh: 14.2,
+            ..DayKpis::default()
+        }
+    }
+
+    #[test]
+    fn a_day_with_no_baseline_has_no_saving_rather_than_a_saving_of_zero() {
+        // The distinction the whole change exists for. A box cannot re-run its
+        // own day as an unmanaged house, so it reports no baseline — and a
+        // fleet that read that as "saved nothing" would publish an average
+        // dragged toward zero by every real household in it.
+        let day = measured();
+        assert_eq!(day.saving_eur(), None);
+        assert_eq!(day.bill_saving_eur(), None);
+        assert!(
+            !day.is_measurable(),
+            "and it is not a day a saving figure may be computed from"
+        );
+    }
+
+    #[test]
+    fn an_unscored_forecast_is_absent_rather_than_zero() {
+        // Same argument, on the other axis. A fleet merges these as episodes,
+        // so a `0.0` coverage from a box that never scored anything is a
+        // measurement that did not happen, counted as one that did.
+        assert_eq!(measured().forecast, None);
+
+        let scored = DayKpis {
+            forecast: Some(ForecastScores {
+                pv_coverage: 0.81,
+                pv_crps: 192.3,
+                load_coverage: 0.85,
+                load_crps: 18.2,
+            }),
+            ..measured()
+        };
+        assert_eq!(scored.forecast.map(|f| f.pv_coverage), Some(0.81));
+    }
+
+    #[test]
+    fn a_foresight_day_is_still_excluded_even_with_a_baseline() {
+        // The older of the two exclusions, and it still holds: a day the
+        // planner was shown the answer to is an upper bound whatever else is
+        // attached to it.
+        let day = DayKpis {
+            economics: Some(Economics::default()),
+            foresight_was_perfect: true,
+            ..measured()
+        };
+        assert!(day.saving_eur().is_some(), "it has one");
+        assert!(!day.is_measurable(), "and it still may not be averaged");
     }
 }

@@ -42,7 +42,9 @@
 
 pub mod api;
 pub mod config;
+pub mod mcp_server;
 pub mod registry;
+pub mod store;
 
 pub use config::Settings;
 pub use registry::{Enrolled, EnrolmentError, Registry};

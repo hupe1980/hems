@@ -49,37 +49,76 @@ async fn main() -> anyhow::Result<()> {
     // secret that is not there is a deployment somebody thought they had
     // configured, and coming up with an empty list would look exactly like one
     // nobody configured at all.
-    let secrets = settings
-        .webhook_secrets
-        .iter()
-        .map(hems_service::Secret::resolve_from_process)
-        .collect::<Result<Vec<_>, _>>()?;
+    // Flattened to (site, secret) pairs: `verify` reports *which* key signed a
+    // report, and the site beside it is how `obsd` learns who sent it rather
+    // than believing what the payload claims (D114).
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    for (site, keys) in &settings.webhook_secrets {
+        for key in keys {
+            secrets.push((site.clone(), key.resolve_from_process()?));
+        }
+    }
+
+    // Two households holding one key make "who signed this" unanswerable, and
+    // the shape that answer takes — pick one and carry on — is the defect this
+    // whole mechanism exists to close (D114). A configuration error, refused
+    // here, rather than a report attributed to whichever site the fold happened
+    // to see last.
+    for (i, (site, key)) in secrets.iter().enumerate() {
+        if let Some((other, _)) = secrets[..i].iter().find(|(_, k)| k == key) {
+            anyhow::bail!(
+                "sites {other:?} and {site:?} are configured with the same webhook secret, \
+                 so a report signed with it names no household in particular; give each \
+                 box a key of its own"
+            );
+        }
+    }
 
     let readers = hems_service::Credentials::resolve(
         &std::collections::BTreeMap::new(),
-        &settings.operator_tokens,
+        &settings.tenants,
+        &settings.operators,
     )?;
     if readers.is_empty() {
         tracing::warn!(
             "no operator token is configured, so the fleet view will not be served; \
-             set operator_tokens in the configuration file"
+             set [[operators]] in the configuration file"
         );
     }
 
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
 
+    let silent_after = time::Duration::seconds(settings.silent_after_s.cast_signed());
+    // The two surfaces answer from the same fleet view and under the same
+    // credentials, and each MCP call is authorised as its own caller — so a
+    // token cannot reach over `/mcp` what the REST route would refuse it.
+    let mut app = router(Observed::new(
+        Arc::clone(&fleet),
+        silent_after,
+        secrets,
+        time::Duration::seconds(settings.webhook_tolerance_s.cast_signed()),
+        readers.clone(),
+    ));
+    if settings.mcp.enabled {
+        let auth = hems_service::McpAuth::per_caller(&settings.mcp, &readers)?;
+        app = app.merge(obsd::mcp_server::router(
+            Arc::new(obsd::mcp_server::State {
+                fleet,
+                silent_after,
+                auth: auth.clone(),
+            }),
+            auth,
+            hems_service::mcp::cancel_on(&signal),
+        ));
+        tracing::info!("the Model Context Protocol surface is mounted at /mcp");
+    }
+
     Server::new(
         hems_service::identity!(),
         settings.service.clone(),
         health,
-        router(Observed::new(
-            fleet,
-            time::Duration::seconds(settings.silent_after_s.cast_signed()),
-            secrets,
-            time::Duration::seconds(settings.webhook_tolerance_s.cast_signed()),
-            readers,
-        )),
+        app,
     )
     .run_until(signal)
     .await?;

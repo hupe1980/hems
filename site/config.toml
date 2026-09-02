@@ -35,8 +35,8 @@ tagline    = "open-source home energy management for the German grid"
 # that changing one is a one-line diff against the thing that produced it:
 # `cargo xtask check-citations`, `cargo test --workspace --all-features`, the
 # `just purity` crate list, `just demo-all`, and `ControlSettings::horizon_slots`.
-stat_rules   = "358"
-stat_tests   = "764"
+stat_rules   = "378"
+stat_tests   = "845"
 stat_crates  = "10"
 stat_days    = "7"
 stat_horizon = "192"

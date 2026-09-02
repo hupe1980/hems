@@ -131,14 +131,36 @@ pub struct Backlog {
     pub events: usize,
     /// Quarter hours waiting.
     pub quarter_hours: usize,
+    /// CloudEvents waiting — day reports, so far.
+    pub outbound: usize,
 }
 
 impl Backlog {
     /// Whether the box is up to date with the fleet.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.events == 0 && self.quarter_hours == 0
+        self.events == 0 && self.quarter_hours == 0 && self.outbound == 0
     }
+}
+
+/// One CloudEvent waiting for the fleet.
+///
+/// The **body** and not a signed request: a Standard Webhooks signature covers
+/// the timestamp and a receiver refuses one older than five minutes, so a
+/// signature made when the row was written is worthless by the time a box back
+/// from an outage sends it. It is signed at each attempt, over these bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundEvent {
+    /// The row identifier, which is what an acknowledgement names.
+    pub id: i64,
+    /// The CloudEvent id, which is also the `webhook-id`.
+    pub event_id: String,
+    /// The CloudEvents `type`, so a drain can route without parsing the body.
+    pub event_type: String,
+    /// The exact bytes the signature covers.
+    pub body: Vec<u8>,
+    /// How many attempts have been made.
+    pub attempts: i64,
 }
 
 /// One event as it is held.
@@ -514,6 +536,163 @@ impl Store {
         )
     }
 
+    /// Queue a CloudEvent for the fleet, or replace the one already queued.
+    ///
+    /// An upsert on `event_id`, because `hemsd` derives that id from what the
+    /// report is *about* — the site and the day — so a box re-reporting a day it
+    /// has corrected is amending one message rather than sending a second. The
+    /// attempt count resets with the body: what was stuck was the old document.
+    ///
+    /// Returns the row identifier, which is what an acknowledgement names. It is
+    /// stable across a re-queue of the same `event_id`, because the row is.
+    ///
+    /// # Errors
+    /// [`StoreError::Sql`].
+    pub fn queue_event(
+        &mut self,
+        event_id: &str,
+        event_type: &str,
+        body: &[u8],
+        at: OffsetDateTime,
+    ) -> Result<i64, StoreError> {
+        // `RETURNING` rather than `last_insert_rowid`, which reports nothing
+        // useful for the `DO UPDATE` half of an upsert.
+        self.connection
+            .query_row(
+                "INSERT INTO outbound_event (event_id, event_type, body, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(event_id) DO UPDATE SET
+                 body = ?3, created_at = ?4, forwarded_at = NULL,
+                 attempts = 0, last_error = NULL
+             RETURNING id",
+                params![event_id, event_type, body, at.unix_timestamp()],
+                |row| row.get(0),
+            )
+            .map_err(StoreError::Sql)
+    }
+
+    /// The CloudEvents the fleet has not taken, oldest first, at most `limit`.
+    ///
+    /// # Errors
+    /// [`StoreError::Sql`].
+    pub fn pending_outbound(&self, limit: usize) -> Result<Vec<OutboundEvent>, StoreError> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, event_id, event_type, body, attempts FROM outbound_event
+             WHERE forwarded_at IS NULL ORDER BY created_at, id LIMIT ?1",
+        )?;
+        let rows =
+            statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                Ok(OutboundEvent {
+                    id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    body: row.get(3)?,
+                    attempts: row.get(4)?,
+                })
+            })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Sql)
+    }
+
+    /// Record that the fleet has taken these CloudEvents.
+    ///
+    /// # Errors
+    /// [`StoreError::Sql`].
+    pub fn mark_sent(&mut self, ids: &[i64], at: OffsetDateTime) -> Result<(), StoreError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let transaction = self.connection.transaction()?;
+        {
+            let mut update =
+                transaction.prepare("UPDATE outbound_event SET forwarded_at = ?2 WHERE id = ?1")?;
+            for id in ids {
+                update.execute(params![id, at.unix_timestamp()])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record that an attempt on this row failed, and why.
+    ///
+    /// On the row rather than only in a log: "which of my reports is stuck, and
+    /// on what" is asked days after the log line has rotated away.
+    ///
+    /// # Errors
+    /// [`StoreError::Sql`].
+    pub fn mark_attempted(&mut self, id: i64, error: &str) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE outbound_event SET attempts = attempts + 1, last_error = ?2 WHERE id = ?1",
+            params![id, error],
+        )?;
+        Ok(())
+    }
+
+    /// Give up on a row the fleet will never take.
+    ///
+    /// A permanent refusal — a `4xx` that is not a rate limit — means `obsd`
+    /// has read the document and will not have it. Retrying is a box asking the
+    /// same rejected question every five minutes for ever, so the row is marked
+    /// forwarded with the refusal on it: out of the backlog, still on record,
+    /// and visible to anybody asking what happened to that day.
+    ///
+    /// # Errors
+    /// [`StoreError::Sql`].
+    pub fn abandon_event(
+        &mut self,
+        id: i64,
+        error: &str,
+        at: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "UPDATE outbound_event
+             SET forwarded_at = ?3, attempts = attempts + 1, last_error = ?2
+             WHERE id = ?1",
+            params![id, error, at.unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// The quarter hours whose slot begins inside `[from, to)`.
+    ///
+    /// A **half-open** window, so a day's last register and the next day's first
+    /// belong to exactly one day each.
+    ///
+    /// # Errors
+    /// As [`Store::quarter_hours`].
+    pub fn quarter_hours_between(
+        &self,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<QuarterHour>, StoreError> {
+        self.read_quarter_hours(
+            "SELECT slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
+                    device_generation_kwh, anzulegender_wert_ct, spot_price_ct
+             FROM quarter_hour WHERE slot_start >= ?1 AND slot_start < ?2 ORDER BY slot_start",
+            params![from.unix_timestamp(), to.unix_timestamp()],
+        )
+    }
+
+    /// The control events **received** inside `[from, to)`.
+    ///
+    /// By when the command arrived rather than when it was released: a reduction
+    /// that ran over midnight belongs to the day a network operator commanded
+    /// it, which is the day they will ask about.
+    ///
+    /// # Errors
+    /// As [`Store::control_events`].
+    pub fn control_events_between(
+        &self,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        self.read_events(
+            "SELECT id, document FROM control_event
+             WHERE received_at >= ?1 AND received_at < ?2 ORDER BY received_at, id",
+            params![from.unix_timestamp(), to.unix_timestamp()],
+        )
+    }
+
     /// Record that the fleet has these events and these quarter hours.
     ///
     /// # Errors
@@ -558,6 +737,7 @@ impl Store {
             Ok(usize::try_from(n).unwrap_or(0))
         };
         Ok(Backlog {
+            outbound: count("SELECT COUNT(*) FROM outbound_event WHERE forwarded_at IS NULL")?,
             events: count("SELECT COUNT(*) FROM control_event WHERE forwarded_at IS NULL")?,
             quarter_hours: count("SELECT COUNT(*) FROM quarter_hour WHERE forwarded_at IS NULL")?,
         })
@@ -796,7 +976,8 @@ mod tests {
             store.backlog().unwrap(),
             Backlog {
                 events: 1,
-                quarter_hours: 1
+                quarter_hours: 1,
+                outbound: 0,
             }
         );
     }
@@ -933,5 +1114,96 @@ mod tests {
         assert_eq!(at, MIGRATIONS.last().unwrap().0);
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const NOW: OffsetDateTime = datetime!(2026-01-15 08:00:00 UTC);
+
+    #[test]
+    fn a_re_reported_day_amends_one_message_rather_than_queueing_two() {
+        // `hemsd` derives the CloudEvent id from the site and the date, so a box
+        // that recomputes yesterday and sends it again is *correcting* one
+        // report. Two rows with one id would send the same day twice, and
+        // `obsd` — which replaces by date — would take the older one second.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .queue_event(
+                "haus-1:2026-01-14",
+                "de.hems.site.day.reported",
+                b"first",
+                NOW,
+            )
+            .unwrap();
+        store.mark_attempted(1, "HTTP 503").unwrap();
+        store
+            .queue_event(
+                "haus-1:2026-01-14",
+                "de.hems.site.day.reported",
+                b"corrected",
+                NOW + time::Duration::hours(1),
+            )
+            .unwrap();
+
+        let pending = store.pending_outbound(10).unwrap();
+        assert_eq!(pending.len(), 1, "one day, one message");
+        assert_eq!(pending[0].body, b"corrected");
+        assert_eq!(
+            pending[0].attempts, 0,
+            "and the attempt count resets with the body — what was stuck was \
+             the document that has just been replaced"
+        );
+    }
+
+    #[test]
+    fn a_queued_day_survives_until_the_fleet_takes_it() {
+        let mut store = Store::in_memory().unwrap();
+        store
+            .queue_event("haus-1:2026-01-14", "de.hems.site.day.reported", b"{}", NOW)
+            .unwrap();
+        assert_eq!(store.backlog().unwrap().outbound, 1);
+
+        store.mark_attempted(1, "connection refused").unwrap();
+        assert_eq!(
+            store.pending_outbound(10).unwrap()[0].attempts,
+            1,
+            "a failed attempt is counted and the day is still queued"
+        );
+
+        store
+            .mark_sent(&[1], NOW + time::Duration::hours(2))
+            .unwrap();
+        assert!(store.pending_outbound(10).unwrap().is_empty());
+        assert_eq!(store.backlog().unwrap().outbound, 0);
+    }
+
+    #[test]
+    fn a_refusal_leaves_the_backlog_without_leaving_the_record() {
+        // A `4xx` that is not a rate limit is `obsd` having read the document
+        // and refused it. Retrying is a box asking the same rejected question
+        // every five minutes for ever; deleting the row is a day that
+        // disappeared with no account of why.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .queue_event("haus-1:2026-01-14", "de.hems.site.day.reported", b"{}", NOW)
+            .unwrap();
+        store.abandon_event(1, "HTTP 400", NOW).unwrap();
+
+        assert!(store.pending_outbound(10).unwrap().is_empty());
+        assert_eq!(store.backlog().unwrap().outbound, 0);
+        let (attempts, error): (i64, String) = store
+            .connection
+            .query_row(
+                "SELECT attempts, last_error FROM outbound_event WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(attempts, 1);
+        assert_eq!(error, "HTTP 400", "and why, on the row, days later");
     }
 }

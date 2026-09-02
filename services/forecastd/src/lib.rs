@@ -44,6 +44,7 @@
 
 pub mod api;
 pub mod config;
+pub mod mcp_server;
 pub mod poller;
 pub mod upstream;
 

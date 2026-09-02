@@ -35,14 +35,16 @@
 pub mod auth;
 pub mod config;
 pub mod health;
+pub mod mcp;
 pub mod serve;
 pub mod shutdown;
 pub mod telemetry;
 pub mod update;
 
-pub use auth::{Authority, Credentials};
+pub use auth::{Authority, Capabilities, Credentials, OperatorCredential, SiteScope};
 pub use config::{ConfigError, Secret, Settings, load, load_from};
 pub use health::{Health, Probe, Readiness};
+pub use mcp::{McpAuth, McpSettings};
 pub use serve::{Server, ServerError};
 pub use shutdown::Shutdown;
 pub use telemetry::init_tracing;

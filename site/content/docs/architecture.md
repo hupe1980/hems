@@ -341,12 +341,13 @@ The table, and the rest of the vocabulary the whole workspace shares, is on
 
 ## The fleet, in one paragraph
 
-Five daemons sit around the box and none of them is a trust anchor. `tariffd`
+Six daemons sit around the box and none of them is a trust anchor. `tariffd`
 fetches prices, `forecastd` fetches the sky, `histd` keeps everybody's two years
 of § 14a evidence, `fleetd` enrols a box and offers it **signed** configuration
-and releases, and `obsd` is the fleet view. They share one shell,
-`hems-service`, which owns configuration, logging, a health surface and a
-shutdown — and owns nothing about energy.
+and releases, `obsd` is the fleet view, and `agentd` is an advisory plane that
+proposes and cannot act. They share one shell, `hems-service`, which owns
+configuration, logging, a health surface, a shutdown and the credential model —
+and owns nothing about energy.
 
 Two of that shell's decisions are load-bearing. **Live and ready are different
 questions**: an orchestrator restarts a process that fails `livez` and merely
@@ -357,7 +358,8 @@ the last.
 
 The rest — what each daemon owns, which are authenticated and which are open on
 purpose, and why a day only arrives signed — is [the fleet
-page](@/docs/services.md).
+page](@/docs/services.md). Each of them also answers over the Model Context
+Protocol; that, and the plane that reads them, is [Agents](@/docs/agents.md).
 
 ### The storage half of “never worse off without the cloud”
 
@@ -366,6 +368,14 @@ and forwards it second: what the fleet has not acknowledged is an outbox that
 grows, not a gap. A record that exists only once it has been uploaded is an
 intention with a network dependency, and the day a network operator asks about is
 the day the link was down.
+
+The day report goes through the same store, and the one thing that could not be
+kept in it is the signature: Standard Webhooks covers `id . timestamp . body` and
+a receiver refuses a timestamp outside five minutes, so a signature made when the
+row was written is worthless by the time a box back from an overnight outage
+sends it. The **body** is stored and each attempt signs it again, under an id
+derived from the site and the date — which is what lets a box correct a day
+rather than report it twice.
 
 That is also the answer to *what runs where*. The edge is **one** process,
 `hemsd`, because the § 14a failsafe is a sixty-second heartbeat and a two-hour

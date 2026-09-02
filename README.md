@@ -52,8 +52,9 @@ This file is the front door.
 | [Flexibility](https://hupe1980.github.io/hems/docs/flexibility/) | S2 / EN 50491-12-2 as the internal model |
 | [Devices and drivers](https://hupe1980.github.io/hems/docs/devices/) | amperes, contact states, contactors — and the sans-I/O driver contract |
 | [Simulation](https://hupe1980.github.io/hems/docs/simulation/) | seven reference days, simulators that say no, and the sweeps a single day cannot replace |
-| [The fleet](https://hupe1980.github.io/hems/docs/services/) | five daemons around one box, and why none of them is a trust anchor |
-| [Security](https://hupe1980.github.io/hems/docs/security/) | a key the box was built with, secrets as references, SBOM and provenance |
+| [The fleet](https://hupe1980.github.io/hems/docs/services/) | six daemons around one box, and why none of them is a trust anchor |
+| [Agents](https://hupe1980.github.io/hems/docs/agents/) | the read-only surface every fleet service answers on, and a plane that proposes and cannot act |
+| [Security](https://hupe1980.github.io/hems/docs/security/) | capabilities that narrow under delegation, a key the box was built with, secrets as references, SBOM and provenance |
 
 ## 🚀 Try it
 
@@ -248,7 +249,7 @@ Seven claims, each argued on the site rather than here.
 
 Every regulatory number carries the document and clause it comes from —
 `[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
-all 358 of them against an index of primary sources, **failing the build** if one
+all 378 of them against an index of primary sources, **failing the build** if one
 names a document the index does not carry. `cargo xtask check-wire` does the same
 for the 121 quantities and instants, each of which has to say how it travels.
 
@@ -274,6 +275,22 @@ the index records the retrieval URL of each.
 
 ## 🛰️ Daemons
 
+```mermaid
+flowchart LR
+  H["<b>hemsd</b><br/>on the wall"]
+  T["tariffd"] -- "prices" --> H
+  F["forecastd"] -- "the sky" --> H
+  FL["fleetd"] -- "signed config<br/>+ releases" --> H
+  H -- "§ 14a evidence" --> HI["histd"]
+  H -- "a signed day" --> O["obsd"]
+  O -. "a population" .-> AG["agentd<br/><i>proposes only</i>"]
+```
+
+Every arrow into the box carries something that can only make a plan **better**.
+The § 14a limit is not among them: it arrives on a wire from the network
+operator's Steuerbox, and the guard enforces it locally whether or not any of
+this is reachable.
+
 | Service | What it does | State |
 |---|---|---|
 | [`hemsd`](services/hemsd) | The house: guard, arbiter, planner and evidence recorder against a simulated site, keeping the household's own two years of § 14a evidence locally with an outbox for the fleet | ⏳ no hardware yet |
@@ -281,7 +298,24 @@ the index records the retrieval URL of each.
 | [`forecastd`](services/forecastd) | ICON-D2 through Open-Meteo at quarter-hour resolution. Serves the **sky**, never a finished forecast — the correction for *this* roof is the box's, because it is a property of one roof | ✅ |
 | [`histd`](services/histd) | The fleet's record: the two years of § 14a evidence `[A1 7.3]`, the quarter-hour registers a settlement is computed from, and both exports — the operator's Nachweis and the household's Data Act Article 4 document, each authorised per site, because Article 4 is a right of the *user* and a fleet token is not a household | ✅ |
 | [`fleetd`](services/fleetd) | Single-use enrolment, and **signed** configuration and releases it holds signatures for and never a key — so a `fleetd` an attacker owns can serve neither a configuration nor an update any box will accept | ✅ |
+| [`agentd`](services/agentd) | The advisory plane, on [agentplane](https://github.com/hupe1980/agentplane): specialists that correlate across many exact answers — whether one cause accounts for most of a week's § 14a breaches, what the dashboard's saving figure actually rests on. It **proposes**, and cannot act: `Advice` is a leaf type nothing consumes, and an agent's authority is derived by `attenuate`, which refuses to widen | ✅ |
 | [`obsd`](services/obsd) | The fleet view: averages what is an average, and **counts** what is a count — every § 14a breach as a named finding, never as a percentage. A day reaches it over TLS and only as a **signed** CloudEvent, because a list of who broke a grid rule that anybody can write to is not evidence | ✅ |
+
+Each of the five mounts a **read-only** MCP server at `/mcp` on the port it
+already binds, over the state its REST routes already read — an agent gets the
+same numbers and gets told what they mean: that an absent price slot is not free
+electricity, that a § 14a breach is a list with a site and a date rather than a
+rate, and that a coverage figure under twenty independent days is not a
+calibration. Off unless configured, and every tool authorises **the caller that
+reached it** against the same credentials the REST routes use.
+
+A principal is a credential (**who**), a set of dotted **capability** patterns
+(`hems.record.read`, `hems.record.*`) and a **site scope** (one household, a
+tenant, or the explicit `"*"`). Capabilities rather than roles because an agent
+must be able to hold *less* than whoever it acts for, and the two pattern forms
+are exactly as wide as containment can stay decidable — the same shape
+[agentplane](https://github.com/hupe1980/agentplane) uses, since that is the
+runtime the advisory agent will run on.
 
 ## 📊 Status
 
@@ -318,20 +352,26 @@ instruction not to use it. `hems-sim` still stands in for those.
 | **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided and what it could not hear |
 | **A receding-horizon plan on a real box** | prices from `tariffd`, the sky from `forecastd`, this roof modelled locally and corrected by what it has actually delivered, the battery read off its own meter, the solve off the runtime — and what it learns kept in its own store, so a reboot does not cost a fortnight |
 | **The § 14a record, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
+| **A box reports what it metered** | `hemsd run` closes each Berlin calendar day from the rows it already wrote — so a restart at 23:50 still reports the whole day — and carries the energies and the § 14a record. No cost and no baseline: a baseline is a counterfactual only a simulator can re-run, and five of the six cost terms are modelled. The fleet counts those days apart rather than averaging them in as days that saved nothing |
+| **The day report, queued before it is sent** | a signed CloudEvent to `obsd` is a row in the box's own store until the fleet takes it, signed **at each attempt** — Standard Webhooks covers the timestamp, so one made when the row was written is stale by the time a box back from an outage sends it. A `5xx` or a refused connection keeps the day; a `4xx` that is not a rate limit is `obsd` having read it and refused it, and asking again changes nothing |
 | **The household's own say** | `boost`, `pause` and `away` per asset, expiring on their own — the one write on the local API, and safe because an override is a *desire* the guard still narrows |
-| The five fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
+| The fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
+| **A read-only agent surface on every fleet daemon** | mounted on the port it already binds, over the state its REST routes already read, so the two cannot disagree — and each call is authorised as *its own caller* against the same credentials, so a household's token reads its own site over MCP exactly as it would over REST |
+| **Capabilities that narrow under delegation, and a tenant on every credential** | dotted patterns rather than roles, so an agent can hold strictly less than whoever it acts for; an operator scoped to a tenant cannot read another tenant's breach list, and an aggregate is computed *within* the caller's scope rather than filtered afterwards |
+| **`agentd`** — two specialists on a replayable journal | whether one cause accounts for most of a week's § 14a breaches, and what the saving on a dashboard actually rests on. Advisory by construction: `Advice` is a leaf type nothing consumes, and its authority is derived by attenuation, which refuses to widen |
 
 | Not yet | |
 |---|---|
+| A transport that carries an event to `agentd` | the subscription table says which event type wakes which specialist and a test proves every pattern matches something the workspace emits; the hop from `obsd`'s collector is what is missing |
 | The car, the building and the tank in the plan | each waits on a driver that reports the state it is planned from — an arrival, an indoor temperature, a tank temperature — **next** |
 | EEBUS certification | mDNS/DNS-SD with the SHIP TXT record set, a pairing flow a person can drive, and a conformance harness against the lab's own test list |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-764 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+845 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (358 citations across five document
+clock, the whole suite, the workspace guards (378 citations across five document
 families, each resolving to a document the index carries; 121 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 

@@ -178,3 +178,86 @@ mod tests {
         assert!(!is_known("de.hems.grid.lpc.limit.invented"));
     }
 }
+
+/// Whether `event_type` matches a subscription `pattern`.
+///
+/// A glob: `*` stands for any run of characters and `?` for one. So
+/// `de.hems.grid.*` wakes on every § 14a event and `*` on all of them.
+///
+/// The one matcher every subscription mechanism uses, for the reason [`ALL`]
+/// exists: a pattern written at the place that dispatches is one nobody can
+/// list, and a typo in one silently matches nothing — which looks exactly like a
+/// subscriber with nothing to say.
+#[must_use]
+pub fn matches(pattern: &str, event_type: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    // Iterative rather than recursive, with one backtrack point: a pattern is
+    // short and a stack overflow on a configuration string would be a poor way
+    // to learn that somebody wrote `**`.
+    let p: Vec<char> = pattern.chars().collect();
+    let v: Vec<char> = event_type.chars().collect();
+    let (mut pi, mut vi) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == v[vi]) {
+            pi += 1;
+            vi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, vi));
+            pi += 1;
+        } else if let Some((sp, sv)) = star {
+            pi = sp + 1;
+            vi = sv + 1;
+            star = Some((sp, vi));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+#[cfg(test)]
+mod subscription_patterns {
+    use super::*;
+
+    #[test]
+    fn a_family_wakes_on_everything_under_it() {
+        assert!(matches("de.hems.grid.*", GRID_LPC_LIMIT_RECEIVED));
+        assert!(matches("de.hems.grid.*", GRID_BELOW_MINIMUM_DETECTED));
+        assert!(!matches("de.hems.grid.*", SITE_DAY_REPORTED));
+        assert!(matches("*", SITE_DAY_REPORTED));
+    }
+
+    #[test]
+    fn an_exact_pattern_wakes_on_one_type() {
+        assert!(matches(SITE_DAY_REPORTED, SITE_DAY_REPORTED));
+        assert!(!matches(SITE_DAY_REPORTED, SITE_PLAN_PUBLISHED));
+    }
+
+    #[test]
+    fn a_pattern_that_matches_nothing_in_the_catalogue_is_findable() {
+        // The reason this lives beside `ALL`: a subscription nobody can list is
+        // a subscriber that never runs, and that looks exactly like a
+        // subscriber with nothing to say.
+        assert!(
+            !ALL.iter().any(|t| matches("de.hems.grid.lpc.limit", t)),
+            "the family needs its wildcard, and a test says so rather than a \
+             specialist silently never waking"
+        );
+        assert!(ALL.iter().any(|t| matches("de.hems.grid.lpc.*", t)));
+    }
+
+    #[test]
+    fn a_star_in_the_middle_backtracks_correctly() {
+        assert!(matches("de.*.day.reported", SITE_DAY_REPORTED));
+        assert!(matches("de.hems.*.reported", SITE_DAY_REPORTED));
+        assert!(!matches("de.hems.*.refused", SITE_DAY_REPORTED));
+        assert!(matches("de.hems.site.day.reporte?", SITE_DAY_REPORTED));
+    }
+}

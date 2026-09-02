@@ -67,6 +67,7 @@
 pub mod api;
 pub mod config;
 pub mod export;
+pub mod mcp_server;
 pub mod store;
 
 pub use config::Settings;

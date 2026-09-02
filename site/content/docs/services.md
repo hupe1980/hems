@@ -1,6 +1,6 @@
 +++
 title = "The fleet"
-description = "Five daemons around one box: prices, weather, the two years of § 14a evidence, enrolment and signed releases, and a fleet view that counts breaches rather than averaging them."
+description = "The services around one box: prices, weather, the two years of § 14a evidence, enrolment and signed releases, and a fleet view that counts breaches rather than averaging them — and why none of them is a trust anchor."
 weight = 11
 +++
 
@@ -30,12 +30,14 @@ flowchart TB
     HI["<b>histd</b><br/>evidence + registers<br/>Nachweis · Data Act export"]
     FL["<b>fleetd</b><br/>enrolment · config · releases"]
     O["<b>obsd</b><br/>the fleet view"]
+    A["<b>agentd</b><br/>advisory only"]
   end
   T -- "prices" --> H
   F -- "the sky" --> H
   H -- "evidence, from its own outbox" --> HI
   FL -- "signed config + manifests" --> H
   H -- "a signed CloudEvent per day" --> O
+  O -. "what a population says" .-> A
   NO["network operator"] -. "Nachweis" .-> HI
   HH["the household"] -. "Data Act Art. 4 export" .-> HI
 </pre>
@@ -49,7 +51,7 @@ house is never worse off when the cloud is gone.
 ## One shell, and two decisions in it
 
 `hems-service` owns the forty lines every daemon has — configuration, logging, a
-health surface, a bounded shutdown — and owns nothing about energy. Six daemons
+health surface, a bounded shutdown — and owns nothing about energy. Seven daemons
 written six times means those forty lines diverge in the direction that costs
 most, because the one that is wrong is the one whose readiness probe lies.
 
@@ -88,6 +90,7 @@ arriving after an ENTSO-E one would overwrite it.
 |---|---|
 | Endpoints | `/v1/prices?from=…&slots=96`, `/v1/prices/coverage` |
 | Authentication | **none, on purpose** — a day-ahead curve is a published auction result |
+| Agents | `/mcp`, when switched on |
 | Holds | two days each way |
 
 The fetching is behind an `Upstream` trait. In production it is `reqwest`; in
@@ -113,6 +116,7 @@ know every roof.
 |---|---|
 | Endpoints | `/v1/weather/{location}`, `/v1/production/{location}?kwp=9.8` |
 | Authentication | **none, on purpose** — irradiance over a location is public weather |
+| Agents | `/mcp`, when switched on |
 | Source | ICON-D2 through Open-Meteo, at quarter-hour resolution |
 
 The cache is the same shape as `tariffd`'s and for the same reason: a weather run
@@ -140,6 +144,7 @@ Keeping them apart is most of the design, and three things fall out of it:
 |---|---|
 | Endpoints | `/v1/sites/{site}/quarter-hours`, `/v1/sites/{site}/events`, `/v1/sites/{site}/nachweis`, `/v1/sites/{site}/export` |
 | Authentication | per site, and a box may write only **its own** |
+| Agents | `/mcp`, authorising each caller as itself — see below |
 
 The two exports are authorised differently on purpose. A **Nachweis** is the
 record of what the network operator itself commanded and what the connection
@@ -162,6 +167,13 @@ and leaves holding a long-lived credential of its own. The secret is
 enrolment secret that still works after the box is in the field is a credential
 sitting in an installer's notes.
 
+Both facts are in an embedded store rather than in memory, and each is written
+**before** it is acted on. A credential exists in exactly two places — the box
+and the fleet — so a `fleetd` that forgot one on restart would leave a household
+presenting a token nothing recognises, unable to enrol again because its secret
+is spent. What is *not* stored is which sites exist and what they should run:
+that is the operator's intent and it lives in the configuration file.
+
 **Configuration.** Versioned, and the box reports which version it is *running*.
 That is the half usually missing: a fleet that can only push cannot answer “how
 many of my boxes actually took the change”, which is the question asked the
@@ -173,7 +185,8 @@ sentence is the whole argument.
 
 | | |
 |---|---|
-| Endpoints | `/v1/enrol`, `/v1/config`, `/v1/config/running`, `/v1/releases/{component}`, `/v1/fleet` |
+| Endpoints | `/v1/enrol`, `/v1/config`, `/v1/config/running`, `/v1/releases/{component}` |
+| Roster | `/v1/fleet`, and an **operator's** token — it says which households exist, which build each is on and which are unreachable right now, and it answers within that operator's tenant |
 
 ## `obsd` — the fleet view
 
@@ -212,17 +225,68 @@ fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.
 
+### A box reports what it metered, and no money at all
+
+`hemsd run` closes each Berlin calendar day and queues a report. It carries the
+energies the connection point saw and the whole § 14a compliance record — and
+**no `economics` and no `forecast`**, because a box cannot produce either
+honestly:
+
+- a **baseline** is what the day would have cost with no energy manager, and the
+  only way to get one is to re-run the day as an unmanaged house. A box has what
+  happened;
+- five of the six **cost** terms are modelled rather than metered — battery wear,
+  curtailment, discomfort, energy borrowed from the stores, charge past what was
+  asked for — so a box filling in the sixth would publish a figure that read as
+  complete and understated itself;
+- a **forecast score** merges as an episode, so an unmeasured coverage reported
+  as `0.0` would drag the fleet's calibration toward zero while looking like a
+  contribution.
+
+So the summary counts `unmeasurable_days` beside `foresight_days`, and a fleet of
+real boxes reports **no** saving rather than a saving of zero. The two exclusions
+are counted apart because they mean different things: a foresight day is an upper
+bound nobody can reach, and a day without a baseline is a household.
+
 The day travels over **TLS** as a **signed CloudEvent**, and the two are different
 guarantees the box needs both of: the signature says the report is the one this
 box sent and has not been edited; TLS says nobody read it on the way. Plain
 `http` is allowed only to a loopback address and refused anywhere else.
 
+It is queued in the box's own store before it is sent, so a fleet that is down
+costs a delay rather than a day — the same store-and-forward the evidence uses.
+Three things follow from that, and they are the interesting part:
+
+- **The signature is made at the attempt, never stored.** Standard Webhooks
+  signs `id . timestamp . body` and a receiver refuses a timestamp outside five
+  minutes, so a signature made when the row was written is worthless by the time
+  a box back from an overnight outage sends it. What is kept is the body.
+- **The message id is the site and the date**, so a box that recomputes
+  yesterday is *correcting* one report rather than adding a second — and `obsd`
+  deduplicates on the same string the signature covers.
+- **A refusal is not a retry.** A `5xx`, a `429` or a refused connection is the
+  fleet being unavailable and the day is worth keeping. Any other `4xx` is
+  `obsd` having read the document and refused it, and asking again changes
+  nothing — so the row leaves the backlog carrying the refusal, rather than the
+  box asking the same rejected question every five minutes for ever.
+
 That endpoint holds the list of households that did *not* respect a network
 operator's reduction, so an unauthenticated write to it can put a compliant site
 on that list or take a breach off it. The signature covers the message id, the
-timestamp and the exact bytes, so a captured request cannot be replayed,
-re-attributed or edited — and an `obsd` with no secret configured refuses
-everything rather than accepting everything.
+timestamp and the exact bytes, so a captured request cannot be replayed or
+edited — and an `obsd` with no secret configured refuses everything rather than
+accepting everything.
+
+Each box signs with **its own** key, and a report whose claimed site is not that
+key's site is refused. A shared secret would authenticate the bytes and say
+nothing about the sender, which for this endpoint means any box could write a
+§ 14a breach onto a household that is not its own.
+
+## Every one of them answers an agent too
+
+Each fleet service mounts a read-only Model Context Protocol surface on the port
+it already binds, and `agentd` is the advisory plane that reads them. Both are on
+their own page — see [Agents](@/docs/agents.md).
 
 ## A store beats a passthrough
 
@@ -252,9 +316,10 @@ household's control history for no reason anybody asked for.
 $ just fleet-demo                     # or, spelled out:
 
 $ cat > obsd.toml <<'TOML'
-webhook_secrets = ["env:HEMS_OBSD_WEBHOOK_SECRET"]
+[webhook_secrets]
+reference-household = ["env:HEMS_OBSD_SECRET_REFERENCE_HOUSEHOLD"]
 TOML
-$ HEMS_OBSD_WEBHOOK_SECRET=whsec_demo cargo run -p obsd -- --config obsd.toml &
+$ HEMS_OBSD_SECRET_REFERENCE_HOUSEHOLD=whsec_demo cargo run -p obsd -- --config obsd.toml &
 $ HEMS_OBSD_SECRET=whsec_demo \
     cargo run -p hemsd -- simulate --day winter --report-to http://127.0.0.1:8080
 ```

@@ -259,7 +259,10 @@ async fn a_box_with_a_fleet_plans_against_real_prices_and_a_real_sky() {
         // The price stack the plan was made against, which a running box hands
         // to the loop that writes its quarter-hour registers. Not read here.
         Arc::new(RwLock::new(None)),
-        Arc::clone(&modelled),
+        hemsd::runtime::planner::Published {
+            modelled_pv: Arc::clone(&modelled),
+            bands: Arc::new(RwLock::new(BTreeMap::new())),
+        },
         Arc::clone(&learned),
         // No store: what is being tested is the planning loop, and a box that
         // keeps its learning is `planner`'s own round-trip test.
@@ -390,7 +393,10 @@ async fn a_battery_whose_charge_nobody_reports_is_left_out_of_the_plan() {
         hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
         Arc::clone(&plan),
         Arc::new(RwLock::new(None)),
-        modelled,
+        hemsd::runtime::planner::Published {
+            modelled_pv: modelled,
+            bands: Arc::new(RwLock::new(BTreeMap::new())),
+        },
         learned,
         None,
         hems_service::Health::new(),
@@ -468,7 +474,10 @@ async fn a_box_installed_this_morning_plans_from_persistence() {
         hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
         Arc::clone(&plan),
         Arc::new(RwLock::new(None)),
-        Arc::new(RwLock::new(BTreeMap::new())),
+        hemsd::runtime::planner::Published {
+            modelled_pv: Arc::new(RwLock::new(BTreeMap::new())),
+            bands: Arc::new(RwLock::new(BTreeMap::new())),
+        },
         // A box that has learned nothing at all — switched on this morning.
         Arc::new(Mutex::new(Learned::new(metering::Bundesland::Be))),
         None,

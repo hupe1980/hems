@@ -19,6 +19,9 @@ use tokio::sync::RwLock;
 
 /// The secret the box and this fleet share in these tests.
 const SECRET: &str = "whsec_the-test-fleet";
+/// A second household's own key, so "who signed this" is a question with two
+/// possible answers rather than one.
+const SECRET_FOR_HAUS_1: &str = "whsec_haus-1";
 /// The credential an operator reads the fleet view with.
 const OPERATOR: &str = "tok-operator";
 
@@ -31,29 +34,49 @@ fn good_day(site: &str, day: u8) -> DayKpis {
         exported_kwh: 0.3,
         produced_kwh: 8.4,
         self_sufficiency: 0.13,
-        cost: CostBreakdown {
-            energy_eur: 21.08,
-            wear_eur: 0.62,
-            discomfort_eur: 0.19,
-            stored_eur: 0.14,
-            ..CostBreakdown::default()
-        },
-        baseline: CostBreakdown {
-            energy_eur: 24.12,
-            ..CostBreakdown::default()
-        },
+        economics: Some(hems_core::report::Economics {
+            cost: CostBreakdown {
+                energy_eur: 21.08,
+                wear_eur: 0.62,
+                discomfort_eur: 0.19,
+                stored_eur: 0.14,
+                ..CostBreakdown::default()
+            },
+            baseline: CostBreakdown {
+                energy_eur: 24.12,
+                ..CostBreakdown::default()
+            },
+        }),
         respected_the_grid: true,
         control_events: 1,
-        pv_coverage: 0.81,
-        pv_crps: 192.0,
-        load_coverage: 0.85,
-        load_crps: 18.0,
+        forecast: Some(hems_core::report::ForecastScores {
+            pv_coverage: 0.81,
+
+            pv_crps: 192.0,
+
+            load_coverage: 0.85,
+
+            load_crps: 18.0,
+        }),
         ..DayKpis::default()
     }
 }
 
 /// Start the service on an ephemeral port; returns the address and the stopper.
 async fn start() -> (
+    std::net::SocketAddr,
+    hems_service::shutdown::ShutdownTrigger,
+) {
+    start_with_a_site_credential(None).await
+}
+
+/// The same service, additionally accepting one household's own credential.
+///
+/// The default harness configures an operator and nothing else, which is why
+/// nothing here noticed what a *site* token could reach.
+async fn start_with_a_site_credential(
+    site: Option<(&str, &str)>,
+) -> (
     std::net::SocketAddr,
     hems_service::shutdown::ShutdownTrigger,
 ) {
@@ -74,11 +97,32 @@ async fn start() -> (
         router(Observed::new(
             fleet,
             time::Duration::days(2),
-            vec![SECRET.to_owned()],
+            // Every site the tests report for, each with a key of its own — which
+            // is the point: two sites sharing one key would make "who signed this"
+            // unanswerable, and the daemon refuses that configuration.
+            (0..10)
+                .map(|i| format!("site-{i}"))
+                .chain(std::iter::once("haus-2".to_owned()))
+                .map(|site| {
+                    let key = format!("{SECRET}-{site}");
+                    (site, key)
+                })
+                .chain(std::iter::once((
+                    "haus-1".to_owned(),
+                    SECRET_FOR_HAUS_1.to_owned(),
+                )))
+                .collect(),
             hems_events::webhook::DEFAULT_TOLERANCE,
             hems_service::Credentials::resolve(
+                &site
+                    .map(|(name, token)| (name.to_owned(), hems_service::Secret::literal(token)))
+                    .into_iter()
+                    .collect(),
                 &std::collections::BTreeMap::new(),
-                &[hems_service::Secret::literal(OPERATOR)],
+                &[hems_service::OperatorCredential {
+                    token: hems_service::Secret::literal(OPERATOR),
+                    tenant: "*".into(),
+                }],
             )
             .unwrap(),
         )),
@@ -152,7 +196,11 @@ fn signed_report(
 
 /// The same, at this instant and under the fleet's own secret.
 fn report_now(day: &DayKpis) -> (String, Vec<(&'static str, String)>) {
-    signed_report(day, SECRET, time::OffsetDateTime::now_utc())
+    signed_report(
+        day,
+        &format!("{SECRET}-{}", day.site),
+        time::OffsetDateTime::now_utc(),
+    )
 }
 
 /// The header an operator reads with.
@@ -239,7 +287,8 @@ async fn a_report_with_a_field_this_build_does_not_know_is_refused() {
     // Re-sign it: the point of this test is the schema, not the signature.
     let at = time::OffsetDateTime::now_utc();
     let id = headers[0].1.clone();
-    let signature = hems_events::webhook::sign(SECRET.as_bytes(), &id, at, tampered.as_bytes());
+    let key = format!("{SECRET}-site-1");
+    let signature = hems_events::webhook::sign(key.as_bytes(), &id, at, tampered.as_bytes());
     let (status, _) = request(
         address,
         "POST",
@@ -296,7 +345,7 @@ async fn a_captured_report_stops_working() {
     let (address, trigger) = start().await;
     let day = good_day("site-1", 15);
     let stale = time::OffsetDateTime::now_utc() - time::Duration::minutes(6);
-    let (body, headers) = signed_report(&day, SECRET, stale);
+    let (body, headers) = signed_report(&day, &format!("{SECRET}-site-1"), stale);
     let (status, _) = request(address, "POST", "/v1/days", Some(&body), &headers).await;
     assert_eq!(status, 401);
     trigger.trigger();
@@ -317,7 +366,8 @@ async fn an_event_of_another_type_does_not_become_a_day() {
         good_day("site-1", 15),
     );
     let body = String::from_utf8(event.to_bytes().unwrap()).unwrap();
-    let signature = hems_events::webhook::sign(SECRET.as_bytes(), &event.id, at, body.as_bytes());
+    let key = format!("{SECRET}-site-1");
+    let signature = hems_events::webhook::sign(key.as_bytes(), &event.id, at, body.as_bytes());
     let (status, _) = request(
         address,
         "POST",
@@ -358,5 +408,78 @@ async fn the_fleet_view_is_not_served_without_a_credential() {
             "{path}"
         );
     }
+    trigger.trigger();
+}
+
+#[tokio::test]
+async fn one_household_cannot_read_the_whole_fleet() {
+    // `/v1/fleet` carries `breached` — the named list of households that did not
+    // respect a network operator's reduction — and `below_minimum`. A site's own
+    // box credential says "I am this household"; it says nothing about any
+    // other, and a summary over all of them is not this household's data.
+    let (address, trigger) = start_with_a_site_credential(Some(("haus-1", "tok-haus-1"))).await;
+
+    let own = [("authorization", "Bearer tok-haus-1".to_owned())];
+    let (status, _) = request(address, "GET", "/v1/fleet", None, &own).await;
+    assert_eq!(
+        status, 403,
+        "a household's own token must not read the fleet summary"
+    );
+
+    // Its own days, on the other hand, are exactly what it may read.
+    let (status, _) = request(address, "GET", "/v1/sites/haus-1", None, &own).await;
+    assert_ne!(status, 403, "and it is not locked out of its own record");
+
+    // …and another household's are not.
+    let (status, _) = request(address, "GET", "/v1/sites/haus-2", None, &own).await;
+    assert_eq!(status, 403);
+
+    let (status, _) = request(address, "GET", "/v1/fleet", None, &operator()).await;
+    assert_eq!(status, 200, "the operator still reads it");
+
+    trigger.trigger();
+}
+
+#[tokio::test]
+async fn a_box_cannot_report_a_day_as_another_household() {
+    // The signature says the bytes were not edited. It does **not** say who sent
+    // them, because the secret is the fleet's rather than the household's — so
+    // any box that can sign can attribute a day to any site. What that buys an
+    // attacker is the one thing `obsd` exists to hold: `breached` is the named
+    // list of households that did not respect a network operator's reduction,
+    // and a forged day writes to it.
+    let (address, trigger) = start().await;
+
+    // `haus-1`'s box, holding the fleet secret, reports a breach for `haus-2`.
+    let mut forged = good_day("haus-2", 15);
+    forged.respected_the_grid = false;
+    let (body, headers) =
+        signed_report(&forged, SECRET_FOR_HAUS_1, time::OffsetDateTime::now_utc());
+    let (status, _) = request(address, "POST", "/v1/days", Some(&body), &headers).await;
+    assert_eq!(
+        status, 401,
+        "a box may report its own day and nobody else's — a signature over a \
+         shared secret authenticates the bytes, never the sender"
+    );
+
+    // And the fleet view did not learn about a breach nobody committed.
+    let (status, summary) = request(address, "GET", "/v1/fleet", None, &operator()).await;
+    assert_eq!(status, 200);
+    let summary: serde_json::Value = serde_json::from_str(&summary).unwrap();
+    assert_eq!(
+        summary["breached"].as_array().map(Vec::len),
+        Some(0),
+        "nothing was recorded: {summary}"
+    );
+
+    // Its own day, under its own secret, is taken.
+    let (body, headers) = signed_report(
+        &good_day("haus-1", 15),
+        SECRET_FOR_HAUS_1,
+        time::OffsetDateTime::now_utc(),
+    );
+    let (status, _) = request(address, "POST", "/v1/days", Some(&body), &headers).await;
+    assert_eq!(status, 202);
+
     trigger.trigger();
 }

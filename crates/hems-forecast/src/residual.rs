@@ -35,8 +35,7 @@
 //! where a corrector like this normally goes wrong. The obvious construction —
 //! take the mean absolute deviation of the ratio, multiply by the factor that
 //! turns a MAD into a 10–90 half-width *for a normal distribution* (1,606), and
-//! floor it so a quiet week cannot claim certainty — is what this module used to
-//! do, and two things were wrong with it.
+//! floor it so a quiet week cannot claim certainty — is wrong on two counts.
 //!
 //! The residual of a roof is **not normal**: it has a hard ceiling at the clear
 //! sky and a long tail downwards, so a Gaussian conversion of its dispersion
@@ -159,10 +158,10 @@ fn calibration_gain(samples: usize) -> f64 {
 
 /// What the tail multipliers ride on where the dispersion has collapsed.
 ///
-/// A multiplier on a base of exactly zero is still zero, so a bucket that has
-/// seen a fortnight of identical days could never be calibrated at all — the
-/// degeneracy the constant floor used to hide. One per cent of the ratio is
-/// small enough not to widen an honest band and large enough to be multiplied.
+/// A multiplier on a base of exactly zero is still zero, so without this a
+/// bucket that has seen a fortnight of identical days could never be calibrated
+/// at all. One per cent of the ratio is small enough not to widen an honest band
+/// and large enough to be multiplied.
 const MIN_BASE: f64 = 0.01;
 
 /// How far a tail multiplier may travel from its Gaussian seed.

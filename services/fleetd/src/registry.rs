@@ -15,6 +15,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 
 use crate::config::SiteEntry;
+use crate::store::{Enrolment, Report};
 
 /// Why an enrolment or a request was refused.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -103,7 +104,39 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// A registry over the configured sites.
+    /// A registry over the configured sites, and what the store remembers.
+    ///
+    /// The two halves come from different places on purpose. The **sites** are
+    /// the operator's intent, declared in configuration; the **enrolments** and
+    /// **reports** are facts about the running world, which only the store has.
+    /// A site the store knows and the configuration no longer names keeps its
+    /// row — deleting a household's credential because somebody edited a TOML
+    /// file is not a decision this constructor gets to take — but it is not
+    /// served a configuration, because there is none to serve.
+    #[must_use]
+    pub fn restore(
+        sites: BTreeMap<String, SiteEntry>,
+        enrolments: BTreeMap<String, Enrolment>,
+        reports: BTreeMap<String, Report>,
+    ) -> Self {
+        let mut registry = Self::new(sites);
+        for (site, enrolment) in enrolments {
+            registry
+                .by_token
+                .insert(enrolment.token.clone(), site.clone());
+            registry.tokens.insert(site.clone(), enrolment.token);
+            registry.last_seen.insert(site, enrolment.enrolled_at);
+        }
+        for (site, report) in reports {
+            registry
+                .running
+                .insert(site.clone(), report.running_version);
+            registry.last_seen.insert(site, report.last_seen);
+        }
+        registry
+    }
+
+    /// A registry over the configured sites, with nothing enrolled.
     #[must_use]
     pub fn new(sites: BTreeMap<String, SiteEntry>) -> Self {
         Self {
@@ -112,7 +145,46 @@ impl Registry {
         }
     }
 
-    /// Adopt a box.
+    /// Whether this site may enrol with this secret, changing nothing.
+    ///
+    /// Split from [`Registry::adopt`] so the credential can be **written down
+    /// before it is handed out**. A fleet that commits the enrolment in memory
+    /// and then persists it has a failure mode where the box leaves holding a
+    /// token the fleet forgets on its next restart, and no route by which it
+    /// could ever enrol again — its secret is spent.
+    ///
+    /// # Errors
+    /// [`EnrolmentError`].
+    pub fn may_enrol(&self, site: &str, secret: &str) -> Result<(), EnrolmentError> {
+        let entry = self.sites.get(site).ok_or(EnrolmentError::UnknownSite)?;
+        if self.tokens.contains_key(site) {
+            return Err(EnrolmentError::AlreadyEnrolled);
+        }
+        // A constant-time comparison, because the alternative leaks the secret
+        // one byte at a time to anybody willing to measure.
+        if !hems_service::auth::constant_time_eq(entry.enrolment_secret.expose(), secret.as_bytes())
+        {
+            return Err(EnrolmentError::WrongSecret);
+        }
+        Ok(())
+    }
+
+    /// Take a minted credential into the registry.
+    ///
+    /// Call only after [`Registry::may_enrol`] has said yes and the store has
+    /// taken the row.
+    pub fn adopt(&mut self, site: &str, token: String, at: OffsetDateTime) -> Enrolled {
+        self.tokens.insert(site.to_owned(), token.clone());
+        self.by_token.insert(token.clone(), site.to_owned());
+        self.last_seen.insert(site.to_owned(), at);
+        Enrolled {
+            site: site.to_owned(),
+            token,
+            enrolled_at: at,
+        }
+    }
+
+    /// Adopt a box: the two halves above, for a caller with nothing to persist.
     ///
     /// `mint` produces the credential; it is a parameter so a test can be
     /// deterministic and a deployment can use whatever entropy it trusts. The
@@ -128,25 +200,8 @@ impl Registry {
         at: OffsetDateTime,
         mint: impl FnOnce() -> String,
     ) -> Result<Enrolled, EnrolmentError> {
-        let entry = self.sites.get(site).ok_or(EnrolmentError::UnknownSite)?;
-        if self.tokens.contains_key(site) {
-            return Err(EnrolmentError::AlreadyEnrolled);
-        }
-        // A constant-time comparison, because the alternative leaks the secret
-        // one byte at a time to anybody willing to measure.
-        if !hems_service::auth::constant_time_eq(entry.enrolment_secret.expose(), secret.as_bytes())
-        {
-            return Err(EnrolmentError::WrongSecret);
-        }
-        let token = mint();
-        self.tokens.insert(site.to_owned(), token.clone());
-        self.by_token.insert(token.clone(), site.to_owned());
-        self.last_seen.insert(site.to_owned(), at);
-        Ok(Enrolled {
-            site: site.to_owned(),
-            token,
-            enrolled_at: at,
-        })
+        self.may_enrol(site, secret)?;
+        Ok(self.adopt(site, mint(), at))
     }
 
     /// Which site a token belongs to.

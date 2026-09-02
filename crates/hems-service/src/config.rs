@@ -43,6 +43,19 @@ pub enum ConfigError {
         /// What the parser said.
         source: toml::de::Error,
     },
+    /// An operator credential names a tenant nothing defines.
+    ///
+    /// A typo, and resolving it to the empty set would start a daemon that
+    /// accepts the token and reads no household — which at the other end looks
+    /// like a permissions problem rather than like a configuration file.
+    #[error(
+        "the operator credential names tenant {tenant:?}, which no [tenants] entry defines; \
+         use \"*\" for every household this daemon knows"
+    )]
+    UnknownTenant {
+        /// What the configuration said.
+        tenant: String,
+    },
     /// A configured secret says where to find itself and it is not there.
     #[error("the secret {reference:?} could not be resolved: {detail}")]
     UnresolvedSecret {

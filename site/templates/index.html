@@ -282,13 +282,98 @@ flowchart TB
   </div>
 </section>
 
+<!-- ── The fleet ────────────────────────────────────────────────────────── -->
+
+<section class="band">
+  <div class="band-inner">
+    <div class="section-head">
+      <h2>One box, then ten thousand — and none of them a trust anchor</h2>
+      <p>Six services stand around the box. Not one of them can make the house
+      unsafe or unlawful: the § 14a limit comes off a wire from the network
+      operator’s Steuerbox and the guard enforces it locally, prices and weather
+      only ever make a plan <em>better</em>, and an update is checked against a
+      key the box was built with rather than against a hostname.</p>
+    </div>
+
+    <figure class="mermaid-figure">
+<pre class="mermaid">
+flowchart LR
+  subgraph house["the household"]
+    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of § 14a evidence"]
+  end
+  subgraph fleet["the fleet"]
+    direction TB
+    T["<b>tariffd</b><br/>five day-ahead sources"]
+    F["<b>forecastd</b><br/>ICON-D2, the sky only"]
+    HI["<b>histd</b><br/>evidence · registers<br/>Nachweis · Data Act export"]
+    FL["<b>fleetd</b><br/>enrolment · signed config · releases"]
+    O["<b>obsd</b><br/>breaches counted, never averaged"]
+    AG["<b>agentd</b><br/>proposes · cannot act"]
+  end
+  T -- "prices" --> H
+  F -- "irradiance" --> H
+  H -- "evidence, from its own outbox" --> HI
+  H -- "a signed CloudEvent per day" --> O
+  FL -- "signed configuration + manifests" --> H
+  O -. "a population, not a household" .-> AG
+  NB(["network operator"]) -. "Nachweis" .-> HI
+  HH(["the household"]) -. "Data Act Art. 4 export" .-> HI
+</pre>
+      <figcaption>Every arrow into the box carries something that can only
+      improve a plan. Nothing in the fleet can widen what the guard decided.</figcaption>
+    </figure>
+
+    <div class="split">
+      <ul class="feature-list">
+        <li>
+          <h3>The same numbers, for an agent</h3>
+          <p>Every fleet service answers over the Model Context Protocol on the
+          port it already binds, over the state its REST routes already read — so
+          the two cannot disagree. What the second surface adds is
+          <em>prose</em>: that an absent price slot is not free electricity, that
+          a § 14a breach is a list with a site and a date rather than a rate, and
+          that a coverage figure under twenty independent days is not a
+          calibration.</p>
+        </li>
+        <li>
+          <h3>Read-only, and every call is its own caller</h3>
+          <p>A tool reads the credential on the request that reached it and
+          resolves it against the same credentials the REST routes use. A
+          household’s token reads its own site and nothing else; an operator’s
+          reads its own tenant. An agent must never be able to move a
+          household’s energy — that decision belongs to the arbiter, behind the
+          guard, on the box.</p>
+        </li>
+      </ul>
+      <ul class="feature-list">
+        <li>
+          <h3>An agent proposes, and it cannot act</h3>
+          <p>Two properties rather than a policy. Its output type is a
+          <strong>leaf</strong> — nothing in the workspace consumes one, so there
+          is no path from an answer into a device. And its authority is derived
+          by attenuation, which <strong>refuses to widen</strong>: it may read
+          the § 14a record and the fleet aggregate, and it may never take the
+          household’s Data Act export, which is a right of the user.</p>
+        </li>
+        <li>
+          <h3>The journal is why it is a runtime</h3>
+          <p>The specialists are pure functions; they run on a durable,
+          replayable runtime anyway. A run, its input and its answer are an
+          append-only hash-chained log, so <em>“why did the queue say that in
+          March”</em> is a replay rather than an argument.</p>
+        </li>
+      </ul>
+    </div>
+  </div>
+</section>
+
 <!-- ── Honesty ──────────────────────────────────────────────────────────── -->
 
 <section class="band band-soft">
   <div class="band-inner">
     <div class="section-head">
       <h2>What is different about the numbers</h2>
-      <p>Four rules the whole workspace is built to keep, because each of them is
+      <p>Five rules the whole workspace is built to keep, because each of them is
       a way a saving figure is routinely inflated.</p>
     </div>
     <ul class="cards">
@@ -318,7 +403,17 @@ flowchart TB
         <p>One household in ten thousand that failed to respect a reduction is an
         incident with a name and a date. “99,99 % compliance” reads as success,
         so the fleet view carries breaches as a list of findings and never as a
-        rate — and a day only reaches it as a <em>signed</em> CloudEvent.</p>
+        rate — and a day only reaches it as a <em>signed</em> CloudEvent, under a
+        key belonging to the household that sent it.</p>
+      </li>
+      <li class="card">
+        <h3>A box reports what it metered, and no money at all</h3>
+        <p>A saving needs a baseline — what the day would have cost with no
+        energy manager — and that is a counterfactual only a simulation can
+        re-run. So a box on a wall reports the energies and the whole § 14a
+        record and <em>no cost</em>, and the fleet counts those days apart rather
+        than averaging them in as days that saved nothing. A figure a product
+        computes about itself with a model it chose is marketing.</p>
       </li>
     </ul>
   </div>
@@ -334,7 +429,9 @@ flowchart TB
         <p style="color:var(--fg-muted)">The domain crates are independent and
         none of them does any I/O. <code>hems-grid</code> is the German grid
         rules; <code>hems-tariff</code> is what a kilowatt-hour costs;
-        <code>hems-flex</code> is the household’s flexibility in S2.</p>
+        <code>hems-flex</code> is the household’s flexibility in S2. Every one of
+        them takes time as a parameter and opens no socket, and a build guard
+        fails if one of them reaches for a clock.</p>
         <ul class="pill-row">
           <li class="pill">hems-core</li>
           <li class="pill">hems-grid</li>
@@ -345,7 +442,7 @@ flowchart TB
           <li class="pill">hems-device</li>
           <li class="pill">hems-drv</li>
           <li class="pill">hems-flex</li>
-          <li class="pill">hems-sim</li>
+          <li class="pill">hems-events</li>
         </ul>
       </div>
       <div>
@@ -380,8 +477,8 @@ assert!((floor.kw() - 7.56).abs() &lt; 1e-9);</code></pre>
   <div class="band-inner">
     <div class="section-head">
       <h2>Where to start</h2>
-      <p>Twelve pages, in the order they build on each other: run it, then how it
-      is arranged, then what each layer actually does.</p>
+      <p>Thirteen pages, in the order they build on each other: run it, then how
+      it is arranged, then what each layer actually does.</p>
     </div>
     <ol class="cards">
       {% set docs = get_section(path="docs/_index.md") %}

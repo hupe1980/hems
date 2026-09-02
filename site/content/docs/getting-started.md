@@ -34,7 +34,7 @@ The same list, in the same order, that CI runs:
 | `deny` | licences and advisories |
 | `doc` | rustdoc with warnings as errors |
 
-`guards` is the unusual one. It resolves **358 regulatory citations** across five
+`guards` is the unusual one. It resolves **378 regulatory citations** across five
 document families against an index of primary sources and fails the build if one
 names a document the index does not carry; and it checks that each of **121**
 quantities, instants and dates says how it travels on the wire.
@@ -227,7 +227,7 @@ that as an instruction not to use it.
 
 ## Run the fleet
 
-Five daemons sit around the box. Each is a binary with a `--config` and a set of
+Six daemons sit around the box. Each is a binary with a `--config` and a set of
 `HEMS_<NAME>_*` environment variables, and **none of them needs the others to
 start**.
 
@@ -248,6 +248,13 @@ $ curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet | jq '{sit
 }
 ```
 
+That day came from `hemsd simulate`, which is why it has a saving at all: a
+saving needs a baseline, and a baseline is what the day would have cost with no
+energy manager — a counterfactual only a simulator can re-run. A day from
+`hemsd run` carries the energies and the § 14a record and no money, and the
+fleet counts those in `unmeasurable_days` rather than averaging them in as days
+that saved nothing.
+
 `saving_eur` is the reference winter day's own €2,09, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
@@ -257,10 +264,23 @@ What each daemon owns, which of them are authenticated and which are open on
 purpose, and why a day only ever arrives signed is on [the
 fleet](@/docs/services.md).
 
+## Ask the advisory plane
+
+```console
+$ just agent-demo
+```
+
+`agentd` runs specialists that answer a question about a **population** rather
+than about one household — whether one cause accounts for most of a week's § 14a
+breaches, what the saving on a dashboard actually rests on. They run on a
+replayable journal, so a finding can be re-derived rather than argued about, and
+they **propose**: nothing an agent says moves a watt, and that is a property of
+the types rather than a policy. See [Agents](@/docs/agents.md).
+
 ## Where the rules come from
 
 Every regulatory number carries the document and clause it comes from —
-`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and the citation guard resolves all 358 of
+`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and the citation guard resolves all 378 of
 them against an index of primary sources.
 
 The documents themselves are third-party copyrighted publications and are **not
@@ -275,3 +295,7 @@ copy can be rebuilt from public sources.
   actually require, with the citation for every number.
 - [The planner](@/docs/optimizer.md) — the formulation, and the fourteen
   decisions in it that are worth explaining.
+- [Agents](@/docs/agents.md) — the read-only surface every fleet service
+  answers on, and the plane that may propose and may not act.
+- [Security](@/docs/security.md) — capabilities that narrow under delegation,
+  tenancy, and why two of the services are open on purpose.

@@ -12,6 +12,10 @@ rust-version.workspace = true
 [dependencies]
 hems-core    = { workspace = true }
 hems-service = { workspace = true }
+http          = { workspace = true }
+rmcp         = { workspace = true }
+schemars     = { workspace = true }
+tokio-util   = { workspace = true }
 hems-tariff  = { workspace = true, features = ["serde"] }
 
 anyhow       = { workspace = true }

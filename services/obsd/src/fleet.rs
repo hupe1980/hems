@@ -88,14 +88,36 @@ impl Fleet {
     /// The whole fleet, summarised.
     #[must_use]
     pub fn summarise(&self, now: OffsetDateTime, silent_after: time::Duration) -> Summary {
+        self.summarise_within(&hems_service::SiteScope::Every, now, silent_after)
+    }
+
+    /// The same, over the households one caller may see.
+    ///
+    /// A shared deployment hosts several operators, and a summary is the one
+    /// answer where "which households" cannot be a parameter the caller
+    /// chooses: it carries the **named list** of those that did not respect a
+    /// network operator's reduction, so a scope that leaked would hand one
+    /// tenant another's compliance incidents (D112).
+    ///
+    /// `sites` counts the households in scope rather than the households on
+    /// record, because a denominator that included somebody else's would make
+    /// every rate quietly wrong as well.
+    #[must_use]
+    pub fn summarise_within(
+        &self,
+        scope: &hems_service::SiteScope,
+        now: OffsetDateTime,
+        silent_after: time::Duration,
+    ) -> Summary {
+        let visible = || self.sites.iter().filter(|(name, _)| scope.covers(name));
         let mut summary = Summary {
-            sites: self.sites.len(),
+            sites: visible().count(),
             ..Summary::default()
         };
         let mut pv = hems_forecast::Calibration::default();
         let mut load = hems_forecast::Calibration::default();
 
-        for (name, history) in &self.sites {
+        for (name, history) in visible() {
             if history
                 .last_report
                 .is_none_or(|last| now - last > silent_after)
@@ -108,17 +130,27 @@ impl Fleet {
                 // rather than a result, and averaging it into a saving figure
                 // produces a number no household can reach. It is counted and
                 // then left out.
-                if day.is_measurable() {
-                    summary.measured_days += 1;
-                    summary.saving_eur += day.saving_eur();
-                    summary.bill_saving_eur += day.bill_saving_eur();
-                    summary.self_sufficiency += day.self_sufficiency;
-                    // The forecast scores merge as **episodes**: one day is one
-                    // draw, whatever its slot count.
-                    pv = pv.merge(one_episode(day.pv_coverage, day.pv_crps));
-                    load = load.merge(one_episode(day.load_coverage, day.load_crps));
-                } else {
-                    summary.foresight_days += 1;
+                match (day.saving_eur(), day.bill_saving_eur()) {
+                    (Some(saving), Some(bill)) if day.is_measurable() => {
+                        summary.measured_days += 1;
+                        summary.saving_eur += saving;
+                        summary.bill_saving_eur += bill;
+                        summary.self_sufficiency += day.self_sufficiency;
+                    }
+                    // Counted apart, because they are excluded for different
+                    // reasons and an operator needs to know which. A foresight
+                    // day is an upper bound; a day with no baseline is a real
+                    // household, and a fleet of them means the saving figure
+                    // above rests on simulations.
+                    _ if day.foresight_was_perfect => summary.foresight_days += 1,
+                    _ => summary.unmeasurable_days += 1,
+                }
+                // The forecast scores merge as **episodes**: one day is one
+                // draw, whatever its slot count. A day nobody scored contributes
+                // nothing rather than an episode that scored zero.
+                if let Some(f) = day.forecast {
+                    pv = pv.merge(one_episode(f.pv_coverage, f.pv_crps));
+                    load = load.merge(one_episode(f.load_coverage, f.load_crps));
                 }
                 if !day.respected_the_grid {
                     summary.breached.push(Finding {
@@ -202,6 +234,18 @@ pub struct Summary {
     pub measured_days: usize,
     /// How many were run with the weather known in advance and left out.
     pub foresight_days: usize,
+    /// How many carried **no baseline**, and were therefore left out too.
+    ///
+    /// A baseline is what the day would have cost with no energy manager, and it
+    /// is a counterfactual: only a simulator can re-run a day as an unmanaged
+    /// house. So a box on a wall reports none, and every day from real hardware
+    /// lands here (D116).
+    ///
+    /// Reported rather than hidden, because `measured_days` silently excluding
+    /// most of the fleet is exactly the shape of a number that reads as a
+    /// measurement and is not one. A summary where this is large and
+    /// `measured_days` is small is a saving figure computed from simulations.
+    pub unmeasurable_days: usize,
 
     /// The mean saving per measured day, euros.
     pub saving_eur: f64,
@@ -264,32 +308,25 @@ mod tests {
             site: site.into(),
             date: on,
             self_sufficiency: 0.5,
-            cost: CostBreakdown {
-                energy_eur: 20.0,
-                ..CostBreakdown::default()
-            },
-            baseline: CostBreakdown {
-                energy_eur: 22.0,
-                ..CostBreakdown::default()
-            },
-            pv_coverage: 0.8,
-            pv_crps: 100.0,
-            load_coverage: 0.8,
-            load_crps: 20.0,
+            economics: Some(hems_core::report::Economics {
+                cost: CostBreakdown {
+                    energy_eur: 20.0,
+                    ..CostBreakdown::default()
+                },
+                baseline: CostBreakdown {
+                    energy_eur: 22.0,
+                    ..CostBreakdown::default()
+                },
+            }),
+            forecast: Some(hems_core::report::ForecastScores {
+                pv_coverage: 0.8,
+                pv_crps: 100.0,
+                load_coverage: 0.8,
+                load_crps: 20.0,
+            }),
+            respected_the_grid: true,
             ..DayKpis::default()
         }
-    }
-
-    #[test]
-    fn an_average_is_what_a_saving_figure_is() {
-        let mut fleet = Fleet::new(60);
-        fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
-        fleet.record(day("b", date!(2026 - 02 - 27)), NOW);
-        let summary = fleet.summarise(NOW, SILENT_AFTER);
-        assert_eq!(summary.sites, 2);
-        assert_eq!(summary.days, 2);
-        assert!((summary.saving_eur - 2.0).abs() < 1e-9);
-        assert!(summary.is_clean());
     }
 
     #[test]
@@ -319,10 +356,16 @@ mod tests {
         fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
         let mut cheat = day("a", date!(2026 - 02 - 28));
         cheat.foresight_was_perfect = true;
-        cheat.cost = CostBreakdown {
-            energy_eur: 10.0,
-            ..CostBreakdown::default()
-        };
+        cheat.economics = Some(hems_core::report::Economics {
+            cost: CostBreakdown {
+                energy_eur: 10.0,
+                ..CostBreakdown::default()
+            },
+            baseline: CostBreakdown {
+                energy_eur: 22.0,
+                ..CostBreakdown::default()
+            },
+        });
         fleet.record(cheat, NOW);
 
         let summary = fleet.summarise(NOW, SILENT_AFTER);
@@ -343,10 +386,16 @@ mod tests {
         let mut fleet = Fleet::new(60);
         fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
         let mut restated = day("a", date!(2026 - 02 - 27));
-        restated.cost = CostBreakdown {
-            energy_eur: 21.0,
-            ..CostBreakdown::default()
-        };
+        restated.economics = Some(hems_core::report::Economics {
+            cost: CostBreakdown {
+                energy_eur: 21.0,
+                ..CostBreakdown::default()
+            },
+            baseline: CostBreakdown {
+                energy_eur: 22.0,
+                ..CostBreakdown::default()
+            },
+        });
         fleet.record(restated, NOW);
 
         let summary = fleet.summarise(NOW, SILENT_AFTER);
@@ -424,5 +473,124 @@ mod tests {
         assert_eq!(summary.sites, 0);
         assert!((summary.saving_eur - 0.0).abs() < f64::EPSILON);
         assert!(summary.is_clean());
+    }
+}
+
+#[cfg(test)]
+mod what_a_real_box_reports {
+    use super::*;
+    use hems_core::report::ForecastScores;
+
+    const NOW: OffsetDateTime = time::macros::datetime!(2026-01-16 08:00:00 UTC);
+    const SILENT_AFTER: time::Duration = time::Duration::days(2);
+
+    /// A day from hardware: what happened, and no counterfactual.
+    fn from_a_box(site: &str, day: u8) -> DayKpis {
+        DayKpis {
+            site: site.into(),
+            date: Date::from_calendar_date(2026, time::Month::January, day).unwrap(),
+            imported_kwh: 14.2,
+            self_sufficiency: 0.31,
+            // No `economics`: five of the six cost terms are modelled and the
+            // baseline is a counterfactual. A box meters, and reports what it
+            // metered.
+            ..DayKpis::default()
+        }
+    }
+
+    /// A day from the simulator: it modelled the money and scored its bands.
+    fn from_the_simulator(site: &str, day: u8) -> DayKpis {
+        DayKpis {
+            economics: Some(hems_core::report::Economics {
+                cost: hems_core::plan::CostBreakdown {
+                    energy_eur: 21.08,
+                    ..Default::default()
+                },
+                baseline: hems_core::plan::CostBreakdown {
+                    energy_eur: 24.12,
+                    ..Default::default()
+                },
+            }),
+            forecast: Some(ForecastScores {
+                pv_coverage: 0.8,
+                pv_crps: 100.0,
+                load_coverage: 0.8,
+                load_crps: 20.0,
+            }),
+            ..from_a_box(site, day)
+        }
+    }
+
+    #[test]
+    fn a_fleet_of_real_boxes_reports_no_saving_rather_than_a_saving_of_zero() {
+        // The failure this exists to prevent. Every day from hardware carries no
+        // baseline, so a fleet that treated a missing one as zero would divide a
+        // real saving by a denominator full of households that never had a
+        // counterfactual — and publish a number that gets smaller the more
+        // customers there are.
+        let mut fleet = Fleet::new(60);
+        for i in 0..5 {
+            fleet.record(from_a_box(&format!("haus-{i}"), 15), NOW);
+        }
+        let summary = fleet.summarise(NOW, SILENT_AFTER);
+
+        assert_eq!(summary.days, 5);
+        assert_eq!(summary.measured_days, 0, "none of them may be averaged");
+        assert_eq!(summary.unmeasurable_days, 5, "and the summary says so");
+        assert_eq!(
+            summary.foresight_days, 0,
+            "for a different reason than this"
+        );
+        assert!(
+            (summary.saving_eur - 0.0).abs() < f64::EPSILON,
+            "a mean over nothing is zero, and `measured_days` is what says it is \
+             a mean over nothing"
+        );
+    }
+
+    #[test]
+    fn an_unscored_day_does_not_drag_the_calibration_down() {
+        // Boxes report no forecast score; the simulator does. Merging the boxes
+        // as episodes that scored zero would put the fleet's coverage at 0,17
+        // and call it a measurement.
+        let mut fleet = Fleet::new(60);
+        fleet.record(from_the_simulator("sim", 15), NOW);
+        for i in 0..5 {
+            fleet.record(from_a_box(&format!("haus-{i}"), 15), NOW);
+        }
+        let summary = fleet.summarise(NOW, SILENT_AFTER);
+
+        assert_eq!(
+            summary.forecast_episodes, 1,
+            "one day was scored, so there is one draw"
+        );
+        assert!(
+            (summary.pv_coverage - 0.8).abs() < 1e-9,
+            "and the coverage is that day's, not it divided by six: {}",
+            summary.pv_coverage
+        );
+    }
+
+    #[test]
+    fn the_two_exclusions_are_counted_apart() {
+        // They mean different things. A foresight day is an upper bound nobody
+        // can reach; a day with no baseline is a real household. A summary that
+        // added them would hide which of the two a small `measured_days` meant.
+        let mut fleet = Fleet::new(60);
+        fleet.record(from_the_simulator("sim-1", 15), NOW);
+        fleet.record(
+            DayKpis {
+                foresight_was_perfect: true,
+                ..from_the_simulator("sim-2", 15)
+            },
+            NOW,
+        );
+        fleet.record(from_a_box("haus-1", 15), NOW);
+
+        let summary = fleet.summarise(NOW, SILENT_AFTER);
+        assert_eq!(summary.days, 3);
+        assert_eq!(summary.measured_days, 1);
+        assert_eq!(summary.foresight_days, 1);
+        assert_eq!(summary.unmeasurable_days, 1);
     }
 }

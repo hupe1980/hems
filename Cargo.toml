@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hems-core", "crates/hems-device", "crates/hems-drv", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-service", "crates/hems-sim", "services/fleetd", "services/forecastd", "services/hemsd", "services/histd", "services/obsd", "services/tariffd", "xtask"]
+members = ["crates/hems-core", "crates/hems-device", "crates/hems-drv", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-service", "crates/hems-sim", "services/agentd", "services/fleetd", "services/forecastd", "services/hemsd", "services/histd", "services/obsd", "services/tariffd", "xtask"]
 
 [workspace.package]
 version      = "0.1.0"
@@ -19,6 +19,9 @@ time         = { version = "0.3", features = ["std", "macros", "parsing", "forma
 rust_decimal = { version = "1", features = ["macros"] }
 uuid         = { version = "1", features = ["v4", "v7", "serde"] }
 tracing      = "0.1"
+# The advisory runtime `agentd` is built on: durable, replayable, and the
+# journal is the plan of record. `redb` is the embedded store one instance uses.
+agentplane   = { version = "0.26", default-features = false, features = ["redb", "manifest"] }
 anyhow       = "1"
 toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
@@ -97,6 +100,16 @@ axum         = { version = "0.8", default-features = false, features = ["http1",
 # resolution to notice — two providers in one binary is a runtime panic.
 reqwest      = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "json", "charset"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std", "ansi"] }
+# The Model Context Protocol. Every fleet daemon mounts a **read-only** tool
+# surface at `/mcp` on the socket it already binds, so an agent reads the same
+# numbers an operator does — and is told what they mean, which is the part a
+# REST route does not carry.
+#
+# Server side only. A daemon that could *call* a model is a daemon whose answers
+# depend on one, and none of these answers may.
+rmcp         = { version = "3", default-features = false, features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+schemars     = { version = "1", default-features = false, features = ["derive"] }
+tokio-util   = { version = "0.7", default-features = false }
 # The box's own store. SQLite `bundled`, so a gateway image needs no system
 # library and a `cargo test` needs no server — and because `meterstore`, which is
 # the *fleet's* history, is PostgreSQL and Iceberg and is not something a
@@ -110,6 +123,7 @@ rusqlite     = { version = "0.40", features = ["bundled", "time"] }
 # public key is 32, and a gateway box verifies one in microseconds.
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "fast", "zeroize"] }
 sha2          = { version = "0.11", default-features = false, features = ["alloc"] }
+http         = "1"
 hex           = { version = "0.4", default-features = false, features = ["std"] }
 # The box→fleet link, signed. `hmac` over the `sha2` above rather than a
 # hand-rolled construction: HMAC is fifteen lines and every one of them is a

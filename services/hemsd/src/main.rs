@@ -396,8 +396,8 @@ async fn main() -> anyhow::Result<()> {
             // point: the household's own record must not depend on a fleet
             // endpoint being up, and the day a network operator asks about is
             // exactly the day the link was down.
-            if let Some(path) = store {
-                record_day(&path, &result, time::OffsetDateTime::now_utc())?;
+            if let Some(path) = &store {
+                record_day(path, &result, time::OffsetDateTime::now_utc())?;
             }
             if let Some(url) = report_to {
                 let secret = report_secret.ok_or_else(|| {
@@ -411,8 +411,10 @@ async fn main() -> anyhow::Result<()> {
                     secret.as_bytes(),
                     &site,
                     &result.kpis(&site, scenario.date),
+                    store.as_deref(),
                     time::OffsetDateTime::now_utc(),
-                )?;
+                )
+                .await?;
             }
         }
         Command::Backtest { day, days, json } => {
@@ -523,11 +525,16 @@ fn record_day(
 
 /// Send one day's KPIs to an `obsd`, as a signed CloudEvent.
 ///
-/// A blocking POST from a command that has already finished: the day is over,
-/// there is nothing to overlap it with, and a `tokio` runtime spun up to send
-/// one request would be machinery for nothing. A failure is **reported and not
-/// fatal** — a box whose fleet endpoint is down has still managed its household
-/// correctly, and exiting non-zero would say otherwise.
+/// A failure is **reported and not fatal** — a box whose fleet endpoint is down
+/// has still managed its household correctly, and exiting non-zero would say
+/// otherwise.
+///
+/// # A failed send is a queued day, where there is somewhere to queue it
+///
+/// With a `--store` the day is written to the outbox **before** the attempt, so
+/// a fleet that is down costs a delay rather than a day; `hemsd run`'s drain
+/// picks it up. Without one there is nowhere to put it, and the failure is the
+/// end of that day — which is why `--store` is what a household runs with.
 ///
 /// # Why the message id is the site and the day
 ///
@@ -536,11 +543,12 @@ fn record_day(
 /// identifier would make the *same* correction a different message every time,
 /// so the identifier is derived from what the report is about, and the receiver
 /// de-duplicates on the same string the signature covers.
-fn report_day(
+async fn report_day(
     url: &str,
     secret: &[u8],
     site: &str,
     kpis: &hems_core::report::DayKpis,
+    store: Option<&std::path::Path>,
     now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
     let event = hems_events::Event::new(
@@ -552,19 +560,44 @@ fn report_day(
     )
     .about(kpis.date.to_string());
     let body = event.to_bytes()?;
-    let signature = hems_events::webhook::sign(secret, &event.id, now, &body);
     let endpoint = format!("{}/v1/days", url.trim_end_matches('/'));
     // Checked before the day is built into a request, and it is the one failure
     // here that is **fatal**: a fleet endpoint that is down costs a dashboard,
     // and one that is plaintext costs the household's privacy every day until
     // somebody notices.
     hemsd::report::is_confidential(&endpoint)?;
-    match hemsd::report::post_event(&endpoint, body, &signature.headers()) {
-        Ok(status) => {
+
+    // Queued first. The order is the same one the evidence record uses and for
+    // the same reason: what is written down survives the send failing, and what
+    // is only in flight does not.
+    let queued = match store {
+        Some(path) => {
+            let mut store = hemsd::store::Store::open(path)?;
+            Some(store.queue_event(&event.id, hems_events::SITE_DAY_REPORTED, &body, now)?)
+        }
+        None => None,
+    };
+
+    let signature = hems_events::webhook::sign(secret, &event.id, now, &body);
+    match hemsd::report::post_event(&endpoint, body, &signature.headers()).await {
+        Ok(status) if (200..300).contains(&status) => {
             println!("\n  reported to {endpoint} — HTTP {status}");
+            if let (Some(path), Some(id)) = (store, queued) {
+                // Taken, so out of the backlog — by the row identifier the queue
+                // handed back rather than by a search through it, which on a box
+                // with a real backlog would not find the row it had just added.
+                hemsd::store::Store::open(path)?.mark_sent(&[id], now)?;
+            }
+        }
+        Ok(status) => {
+            eprintln!("\n  {endpoint} answered HTTP {status}");
+            eprintln!("  the day is queued and `hemsd run` will try again");
         }
         Err(e) => {
             eprintln!("\n  could not report to {endpoint}: {e}");
+            if store.is_some() {
+                eprintln!("  the day is queued and `hemsd run` will try again");
+            }
         }
     }
     Ok(())

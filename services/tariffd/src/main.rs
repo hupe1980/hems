@@ -97,11 +97,25 @@ async fn main() -> anyhow::Result<()> {
         signal.clone(),
     ));
 
+    // The two surfaces answer from the same cache, so they cannot disagree. The
+    // MCP one is off unless an operator switched it on: an endpoint that speaks
+    // to whatever can reach it is one somebody should have to ask for.
+    let mut app = router(Prices::new(cache.clone()));
+    if settings.mcp.enabled {
+        let auth = hems_service::McpAuth::gated(&settings.mcp)?;
+        app = app.merge(tariffd::mcp_server::router(
+            Arc::new(tariffd::mcp_server::State { cache }),
+            auth,
+            hems_service::mcp::cancel_on(&signal),
+        ));
+        tracing::info!("the Model Context Protocol surface is mounted at /mcp");
+    }
+
     Server::new(
         hems_service::identity!(),
         settings.service.clone(),
         health,
-        router(Prices::new(cache)),
+        app,
     )
     .run_until(signal)
     .await?;

@@ -16,8 +16,14 @@ rust-version.workspace = true
 anyhow             = { workspace = true }
 ed25519-dalek      = { workspace = true }
 hex                = { workspace = true }
+http               = { workspace = true }
 sha2               = { workspace = true }
 axum               = { workspace = true }
+# The Model Context Protocol surface every fleet daemon mounts at `/mcp`.
+# Server side only: a daemon that could *call* a model is a daemon whose answers
+# depend on one, and none of these answers may.
+rmcp               = { workspace = true }
+tokio-util         = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }

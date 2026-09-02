@@ -10,7 +10,15 @@ repository.workspace   = true
 rust-version.workspace = true
 
 [dependencies]
+rusqlite     = { workspace = true }
 hems-service = { workspace = true }
+# The Model Context Protocol surface at `/mcp`, on the socket this daemon
+# already binds. Read-only tools: an agent may read what an operator reads and
+# may move nothing.
+http           = { workspace = true }
+rmcp          = { workspace = true }
+schemars      = { workspace = true }
+tokio-util    = { workspace = true }
 
 anyhow        = { workspace = true }
 axum          = { workspace = true }

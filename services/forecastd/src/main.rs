@@ -57,11 +57,23 @@ async fn main() -> anyhow::Result<()> {
         signal.clone(),
     ));
 
+    // The two surfaces answer from the same runs, so they cannot disagree.
+    let mut app = router(Weather::new(runs.clone()));
+    if settings.mcp.enabled {
+        let auth = hems_service::McpAuth::gated(&settings.mcp)?;
+        app = app.merge(forecastd::mcp_server::router(
+            Arc::new(forecastd::mcp_server::State { runs }),
+            auth,
+            hems_service::mcp::cancel_on(&signal),
+        ));
+        tracing::info!("the Model Context Protocol surface is mounted at /mcp");
+    }
+
     Server::new(
         hems_service::identity!(),
         settings.service.clone(),
         health,
-        router(Weather::new(runs)),
+        app,
     )
     .run_until(signal)
     .await?;

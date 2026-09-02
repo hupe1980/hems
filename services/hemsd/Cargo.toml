@@ -51,11 +51,12 @@ metering       = { workspace = true }
 anyhow       = { workspace = true }
 axum         = { workspace = true }
 clap         = { version = "4", features = ["derive", "env"] }
-# The box's one outbound call. `blocking`, because `simulate` is a command that
-# has already finished by the time it reports — the runtime arrives properly when
-# the daemon grows its driver tasks. Taken from the workspace so the box and the
-# fleet share one HTTP client and one TLS provider (D84, D85).
-reqwest      = { workspace = true, features = ["blocking"] }
+# The box's one outbound call, on the **async** client. `main` is
+# `#[tokio::main]`, so every command runs inside a runtime, and
+# `reqwest::blocking` builds a runtime of its own that panics when dropped in an
+# asynchronous context (D115). Taken from the workspace so the box and the fleet
+# share one HTTP client and one TLS provider (D84, D85).
+reqwest      = { workspace = true }
 rusqlite     = { workspace = true }
 rust_decimal = { workspace = true }
 serde        = { workspace = true }

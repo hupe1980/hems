@@ -131,6 +131,12 @@ pub struct Managed {
     /// number: the residual it exists to learn is the roof's, and comparing a
     /// cloudy afternoon with a clear-sky model would teach it the weather.
     pub modelled_pv: Arc<tokio::sync::RwLock<BTreeMap<Slot, f64>>>,
+    /// The bands the standing plan was made against, for the box to score
+    /// itself once each slot has happened.
+    ///
+    /// The forecast that was **acted on**, not a fresh one: a score of a band
+    /// nobody planned against says nothing about the plan (D117).
+    pub bands: Arc<tokio::sync::RwLock<crate::runtime::day::PublishedBands>>,
 }
 
 /// The state this loop shares with the rest of the box.
@@ -206,6 +212,12 @@ pub async fn run(
         phases: BTreeMap::new(),
         delivered: BTreeMap::new(),
         delivered_slot: Slot::containing(started),
+        local_day: metering::calendar::local_day(started),
+        // A box that has just started did not watch the earlier part of today,
+        // and saying so is the difference between "nothing went wrong" and
+        // "nobody was looking" (D116).
+        unplanned: crate::runtime::day::Unplanned::resumed(),
+        scored: crate::runtime::day::Scored::default(),
         overruns: 0,
         pv_wh: 0.0,
         load_wh: 0.0,
@@ -415,6 +427,84 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
 /// register written with a zero anzulegender Wert would settle a month at the
 /// wrong figure and look complete while doing it, so a slot with no price is a
 /// slot with no register: skipped, and said out loud once.
+/// Queue the day's report where a Berlin calendar day has just ended.
+///
+/// Called on the quarter-hour boundary and does nothing on the other ninety-five
+/// of them. The day is built from the rows this loop already wrote rather than
+/// from a counter, so a box that restarted at half past eleven still reports the
+/// whole day — see [`crate::runtime::day`].
+///
+/// A failure is logged and not fatal. What is at stake is a fleet dashboard; the
+/// household's own `[A1 7.3]` record is already written, and a box that stopped
+/// controlling a house because a report could not be queued would have the
+/// priorities exactly backwards.
+async fn close_the_day(
+    managed: &Managed,
+    carried: &mut Carried,
+    store: Option<&Arc<Mutex<crate::store::Store>>>,
+    now: OffsetDateTime,
+) {
+    let today = metering::calendar::local_day(now);
+    if today == carried.local_day {
+        return;
+    }
+    let finished = carried.local_day;
+    carried.local_day = today;
+    let unplanned = carried.unplanned;
+    let scored = carried.scored.clone();
+    carried.unplanned.roll();
+    carried.scored.roll();
+
+    let Some(store) = store else {
+        // No store is already an error the loop reports once at start-up: a
+        // § 14a household that cannot keep its two years is the bigger problem,
+        // and this one is downstream of it.
+        return;
+    };
+
+    let site = managed.site.id.to_string();
+    let mut guard = store.lock().await;
+    let built = crate::runtime::day::kpis(&guard, &site, finished, unplanned, &scored);
+    match built {
+        Ok(Some(day)) => {
+            let event = hems_events::Event::new(
+                hems_events::SITE_DAY_REPORTED,
+                format!("hems://sites/{site}"),
+                // Derived from what the report is *about*, so a box that
+                // recomputes a day is correcting one message rather than
+                // sending a second (D110).
+                format!("{site}:{finished}"),
+                now,
+                &day,
+            )
+            .about(finished.to_string());
+            match event.to_bytes() {
+                Ok(body) => {
+                    if let Err(error) =
+                        guard.queue_event(&event.id, hems_events::SITE_DAY_REPORTED, &body, now)
+                    {
+                        tracing::error!(%error, %finished, "the day report could not be queued");
+                    } else {
+                        tracing::info!(
+                            %finished,
+                            imported_kwh = day.imported_kwh,
+                            control_events = day.control_events,
+                            "the day is closed and queued for the fleet"
+                        );
+                    }
+                }
+                Err(error) => tracing::error!(%error, %finished, "the day would not serialise"),
+            }
+        }
+        Ok(None) => tracing::info!(
+            %finished,
+            "no register for that day, so nothing to report — a box that was off \
+             is not a household that used nothing"
+        ),
+        Err(error) => tracing::error!(%error, %finished, "the day could not be built"),
+    }
+}
+
 async fn register(
     managed: &Managed,
     carried: &Carried,
@@ -482,7 +572,7 @@ async fn register(
 async fn teach(
     managed: &Managed,
     learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
-    carried: &Carried,
+    carried: &mut Carried,
     period: std::time::Duration,
 ) {
     if carried.samples == 0 {
@@ -513,6 +603,16 @@ async fn teach(
         .lock()
         .await
         .observe(carried.delivered_slot, modelled, pv, load);
+
+    // The same truth, scored against the band the plan was actually made
+    // against. This is the one half of the fleet's forecast picture a box can
+    // produce honestly, and without it twenty independent *real* days would
+    // never reach `obsd` — so `forecast_is_calibrated` could only ever be true
+    // of simulations (D117).
+    let published = managed.bands.read().await;
+    carried
+        .scored
+        .observe(published.get(&carried.delivered_slot), pv, load.get());
 }
 
 /// What one tick hands to the next.
@@ -525,6 +625,12 @@ struct Carried {
     delivered: BTreeMap<AssetId, Energy>,
     /// Which quarter hour that is.
     delivered_slot: Slot,
+    /// Which Berlin calendar day the loop is in, so the end of one is noticed.
+    local_day: time::Date,
+    /// Minutes the arbiter has spent on the fallback today.
+    unplanned: crate::runtime::day::Unplanned,
+    /// How today's forecasts have scored against what actually happened.
+    scored: crate::runtime::day::Scored,
     /// How many ticks have overrun their period.
     overruns: u64,
     /// Production accumulated over the quarter hour in progress, watt-hours.
@@ -578,6 +684,9 @@ async fn tick(
     if slot != carried.delivered_slot {
         teach(managed, learned, carried, period).await;
         register(managed, carried, prices, store).await;
+        // After the register, because the day being closed is built from the
+        // rows this loop has written — including the one that was just written.
+        close_the_day(managed, carried, store, now).await;
         carried.delivered.clear();
         carried.samples = 0;
         carried.pv_wh = 0.0;
@@ -588,6 +697,15 @@ async fn tick(
         carried.device_feed_wh = 0.0;
         carried.delivered_slot = slot;
     }
+
+    // Counted here rather than derived from the plan's age on the screen: the
+    // screen answers "how stale is the plan now", and the fleet asks "how much
+    // of the day did this box spend without one" — which is a sum over ticks and
+    // cannot be recovered from a single instant (D116).
+    carried.unplanned.tick(
+        plan.is_some(),
+        u32::try_from(period.as_secs()).unwrap_or(u32::MAX),
+    );
 
     // ── 1. What the drivers said ────────────────────────────────────────────
     let observed: Observed = {

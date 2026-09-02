@@ -19,23 +19,31 @@ pub struct Settings {
     /// A box reports once a day, so two days is a box that has missed one and
     /// then missed another — which is a fault rather than a late night.
     pub silent_after_s: u64,
-    /// The secrets a box's report may be signed with.
+    /// The secret each household's box signs its day report with, by site.
     ///
-    /// A **list** rather than one, because rotation is the reason a signature
-    /// scheme has a version prefix: an operator publishes a new secret, both are
-    /// accepted for a window, the old one is withdrawn. Order does not matter —
-    /// [`hems_events::webhook::verify`] tries all of them.
+    /// **One key per box, not one for the fleet.** A signature proves the bytes
+    /// were not edited; it proves *who sent them* only if the sender holds a key
+    /// nobody else does. With a shared secret any box could report a day
+    /// attributed to any site — and what that writes to is `breached`, the named
+    /// list of households that did not respect a network operator's reduction
+    /// (D114).
+    ///
+    /// The list per site is rotation, which is the reason a signature scheme has
+    /// a version prefix: an operator publishes a new secret, both are accepted
+    /// for a window, the old one is withdrawn. Order does not matter —
+    /// [`hems_events::webhook::verify`] tries all of them without
+    /// short-circuiting, so how long a check takes says nothing about which one
+    /// is live.
     ///
     /// Empty means the service accepts **nothing**, and that is deliberate. An
     /// unconfigured receiver that accepted unsigned reports would be an open
-    /// write endpoint onto the list of households that did not respect a network
-    /// operator's reduction, and the deployment where somebody forgot the
-    /// environment variable is exactly the one nobody would notice.
+    /// write endpoint onto that same list, and the deployment where somebody
+    /// forgot the environment variable is exactly the one nobody would notice.
     ///
     /// Each is a [`hems_service::Secret`], so the usual deployment writes
-    /// `["env:HEMS_OBSD_WEBHOOK_SECRET"]` or `["file:/run/secrets/webhook"]`
-    /// and the credential never enters the configuration file at all.
-    pub webhook_secrets: Vec<hems_service::Secret>,
+    /// `haus-1 = ["env:HEMS_OBSD_SECRET_HAUS_1"]` and the credential never
+    /// enters the configuration file at all.
+    pub webhook_secrets: std::collections::BTreeMap<String, Vec<hems_service::Secret>>,
     /// Tokens that may **read** the fleet view.
     ///
     /// `/v1/fleet` and `/v1/sites/{site}` carry what every household spent,
@@ -46,14 +54,32 @@ pub struct Settings {
     ///
     /// Empty means nothing is served, for the same reason an empty
     /// [`Settings::webhook_secrets`] accepts nothing.
+    ///
+    /// Which households each tenant covers.
+    ///
+    /// A shared deployment hosting several operators names each one's
+    /// households here, and an operator credential names the tenant it belongs
+    /// to. A single-tenant deployment leaves this empty and writes
+    /// `tenant = "*"` on its credential, which is the same reach stated out
+    /// loud rather than arrived at by omission (D112).
     #[serde(default)]
-    pub operator_tokens: Vec<hems_service::Secret>,
+    pub tenants: std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// The operator credentials, each scoped to a tenant.
+    #[serde(default)]
+    pub operators: Vec<hems_service::OperatorCredential>,
     /// How far a report's signing timestamp may be from this service's clock,
     /// seconds.
     ///
     /// The replay bound rather than a clock-skew allowance: a captured request
     /// stops working once it is outside this window.
     pub webhook_tolerance_s: u64,
+    /// The Model Context Protocol surface, off by default.
+    ///
+    /// It holds a household's data, so a token is **required** when it is
+    /// switched on and the surface answers as whatever authority that token
+    /// already carries here — an operator, or one site.
+    #[serde(default)]
+    pub mcp: hems_service::McpSettings,
 }
 
 impl Default for Settings {
@@ -62,11 +88,13 @@ impl Default for Settings {
             service: hems_service::Settings::default(),
             keep_days: 60,
             silent_after_s: 2 * 24 * 3600,
-            webhook_secrets: Vec::new(),
-            operator_tokens: Vec::new(),
+            webhook_secrets: std::collections::BTreeMap::new(),
+            tenants: std::collections::BTreeMap::new(),
+            operators: Vec::new(),
             webhook_tolerance_s: hems_events::webhook::DEFAULT_TOLERANCE
                 .whole_seconds()
                 .unsigned_abs(),
+            mcp: hems_service::McpSettings::default(),
         }
     }
 }

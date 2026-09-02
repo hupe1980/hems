@@ -182,16 +182,37 @@ msrv:
 # demonstration secret in a justfile is a demonstration secret; a real one comes
 # from the enrolment.
 #
+# 🤖 What the advisory plane says about a fleet, and the replay that proves it
+agent-demo:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo test -q -p agentd 2>&1 | tail -3
+    @echo
+    @echo "  The specialists are pure functions; the journal is why they run on a"
+    @echo "  runtime. A replay re-executes the logic and reads every effect back,"
+    @echo "  so \"why did the queue say that in March\" is a replay rather than an"
+    @echo "  argument — and nothing an agent says moves a watt."
+
 # 🛰️ One box reporting a day into the fleet view
 fleet-demo day="winter":
     #!/usr/bin/env bash
     set -uo pipefail
     cargo build -q -p obsd -p hemsd
     conf="$(mktemp -t obsd-demo-XXXXXX.toml)"
-    # The secret is a *reference*: `obsd` reads it from the environment, so the
+    # One signing key **per household**, because a signature over a shared secret
+    # says the bytes were not edited and nothing about who sent them (D114). The
+    # secret is a *reference*: `obsd` reads it from the environment, so the
     # credential is not in the file even in a demonstration.
-    printf 'webhook_secrets = ["env:HEMS_OBSD_WEBHOOK_SECRET"]\noperator_tokens = ["env:HEMS_OBSD_OPERATOR_TOKEN"]\n' > "$conf"
-    HEMS_OBSD_WEBHOOK_SECRET=whsec_fleet-demo HEMS_OBSD_OPERATOR_TOKEN=tok-demo \
+    cat > "$conf" <<'TOML'
+    [webhook_secrets]
+    reference-household = ["env:HEMS_OBSD_SECRET_REFERENCE_HOUSEHOLD"]
+
+    [[operators]]
+    token  = "env:HEMS_OBSD_OPERATOR_TOKEN"
+    tenant = "*"
+    TOML
+    sed -i'' -e 's/^    //' "$conf"
+    HEMS_OBSD_SECRET_REFERENCE_HOUSEHOLD=whsec_fleet-demo HEMS_OBSD_OPERATOR_TOKEN=tok-demo \
         ./target/debug/obsd --config "$conf" &
     obsd=$!
     trap 'kill $obsd 2>/dev/null; rm -f "$conf"' EXIT
@@ -200,8 +221,17 @@ fleet-demo day="winter":
         ./target/debug/hemsd simulate --day {{ day }} --report-to http://127.0.0.1:8080
     echo
     echo "  ── the fleet view ──"
-    curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet
-    echo
+    view="$(curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet)"
+    echo "$view"
+    # Checked, not merely printed. This demonstration ran for months with a
+    # panic in it — `reqwest::blocking` dropped inside `#[tokio::main]` (D115) —
+    # and nothing noticed, because printing a summary with no sites in it looks
+    # like output. A demonstration that asserts nothing is a test that cannot
+    # fail, which is the failure this workspace keeps finding in itself.
+    case "$view" in
+        *'"sites":1'*) ;;
+        *) echo "  ✗ the day did not reach the fleet view"; exit 1 ;;
+    esac
     echo "  ── readiness, which names every dependency and when it was last good ──"
     curl -s localhost:8080/readyz
     echo

@@ -176,6 +176,24 @@ every_s = 300
 # in one burst is how a fleet service falls over the morning a region comes back.
 batch = 50
 
+# ── How the day went ─────────────────────────────────────────────────────────
+#
+# One signed CloudEvent per day to `obsd`. It goes through the same store as the
+# evidence and for the same reason: what is written down survives the send
+# failing, and what is only in flight does not. A fleet that is down therefore
+# costs a delay rather than a day, and the drain above carries both.
+#
+# The signature is made at each attempt rather than stored — Standard Webhooks
+# covers the timestamp and `obsd` refuses one older than five minutes, so a box
+# back from an overnight outage would otherwise present a backlog of stale ones.
+[obsd]
+url = "https://obsd.internal:7780"
+# A **signature** secret, not a bearer token. What `obsd` holds is the list of
+# households that did not respect a network operator's reduction, so an
+# unauthenticated write can put a compliant site on it. A token says who is
+# asking; a signature says what was said.
+secret = "env:HEMS_OBSD_SECRET"
+
 # ── How the box presents itself on the EEBUS network ─────────────────────────
 #
 # Its SKI is printed by `hemsd run --check` and served on /v1/status. That is

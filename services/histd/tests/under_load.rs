@@ -86,7 +86,7 @@ async fn start(
         router(History::new(
             two_years_at(path),
             Arc::new(std::sync::Mutex::new(Db::at(path).connect().unwrap())),
-            Credentials::resolve(&sites, &[]).unwrap(),
+            Credentials::resolve(&sites, &std::collections::BTreeMap::new(), &[]).unwrap(),
         )),
     );
     tokio::spawn(async move { server.run_until(signal).await.unwrap() });
