@@ -194,10 +194,18 @@ pub struct Modul3Eligibility {
 }
 
 impl Modul3Eligibility {
-    /// Whether the customer may be billed under Modul 3.
+    /// Whether the customer may be billed under Modul 3 on `day`.
+    ///
+    /// Four conditions, not three. The three facts about the delivery point are
+    /// § 1's, and the fourth is the calendar: Modul 3 has only been orderable
+    /// from network operators since [`MODUL3_AVAILABLE_FROM`], so a definition
+    /// dated before it describes a tariff nobody could have been on. Leaving the
+    /// date out is how a curated calendar transcribed from a 2024 price sheet
+    /// passes an eligibility check and prices a year of somebody's electricity
+    /// against a module that did not exist.
     #[must_use]
-    pub const fn is_eligible(&self) -> bool {
-        self.has_modul_1 && self.has_imsys && !self.has_rlm
+    pub fn is_eligible_on(&self, day: time::Date) -> bool {
+        day >= MODUL3_AVAILABLE_FROM && self.has_modul_1 && self.has_imsys && !self.has_rlm
     }
 
     /// The same three facts, as the context `metering`'s assessment wants them.
@@ -233,6 +241,18 @@ mod tests {
             has_imsys: true,
             has_rlm: false,
         }
+    }
+
+    #[test]
+    fn modul_3_is_not_eligible_before_it_was_orderable() {
+        // A delivery point can satisfy every one of § 1's three conditions and
+        // still not have been on Modul 3, because network operators could not
+        // offer it before 01.04.2025. A calendar transcribed from an older
+        // price sheet is the way that mistake actually arrives.
+        let point = eligible();
+        assert!(!point.is_eligible_on(time::macros::date!(2025 - 03 - 31)));
+        assert!(point.is_eligible_on(MODUL3_AVAILABLE_FROM));
+        assert!(point.is_eligible_on(time::macros::date!(2026 - 01 - 15)));
     }
 
     #[test]
@@ -280,7 +300,7 @@ mod tests {
             has_modul_1: false,
             ..eligible()
         };
-        assert!(!point.is_eligible());
+        assert!(!point.is_eligible_on(time::macros::date!(2026 - 01 - 15)));
         let (verdict, findings) = calendar().assess(&point.as_context());
         assert_eq!(verdict, Modul3Conformance::Violates);
         assert!(

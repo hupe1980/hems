@@ -1,0 +1,249 @@
+# hemsd — the configuration of one household.
+#
+#   hemsd run --config /etc/hems/hemsd.toml
+#
+# Every value in [service], [control] and [site] below is the default, so a file
+# that sets none of them describes the reference household. The `[[drivers]]`
+# list has no default and `hemsd run` refuses to start without it: a box with no
+# drivers measures nothing, so the guard would assume every controllable device
+# was drawing its nameplate power, for ever.
+#
+# The environment overrides the file (`HEMS_HEMSD_…`), because the file is what
+# somebody wrote down last month and the environment is what an operator reaches
+# for when something is on fire.
+#
+# This file is parsed by a test in `config.rs`, so an example that has drifted
+# from the struct it documents fails the build rather than misleading an
+# installer.
+
+# The box's own two years, and what it has learned about its own house.
+#
+# [A1 7.3] documents a control event for two years and G3 says the house is
+# never worse off when the cloud is gone, so a record that exists only once it
+# has been uploaded is an intention with a network dependency. It is also where
+# the correction this roof has earned and this household's own quarter hours are
+# kept, and without it every reboot costs a fortnight of both.
+store_path = "/var/lib/hemsd/hemsd.sqlite"
+
+# ── The shell ────────────────────────────────────────────────────────────────
+[service]
+# Loopback, not 0.0.0.0. A daemon on a household gateway box is on the
+# household's own network, and a box that binds every interface by default is a
+# box that is exposed by default. Put a proxy in front of it to change that.
+listen = "127.0.0.1:8080"
+log_filter = "info"
+log_json = false
+shutdown_grace_s = 20
+
+# ── How fast the planes run ──────────────────────────────────────────────────
+[control]
+# The guard and the arbiter. The guard needs this as arithmetic and not only as
+# a schedule: a bound on a *state* — a backup reserve, a full battery — is only
+# a bound on a *rate* once you know how long the rate will be held for.
+tick_period_s = 1
+# The planner, on a receding horizon.
+replan_every_s = 300
+# Two days of quarter hours. One is not enough: a re-plan at six in the evening
+# on a one-day horizon is told there is no sun *and* no household tomorrow.
+horizon_slots = 192
+# What the solver may spend, seconds. 0 means "no limit", which is what a
+# household wants if it needs the same inputs to give the same plan every time.
+solve_budget_s = 10.0
+
+# ── The house ────────────────────────────────────────────────────────────────
+#
+# Every field carries its unit in its name. A configuration file is read by a
+# person with a clipboard standing in a cellar.
+# A size of zero describes a device of no size rather than the absence of one:
+# the site model always builds the same assets, so the arbiter still decides for
+# a 0 kWp roof and `/v1/status` still lists it under `undriven` if nothing speaks
+# for it.
+[site]
+pv_kwp = 9.8
+pv_ac_kw = 8.0
+battery_kwh = 10.0
+battery_kw = 5.0
+# Held back for a power cut. The planner never plans below it and the guard
+# bounds the discharge power so a whole control period cannot cross it.
+reserve_soc = 0.1
+# What a kilowatt-hour of throughput costs in battery life. Leave it at zero and
+# the plan will cycle the pack for a spread that does not cover the damage.
+battery_wear_eur_per_kwh = 0.08
+fuse_a = 35.0
+
+# The federal state whose public holidays decide a day type — a holiday counts
+# as a Sunday in a load profile, and Fronleichnam is a working day in Berlin and
+# is not in Bayern.
+bundesland = "BE"
+
+latitude = 52.52
+longitude = 13.4
+altitude_m = 34.0
+
+heat_pump_kw = 5.0
+heat_pump_modulating = true
+comfort_min_c = 20.0
+comfort_max_c = 23.0
+
+dhw_litres = 300.0
+dhw_heater_kw = 0.5
+
+# Almost every wallbox sold in Germany since about 2022 can drop to one
+# conductor, and it decides whether 2 kW of surplus charges a car or is
+# exported: three-phase charging cannot start below 4,14 kW.
+evse_switchable = true
+ev_charge_limit = 0.75
+
+# § 9 Abs. 2 EEG lifts the 60 % feed-in cap only after the network operator's
+# **first successful Ansteuerbarkeit test** — a different event on a different
+# clock from the meter being fitted. So this stays false until that test has
+# happened, however long the meter has been in the cupboard.
+imsys_control_device = false
+# When the intelligent metering system was fitted, which is § 51 EEG's clock:
+# from the end of that calendar year the plant earns nothing in a negative
+# quarter hour. Remove the line for a household that has no such meter.
+imsys_since = "2024-06-01"
+
+# The dishwasher's programme, as the average power in kW of each consecutive
+# quarter hour: heat, wash, wash, wash, dry, finish. Steps rather than a
+# duration and an average, because a planner given the average would schedule
+# 700 W into every sunny slot and no dishwasher will do that. Leave the list
+# empty for a household with nothing waiting.
+dishwasher_kw_steps = [2.0, 0.2, 0.2, 0.2, 1.8, 0.1]
+
+# ── What a kilowatt-hour costs and earns ─────────────────────────────────────
+#
+# Everything is **net** ct/kWh, because that is how a German price sheet is
+# written; the levies and the value-added tax are added on top from
+# `hems_tariff::Levies`.
+[tariff]
+# § 41a EnWG has obliged every supplier to offer a dynamic tariff since
+# 01.01.2025, and since 01.10.2025 the market time unit has been a quarter hour
+# — which is why this whole workspace plans in quarter hours.
+markup_ct_per_kwh = 3.0
+# What to assume past tomorrow's auction, and after an outage. A *flat* number,
+# which makes the plan indifferent about when to act out there — exactly the
+# state of knowledge.
+fallback_ct_per_kwh = 20.0
+# Set `fixed_ct_per_kwh` instead and the box stops asking `tariffd` for
+# anything: a household on a fixed tariff has no day-ahead curve to optimise
+# against, and shifting load for a spread it is not charged is not a saving. It
+# still plans against the roof, the battery and the § 14a ceiling.
+# fixed_ct_per_kwh = 28.5
+
+network_ct_per_kwh = 10.0
+# "none", "modul1" or "modul2". Modul 3 is deliberately not offered: it needs
+# the network operator's own Zählzeitdefinition, and this workspace will not
+# invent one.
+modul = "modul1"
+modul_1_reduction_eur_per_year = 120.0
+
+feed_in_ct_per_kwh = 7.86
+standing_charge_eur_per_year = 120.0
+
+# ── Where the box asks for prices and weather ────────────────────────────────
+#
+# Both optional, and a box with neither still runs: the guard and the arbiter
+# need nothing but measurements. What it loses is the plan — and it says so, on
+# `/v1/status` and on the readiness probe, rather than looking like a box that
+# is planning badly.
+[fleet]
+tariffd_url = "http://tariffd.internal:7380"
+forecastd_url = "http://forecastd.internal:7280"
+# Which of `forecastd`'s **configured** locations is this household's. A name
+# rather than a latitude: the sun position a production figure is computed from
+# has to be the one the irradiance was fetched at, so a box that could name its
+# own coordinates would be given somebody else's sky.
+location = "berlin"
+request_timeout_s = 10
+
+# ── Where the box forwards its own record ────────────────────────────────────
+#
+# The box records **first** and forwards second: [A1 7.3] gives a network
+# operator two years to ask about a control event, and the day they ask about is
+# the day the link was down. What has not been acknowledged stays in the store's
+# outbox, and forwarded is never deleted — the two years are the household's.
+[histd]
+url = "http://histd.internal:7580"
+site = "reference-household"
+# The *reference*, never the credential: one in a configuration file is one in
+# an image, in a backup and eventually in a repository.
+token = "env:HEMS_HISTD_TOKEN"
+# Slow on purpose. What is being forwarded is already safe on the box, so
+# urgency buys nothing but load on a service the household does not own.
+every_s = 300
+# A box that has been offline for a month has a month of backlog, and sending it
+# in one burst is how a fleet service falls over the morning a region comes back.
+batch = 50
+
+# ── How the box presents itself on the EEBUS network ─────────────────────────
+#
+# Its SKI is printed by `hemsd run --check` and served on /v1/status. That is
+# the number the metering point operator needs before a Steuerbox will trust
+# this box, and it follows the key — which lives in `store_path` above, so it is
+# the same number after a reboot and the pairing is done once.
+#
+# The Energy Guard is the network operator's box and it is the side that dials,
+# so the household **listens**. Without `listen` the § 14a driver runs its clock
+# and hears nothing, which `hemsd run` reports as an error rather than leaving
+# a household to believe it is participating.
+[ship]
+listen = "0.0.0.0:4712"
+# The certificate's common name — `<IANA PEN>_<vendor product id>` where there is
+# one. It is not the identity: that is the **SKI**, which follows the key, is
+# kept in the box's own store so it survives a reboot, and is printed at start-up
+# because it is what the metering point operator has to be given. Field reports
+# make that exchange the most common § 14a commissioning failure there is.
+ship_id = "hems_hems-1"
+# The Steuerbox's own SKI, as printed on it. A peer that is not here may still
+# complete TLS — it has to, so its SKI can be shown to a user — and is held short
+# of the data phase. Merged with whatever the store already trusts, so a pairing
+# done through a screen is not undone by a deployment that did not know about it.
+trust = []
+
+# ── What speaks to the hardware ──────────────────────────────────────────────
+#
+# One entry per device, and `asset` has to name an asset the site above has.
+# A driver for an asset that does not exist, two drivers for one asset, or a
+# controllable asset whose driver cannot take commands are all refused at
+# start-up rather than discovered months later by a limit that never arrived.
+
+# The inverter, over SunSpec on Modbus TCP.
+[[drivers]]
+kind = "sunspec"
+asset = "pv"
+address = "192.0.2.10:502"
+unit = 1
+poll_ms = 1000
+# Shorter than the guard's own `max_measurement_age`, or a device could be
+# silent for a whole control period while the guard still called its last
+# reading fresh.
+timeout_ms = 5000
+listens_only = false
+# SunSpec model 123 expresses a production ceiling as a percentage of the
+# rating, so a curtailment cannot be expressed at all without one.
+rating_kw = 8.0
+
+# The meter at the connection point. Read and never written — and the one
+# measurement every § 14a decision starts from: `[A1 2.3]` measures the
+# netzwirksamer Leistungsbezug *there*, and without it the guard has to close
+# its balance from the sub-meters alone, which understates the rest of the house
+# by exactly the loads nobody instrumented.
+[[drivers]]
+kind = "sunspec"
+asset = "netzanschluss-zaehler"
+address = "192.0.2.11:502"
+unit = 1
+listens_only = true
+
+# The network operator's Steuerbox, over EEBUS. The session it arrives on is
+# `[ship]` above.
+[[drivers]]
+kind = "eebus-lpc"
+asset = "netzanschluss"
+# Omit `failsafe_kw` and the box computes `[A1 4.5.2]`'s own minimum from the
+# site, which grows with the number of controllable devices. A vendor's flat
+# 4,2 kW on a household owed 10,5 kW gives away six kilowatts nobody asked for.
+failsafe_hours = 2
+spine_vendor = "n:hems"
+spine_unique = "hems-1"

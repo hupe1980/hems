@@ -35,6 +35,7 @@ use std::path::Path;
 use hems_core::prelude::{GuardRule, Power, Slot};
 use hems_grid::evidence::{ComplianceSample, ControlEvent};
 use hems_grid::mispel::QuarterHour;
+use rusqlite::OptionalExtension;
 use rusqlite::{Connection, params};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -94,6 +95,34 @@ pub enum StoreError {
 /// them with `sqlx::migrate!`; this is SQLite, so they are compiled in and the
 /// applied revision lives in SQLite's own `user_version`.
 const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_schema.sql"))];
+
+/// The box's EEBUS identity, as it is stored.
+///
+/// The SKI is derived from the key rather than stored beside it: two fields that
+/// can disagree about one identity is one field too many, and the derivation is
+/// `eebus::cert::ski_from_public_key`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredIdentity {
+    /// The SHIP ID the certificate carries as its common name.
+    pub ship_id: String,
+    /// The private key, PKCS#8 PEM.
+    pub key_pem: String,
+    /// The trusted peers, as `eebus::runtime::TrustStore`'s own JSON.
+    pub trusted: String,
+}
+
+impl core::fmt::Debug for StoredIdentity {
+    /// Never the key. It is the one value in this store whose leak would let
+    /// another device be this household to a network operator, and a `Debug`
+    /// that printed it would put it in the first log line somebody pastes into
+    /// a bug report.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("StoredIdentity")
+            .field("ship_id", &self.ship_id)
+            .field("trusted", &self.trusted)
+            .finish_non_exhaustive()
+    }
+}
 
 /// What has not reached the fleet yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -217,6 +246,122 @@ impl Store {
             ))?;
         }
         Ok(())
+    }
+
+    /// The box's EEBUS identity and the peers it trusts, if it has been given
+    /// one.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the read fails.
+    pub fn eebus_identity(&self) -> Result<Option<StoredIdentity>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT ship_id, key_pem, trusted FROM eebus_identity WHERE id = 1",
+                [],
+                |row| {
+                    Ok(StoredIdentity {
+                        ship_id: row.get(0)?,
+                        key_pem: row.get(1)?,
+                        trusted: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Keep it.
+    ///
+    /// The key is the one thing in this store whose leak would let another
+    /// device be this household to a network operator, so it is written and
+    /// never logged.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the write fails.
+    pub fn put_eebus_identity(
+        &self,
+        identity: &StoredIdentity,
+        now: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO eebus_identity (id, ship_id, key_pem, trusted, created_at)
+             VALUES (1, ?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET ship_id = ?1, key_pem = ?2, trusted = ?3",
+            params![
+                identity.ship_id,
+                identity.key_pem,
+                identity.trusted,
+                now.unix_timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Keep what the box has learned about its own house.
+    ///
+    /// Overwrites: there is one current model per name, and a history of a
+    /// forecast's own past states is not something anybody asks a box for. The
+    /// two years above are the history, and this is derived from them.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the write fails, or where the model cannot be
+    /// serialised — which would be a defect in `hems-forecast` rather than a
+    /// runtime condition, and is worth an error rather than a silent skip
+    /// because a box that quietly stopped remembering its roof would look
+    /// exactly like one that had just been installed.
+    pub fn put_learned<T: serde::Serialize>(
+        &self,
+        name: &str,
+        model: &T,
+        now: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(model).map_err(|e| StoreError::NotSerialisable {
+            detail: format!("`{name}`: {e}"),
+        })?;
+        self.connection.execute(
+            "INSERT INTO learned (name, model, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET model = ?2, updated_at = ?3",
+            rusqlite::params![name, json, now.unix_timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Read one back, or `None` where the box has never learned it.
+    ///
+    /// A stored model whose *shape* has moved on — a field added, a bucket key
+    /// changed — comes back as `None` with a warning rather than as an error.
+    /// The alternative is a box that will not start after an update because it
+    /// cannot read a fortnight of learning it can perfectly well relearn, and
+    /// the trade is a week of slightly worse forecasts against a household with
+    /// no energy manager at all.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the read itself fails.
+    pub fn learned<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT model FROM learned WHERE name = ?1",
+                rusqlite::params![name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(json) = json else { return Ok(None) };
+        match serde_json::from_str(&json) {
+            Ok(model) => Ok(Some(model)),
+            Err(e) => {
+                tracing::warn!(
+                    name,
+                    %e,
+                    "a stored model no longer matches the shape this build expects; \
+                     relearning it"
+                );
+                Ok(None)
+            }
+        }
     }
 
     /// Write one quarter hour's registers.

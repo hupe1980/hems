@@ -20,7 +20,7 @@ flowchart TB
   M["measurements<br/>every second"] --> G
   L["§ 14a limit from the Steuerbox<br/>§ 9 EEG cap · fuses · reserve"] --> G
   G["<b>Guard</b><br/>an interval per asset"]
-  F["forecasts · prices<br/>the site's own state"] --> P["<b>Planner</b><br/>96 slots, re-solved<br/>every quarter hour"]
+  F["forecasts · prices<br/>the site's own state"] --> P["<b>Planner</b><br/>quarter-hour slots,<br/>receding horizon"]
   P -- "target · envelope · a price per asset" --> A["<b>Arbiter</b><br/>desire → guard → smooth → explain"]
   G -- "the interval nothing may widen" --> A
   A --> S["setpoints, each naming its Reason"]
@@ -257,10 +257,19 @@ release.
 Something has to own a *set* of them, and that is `hemsd`'s registry: it gives
 each driver its bytes, folds what they say into what the house is doing and what
 the operator is asking for, and — before a single byte moves — checks that the
-drivers and the site agree about what they are for. Four mismatches are loud at
-startup rather than silent for months: a driver for an asset that does not exist,
-two drivers for one asset, a controllable device whose driver cannot command it,
-and a § 14a household with nothing that could hear a reduction.
+drivers and the site agree about what they are for. Five mismatches are loud at
+startup rather than silent for months: a box with no drivers at all, a driver for
+an asset that does not exist, two drivers for one asset, a controllable device
+whose driver cannot command it, and a § 14a household with nothing that could
+hear a reduction. `hemsd run --check` is exactly that, without a socket.
+
+**And around the registry, one task per socket.** It connects, reads until the
+driver's own deadline, writes whatever the driver produced, and reconnects with a
+bounded backoff for ever — an inverter that is off overnight is not a request
+that can fail. The one thing a stream of bytes cannot say is that the socket
+under it is a *new* one, so the transport tells the driver: a half-frame left
+over from before a drop would make the whole new stream decode at an offset, and
+every reading after it would be plausible and wrong.
 
 The drivers themselves, the registry that owns a set of them and what a wanted
 power becomes on real hardware are on [devices and
@@ -275,6 +284,49 @@ control plane:
   its own state from it rather than tracking one alongside. Two implementations
   of a certifiable state machine disagree, and the one that is wrong is whichever
   the certification lab is not looking at.
+
+  That is why the Controllable System driver owns a **SPINE engine** rather than
+  a bare state machine: what its bytes are is a SPINE datagram, which is the
+  whole payload of a SHIP data frame, so a network operator's Energy Guard
+  discovering the box, binding to its load-control feature and writing 4,2 kW is
+  a test with no socket in it. What `hemsd` adds underneath is TLS, a WebSocket
+  and a handshake — and no protocol logic at all, which is the only arrangement
+  in which there is exactly one copy of the § 14a state machine in the product.
+
+## The box's two outbound questions
+
+A plan needs two things a household cannot measure: what electricity will cost,
+and what the sky will do. Both are fetched, and neither is a trust anchor — a box
+that cannot reach either keeps the house safe and lawful and loses the plan,
+which is a cost in euros rather than in compliance.
+
+The second one is asked in a particular way. `forecastd` will serve a finished
+production figure for a named geometry, and the box does **not** ask for it: it
+asks for the *sky* and models its own roof. The correction that turns a
+geometric model into a forecast of **this** roof — the tree that shades the east
+string, the datasheet that was optimistic, the dust on the glass — is a property
+of one address, and only that box's own meter can teach it. A route called
+`/forecast` is one somebody eventually plans against uncorrected, and asking for
+the sky instead makes that mistake unavailable.
+
+What the box learns from its own meter is taught on the quarter-hour boundary —
+the only moment at which a quarter hour is *over* — and kept in its own store, so
+a reboot does not cost a fortnight of it.
+
+### The plan models what the drivers can report, and names no more
+
+The planner fills in the stores whose state something actually measures: today
+the battery, off its own meter. The car, the building and the tank wait on
+drivers that report an arrival, an indoor temperature and a tank temperature.
+
+Leaving a store out is not the same as *naming* it. A plan that named the charge
+point while modelling no car emits a target of zero watts with an envelope
+pinned at zero — and the arbiter obeys that, all day, as an instruction not to
+charge. So an asset is named if and only if the problem models it.
+
+The battery is the sharp case in the other direction: a plan built on a guessed
+state of charge empties a pack it thought was full. No fresh reading means no
+battery in the plan.
 
 ## One sign convention
 

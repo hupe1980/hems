@@ -27,10 +27,10 @@
 <section class="stats">
   <div class="stats-inner">
     <div><strong>{{ config.extra.stat_rules }}</strong><span>regulatory citations resolved by the build</span></div>
-    <div><strong>{{ config.extra.stat_tests }}</strong><span>tests, most of them a whole simulated day</span></div>
+    <div><strong>{{ config.extra.stat_tests }}</strong><span>tests, from a unit to a whole simulated day</span></div>
     <div><strong>{{ config.extra.stat_crates }}</strong><span>domain crates with no clock and no socket</span></div>
     <div><strong>{{ config.extra.stat_days }}</strong><span>reference days run end to end in CI</span></div>
-    <div><strong>{{ config.extra.stat_horizon }}</strong><span>quarter-hour slots in the planning horizon</span></div>
+    <div><strong>{{ config.extra.stat_horizon }}</strong><span>quarter-hour slots — two days — the box plans over</span></div>
   </div>
 </section>
 
@@ -112,7 +112,7 @@
 flowchart TB
   subgraph edge["hemsd — one process on the box"]
     direction TB
-    P["<b>Planner</b><br/>every 15 min · advisory<br/><i>hems-optimizer</i>"]
+    P["<b>Planner</b><br/>receding horizon · advisory<br/><i>hems-optimizer</i>"]
     A["<b>Arbiter</b><br/>every second · inside the guard<br/><i>hems-realtime::arbiter</i>"]
     G["<b>Guard</b><br/>every tick · absolute<br/><i>hems-realtime::guard + hems-grid</i>"]
     D["<b>Drivers</b><br/>sans-I/O · bytes in, events out<br/><i>hems-drv</i>"]

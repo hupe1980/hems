@@ -113,6 +113,7 @@ sequenceDiagram
   participant D as Driver (sans-I/O)
   participant R as Registry
   participant G as Guard
+  S->>D: on_link(Up, now)
   S->>D: on_bytes(&[u8], now)
   Note over D: or on_timeout(now)<br/>when poll_deadline passes
   D-->>R: poll_event() → Measured / GridLimit / CommandOutcome
@@ -137,6 +138,26 @@ Three things follow, and the third is the one that matters:
 - **The guard cannot be lied to by accident.** A driver reports what it *read*; it
   does not decide what the site may do. A driver that computed its own limit
   would be a second control plane nobody audited.
+
+### The one fact bytes cannot carry
+
+A driver holds state that belongs to a *session* rather than to a device: half a
+Modbus frame that has arrived and is not yet whole, a request waiting for its
+answer, a SPINE peer it has discovered. A reconnect invalidates every one of
+them — and nothing in a stream of bytes says so, because the first bytes of the
+new socket look exactly like the continuation of the old one. A leftover
+half-frame then makes the whole stream decode at an offset, and every reading
+after it is plausible and wrong.
+
+So the layer that owns the socket says: `on_link(LinkState, now)`. It is the one
+thing only that layer knows.
+
+For EEBUS it is also where **discovery** begins — SPINE learns who is on the
+other end by asking — and it is deliberately *not* a reason to fall to the
+failsafe. `[LPC-911]` times the failsafe by the heartbeat and by nothing else, so
+a WLAN glitch a reconnect repairs inside two minutes costs the household nothing.
+A driver that restrained a house for a lost packet would be obeying a rule nobody
+wrote.
 
 ### Two kinds of driver, one trait
 
@@ -167,7 +188,7 @@ So drivers declare `reports_available_power`, and a household is entitled to kno
 which of the two its box is running on. Where it is false the fallback is the
 nameplate — optimistic, and self-correcting on the next tick.
 
-## The registry: four mismatches that are loud at startup
+## The registry: five mismatches that are loud at startup
 
 Something has to own a *set* of drivers, give each one its bytes, and fold what
 they say into the two things the control planes read — `SiteState`, what the
@@ -176,18 +197,58 @@ house is doing, and `GridLimits`, what the operator is asking for. That is
 the layer where a socket becomes legitimate.
 
 Registration is a **check**, not a formality. A declaration nothing validates is a
-comment with a type, so `Registry::register` refuses four mismatches that would
-otherwise be discovered months later:
+comment with a type, so registration refuses five mismatches that would otherwise
+be discovered months later:
 
 | Refused | Otherwise presents as |
 |---|---|
+| no drivers at all | a box that keeps the house safe by assuming every controllable device is at its nameplate, for ever |
 | a driver for an asset the site does not have | a device that is simply never commanded |
 | two drivers for one asset | two sources of truth about one meter |
 | a controllable asset whose driver cannot command | a device the arbiter talks to all day and never moves |
 | a § 14a site with no driver that reports grid limits | a household that believes it is participating and would never hear a reduction |
 
 Each of those is silent at runtime and loud at startup, which is the right way
-round.
+round — and `hemsd run --check` is all five without opening a socket, which is
+what an installer runs before leaving.
+
+The first two are different mistakes with the same symptom, and they are reported
+apart on purpose: one is a household commissioned wrongly, the other is a box
+nobody has commissioned yet, and telling an installer the first when they have
+done the second sends them looking in the wrong place.
+
+### What is *not* refused, and why
+
+A controllable asset with **no driver at all** is a different fact from the five
+above, and it is named rather than rejected. The five are declarations
+contradicting themselves; this one is a box part-way through commissioning, or a
+household that owns a device hems has no driver for yet. Refusing would make the
+site model a list of what is *wired* rather than a list of what is *there*.
+
+It is not nothing either — the arbiter decides a setpoint for each of them every
+second and has nowhere to send it — so it is logged once at start-up and carried
+on `/v1/status` as `undriven`. A fact that is equally true every second belongs
+on a screen, not in a log: a partly commissioned box that warned per asset per
+tick would write eighty-six thousand identical lines a day and bury the one real
+fault in the middle of them.
+
+### And the loop around it
+
+The registry holds the drivers; something has to hold the **sockets**. That is
+one `tokio` task each: connect, read until the driver's own deadline, write
+whatever it produced, reconnect with a bounded backoff — for ever, because a
+household gateway box is not a request that can fail. An inverter that is off
+overnight, a wallbox on a switched socket and a Wi-Fi bridge somebody unplugged
+all come back, and a task that gave up on the third attempt would leave the guard
+assuming a nameplate for the rest of the year.
+
+Two details in it are written down because they were got wrong first. A deadline
+already in the past means *wake now*, not a seventy-year sleep — which is what
+converting a negative duration to an unsigned one produces, with no symptom but a
+device that is never polled again. And a device that stops answering has to stop
+being **believed**: its reading ages out, the box reports it as silent, and the
+guard goes back to the conservative assumption. That is safe, it is expensive,
+and the household is entitled to know which device is costing them.
 
 ## `modbus` — SunSpec over Modbus TCP
 
@@ -250,8 +311,40 @@ restraining itself because nobody is talking to it are reported as **different
 events**, because they are different things in the evidence record of
 `[A1 7.2]`.
 
-*Not yet:* the SHIP session and the SPINE datagrams that carry a write from a
-real Steuerbox.
+### The bytes are SPINE datagrams
+
+The driver owns a **SPINE engine** as well as the state machine, so what
+`on_bytes` and `poll_transmit` take and give is one SPINE datagram as JSON —
+which is the whole payload of a SHIP data frame. That is not a convention chosen
+for convenience; it is where the specification puts the boundary, and putting the
+driver's boundary in the same place has two consequences worth having.
+
+A network operator's Energy Guard discovering the box, binding to its
+`LoadControl` feature, sending its heartbeat and writing 4,2 kW is then an
+ordinary integration test with **no socket in it** — both ends are the real
+engines, and a message either side refuses to encode simply does not arrive. And
+`hemsd` is left with TCP, TLS, a WebSocket and a handshake, and no protocol logic
+at all, which is the only arrangement in which there is exactly one copy of the
+§ 14a state machine in the product.
+
+### The session under it
+
+`hemsd` opens the socket: TCP, TLS 1.2 with mutual authentication, a WebSocket
+upgrade and the SHIP handshake. The household **listens** — the Energy Guard is
+the network operator's box and it is the side that dials — and accepts one
+session at a time, because a Controllable System has exactly one Energy Guard.
+
+The box's key lives in its own database, and that is the commissioning story
+rather than a storage detail. **The SKI follows the key**: it is what an
+installer reads off a screen and gives to the metering point operator, and field
+reports make that exchange the single most common § 14a commissioning failure
+there is. A box that generated a fresh key on every boot would make it fail again
+on every boot. The trust store is kept with it, so a household does not re-pair
+its Steuerbox after a power cut.
+
+An unapproved peer still completes TLS — it has to, so its SKI can be shown to
+somebody — and is held short of the data phase. That is the whole of SHIP's trust
+model, and it is what stops anyone on the household's network reducing the house.
 
 ## One crate, protocols behind features
 

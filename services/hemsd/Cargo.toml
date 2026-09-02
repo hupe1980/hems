@@ -31,11 +31,25 @@ hems-grid      = { workspace = true }
 # would rather not have a C++ toolchain than for the thing doing the solving.
 hems-optimizer = { workspace = true, features = ["highs"] }
 hems-realtime  = { workspace = true }
+hems-service   = { workspace = true }
+
+# The SHIP session under the EEBUS Controllable System: TCP, TLS 1.2 with mutual
+# authentication, the WebSocket upgrade and the handshake. This is the process
+# that owns the sockets, so it is the one place the transport is allowed to
+# exist — `hems-drv` stays sans-I/O and the purity gate keeps it that way.
+#
+# `aws-lc-rs` rather than `ring`, and named rather than inherited: `rustls` 0.23
+# supports both and picking one is the consumer's decision because it is
+# process-global — two providers in one binary panic at the first connection.
+# The rest of the workspace already runs `aws-lc-rs` through `reqwest` (D84), so
+# this is the same choice stated twice rather than a second one.
+eebus        = { workspace = true, features = ["runtime", "aws-lc-rs"] }
 hems-sim       = { workspace = true }
 hems-tariff    = { workspace = true }
 metering       = { workspace = true }
 
 anyhow       = { workspace = true }
+axum         = { workspace = true }
 clap         = { version = "4", features = ["derive", "env"] }
 # The box's one outbound call. `blocking`, because `simulate` is a command that
 # has already finished by the time it reports — the runtime arrives properly when
@@ -47,6 +61,8 @@ rust_decimal = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
+toml         = { workspace = true }
+tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal", "io-util"] }
 time         = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

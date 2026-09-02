@@ -58,6 +58,29 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage a real household: open the drivers' sockets and run the guard and
+    /// the arbiter against them until the process is asked to stop.
+    ///
+    /// The other subcommands run a *simulated* day and finish in seconds. This
+    /// one is the box on the wall.
+    Run {
+        /// The configuration file. Absent, or absent from disk, means the
+        /// defaults — the reference household and no drivers at all, which is a
+        /// box that keeps the house safe by assuming the worst about every
+        /// device and says so at start-up.
+        #[arg(long, env = "HEMS_HEMSD_CONFIG")]
+        config: Option<PathBuf>,
+        /// Check the configuration, build the site and the drivers, and exit
+        /// without opening a socket.
+        ///
+        /// What an installer runs before leaving: every mismatch this daemon can
+        /// refuse — a driver for an asset that does not exist, two drivers for
+        /// one asset, a controllable device whose driver cannot command it, a
+        /// § 14a household with nothing that could hear a reduction — is
+        /// refused here rather than by a limit that never arrives.
+        #[arg(long)]
+        check: bool,
+    },
     /// Run one simulated day through the whole control stack and report on it.
     Simulate {
         /// Which day to run.
@@ -215,15 +238,108 @@ enum Day {
     Capped,
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "hemsd=info".into()),
-        )
-        .init();
+/// The box on the wall: configuration in, sockets open, guard and arbiter
+/// running until somebody stops it.
+///
+/// # What it refuses to start with
+///
+/// Everything the registry can catch is caught before a byte moves (D75), and
+/// `--check` is that half on its own — the command an installer runs before
+/// leaving the cellar. The alternative is a box that comes up, looks healthy and
+/// is never told about a reduction, which is the failure this daemon exists to
+/// make impossible.
+async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result<()> {
+    let settings: hemsd::Settings = hems_service::load(config, "HEMS_HEMSD")?;
+    hems_service::init_tracing(
+        hems_service::identity!(),
+        &settings.service.log_filter,
+        settings.service.log_json,
+    );
 
-    match Cli::parse().command {
+    if check {
+        let now = time::OffsetDateTime::now_utc();
+        let running = hemsd::runtime::assemble(&settings, now)?;
+        // The SKI, printed rather than only logged: it is what an installer has
+        // to give the metering point operator before a Steuerbox can be told to
+        // trust this box, and it is the step field reports say goes wrong most
+        // often. Deriving it here also *creates* it on a first run, so the
+        // number does not change when the daemon starts for real.
+        if settings.ship.listen.is_some() {
+            let store = match &settings.store_path {
+                Some(path) => Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                    hemsd::store::Store::open(path)?,
+                ))),
+                None => None,
+            };
+            let (_, ski) =
+                hemsd::runtime::ship::identity(&settings.ship, store.as_ref(), now).await?;
+            println!("🔑 SKI  {}", ski.to_display_string());
+            println!("   give this to the metering point operator, so the Steuerbox trusts it");
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let modes = std::collections::BTreeMap::new();
+        let described = hems_flex::describe_site(
+            &running.household.site,
+            &hems_flex::DescribeContext::new(now, now + time::Duration::hours(24), &modes),
+        );
+        println!(
+            "✅ {} assets, {} drivers, {} resources described in S2{}",
+            running.household.site.assets.len(),
+            settings.drivers.len(),
+            described.resources.len(),
+            match described.undescribed.len() {
+                0 => String::new(),
+                n => format!(", {n} it cannot express"),
+            }
+        );
+        return Ok(());
+    }
+
+    let (signal, trigger) = hems_service::Shutdown::channel();
+    tokio::spawn(hems_service::shutdown::on_signal(trigger));
+
+    let health = hems_service::Health::new();
+    // Not ready until a driver has actually been heard from. A box that reported
+    // itself ready while every device was silent would be reporting that the
+    // *process* was up, which is what liveness is for.
+    health.bad("drivers", "no driver has reported yet");
+
+    let running = hemsd::runtime::run(&settings, &health, &signal).await?;
+    let site = running.household.site.id.to_string();
+
+    hems_service::Server::new(
+        hems_service::identity!(),
+        settings.service.clone(),
+        health,
+        hemsd::runtime::api::router(hemsd::runtime::api::Local::new(
+            running.status,
+            site,
+            running.ski,
+            running.overrides,
+        )),
+    )
+    .run_until(signal)
+    .await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let command = Cli::parse().command;
+    // `run` configures its own logging from the file it is about to read, which
+    // is the only subcommand with a file to read it from. The rest are
+    // command-line tools and log for a person watching them.
+    if !matches!(command, Command::Run { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "hemsd=info".into()),
+            )
+            .init();
+    }
+
+    match command {
+        Command::Run { config, check } => return manage(config.as_deref(), check).await,
         Command::Simulate {
             day,
             json,

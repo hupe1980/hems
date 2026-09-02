@@ -76,10 +76,54 @@ impl Cell {
 /// treated as informative.
 pub const MIN_SAMPLES: usize = 3;
 
+/// The cells, as a **sequence** rather than a map.
+///
+/// The key is a `(DayType, u32)` pair, and a map with a non-string key is
+/// something JSON cannot express at all: `serde_json` refuses it at
+/// serialisation time with "key must be a string". The derive is therefore not
+/// enough on its own, and the failure is the worst shape a failure can have —
+/// the type compiles, every other format accepts it, and the one a box actually
+/// stores its learning in returns an error at run time, once, in a code path
+/// that was warning rather than failing. A whole household's fortnight of
+/// history went missing and the only symptom was a forecast that never got
+/// better.
+///
+/// A sequence of triples has none of that: every format can carry it, the
+/// ordering is the `BTreeMap`'s own so the bytes are stable, and a round trip is
+/// a test rather than a hope (P3 — a serialisable type states how it travels).
+#[cfg(feature = "serde")]
+mod cells_as_a_sequence {
+    use super::{Cell, DayType};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(
+        cells: &BTreeMap<(DayType, u32), Cell>,
+        s: S,
+    ) -> Result<S::Ok, S::Error> {
+        let flat: Vec<(DayType, u32, &Cell)> = cells
+            .iter()
+            .map(|((day, index), cell)| (*day, *index, cell))
+            .collect();
+        flat.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<BTreeMap<(DayType, u32), Cell>, D::Error> {
+        let flat: Vec<(DayType, u32, Cell)> = Vec::deserialize(d)?;
+        Ok(flat
+            .into_iter()
+            .map(|(day, index, cell)| ((day, index), cell))
+            .collect())
+    }
+}
+
 /// A household's load profile, learned from its own history.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LoadProfile {
+    #[cfg_attr(feature = "serde", serde(with = "cells_as_a_sequence"))]
     cells: BTreeMap<(DayType, u32), Cell>,
     /// The state whose holiday calendar applies.
     pub land: Bundesland,
@@ -185,6 +229,27 @@ impl LoadProfile {
 
 #[cfg(test)]
 mod tests {
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn a_profile_survives_a_round_trip_through_json() {
+        // A `BTreeMap` with a `(DayType, u32)` key is something JSON cannot
+        // express: `serde_json` refuses a non-string map key at serialisation
+        // time. The derive compiles, every other format accepts it, and the one
+        // a box actually keeps its learning in fails at run time — which is how
+        // a household's fortnight of history went missing with no symptom but a
+        // forecast that never got better.
+        let mut profile = LoadProfile::new(Bundesland::Be);
+        let start = Slot::containing(time::macros::datetime!(2026-01-15 00:00:00 UTC));
+        for i in 0..96 {
+            profile.observe(start.offset(i), Power::from_kw(0.6));
+        }
+
+        let json = serde_json::to_string(&profile).expect("a profile has to be storable as JSON");
+        let back: LoadProfile = serde_json::from_str(&json).expect("and readable again");
+        assert_eq!(back, profile);
+        assert!(back.support(start) > 0, "with its history intact");
+    }
     use super::*;
     use time::macros::datetime;
 

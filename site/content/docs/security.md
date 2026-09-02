@@ -130,6 +130,27 @@ TLS is the other half and it is a different guarantee: the signature says the
 report is the one this box sent and has not been edited; TLS says nobody read it
 on the way. Plain `http` is allowed only to a loopback address.
 
+## The box's own identity
+
+SHIP authenticates a **SKI** — the hash of a public key — and nothing else. So
+the box holds a private key, and where it holds it decides two things.
+
+It is kept in the box's own database rather than regenerated, because the SKI
+follows the key: it is what an installer reads off a screen and gives to the
+metering point operator, and a box that made a fresh one on every boot would
+have to be re-paired on every boot. The trust store is kept with it, so a power
+cut does not un-approve the Steuerbox.
+
+Both are therefore worth exactly what the disk is worth. There is no secure
+element yet, and that is stated rather than glossed: anything holding that key
+is this household as far as a network operator's box is concerned.
+
+TLS 1.2 with mutual authentication is what SHIP specifies, and the crypto
+provider is **named** rather than inherited — `aws-lc-rs`, the same one the fleet
+client uses. `rustls` supports two and the choice is process-global, so two in
+one binary panic at the first connection; `deny.toml` bans the other so a second
+one is a build failure rather than something to notice in a resolution.
+
 ## The supply chain
 
 Released builds for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`
@@ -162,12 +183,14 @@ filesystem, the network or `unsafe`.
 
 ## What is deliberately not claimed
 
-- The SHIP/SPINE transport under EEBUS — TLS, SKI pairing, a trust store — is
-  **not written yet**. Until it is, a § 14a limit can only arrive from the
-  simulator or from the sans-I/O driver being handed bytes.
 - Nothing here has been through a certification lab. The EEBUS conformance
   harness and the ElaadNL interoperability event are on the roadmap, and the
   state machine deliberately lives in the [`eebus`](https://crates.io/crates/eebus)
   crate so that there is only one implementation to certify.
-- There is no secure-element or measured-boot story. The built-in key is a key in
-  a binary, which is the right shape and not yet the right storage.
+- There is no secure-element or measured-boot story. The release-signing key is
+  built into the binary and the box's SHIP private key sits in its database —
+  both the right shape and not yet the right storage. A secure element is what
+  would make the second one survive somebody taking the disk out.
+- There is no pairing *flow*. A Steuerbox is trusted by putting its SKI in the
+  configuration or by the box being given one to remember; a screen an installer
+  can approve one on is not built.

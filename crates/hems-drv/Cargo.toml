@@ -23,12 +23,22 @@ time      = { workspace = true }
 eebus     = { workspace = true, optional = true }
 hems-grid = { workspace = true, optional = true }
 sunspec   = { workspace = true, optional = true }
+# SPINE datagrams travel as JSON inside a SHIP data frame, so the driver that
+# takes and gives them needs exactly one thing of the wire format: `serde_json`.
+serde_json = { workspace = true, optional = true }
 
 [features]
 default = ["serde"]
 ## Serialize/deserialize every public type.
 serde = ["dep:serde", "hems-core/serde"]
 ## EEBUS: the Controllable System of LPC/LPP — the § 14a side of a household.
-eebus = ["dep:eebus", "dep:hems-grid"]
+eebus = ["dep:eebus", "dep:hems-grid", "dep:serde_json"]
 ## SunSpec over Modbus TCP: inverters, meters and batteries.
 modbus = ["dep:sunspec"]
+
+[dev-dependencies]
+# The integration test drives both ends of a SPINE exchange and moves the
+# datagrams between them as the bytes a SHIP data frame carries, which is the
+# seam `hemsd` owns. It needs the encoder unconditionally, where the library
+# needs it only with `eebus`.
+serde_json = { workspace = true }

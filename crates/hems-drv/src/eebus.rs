@@ -48,9 +48,13 @@ use crate::{
     Driver, DriverCapabilities, DriverError, DriverEvent, GridLimit, LimitDirection, LimitSource,
     LinkState,
 };
+use eebus::model::{DeviceType, EntityType};
+use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::usecases::limitation::{
-    ControllableSystem, CsConfig, EffectiveLimit, LimitationState, LocalDecision,
+    ControllableSystem, ControllableSystemActor, CsConfig, EffectiveLimit, LimitationState,
+    LocalDecision,
 };
+use eebus::usecases::{limitation, lpc, lpp};
 
 /// What the Energy Guard wrote, and what a Controllable System answers.
 ///
@@ -84,16 +88,68 @@ impl Use {
     }
 }
 
+/// How this Controllable System names itself on the EEBUS network.
+///
+/// SHIP and SPINE both address a *device* rather than a household, so the box
+/// has to have a name before a Steuerbox can write to it. It is configuration
+/// rather than a constant: `vendor` says who made it and `unique` distinguishes
+/// two boxes from the same maker, and together they are what a pairing screen
+/// shows an installer beside the SKI.
+///
+/// SPINE's own pattern is `d:_<vendor>_<unique>` with the vendor part either
+/// `i:<IANA Private Enterprise Number>` or `n:<name>`
+/// (Protocol Specification § 7.1.1.2). A project with a registered enterprise
+/// number should use it — they are free and unique, where names need a registry
+/// nobody runs — so the default here is the honest `n:` form until hems has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SpineIdentity {
+    /// The vendor part of the SPINE device address, `i:46925` or `n:hems`.
+    pub vendor: String,
+    /// What distinguishes this box from the next one off the same line.
+    pub unique: String,
+}
+
+impl Default for SpineIdentity {
+    fn default() -> Self {
+        Self {
+            vendor: "n:hems".into(),
+            unique: "hems-1".into(),
+        }
+    }
+}
+
+impl SpineIdentity {
+    /// An identity with this vendor and unique name.
+    pub fn new(vendor: impl Into<String>, unique: impl Into<String>) -> Self {
+        Self {
+            vendor: vendor.into(),
+            unique: unique.into(),
+        }
+    }
+}
+
 /// The Controllable System of LPC or LPP, as hems sees it.
 ///
-/// Holds [`eebus`]'s state machine and translates in both directions. It carries
-/// **no transport**: bytes are the job of `hemsd`, and the SHIP/SPINE session
-/// that delivers a write to [`Lpc::on_limit`] is a layer above this one.
+/// Holds [`eebus`]'s state machine, the SPINE engine that serves it, and the
+/// translation into hems's vocabulary in both directions. It carries **no
+/// socket**: what it takes and gives are SPINE datagrams as bytes, which is what
+/// a SHIP data frame carries, and opening the TLS WebSocket under them is
+/// `hemsd`'s job.
 #[derive(Debug)]
 pub struct Lpc {
     asset: AssetId,
     which: Use,
-    system: ControllableSystem,
+    /// The SPINE engine: discovery, bindings, subscriptions and the datagrams
+    /// that carry them. Sans-I/O like everything else here — datagrams in,
+    /// datagrams out, and a clock as a parameter.
+    engine: Engine,
+    /// The use-case actor, which owns the one and only [`ControllableSystem`].
+    ///
+    /// There is deliberately no second copy: `hems_grid::LpcState` is *derived*
+    /// from this one (see the module note), and so is everything the guard is
+    /// told.
+    actor: ControllableSystemActor,
     /// The instant `eebus`'s monotonic clock counts from.
     started_at: OffsetDateTime,
     /// What was last reported upwards, so an unchanged limit is not re-emitted
@@ -122,15 +178,58 @@ impl Lpc {
         failsafe_for: StdDuration,
         started_at: OffsetDateTime,
     ) -> Self {
-        let config = CsConfig::new(failsafe.get().max(0.0), failsafe_for).on_cem();
-        Self {
+        Self::with_identity(
             asset,
             which,
-            system: ControllableSystem::new(config, StdDuration::ZERO),
+            failsafe,
+            failsafe_for,
+            started_at,
+            &SpineIdentity::default(),
+        )
+        .expect("the default SPINE identity is a valid device address")
+    }
+
+    /// The same, under a name a Steuerbox will see on the network.
+    ///
+    /// Refused rather than corrected where the identity is not one SPINE's
+    /// addressing rules allow: an installer who typed a vendor part wrongly has
+    /// configured a box that would be discovered under a name nobody expects,
+    /// and finding that out at start-up is the cheap version of finding it out
+    /// during a commissioning appointment.
+    ///
+    /// # Errors
+    /// [`DriverError::Unsupported`] where `identity` does not make a valid SPINE
+    /// device address.
+    pub fn with_identity(
+        asset: AssetId,
+        which: Use,
+        failsafe: Power,
+        failsafe_for: StdDuration,
+        started_at: OffsetDateTime,
+        identity: &SpineIdentity,
+    ) -> Result<Self, DriverError> {
+        let config = CsConfig::new(failsafe.get().max(0.0), failsafe_for).on_cem();
+        let system = ControllableSystem::new(config, StdDuration::ZERO);
+        let (mut engine, actor) = build(which, system, identity)?;
+        // Published once, here: the descriptions and the current values a peer
+        // reads before it writes anything. A Controllable System that answered
+        // a discovery with nothing would be discovered as a device that plays no
+        // use case at all.
+        actor.install(&mut engine, StdDuration::ZERO);
+        Ok(Self {
+            asset,
+            which,
+            engine,
+            actor,
             started_at,
             last_reported: None,
             events: Vec::new(),
-        }
+        })
+    }
+
+    /// The SPINE device address this box answers on, for a pairing screen.
+    pub fn spine_address(&self) -> &str {
+        self.engine.device().address().as_str()
     }
 
     /// Which asset the limit applies to — the connection point, ordinarily.
@@ -151,7 +250,7 @@ impl Lpc {
     /// **Derived**, never tracked in parallel. See the module note: two copies
     /// of a certifiable state machine are one copy and one liability.
     pub fn state(&self) -> LpcState {
-        match self.system.state() {
+        match self.actor.system().state() {
             LimitationState::Init => LpcState::Init,
             LimitationState::Limited => LpcState::Limited,
             LimitationState::UnlimitedControlled => LpcState::UnlimitedControlled,
@@ -167,15 +266,21 @@ impl Lpc {
 
     /// The ceiling in force right now, if any.
     pub fn ceiling(&self) -> Option<Power> {
-        match self.system.effective_limit() {
+        match self.actor.system().effective_limit() {
             EffectiveLimit::None => None,
             EffectiveLimit::Active(w) | EffectiveLimit::Failsafe(w) => Some(Power::new(w)),
         }
     }
 
     /// The operator's heartbeat arrived.
+    ///
+    /// The direct form, for a caller that has a heartbeat and no SPINE session —
+    /// a simulator, a relay input, a test. Over a real session the heartbeat
+    /// arrives as a datagram and [`Driver::on_bytes`] is what carries it.
     pub fn on_heartbeat(&mut self, now: OffsetDateTime) {
-        self.system.on_heartbeat(self.since_start(now));
+        let elapsed = self.since_start(now);
+        self.actor.system_mut().on_heartbeat(elapsed);
+        self.publish(elapsed);
         self.drain(now);
     }
 
@@ -187,9 +292,16 @@ impl Lpc {
     /// decides how the household meets it, and refusing at this layer would be
     /// the driver making a compliance decision on its own.
     pub fn on_limit(&mut self, write: &LimitWrite, now: OffsetDateTime) -> WriteOutcome {
-        let outcome =
-            self.system
-                .on_limit_write(write, LocalDecision::Apply, self.since_start(now));
+        let elapsed = self.since_start(now);
+        let outcome = self
+            .actor
+            .system_mut()
+            .on_limit_write(write, LocalDecision::Apply, elapsed);
+        // What the state machine now holds is also what the Energy Guard reads
+        // back, so the published value follows the decision. Left out, a
+        // Steuerbox that subscribed to `LoadControlLimitListData` would be told
+        // nothing had changed.
+        self.publish(elapsed);
         self.drain(now);
         outcome
     }
@@ -199,7 +311,14 @@ impl Lpc {
     /// The most important call in the driver: this is where a missed heartbeat
     /// becomes a failsafe.
     pub fn on_timeout(&mut self, now: OffsetDateTime) {
-        self.system.handle_timeout(self.since_start(now));
+        let elapsed = self.since_start(now);
+        // Both clocks, in this order. The engine's own timers retire
+        // acknowledgements and re-send what was not answered; the actor's are
+        // where the heartbeat this box owes goes out and where a missed one
+        // becomes the failsafe of `[LPC-911]`.
+        self.engine.handle_timeout(elapsed);
+        let _ = self.actor.handle_timeout(&mut self.engine, elapsed);
+        self.consume_engine_events(elapsed);
         self.drain(now);
     }
 
@@ -208,9 +327,18 @@ impl Lpc {
     /// Never `None` while the operator is in contact — that is what makes the
     /// failsafe reachable rather than merely written down.
     pub fn deadline(&self) -> Option<OffsetDateTime> {
-        self.system
-            .poll_timeout()
-            .and_then(|d| time::Duration::try_from(d).ok())
+        // Whichever wants waking first. The actor always wants waking — it owes
+        // a heartbeat every sixty seconds — so this is never `None` in practice,
+        // and that is what makes the failsafe reachable rather than merely
+        // written down.
+        let actor = Some(self.actor.poll_timeout());
+        let engine = self.engine.poll_timeout();
+        let soonest = match (actor, engine) {
+            (Some(a), Some(e)) => Some(a.min(e)),
+            (only, None) | (None, only) => only,
+        }?;
+        time::Duration::try_from(soonest)
+            .ok()
             .map(|d| self.started_at + d)
     }
 
@@ -220,6 +348,43 @@ impl Lpc {
             None
         } else {
             Some(self.events.remove(0))
+        }
+    }
+
+    /// Ask whoever is on the other end who they are.
+    ///
+    /// SPINE's own bootstrap (implementation guide § 2.7): the detailed
+    /// discovery, then the use cases, both read from the NodeManagement feature
+    /// with **no device part** — the one message allowed to omit it, because the
+    /// peer's address is by definition not yet known.
+    fn discover(&mut self, elapsed: StdDuration) {
+        let source = eebus::spine::node_management(self.engine.device().address());
+        let destination = eebus::spine::node_management_without_device();
+        for function in [
+            eebus::model::Function::NodeManagementDetailedDiscoveryData,
+            eebus::model::Function::NodeManagementUseCaseData,
+        ] {
+            let _ = self.engine.read(&destination, &source, function, elapsed);
+        }
+    }
+
+    /// Publish what the state machine now holds, so a peer reading it — or
+    /// subscribed to it — is told.
+    fn publish(&mut self, elapsed: StdDuration) {
+        self.actor.publish(&mut self.engine, elapsed);
+        self.consume_engine_events(elapsed);
+    }
+
+    /// Hand every event the engine has produced to the use-case actor.
+    ///
+    /// The actor is what turns a binding request, a subscription and a
+    /// heartbeat notification into state-machine input; the engine is only the
+    /// postal service. Draining to empty each turn is deliberate — one datagram
+    /// can produce several events, and an event left in the queue is a limit
+    /// that arrived and was not acted on.
+    fn consume_engine_events(&mut self, elapsed: StdDuration) {
+        while let Some(event) = self.engine.poll_event() {
+            let _ = self.actor.handle_event(&mut self.engine, &event, elapsed);
         }
     }
 
@@ -234,7 +399,7 @@ impl Lpc {
 
     /// Emit an event where the effective limit has actually moved.
     fn drain(&mut self, now: OffsetDateTime) {
-        let current = self.system.effective_limit();
+        let current = self.actor.system().effective_limit();
         if self.last_reported == Some(current) {
             return;
         }
@@ -263,21 +428,74 @@ impl Lpc {
     }
 }
 
-/// The driver contract, for the half of it a limitation use case has.
+/// The SPINE device a Controllable System lives on, and the actor that serves it.
 ///
-/// # `on_bytes` is where SHIP and SPINE will go, and until they do it says so
+/// Three features, because the use case needs exactly three: `LoadControl`
+/// carries the limit, `DeviceConfiguration` carries the failsafe values, and
+/// `DeviceDiagnosis` carries the heartbeat. Their addresses are what the actor
+/// is wired to, so they are built here in one place rather than being passed in
+/// — a caller that got them out of order would produce a device that discovers
+/// correctly and answers a limit write on the wrong feature.
 ///
-/// Every other method here is real: the state machine runs, the heartbeat
-/// timeout fires, the failsafe engages and releases, and the limit reaches the
-/// guard. What is missing is the **transport** that would deliver a write from a
-/// Steuerbox — a SHIP session over TLS and the SPINE datagrams inside it.
+/// The entity is a `CEM`: hems is an energy manager acting for everything behind
+/// it, which is `[A1 4.4.b]`'s addressing of the whole household through one
+/// system rather than device by device.
+fn build(
+    which: Use,
+    system: ControllableSystem,
+    identity: &SpineIdentity,
+) -> Result<(Engine, ControllableSystemActor), DriverError> {
+    let mut device = LocalDevice::new(
+        &identity.vendor,
+        &identity.unique,
+        DeviceType::EnergyManagementSystem,
+    )
+    .map_err(|e| {
+        DriverError::Unsupported(format!(
+            "`{}` and `{}` do not make a SPINE device address: {e}",
+            identity.vendor, identity.unique
+        ))
+    })?;
+
+    let entity = LocalEntity::new([1], EntityType::CEM)
+        .with_feature(limitation::load_control_feature(1))
+        .with_feature(limitation::device_configuration_feature(2))
+        .with_feature(limitation::device_diagnosis_feature(3));
+    device
+        .add_entity(entity)
+        .expect("entity [1] is the first one added");
+
+    let load_control = device.address_of(&[1], 1);
+    let configuration = device.address_of(&[1], 2);
+    let diagnosis = device.address_of(&[1], 3);
+
+    let mut engine = Engine::new(device);
+    let (descriptor, direction) = match which {
+        Use::Lpc => (&lpc::CONTROLLABLE_SYSTEM, lpc::DIRECTION),
+        Use::Lpp => (&lpp::CONTROLLABLE_SYSTEM, lpp::DIRECTION),
+    };
+    engine.add_use_case([1], 1, descriptor);
+
+    let actor =
+        ControllableSystemActor::new(system, direction, load_control, configuration, diagnosis);
+    Ok((engine, actor))
+}
+
+/// The driver contract, over SPINE datagrams.
 ///
-/// So this refuses bytes rather than accepting and ignoring them. A driver that
-/// swallowed a frame and returned `Ok` would be indistinguishable from one that
-/// understood it, which is the exact shape of the defects this workspace keeps
-/// finding in itself: a mechanism that looks like it works because nothing
-/// contradicts it. A caller that hands it bytes today has made a wiring mistake
-/// and is told so.
+/// # The bytes are the SPINE datagram, and that is not a convention
+///
+/// A SHIP data frame carries one SPINE datagram as JSON and nothing else
+/// (SHIP § 13.4). So `on_bytes` and `poll_transmit` here take and give exactly
+/// what the wire carries, and what `hemsd` adds underneath is the *session*:
+/// TCP, TLS 1.2 with mutual authentication, the WebSocket upgrade, the SHIP
+/// handshake and the framing. That split is what keeps this crate testable
+/// without a socket — a § 14a day, a lost heartbeat and a failsafe are ordinary
+/// assertions — while leaving nothing about the protocol itself in `hemsd`.
+///
+/// [`Lpc::on_limit`] and [`Lpc::on_heartbeat`] remain, and they are not a second
+/// path into the state machine: they are the same machine reached without a
+/// session, which is what a simulator, a relay input and a conformance test use.
 impl Driver for Lpc {
     fn asset(&self) -> &AssetId {
         &self.asset
@@ -287,12 +505,55 @@ impl Driver for Lpc {
         DriverCapabilities::grid()
     }
 
-    fn on_bytes(&mut self, _bytes: &[u8], _now: OffsetDateTime) -> Result<(), DriverError> {
-        Err(DriverError::Unsupported(
-            "the SHIP/SPINE transport is not wired: this driver runs the LPC state \
-             machine and is fed by `on_limit` and `on_heartbeat`, not by bytes"
-                .into(),
-        ))
+    fn on_bytes(&mut self, bytes: &[u8], now: OffsetDateTime) -> Result<(), DriverError> {
+        let datagram: eebus::model::Datagram = serde_json::from_slice(bytes)
+            .map_err(|e| DriverError::Malformed(format!("not a SPINE datagram: {e}")))?;
+        let elapsed = self.since_start(now);
+        // `handle_datagram` answers `false` for a datagram this device is not
+        // the destination of, which over a point-to-point SHIP session means the
+        // peer is addressing somebody else. Not an error and not silence: the
+        // engine has already decided, and there is nothing for the state machine
+        // to do about it.
+        let _ = self.engine.handle_datagram(&datagram, elapsed);
+        self.consume_engine_events(elapsed);
+        self.drain(now);
+        Ok(())
+    }
+
+    /// A SHIP session opened or closed under this driver.
+    ///
+    /// Opening one is where **discovery** begins: SPINE learns who is on the
+    /// other end by asking, and until it has, a Controllable System does not
+    /// know which entity of the Energy Guard is going to write to it or where
+    /// that guard's heartbeat lives. The Energy Guard asks too, and a device
+    /// that only ever answered would be discovered without ever discovering.
+    ///
+    /// Closing one drops the peer. That is deliberately **not** the same thing
+    /// as losing contact: `[LPC-911]`'s failsafe is timed by the heartbeat and
+    /// only by the heartbeat, so a dropped socket starts the same two-minute
+    /// clock a silent one does, and a reconnect inside it costs the household
+    /// nothing. A driver that forced the failsafe on a TCP reset would restrain
+    /// a house for a WLAN glitch.
+    fn on_link(&mut self, state: LinkState, now: OffsetDateTime) {
+        let elapsed = self.since_start(now);
+        match state {
+            LinkState::Up => {
+                self.actor.install(&mut self.engine, elapsed);
+                self.discover(elapsed);
+                self.consume_engine_events(elapsed);
+            }
+            LinkState::Down | LinkState::Stale | LinkState::Connecting => {
+                let peers: Vec<_> = self
+                    .engine
+                    .peers()
+                    .filter_map(|p| p.address.clone())
+                    .collect();
+                for peer in &peers {
+                    self.engine.remove_peer(peer);
+                }
+            }
+        }
+        self.drain(now);
     }
 
     fn on_timeout(&mut self, now: OffsetDateTime) {
@@ -316,10 +577,17 @@ impl Driver for Lpc {
     }
 
     fn poll_transmit(&mut self) -> Option<Vec<u8>> {
-        // Likewise the transport's: the heartbeat and the acknowledgement a
-        // Controllable System owes are SPINE messages, and there is nothing yet
-        // to encode them into.
-        None
+        // One datagram per call, as JSON — a SHIP data frame's whole payload.
+        // A datagram that cannot be serialised is dropped rather than returned
+        // half-encoded: it would be a bug in `eebus`'s own model types, and
+        // putting a truncated frame on a certifiable wire is worse than putting
+        // nothing there.
+        loop {
+            let datagram = self.engine.poll_transmit()?;
+            if let Ok(bytes) = serde_json::to_vec(&datagram) {
+                return Some(bytes);
+            }
+        }
     }
 
     fn poll_deadline(&self) -> Option<OffsetDateTime> {

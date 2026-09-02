@@ -93,3 +93,56 @@ CREATE TABLE IF NOT EXISTS compliance_sample (
     ceiling_w     REAL    NOT NULL,
     PRIMARY KEY (event_id, at)
 ) STRICT;
+
+-- What the box has learned about its own house.
+--
+-- Two models, and neither can be shipped from a factory: the multiplicative
+-- corrector that turns a geometric roof model into a forecast of *this* roof —
+-- the tree that shades the east string, the datasheet that was optimistic, the
+-- dust — and this household's own quarter hours by day type. A fortnight of
+-- observations is what makes a forecast worth having, and a box that forgot
+-- them on every reboot would start from a factory roof and refuse to plan until
+-- it had seen a quarter hour of its own load.
+--
+-- One row per model, keyed by name, holding the model as JSON. JSON rather than
+-- columns because the *shape* is `hems-forecast`'s and belongs to it: a schema
+-- here would be a second definition of a structure this crate does not own, and
+-- the one that is wrong would be whichever nobody is testing. What this table
+-- promises is only that the bytes come back, and `Store::learned` refuses to
+-- deserialise them into a shape that has moved on rather than guessing.
+--
+-- No `forwarded_at`: this is the box's own state and not a record anybody is
+-- owed. It is derived from the two years above and can be rebuilt from them.
+CREATE TABLE IF NOT EXISTS learned (
+    name        TEXT    NOT NULL PRIMARY KEY,
+    model       TEXT    NOT NULL,
+    updated_at  INTEGER NOT NULL
+) STRICT;
+
+-- The box's EEBUS identity and the peers it trusts.
+--
+-- Both have to survive a restart, and for different reasons.
+--
+-- The **identity** is a private key, and the SKI derived from it is what an
+-- installer reads off a screen and gives to the metering point operator. Field
+-- reports make that exchange the single most common § 14a commissioning
+-- failure, and a box that generated a fresh key on every boot would make it
+-- fail again on every boot. Stored as PEM, and never logged.
+--
+-- The **trust store** is the whole of SHIP's trust model: a peer whose SKI is
+-- not in it may complete TLS — it has to, so its SKI can be shown to a user —
+-- and is held short of the data phase. Forgetting it on a reboot means a
+-- household re-pairing its Steuerbox after a power cut.
+--
+-- One row, because a box is one node. The `id` column is a constant so the
+-- table cannot grow a second identity nobody meant to create.
+CREATE TABLE IF NOT EXISTS eebus_identity (
+    id            INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+    ship_id       TEXT    NOT NULL,
+    key_pem       TEXT    NOT NULL,
+    -- The trusted peers as JSON, which is `eebus::runtime::TrustStore`'s own
+    -- form. A schema here would be a second definition of a structure this
+    -- crate does not own.
+    trusted       TEXT    NOT NULL,
+    created_at    INTEGER NOT NULL
+) STRICT;

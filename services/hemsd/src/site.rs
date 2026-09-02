@@ -5,11 +5,14 @@ use hems_core::asset::{
     HeatPumpControl, LoadKind, Programme, PvArray,
 };
 use hems_core::prelude::*;
+use hems_optimizer::model::{PlanningLimits, TimedLimit};
 use hems_optimizer::solve::AssetNames;
+use hems_realtime::guard::GridLimits;
 use hems_tariff::levies::Levies;
 use hems_tariff::tariff::{EnergyPrice, FeedIn, NetworkCharge, Tariff};
 use rust_decimal::Decimal;
 use std::collections::BTreeMap;
+use time::OffsetDateTime;
 
 /// How the house is put together.
 #[derive(Debug, Clone, PartialEq)]
@@ -154,6 +157,13 @@ pub struct Household {
     pub load: AssetId,
     /// The hot-water tank.
     pub dhw: AssetId,
+    /// The meter at the connection point.
+    ///
+    /// The one measurement every § 14a decision starts from `[A1 2.3]`, and the
+    /// only witness for the part of the house nobody instrumented. Without it
+    /// the guard has to close its balance from the sum of the sub-meters, which
+    /// is exact only in a house where every load has one.
+    pub grid_meter: AssetId,
     /// The shiftable appliance, where the household has one.
     pub dishwasher: Option<AssetId>,
     /// The names, as the optimiser wants them.
@@ -177,6 +187,7 @@ impl Household {
         let heat_pump = AssetId::new("waermepumpe")?;
         let load = AssetId::new("haushalt")?;
         let dhw = AssetId::new("warmwasser")?;
+        let grid_meter = AssetId::new("netzanschluss-zaehler")?;
         let dishwasher = config
             .dishwasher
             .as_ref()
@@ -211,6 +222,7 @@ impl Household {
             heat_pump,
             load,
             dhw,
+            grid_meter,
             dishwasher,
         })
     }
@@ -319,6 +331,7 @@ fn assets_of(
             t_max_c: 60.0,
         }),
         base_load(main)?,
+        grid_meter(main, config.fuse)?,
     ]
     .into_iter()
     .chain(
@@ -328,6 +341,32 @@ fn assets_of(
             .map(|p| shiftable_appliance(p, main)),
     )
     .collect())
+}
+
+/// The meter at the connection point.
+///
+/// `[A1 2.3]` measures the netzwirksamer Leistungsbezug *there* and nowhere
+/// else, so this is the one asset whose absence changes what every other one is
+/// allowed to do: without it the guard closes its balance from the sub-meters
+/// alone, which understates the rest of the house by exactly the loads nobody
+/// instrumented — and understating the house overstates the surplus, which is
+/// the one direction a § 14a budget may never be wrong in.
+///
+/// It measures and nothing else. A meter is not a device the arbiter may
+/// command, and the capability set is what says so.
+fn grid_meter(circuit: &CircuitId, fuse: Current) -> anyhow::Result<Asset> {
+    Ok(Asset::Meter(hems_core::asset::Meter {
+        meta: AssetMeta::new(
+            AssetId::new("netzanschluss-zaehler")?,
+            circuit.clone(),
+            PhaseConnection::Three,
+            // What can cross it, which is the fuse rather than any one device.
+            Power::new(fuse.get() * 230.0 * 3.0),
+        )
+        .with_capabilities(Capabilities::MEASURE),
+        role: hems_core::asset::MeterRole::GridConnection,
+        subject: None,
+    }))
 }
 
 /// The part of the house nobody manages.
@@ -368,6 +407,49 @@ fn shiftable_appliance(programme: Programme, circuit: &CircuitId) -> Asset {
         nominal: programme.peak(),
         kind: LoadKind::Shiftable(programme),
     })
+}
+
+/// What the planner is allowed to do, slot by slot.
+///
+/// The § 14a ceiling carries the **window it applies in**. A reduction has a
+/// duration — `[LPC-909]` sends one with the limit, and the failsafe releases
+/// after its own minimum `[LPC-022]` — and stretching today's ninety minutes
+/// across a forty-eight-hour horizon plans the house under a limit that lapsed
+/// before teatime. It costs money in both directions: the plan charges the car
+/// at three in the morning as if the network operator were still asking for
+/// something, and it never sees the reduction coming when one is announced ahead.
+///
+/// The feed-in ceiling has no such window: § 9 EEG applies until an intelligent
+/// metering system with a control device is in operation, which is a change of
+/// installation rather than a change of hour.
+///
+/// Shared by the simulated day and the running box, because they are the same
+/// translation and a second copy of it would be a second place for a § 14a
+/// ceiling to be read one slot short.
+pub fn planning_limits(
+    limits: &GridLimits,
+    ends_at: Option<OffsetDateTime>,
+    site: &Site,
+) -> PlanningLimits {
+    let mut planning = PlanningLimits::default()
+        .with_import_ceiling(site.grid.import_ceiling())
+        // What the *baseline* household lives under while the same reduction is
+        // in force. It has no energy manager, so it cannot be addressed as one
+        // `[A1 4.4.b]`: its Steuerbox turns each device down on its own
+        // `[A1 4.4.a]`, and may not take any of them below the minimum of
+        // `[A1 4.5.1]`. The plan is unaffected — this bounds the comparison, not
+        // the optimisation.
+        .with_direct_control_ceiling(hems_grid::para14a::MINDESTLEISTUNG);
+    if let Some(ceiling) = limits.steuve_ceiling {
+        planning = planning.with_steuve(match ends_at {
+            Some(end) => TimedLimit::until(ceiling, Slot::containing(end)),
+            None => TimedLimit::always(ceiling),
+        });
+    }
+    if let Some(ceiling) = limits.feed_in_ceiling {
+        planning = planning.with_feed_in(TimedLimit::always(ceiling));
+    }
+    planning
 }
 
 /// The § 14a network-charge modules this household could choose between.

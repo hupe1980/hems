@@ -113,6 +113,16 @@ pub enum DriverError {
     /// The link is not in a state where anything can be sent.
     #[error("not connected")]
     NotConnected,
+    /// Nothing speaks for this asset at all.
+    ///
+    /// Distinct from [`DriverError::Unsupported`], and the distinction is what
+    /// keeps a log readable: "this device cannot do that" is a fault to look
+    /// into, and "this device has no driver" is a **configuration** fact that is
+    /// equally true on every tick. Reported as the same error, a partially
+    /// commissioned box writes one warning per asset per second for ever, and
+    /// the real fault is somewhere in the middle of it.
+    #[error("no driver speaks for {0}")]
+    NoDriver(String),
 }
 
 /// The contract every driver keeps.
@@ -120,12 +130,14 @@ pub enum DriverError {
 /// # The order `hemsd` calls these in
 ///
 /// ```text
+/// socket = connect()?;                       driver.on_link(Up, now);
 /// loop {
 ///     // whichever comes first
 ///     bytes = read(socket, until: driver.poll_deadline())
 ///     match bytes {
-///         Some(b) => driver.on_bytes(&b, now)?,
-///         None    => driver.on_timeout(now),
+///         Some(b)  => driver.on_bytes(&b, now)?,
+///         None     => driver.on_timeout(now),
+///         Closed   => { driver.on_link(Down, now); break }
 ///     }
 ///     while let Some(event) = driver.poll_event() { … }
 ///     while let Some(out)   = driver.poll_transmit() { write(socket, out) }
@@ -148,6 +160,28 @@ pub trait Driver {
     /// asks a driver for something it has not declared, which is the cheap half
     /// of the bug where a command is sent for a year and silently ignored.
     fn capabilities(&self) -> DriverCapabilities;
+
+    /// The transport under this driver opened or closed.
+    ///
+    /// # Why a byte-oriented contract still needs this
+    ///
+    /// A driver holds state that belongs to a *session* and not to a device:
+    /// half a Modbus frame that has arrived and is not yet whole, a request that
+    /// went out and is waiting for its answer, a SPINE peer it has discovered.
+    /// A reconnect invalidates every one of them, and nothing in a stream of
+    /// bytes says so — the first bytes of the new socket look exactly like the
+    /// continuation of the old one, and a partial frame left over from before
+    /// the drop makes the whole stream decode at an offset.
+    ///
+    /// So the layer that owns the socket says. It is the one fact only that
+    /// layer knows, and leaving it out is how a box comes back from a
+    /// twenty-second outage reading rubbish and reporting it as a measurement.
+    ///
+    /// The default is to do nothing, because a stateless driver genuinely has
+    /// nothing to forget.
+    fn on_link(&mut self, state: LinkState, now: OffsetDateTime) {
+        let _ = (state, now);
+    }
 
     /// Bytes arrived from the device.
     ///

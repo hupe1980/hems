@@ -18,9 +18,7 @@ use hems_grid::evidence::{EvidenceRecorder, Observation};
 use hems_grid::lpc::{LpcConfig, LpcMachine};
 use hems_grid::mispel::QuarterHour as MispelQuarterHour;
 use hems_grid::para14a::ControlMode;
-use hems_optimizer::model::{
-    BatteryModel, DhwModel, HeatPumpModel, PlanningLimits, Problem, ThermalModel, TimedLimit,
-};
+use hems_optimizer::model::{BatteryModel, DhwModel, HeatPumpModel, Problem, ThermalModel};
 use hems_optimizer::solve::solve;
 use hems_realtime::arbiter::{Arbiter, ArbiterConfig, Tick};
 use hems_realtime::guard::{GridLimits, SiteState};
@@ -647,45 +645,6 @@ impl Scenario {
     pub fn start(&self) -> OffsetDateTime {
         metering::calendar::day_start_utc(self.date)
     }
-}
-
-/// What the planner is allowed to do, slot by slot.
-///
-/// The § 14a ceiling carries the **window it applies in**. A reduction has a
-/// duration — `[LPC-909]` sends one with the limit, and the failsafe releases
-/// after its own minimum `[LPC-022]` — and stretching today's ninety minutes
-/// across a forty-eight-hour horizon plans the house under a limit that lapsed
-/// before teatime. It costs money in both directions: the plan charges the car
-/// at three in the morning as if the network operator were still asking for
-/// something, and it never sees the reduction coming when one is announced ahead.
-///
-/// The feed-in ceiling has no such window: § 9 EEG applies until an intelligent
-/// metering system with a control device is in operation, which is a change of
-/// installation rather than a change of hour.
-fn planning_limits(
-    limits: &GridLimits,
-    ends_at: Option<OffsetDateTime>,
-    site: &Site,
-) -> PlanningLimits {
-    let mut planning = PlanningLimits::default()
-        .with_import_ceiling(site.grid.import_ceiling())
-        // What the *baseline* household lives under while the same reduction is
-        // in force. It has no energy manager, so it cannot be addressed as one
-        // `[A1 4.4.b]`: its Steuerbox turns each device down on its own
-        // `[A1 4.4.a]`, and may not take any of them below the minimum of
-        // `[A1 4.5.1]`. The plan is unaffected — this bounds the comparison, not
-        // the optimisation.
-        .with_direct_control_ceiling(hems_grid::para14a::MINDESTLEISTUNG);
-    if let Some(ceiling) = limits.steuve_ceiling {
-        planning = planning.with_steuve(match ends_at {
-            Some(end) => TimedLimit::until(ceiling, Slot::containing(end)),
-            None => TimedLimit::always(ceiling),
-        });
-    }
-    if let Some(ceiling) = limits.feed_in_ceiling {
-        planning = planning.with_feed_in(TimedLimit::always(ceiling));
-    }
-    planning
 }
 
 /// A plausible winter price curve: cheap at night, dear morning and evening.
@@ -1483,7 +1442,11 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     },
                     &horizon_draw,
                 )
-                .with_limits(planning_limits(&limits, lpc.limit_ends_at(), site))
+                .with_limits(crate::site::planning_limits(
+                    &limits,
+                    lpc.limit_ends_at(),
+                    site,
+                ))
                 .in_community(&horizon_share);
 
             // The dishwasher, while there is still a decision to make about it.

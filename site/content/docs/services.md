@@ -9,10 +9,20 @@ two-hour minimum, and an IPC hop inside that path buys nothing — so a gateway
 runs `hemsd` and nothing else, with its stores embedded. Everything else in this
 page is cloud.
 
+`hemsd run` is that process today: a household, a tariff and a driver set from
+TOML, one task per driver holding its own socket, the guard and the arbiter
+deciding against real measurements, and a receding-horizon plan every five
+minutes against the two arrows coming *into* it below.
+
+Neither of those is a trust anchor. A box that cannot reach `tariffd` or
+`forecastd` keeps the house safe and lawful and loses the plan — a cost in euros
+rather than in compliance — and it says which of the two is missing on its own
+readiness probe rather than looking like a box that is planning badly.
+
 <pre class="mermaid">
 flowchart TB
   subgraph box["the household"]
-    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of evidence<br/>+ an outbox"]
+    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of evidence<br/>what its roof has learned<br/>+ an outbox"]
   end
   subgraph fleet["the fleet"]
     T["<b>tariffd</b><br/>five day-ahead sources"]
@@ -23,7 +33,7 @@ flowchart TB
   end
   T -- "prices" --> H
   F -- "the sky" --> H
-  H -- "evidence, registers" --> HI
+  H -- "evidence, from its own outbox" --> HI
   FL -- "signed config + manifests" --> H
   H -- "a signed CloudEvent per day" --> O
   NO["network operator"] -. "Nachweis" .-> HI
@@ -226,6 +236,15 @@ for two years, so `hemsd` holds its **own** copy and forwards second: what the
 fleet has not acknowledged is an outbox that grows, not a gap. A record that
 exists only once it has been uploaded is an intention with a network dependency —
 and the day a network operator asks about is the day the link was down.
+
+The drain is slow and batched for the same reason: what is being forwarded is
+already safe, so urgency buys nothing but load on a service the household does
+not own, and a box back from a month offline must not send a month at once.
+Forwarded is never *deleted* — the two years are the household's, and pruning
+follows the retention window rather than an acknowledgement. The sweep runs where
+the record is written, a few times a day, rather than on a timer with its own
+idea of when: two years is `[A1 7.3]`'s floor and keeping more is holding a
+household's control history for no reason anybody asked for.
 
 ## Running the fleet locally
 

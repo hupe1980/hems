@@ -10,7 +10,7 @@ the consequences of it.
 
 <pre class="mermaid">
 flowchart LR
-  I["prices · forecasts<br/>site state · grid limits"] --> S["solve 96 slots<br/>MILP"]
+  I["prices · forecasts<br/>site state · grid limits"] --> S["solve the horizon<br/>MILP"]
   S --> E["execute slot 0<br/>as a target + an envelope"]
   S --> T["slots 1…95<br/>discarded"]
   E --> A["the arbiter,<br/>once a second"]

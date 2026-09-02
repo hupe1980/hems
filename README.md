@@ -16,7 +16,10 @@
 ---
 
 > 🚧 **Pre-alpha.** The control stack is real, tested and simulated end to end.
-> Nothing talks to household hardware yet — see [Status](#-status).
+> `hemsd run` opens real sockets to real devices, accepts a network operator's
+> Steuerbox over TLS, and plans against fetched prices and a fetched sky. The
+> plan is a battery — the car, the building and the tank wait on drivers. See
+> [Status](#-status).
 
 A household with a roof, a battery, a car, a heat pump and a hot-water tank is
 now a small power station with legal obligations. Since 2024 the network operator
@@ -61,6 +64,22 @@ $ just ci          # fmt, clippy, purity, tests, guards, licences, docs
 $ just fleet-demo  # a box reporting its day into the fleet view
 ```
 
+And to manage a real house, from a file that describes it:
+
+```console
+$ cargo run -p hemsd -- run --check --config services/hemsd/hemsd.example.toml
+✅ 8 assets, 3 drivers, 6 resources described in S2
+
+$ cargo run -p hemsd -- run --config /etc/hems/hemsd.toml
+```
+
+`--check` builds the site and the drivers and stops before opening a socket — the
+command an installer runs before leaving the cellar. It refuses a driver for an
+asset the site does not have, two drivers for one asset, a controllable device
+whose driver cannot command it, and a § 14a household with nothing that could
+hear a reduction. Each of those is silent at runtime and loud at start-up, which
+is the right way round.
+
 Rust 1.94 and [`just`](https://just.systems). Nothing else: the default solver is
 pure Rust, so there is no C++ toolchain and no system library to install.
 
@@ -97,7 +116,7 @@ flowchart TB
   M["measurements, every second"] --> G
   L["§ 14a limit from the Steuerbox<br/>§ 9 EEG cap · fuses · backup reserve"] --> G
   G["<b>Guard</b> — absolute<br/>an interval per asset"]
-  F["forecasts · prices · site state"] --> P["<b>Planner</b> — advisory<br/>96 quarter-hour slots,<br/>re-solved every quarter hour"]
+  F["forecasts · prices · site state"] --> P["<b>Planner</b> — advisory<br/>quarter-hour slots over two days,<br/>re-solved on a receding horizon"]
   P -- "target · envelope · a price per asset" --> A["<b>Arbiter</b> — once a second<br/>desire → guard → smooth → explain"]
   G -- "the interval nothing may widen" --> A
   A --> S["setpoints, each naming its Reason"]
@@ -229,7 +248,7 @@ Seven claims, each argued on the site rather than here.
 
 Every regulatory number carries the document and clause it comes from —
 `[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
-all 328 of them against an index of primary sources, **failing the build** if one
+all 358 of them against an index of primary sources, **failing the build** if one
 names a document the index does not carry. `cargo xtask check-wire` does the same
 for the 121 quantities and instants, each of which has to say how it travels.
 
@@ -266,10 +285,24 @@ the index records the retrieval URL of each.
 
 ## 📊 Status
 
-**Pre-alpha, and the line is worth being exact about: nothing here talks to
-household hardware yet.** `hems-sim` stands in for every device. What is real is
-the control stack, the rules and the fleet — and the simulated days run the same
-guard, arbiter and planner a box would.
+**Pre-alpha, and the line is worth being exact about.** `hemsd run` opens real
+sockets and plans: a SunSpec inverter on Modbus TCP is read, folded into the
+guard's view and commanded; every five minutes the box asks `tariffd` what
+electricity costs and `forecastd` what the sky will do, models this roof, applies
+the correction the roof has earned from its own meter, reads the battery's charge
+and publishes a plan the arbiter follows.
+
+A network operator's Steuerbox reduces it. `hemsd` accepts one over TCP, TLS 1.2
+with mutual authentication, a WebSocket upgrade and the SHIP handshake; what
+crosses that seam is a SPINE datagram, so a limit an Energy Guard writes becomes
+the ceiling the guard enforces, the control loop writes the `[A1 7.2]` record as
+the reduction runs, and `histd` gets what it will take.
+
+What it does **not** do is plan the whole house. The plan is a **battery**: the
+car, the building and the hot-water tank are left out, because nothing reports an
+arrival, an indoor temperature or a tank temperature — each is a driver rather
+than a planner change, and an asset the plan named but did not model would be an
+instruction not to use it. `hems-sim` still stands in for those.
 
 | Works today | |
 |---|---|
@@ -279,31 +312,38 @@ guard, arbiter and planner a box would.
 | Forecasting, and being scored on it | solar geometry, a residual corrector that learns *this* roof, CRPS and calibration beside the money |
 | Seven reference days end to end | plus multi-day back-test and risk sweeps |
 | S2 / EN 50491-12-2 as the internal flexibility model | every message a whole site would send, and a count of what it cannot express |
-| The driver contract, SunSpec over Modbus TCP, and the EEBUS LPC Controllable System | sans-I/O; a whole § 14a day in virtual time |
+| The driver contract, SunSpec over Modbus TCP, and the EEBUS LPC Controllable System | sans-I/O; a whole § 14a day in virtual time, and an Energy Guard writing a limit over SPINE datagrams |
+| **The SHIP session** — TLS 1.2 with mutual authentication, the WebSocket upgrade, the handshake, a trust store and a SKI that survive a reboot | a Steuerbox reduces a running household to 4,2 kW over a real socket, and an unapproved one completes TLS and gets no further |
 | The driver registry | `hemsd` checks the drivers against the site *before* a byte moves |
+| **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided and what it could not hear |
+| **A receding-horizon plan on a real box** | prices from `tariffd`, the sky from `forecastd`, this roof modelled locally and corrected by what it has actually delivered, the battery read off its own meter, the solve off the runtime — and what it learns kept in its own store, so a reboot does not cost a fortnight |
+| **The § 14a record, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
+| **The household's own say** | `boost`, `pause` and `away` per asset, expiring on their own — the one write on the local API, and safe because an override is a *desire* the guard still narrows |
 | The five fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
 
 | Not yet | |
 |---|---|
-| The event loop that owns real sockets | a task per driver that connects, reads, writes and reconnects, and a site loaded from configuration — **next** |
-| SHIP / SPINE under EEBUS | TLS, SKI pairing, a trust store; the conformance harness and an interoperability event |
+| The car, the building and the tank in the plan | each waits on a driver that reports the state it is planned from — an arrival, an indoor temperature, a tank temperature — **next** |
+| EEBUS certification | mDNS/DNS-SD with the SHIP TXT record set, a pairing flow a person can drive, and a conformance harness against the lab's own test list |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-727 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+764 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (328 citations across five document
+clock, the whole suite, the workspace guards (358 citations across five document
 families, each resolving to a document the index carries; 121 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
-Three of those tests are worth naming because of what they guard against. One
+Four of those tests are worth naming because of what they guard against. One
 asserts the reference day's forecasts were **wrong**, since a day the planner
 cannot be surprised by measures a planner that was shown the answer. One runs the
 day's own quarter-hour registers through the § 42c allocation. One checks that
-every asset the arbiter commands can be described in S2. A rule module can be
-implemented, cited, tested and reached by nothing at all, and no property test
-catches that — a property is a statement about code that runs.
+every asset the arbiter commands can be described in S2. And one hangs a socket
+up in the middle of a device discovery and insists the reading that comes back
+afterwards is still the right number. A rule module can be implemented, cited,
+tested and reached by nothing at all, and no property test catches that — a
+property is a statement about code that runs.
 
 ## 🤝 Related crates
 

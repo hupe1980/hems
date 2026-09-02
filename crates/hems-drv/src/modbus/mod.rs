@@ -315,6 +315,38 @@ impl Driver for SunSpec {
         Ok(())
     }
 
+    /// A socket opened or closed under this driver.
+    ///
+    /// Everything a *session* owns is dropped: the half-frame in the inbox, the
+    /// request waiting for an answer, the queue of requests that were never
+    /// sent, and the half-assembled measurement they were building. Keeping any
+    /// of them across a reconnect is how a box comes back from a twenty-second
+    /// outage and decodes the new stream at the old one's offset.
+    ///
+    /// The **discovery** is dropped with them, and that is not caution for its
+    /// own sake: an address that reconnects may be a different device — a
+    /// replaced inverter, a Modbus gateway that renumbered its units, a DHCP
+    /// lease that moved. Walking the chain again costs three reads.
+    fn on_link(&mut self, state: LinkState, now: OffsetDateTime) {
+        self.inbox.clear();
+        self.outbox.clear();
+        self.pending = None;
+        self.partial = None;
+        self.due = None;
+        self.discovery.restart();
+        self.models.rewind();
+        if self.link != state {
+            self.link = state;
+            self.events.push(DriverEvent::Link(state));
+        }
+        if state == LinkState::Up {
+            // The first read of the new session goes out now rather than at the
+            // next poll: a reconnect that then waited a cadence would leave the
+            // guard assuming a nameplate for a device that is answering.
+            self.advance(now);
+        }
+    }
+
     fn on_timeout(&mut self, now: OffsetDateTime) {
         // An unanswered request is the only thing a timeout means here. The
         // guard is told the link is stale rather than being left with a
@@ -338,14 +370,19 @@ impl Driver for SunSpec {
         let Command::ProductionCeiling(ceiling) = command else {
             return Err(DriverError::Unsupported(format!("{command:?}")));
         };
+        // The link first, and the order matters. A device that has never been
+        // connected to has never been walked either, so it has no model 123
+        // *yet* — answering "this device cannot be curtailed" about a device
+        // nobody has spoken to is a diagnosis of the wrong thing, and it is the
+        // one an operator would act on.
+        if self.link != LinkState::Up {
+            return Err(DriverError::NotConnected);
+        }
         let Some(write) = self.models.curtailment_write(*ceiling) else {
             return Err(DriverError::Unsupported(
                 "a production ceiling on a device with no model 123".into(),
             ));
         };
-        if self.link != LinkState::Up {
-            return Err(DriverError::NotConnected);
-        }
         let transaction = self.transaction();
         self.outbox.push(Request {
             transaction,

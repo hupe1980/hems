@@ -34,7 +34,7 @@ The same list, in the same order, that CI runs:
 | `deny` | licences and advisories |
 | `doc` | rustdoc with warnings as errors |
 
-`guards` is the unusual one. It resolves **328 regulatory citations** across five
+`guards` is the unusual one. It resolves **358 regulatory citations** across five
 document families against an index of primary sources and fails the build if one
 names a document the index does not carry; and it checks that each of **121**
 quantities, instants and dates says how it travels on the wire.
@@ -121,6 +121,110 @@ assert!((minimum_power(&devices, ControlMode::Ems).kw() - 7.56).abs() < 1e-9);
 | `hems-sim` | deterministic hardware and a seeded weather | [Simulation](@/docs/simulation.md) |
 | `hems-service` | the shell the daemons share | [The fleet](@/docs/services.md) |
 
+## Manage a real house
+
+The days above are simulated. To point the box at hardware, describe the house
+and the devices in a file:
+
+```console
+$ cargo run -p hemsd -- run --check --config services/hemsd/hemsd.example.toml
+✅ 8 assets, 3 drivers, 6 resources described in S2
+
+$ cargo run -p hemsd -- run --config /etc/hems/hemsd.toml
+```
+
+`services/hemsd/hemsd.example.toml` is the annotated starting point, and it is
+parsed by a test — an example that has drifted from the struct it documents fails
+the build rather than misleading an installer in a cellar. Every field carries
+its unit in its name (`battery_kwh`, `fuse_a`, `comfort_min_c`) and every one has
+a default; the `[[drivers]]` list does not, and `run` refuses to start without
+it. A box with no drivers measures nothing, so the guard would assume every
+controllable device was at its nameplate, for ever.
+
+`--check` builds the site and the drivers and stops before opening a socket. It
+is what an installer runs before leaving, and it refuses the five mistakes that
+are otherwise silent for months — including a § 14a household with nothing that
+could hear a reduction.
+
+It also prints the box's **SKI**:
+
+```console
+🔑 SKI  1621 7EDA 71A2 12FD 004A 1864 CFE4 F4CE 3689 D5AD
+   give this to the metering point operator, so the Steuerbox trusts it
+```
+
+That is the number the whole § 14a link hangs on, and field reports make handing
+it over the single most common commissioning failure there is. It follows the
+box's key, which lives in the box's own store — so it is the same number after a
+reboot, and the pairing is done once.
+
+Once it is running, the box says what it is doing:
+
+```console
+$ curl -s localhost:8080/v1/status | jq '{silent, undriven, steuve_budget_kw, minutes_without_a_plan, plan_expected_eur}'
+```
+
+`silent` is the devices it cannot hear from and `undriven` the controllable ones
+nothing speaks for — each of those is a device the guard is being conservative
+about, and being conservative costs money. `minutes_without_a_plan` is `null`
+until the box has published one, and the readiness probe says why:
+
+```console
+$ curl -s localhost:8080/readyz | jq '.probes.planner'
+{ "ready": false, "detail": "no day-ahead prices", "last_good": null }
+```
+
+## Overruling it
+
+A plan the person paying for the electricity cannot overrule is a plan they pull
+the fuse on:
+
+```console
+$ curl -sX PUT localhost:8080/v1/overrides/wallbox \
+    -H 'content-type: application/json' -d '{"what":"boost","minutes":90}'
+{"asset":"wallbox","what":"boost","until":"2026-09-02T06:16:30Z"}
+
+$ curl -sX DELETE localhost:8080/v1/overrides      # back to normal
+```
+
+`boost`, `pause` and `away`, per asset. This is the **only write** on the local
+API, and it is safe for the same reason everything else is read-only: an
+override is a *desire*, which the arbiter reads and the guard then narrows. A
+household that presses boost in the middle of a § 14a reduction gets as much as
+the reduction allows and not a watt more. An endpoint that set a value on a
+device would have gone round the guard.
+
+They expire — four hours by default, a day at most. One that did not would be a
+household still paying in July for a boost it pressed in March, and anything
+longer than a day is a statement about the house that belongs in the file.
+
+## What it takes to plan
+
+Two services, both optional and neither a trust anchor. Point the box at
+`tariffd` and `forecastd` in `[fleet]` and every five minutes it asks what
+electricity costs and what the sky will do, models this household's roof
+locally, corrects the model with what the roof has actually been delivering,
+reads the battery's charge off its own meter, and publishes a plan the arbiter
+follows.
+
+It asks for the **sky** rather than for a finished production figure, and the
+distinction is the architecture: the correction that turns a geometric model
+into a forecast of *this* roof is a property of one address — the tree that
+shades the east string, the datasheet that was optimistic, the dust — and only
+the box's own meter can teach it.
+
+What it learns is kept in the box's own store, so a reboot does not cost a
+fortnight of it. And a box that cannot reach either service keeps the house safe
+and lawful and loses the plan, which is a cost in euros rather than in
+compliance.
+
+**The plan is a battery.** The car, the building and the hot-water tank are not
+in it, because nothing reports an arrival, an indoor temperature or a tank
+temperature yet — each waits on a driver rather than on a planner change. They
+are also left out of the *names* the plan may command, because an asset a plan
+names but does not model gets an envelope pinned at zero, and the arbiter obeys
+that as an instruction not to use it.
+
 ## Run the fleet
 
 Five daemons sit around the box. Each is a binary with a `--config` and a set of
@@ -156,7 +260,7 @@ fleet](@/docs/services.md).
 ## Where the rules come from
 
 Every regulatory number carries the document and clause it comes from —
-`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and the citation guard resolves all 328 of
+`[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and the citation guard resolves all 358 of
 them against an index of primary sources.
 
 The documents themselves are third-party copyrighted publications and are **not

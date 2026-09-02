@@ -416,6 +416,21 @@ impl EvidenceRecorder {
         &self.closed
     }
 
+    /// Take every finished record, leaving the recorder holding only the one
+    /// still open.
+    ///
+    /// For a consumer that **persists** them, which is what a box does: the
+    /// store is the record and this is a buffer, so a recorder that kept a copy
+    /// of everything it had ever built would hold every minute-resolution trace
+    /// of two years in memory for nothing.
+    ///
+    /// Distinct from [`EvidenceRecorder::prune`], which is the right call for a
+    /// consumer that has nowhere else to put them — a simulated day, which
+    /// reports on its own records at the end.
+    pub fn take_closed(&mut self) -> Vec<ControlEvent> {
+        core::mem::take(&mut self.closed)
+    }
+
     /// Drop records the retention period no longer covers, `[A1 7.3]`.
     ///
     /// Two years is a floor, not a ceiling — but keeping them for ever is a

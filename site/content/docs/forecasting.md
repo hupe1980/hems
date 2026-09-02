@@ -136,7 +136,10 @@ is quoting the second one.
 
 Everything is a pure function of a record. Nothing here reads a clock, opens a
 socket or holds a model file, which is what lets a whole simulated season of
-forecasting run as a unit test.
+forecasting run as a unit test. On a real box the two models that learn — the
+residual corrector and the load profile — are taught on the quarter-hour
+boundary and kept in `hemsd`'s own store, so a reboot does not cost a fortnight
+of them.
 
 | Module | Predicts | From |
 |---|---|---|

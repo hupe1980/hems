@@ -79,6 +79,25 @@ deny:
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features
 
+# Everything a box refuses to start with, without opening a socket: a driver for
+# an asset the site does not have, two drivers for one asset, a controllable
+# device whose driver cannot command it, and a § 14a household with nothing that
+# could hear a reduction. What an installer runs before leaving the cellar.
+#
+# 🔌 Check a real household's configuration
+check-box config="services/hemsd/hemsd.example.toml":
+    cargo run -p hemsd -- run --check --config {{ config }}
+
+# The box on the wall rather than a simulated day: a site and a driver set from
+# TOML, one task per driver holding its own socket, and the guard and the arbiter
+# deciding against real measurements. It will sit there reconnecting to devices
+# that are not on this machine, which is the correct behaviour and is why this is
+# a convenience rather than a demonstration.
+#
+# 🔌 Manage a real household
+box config="services/hemsd/hemsd.example.toml":
+    cargo run -p hemsd -- run --config {{ config }}
+
 # 🏠 One simulated day through the whole control stack
 demo day="winter":
     cargo run -p hemsd -- simulate --day {{ day }}

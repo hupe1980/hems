@@ -21,14 +21,18 @@
 )]
 
 pub mod backtest;
+pub mod config;
 pub mod drivers;
 pub mod forecasting;
 pub mod report;
+pub mod runtime;
 pub mod scenario;
 pub mod site;
 pub mod store;
 
 pub use backtest::{Spread, spread_over_days};
+pub use config::{ControlSettings, DriverSettings, Settings, SiteSettings};
 pub use forecasting::{Learned, Weather, WeatherSpec};
+pub use runtime::{Running, Status};
 pub use scenario::{CommunityMembership, DayResult, EvPlan, Scenario, run};
 pub use site::{Household, HouseholdConfig};

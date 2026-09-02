@@ -30,13 +30,21 @@ pub use m14a::{Para14aConfig, Verursachungsregel};
 /// value and its citation live.
 pub const MINDESTLEISTUNG: Power = Power::new_const(4_200.0);
 
-/// The threshold above which a heat-pump or cooling group is scaled instead of
-/// being given the flat minimum, `[A1 4.5.1 S. 2]`, `[A1 4.5.2 S. 3]`.
-pub const SCALING_THRESHOLD: Power = Power::new_const(11_000.0);
-
-/// The scaling factor presumed appropriate until a different recommendation
-/// takes effect, `[A1 4.5.1 S. 3]`.
-pub const SKALIERUNGSFAKTOR: f64 = 0.4;
+// There are deliberately no `SCALING_THRESHOLD` and `SKALIERUNGSFAKTOR`
+// constants here, and the absence is a decision rather than an omission.
+//
+// The 11 kW threshold of `[A1 4.5.1 S. 2]` and the 0,4 factor of
+// `[A1 4.5.1 S. 3]` are inputs to `mindestleistung_ems`, which is
+// `metering::para14a`'s — so this crate restating them as literals would be a
+// second copy of a regulation that nothing here evaluates and nothing here
+// tests. A second copy of a rule does not stay in step: the day the
+// Bundesnetzagentur's recommendation changes, one of the two moves and the
+// other is a number somebody reads and believes.
+//
+// `metering::para14a::SKALIERUNG_SCHWELLE_KW` and
+// `metering::para14a::SKALIERUNGSFAKTOR` are the values, in the exact decimals
+// the arithmetic is done in. `MINDESTLEISTUNG` above stays because it *is*
+// read here, and it says in its own doc that `metering` is where it comes from.
 
 /// The power above which a device is controllable at all, `[A1 2.4.1]`.
 ///
