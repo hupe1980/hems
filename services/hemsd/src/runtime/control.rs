@@ -217,9 +217,11 @@ pub async fn run(
         // and saying so is the difference between "nothing went wrong" and
         // "nobody was looking" (D116).
         unplanned: crate::runtime::day::Unplanned::resumed(),
+        clipping: crate::runtime::day::Clipping::default(),
         scored: crate::runtime::day::Scored::default(),
         overruns: 0,
         pv_wh: 0.0,
+        pv_samples: 0,
         load_wh: 0.0,
         samples: 0,
         grid_draw_wh: 0.0,
@@ -389,13 +391,19 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
     let Some(load) = crate::drivers::household_load(observed) else {
         return;
     };
-    let pv = observed
+    let measured_pv = observed
         .state
         .asset(&managed.pv)
         .and_then(|m| m.power)
-        .map_or(Power::ZERO, Power::outflow);
+        .map(Power::outflow);
+    let pv = measured_pv.unwrap_or(Power::ZERO);
     let hours = seconds / 3600.0;
     carried.pv_wh += pv.get() * hours;
+    // Whether anything was *read* — a roof nobody metered did not produce
+    // nothing, and the quarter-hour record says `None` rather than nought
+    // (D124). Kept apart from `samples`, which counts what the *load* teacher
+    // saw.
+    carried.pv_samples += usize::from(measured_pv.is_some());
     carried.load_wh += load.get() * hours;
     carried.samples += 1;
 
@@ -451,8 +459,10 @@ async fn close_the_day(
     let finished = carried.local_day;
     carried.local_day = today;
     let unplanned = carried.unplanned;
+    let clipping = carried.clipping;
     let scored = carried.scored.clone();
     carried.unplanned.roll();
+    carried.clipping.roll();
     carried.scored.roll();
 
     let Some(store) = store else {
@@ -464,7 +474,7 @@ async fn close_the_day(
 
     let site = managed.site.id.to_string();
     let mut guard = store.lock().await;
-    let built = crate::runtime::day::kpis(&guard, &site, finished, unplanned, &scored);
+    let built = crate::runtime::day::kpis(&guard, &site, finished, unplanned, clipping, &scored);
     match built {
         Ok(Some(day)) => {
             let event = hems_events::Event::new(
@@ -543,10 +553,19 @@ async fn register(
     };
     drop(held);
 
+    // The roof is recorded **beside** the registers rather than inside them: the
+    // MiSpeL set is the Festlegung's own and `Z2E¼` is the storage system's
+    // generation, not the sun's (D124). `None` would be a box with no production
+    // measurement; this one has been accumulating the meter all quarter hour.
+    let recorded = crate::store::Recorded {
+        registers: quarter,
+        production: (carried.pv_samples > 0).then(|| kwh(carried.pv_wh)),
+    };
+
     if let Err(error) = store
         .lock()
         .await
-        .put_quarter_hour(&quarter, OffsetDateTime::now_utc())
+        .put_quarter_hour(&recorded, OffsetDateTime::now_utc())
     {
         tracing::warn!(%error, "a quarter-hour register could not be written");
     }
@@ -629,12 +648,18 @@ struct Carried {
     local_day: time::Date,
     /// Minutes the arbiter has spent on the fallback today.
     unplanned: crate::runtime::day::Unplanned,
+    /// What the hardware would not take today.
+    clipping: crate::runtime::day::Clipping,
     /// How today's forecasts have scored against what actually happened.
     scored: crate::runtime::day::Scored,
     /// How many ticks have overrun their period.
     overruns: u64,
     /// Production accumulated over the quarter hour in progress, watt-hours.
     pv_wh: f64,
+    /// How many ticks of it were actually read off a meter. Zero is a roof
+    /// nobody measured, which is a different fact from a roof that produced
+    /// nothing.
+    pv_samples: usize,
     /// The household's own load over the same, watt-hours.
     load_wh: f64,
     /// How many ticks contributed to those two.
@@ -690,6 +715,7 @@ async fn tick(
         carried.delivered.clear();
         carried.samples = 0;
         carried.pv_wh = 0.0;
+        carried.pv_samples = 0;
         carried.load_wh = 0.0;
         carried.grid_draw_wh = 0.0;
         carried.grid_feed_wh = 0.0;
@@ -781,6 +807,16 @@ async fn tick(
             .entry(asset.clone())
             .or_insert(Energy::ZERO) += moved;
     }
+
+    // What the hardware would not take. The arbiter resolves a command a device
+    // cannot hold — a charge point below 6 A, a hot-water relay part way on —
+    // and every layer above then believes the decided value; counting it is the
+    // only thing that says a household's wallbox is not the one the planner is
+    // modelling.
+    carried.clipping.tick(
+        decision.clipped.values().copied().sum(),
+        u32::try_from(period.as_secs()).unwrap_or(u32::MAX),
+    );
 
     // ── 4. The record `[A1 7.2]` asks for ──────────────────────────────────
     //

@@ -14,6 +14,7 @@
 //! | `ev_e[k]` | energy in the car at the end of slot `k`, Wh |
 //! | `curtail[k]` | production thrown away |
 //! | `sh_start[i][k]` | binary: appliance `i` starts its programme in slot `k` |
+//! | `z[k]` | binary: the connection point is exporting — **only where a price could pay for a round trip** |
 //!
 //! subject to, in every slot,
 //!
@@ -21,24 +22,28 @@
 //! g_in − g_out = load + b_ch − b_dis + ev + hp + dhw + a − (pv − curtail)
 //!                                                               (energy balance)
 //! g_out ≤ pv − curtail + b_dis                                  (no invented export)
+//! g_in ≤ M_in·(1 − z),  g_out ≤ M_out·z   where export > import (one way at a time)
 //! e[k] = e[k−1] + Δ(η_ch·b_ch − b_dis/η_dis)                    (battery state)
 //! ev_e[k] = ev_e[k−1] + Δ·η·ev                                  (car state)
 //! b_ch + ev + hp − b_dis + curtail + dhw + a ≤ ceiling + (pv − load)
 //!                                                               (§ 14a, with a surplus)
-//! b_ch + ev + hp − b_dis ≤ ceiling                              (§ 14a, without one)
+//! Σ SteuVE − b_dis ≤ ceiling                                    (§ 14a, without one)
 //! g_out ≤ feed-in ceiling                                       (§ 9 EEG, LPP)
 //! curtail ≤ pv
 //! ```
 //!
-//! `a` is what the shiftable appliances draw. Four details of the § 14a rows are
+//! `a` is what the shiftable appliances draw. Five details of the § 14a rows are
 //! each a decision rather than an accident, and `grid_rules` gives the argument
 //! for every one: curtailment is on the **left** because throwing energy away
 //! cannot buy headroom; the tank and the appliances are on the left because they
 //! spend the surplus without being steuerbare Verbrauchseinrichtungen
 //! themselves; the battery's **discharge** is on the left with a minus, because
-//! `[A1 2.3]` measures what crosses the connection point; and the `max(0, ·)`
-//! around the surplus is dropped, which is exact wherever the surplus survives
-//! and conservative where it does not.
+//! `[A1 2.3]` measures what crosses the connection point; the `max(0, ·)` around
+//! the surplus is dropped, which is exact wherever the surplus survives and
+//! conservative where it does not; and `Σ SteuVE` is the devices a network
+//! operator may actually reduce rather than every device this crate models, which
+//! is a fact about a site's nameplates and arrives in
+//! [`crate::model::SteuVeDevices`].
 //!
 //! and minimising
 //!
@@ -46,7 +51,7 @@
 //! Σ Δ·(price_in·g_in − price_out·g_out + wear·(b_ch + b_dis) + penalty·curtail)
 //! ```
 //!
-//! # Two things this does that most do not
+//! # Three things this does that most do not
 //!
 //! **Battery wear is in the objective.** Without it a cost-minimising plan will
 //! cycle a battery for a spread that does not cover the damage — measured at up
@@ -57,6 +62,16 @@
 //! consumption, so the surplus a roof is producing raises the ceiling exactly as
 //! `[A1 2.3]` says it does. The same arithmetic runs in the guard at one-second
 //! resolution against measurements; here it runs against the forecast.
+//!
+//! **The connection point runs one way at a time.** `g_in` and `g_out` are two
+//! non-negative variables whose difference the balance fixes, so adding the same
+//! watt to both is always feasible and the objective charges `import − export`
+//! for it. Where that is negative — a deeply negative quarter hour, a legacy
+//! feed-in tariff above retail — the plan used to report a household importing
+//! its whole load *and* exporting its whole roof at once and book the spread as
+//! revenue. No inequality implies `g_in · g_out = 0`, so the direction is a
+//! binary; `direction_binary` declares one only in the slots that could pay for
+//! the round trip, which on a modern tariff is none of them.
 
 use good_lp::constraint::ConstraintReference;
 use good_lp::{
@@ -348,7 +363,7 @@ pub fn solve(
     // with `microlp` and one built with HiGHS agree about what a kilowatt-hour
     // is worth. See `crate::shadow`.
     let shadows = if problem.shadow_prices {
-        shadow_prices(problem, &solution, &declared[0].borrow())
+        shadow_prices(problem, &solution, &declared)
     } else {
         Vec::new()
     };
@@ -448,11 +463,12 @@ fn central_future(problem: &Problem<'_>) -> usize {
 fn shadow_prices(
     problem: &Problem<'_>,
     solution: &impl Solution,
-    solved: &Vars<'_>,
+    declared: &[Variables],
 ) -> Vec<crate::shadow::Shadow> {
     use good_lp::solvers::{DualValues, SolutionWithDual};
 
     let n = problem.horizon.len;
+    let solved = declared[0].borrow();
     let pins = Pins {
         ev_on: (0..n)
             .map(|k| solution.value(solved.ev_on[k]).round())
@@ -464,6 +480,16 @@ fn shadow_prices(
             .sh_start
             .iter()
             .map(|starts| starts.iter().map(|v| solution.value(*v).round()).collect())
+            .collect(),
+        // Per future, because the direction is.
+        exporting: declared
+            .iter()
+            .map(|f| {
+                f.exporting
+                    .iter()
+                    .map(|z| z.map_or(0.0, |v| solution.value(v).round()))
+                    .collect()
+            })
             .collect(),
     };
 
@@ -601,6 +627,10 @@ struct Vars<'a> {
     sh_short: &'a [Variable],
     /// Import that a § 42c community allocated to this member, watts.
     shared: &'a [Variable],
+    /// `1` while the connection point is **exporting** — `None` in every slot
+    /// where the objective cannot pay for a round trip through the meter and
+    /// the direction therefore needs no deciding. See [`balance`].
+    exporting: &'a [Option<Variable>],
 }
 
 /// Every decision variable of the model, owned.
@@ -631,6 +661,7 @@ struct Variables {
     sh_start: Vec<Vec<Variable>>,
     sh_short: Vec<Variable>,
     shared: Vec<Variable>,
+    exporting: Vec<Option<Variable>>,
 }
 
 impl Variables {
@@ -659,6 +690,7 @@ impl Variables {
             sh_start: &self.sh_start,
             sh_short: &self.sh_short,
             shared: &self.shared,
+            exporting: &self.exporting,
         }
     }
 }
@@ -676,6 +708,11 @@ struct Pins {
     hp_on: Vec<f64>,
     /// Where each appliance's programme was placed, `[i][k]`.
     sh_start: Vec<Vec<f64>>,
+    /// Which way the connection point ran, `[future][k]`. Per future rather
+    /// than shared, because it is physics rather than a commitment: a dull
+    /// afternoon imports where a bright one exports, and tying the two together
+    /// would make one of them infeasible.
+    exporting: Vec<Vec<f64>>,
 }
 
 /// Declare the variables and their bounds.
@@ -705,7 +742,10 @@ fn build_variables(
 
     let per: Vec<Variables> = futures
         .iter()
-        .map(|realisation| recourse_variables(problem, &mut vars, &shared, *realisation))
+        .enumerate()
+        .map(|(s, realisation)| {
+            recourse_variables(problem, &mut vars, &shared, *realisation, s, pins)
+        })
         .collect();
 
     // ζ and one tail excess per future — the Rockafellar–Uryasev linearisation
@@ -788,6 +828,8 @@ fn recourse_variables(
     vars: &mut ProblemVariables,
     shared: &SharedBinaries,
     realisation: crate::model::Realisation,
+    future: usize,
+    pins: Option<&Pins>,
 ) -> Variables {
     let n = problem.horizon.len;
     let mut v = Variables {
@@ -813,6 +855,7 @@ fn recourse_variables(
         sh_start: Vec::with_capacity(problem.shiftable.len()),
         sh_short: Vec::with_capacity(problem.shiftable.len()),
         shared: Vec::with_capacity(n),
+        exporting: Vec::with_capacity(n),
     };
 
     let import_ceiling = problem
@@ -852,6 +895,14 @@ fn recourse_variables(
         }
         v.g_out
             .push(vars.add(variable().min(0.0).max(export_ceiling)));
+        v.exporting.push(direction_binary(
+            problem,
+            vars,
+            realisation,
+            k,
+            future,
+            pins,
+        ));
         v.curtail.push(vars.add(variable().min(0.0).max(pv)));
 
         let (charge_max, discharge_max, floor, ceiling) =
@@ -871,53 +922,148 @@ fn recourse_variables(
         charge_point_variables(problem, vars, &mut v);
         v.ev_on.push(shared.ev_on[k]);
 
-        let (dhw_max, dhw_capacity) = problem
-            .dhw
-            .map_or((0.0, 0.0), |d| (d.heater.get(), d.capacity.get()));
-        v.dhw.push(vars.add(variable().min(0.0).max(dhw_max)));
-        v.dhw_e
-            .push(vars.add(variable().min(0.0).max(dhw_capacity)));
-        // The shortfall covers the standing loss as well as the draw. `dhw_e ≥ 0`
-        // is the lowest temperature the household accepts, not the ambient one,
-        // so a tank on that floor is still losing heat — and an equality that can
-        // only be closed by heating forces the heater to `loss/cop` for ever, and
-        // is infeasible wherever a heater cannot out-run its own cylinder.
-        let dhw_deficit = problem
-            .dhw
-            .map_or(0.0, |d| d.standing_loss.get() * DT_HOURS)
-            + problem.dhw_draw_at(k);
-        v.dhw_short
-            .push(vars.add(variable().min(0.0).max(dhw_deficit)));
-
+        hot_water_variables(problem, vars, &mut v, k);
         v.hp_on.push(shared.hp_on[k]);
-        match problem.thermal {
-            Some(t) => {
-                v.hp.push(vars.add(variable().min(0.0).max(t.heat_pump.max_electrical.get())));
-                // Wide bounds on the temperatures: the comfort band is a *soft*
-                // constraint, and pinning the state variable to it would make a
-                // cold snap infeasible instead of merely uncomfortable.
-                v.t_in.push(vars.add(variable().min(-20.0).max(45.0)));
-                v.t_mass.push(vars.add(variable().min(-20.0).max(45.0)));
-                v.cold.push(vars.add(variable().min(0.0)));
-                v.warm.push(vars.add(variable().min(0.0)));
-            }
-            None => {
-                for target in [
-                    &mut v.hp,
-                    &mut v.t_in,
-                    &mut v.t_mass,
-                    &mut v.cold,
-                    &mut v.warm,
-                ] {
-                    target.push(vars.add(variable().min(0.0).max(0.0)));
-                }
-            }
-        }
+        building_variables(problem, vars, &mut v);
     }
 
     v.sh_start.clone_from(&shared.sh_start);
     v.sh_short.clone_from(&shared.sh_short);
     v
+}
+
+/// The hot-water tank's heater, its store and the draw it could not serve.
+fn hot_water_variables(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    v: &mut Variables,
+    k: usize,
+) {
+    let (dhw_max, dhw_capacity) = problem
+        .dhw
+        .map_or((0.0, 0.0), |d| (d.heater.get(), d.capacity.get()));
+    v.dhw.push(vars.add(variable().min(0.0).max(dhw_max)));
+    v.dhw_e
+        .push(vars.add(variable().min(0.0).max(dhw_capacity)));
+    // The shortfall covers the standing loss as well as the draw. `dhw_e ≥ 0`
+    // is the lowest temperature the household accepts, not the ambient one, so a
+    // tank on that floor is still losing heat — and an equality that can only be
+    // closed by heating forces the heater to `loss/cop` for ever, and is
+    // infeasible wherever a heater cannot out-run its own cylinder.
+    let dhw_deficit = problem
+        .dhw
+        .map_or(0.0, |d| d.standing_loss.get() * DT_HOURS)
+        + problem.dhw_draw_at(k);
+    v.dhw_short
+        .push(vars.add(variable().min(0.0).max(dhw_deficit)));
+}
+
+/// The heat pump's power, the two thermal masses and the comfort slack.
+fn building_variables(problem: &Problem<'_>, vars: &mut ProblemVariables, v: &mut Variables) {
+    match problem.thermal {
+        Some(t) => {
+            v.hp.push(vars.add(variable().min(0.0).max(t.heat_pump.max_electrical.get())));
+            // Wide bounds on the temperatures: the comfort band is a *soft*
+            // constraint, and pinning the state variable to it would make a cold
+            // snap infeasible instead of merely uncomfortable.
+            v.t_in.push(vars.add(variable().min(-20.0).max(45.0)));
+            v.t_mass.push(vars.add(variable().min(-20.0).max(45.0)));
+            v.cold.push(vars.add(variable().min(0.0)));
+            v.warm.push(vars.add(variable().min(0.0)));
+        }
+        None => {
+            for target in [
+                &mut v.hp,
+                &mut v.t_in,
+                &mut v.t_mass,
+                &mut v.cold,
+                &mut v.warm,
+            ] {
+                target.push(vars.add(variable().min(0.0).max(0.0)));
+            }
+        }
+    }
+}
+
+/// Whether the connection point exports in this slot — `None` where the
+/// question cannot arise.
+///
+/// `g_in` and `g_out` are two non-negative variables whose *difference* the
+/// balance fixes, so adding the same watt to both is always feasible and the
+/// objective charges `import − export` for it. Where a kilowatt-hour earns more
+/// leaving than it costs arriving — a deeply negative quarter hour, a legacy
+/// feed-in tariff above retail — that is negative, and the plan takes as much of
+/// it as the export bound allows: a household importing its whole load *and*
+/// exporting its whole roof at once, which one connection point cannot do.
+///
+/// `g_in · g_out = 0` is a disjunction and no inequality implies it — the mirror
+/// of the export bound is algebraically the export bound (see [`balance`]) — so
+/// the direction is a binary, declared **only in the slots that can pay for the
+/// round trip**. On a modern feed-in tariff that is none of them (D120).
+fn direction_binary(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    realisation: crate::model::Realisation,
+    k: usize,
+    future: usize,
+    pins: Option<&Pins>,
+) -> Option<Variable> {
+    let (import_eur, export_eur) = connection_prices(problem, k);
+    // Nothing to decide where the objective already prefers the honest answer,
+    // or where one of the two directions is physically impossible anyway.
+    if export_eur <= import_eur
+        || import_cap(problem, realisation, k) <= 0.0
+        || export_cap(problem, realisation, k) <= 0.0
+    {
+        return None;
+    }
+    Some(match pins {
+        // The dual pass builds the same model from the same problem, and
+        // `Problem::realisations` does not depend on the risk weight the pass
+        // zeroes — so the pins have one entry per future per slot, and an index
+        // that missed would be a model the duals do not belong to.
+        Some(p) => {
+            let pinned = p.exporting[future][k];
+            vars.add(variable().min(pinned).max(pinned))
+        }
+        None => vars.add(variable().binary()),
+    })
+}
+
+/// The most the connection point could draw in one slot, watts.
+///
+/// Everything the household could switch on at once plus the load it cannot
+/// switch off, which is a valid upper bound on `g_in` whenever nothing is being
+/// exported — and therefore a big-M that never cuts off a feasible plan.
+fn import_cap(problem: &Problem<'_>, realisation: crate::model::Realisation, k: usize) -> f64 {
+    let (_, load) = problem.forecasts_in(realisation, k);
+    let switchable = problem.battery.map_or(0.0, |b| b.max_charge.get())
+        + problem.ev.map_or(0.0, |e| e.max_charge.get())
+        + problem
+            .thermal
+            .map_or(0.0, |t| t.heat_pump.max_electrical.get())
+        + problem.dhw.map_or(0.0, |d| d.heater.get())
+        + problem
+            .shiftable
+            .iter()
+            .map(|r| r.programme.peak().get())
+            .sum::<f64>();
+    let ceiling = problem
+        .limits
+        .import_ceiling
+        .map_or(f64::INFINITY, Power::get);
+    (load.max(0.0) + switchable).min(ceiling)
+}
+
+/// The most it could feed in, watts — the roof plus the battery.
+fn export_cap(problem: &Problem<'_>, realisation: crate::model::Realisation, k: usize) -> f64 {
+    let (pv, _) = problem.forecasts_in(realisation, k);
+    let ceiling = problem
+        .horizon
+        .get(k)
+        .and_then(|s| problem.limits.feed_in_at(s))
+        .map_or(f64::INFINITY, Power::get);
+    (pv.max(0.0) + problem.battery.map_or(0.0, |b| b.max_discharge.get())).min(ceiling)
 }
 
 /// The charge point's on/off binary for one slot.
@@ -1153,6 +1299,39 @@ fn build_objective(
     mean * (1.0 - lambda) + tail * lambda
 }
 
+/// What a kilowatt-hour costs and earns at the connection point in slot `k`,
+/// €/kWh.
+///
+/// The two coefficients the objective puts on `g_in` and `g_out`, in **one**
+/// place because a second consumer needs exactly the same pair and must not be
+/// able to disagree with it: [`recourse_variables`] decides from them whether a
+/// slot needs a direction binary, and a slot the objective thinks is concave
+/// while the variables think it is convex is a slot in which the plan invents
+/// money (see [`balance`]).
+///
+/// A carbon price and an autarky premium are what the household is willing to
+/// pay to avoid a kilogram of CO₂ and a kilowatt-hour of import, so they add to
+/// the energy price instead of replacing it — which is what keeps them
+/// comparable with battery wear, curtailment and discomfort.
+fn connection_prices(problem: &Problem<'_>, k: usize) -> (f64, f64) {
+    let price = problem.prices.slots.get(k);
+    let carbon_eur = price
+        .and_then(|p| p.co2_g_per_kwh)
+        .unwrap_or(DEFAULT_CO2_G_PER_KWH)
+        / 1000.0
+        * problem.objective.co2_eur_per_kg;
+    let import_eur = price.map_or(
+        DEFAULT_IMPORT_EUR_PER_KWH,
+        hems_tariff::SlotPrice::import_f64,
+    ) + carbon_eur
+        + problem.objective.autarky_eur_per_kwh;
+    let export_eur = price.map_or(
+        DEFAULT_EXPORT_EUR_PER_KWH,
+        hems_tariff::SlotPrice::export_f64,
+    );
+    (import_eur, export_eur)
+}
+
 /// What one future costs, in euros over the horizon.
 fn scenario_cost(
     problem: &Problem<'_>,
@@ -1162,25 +1341,7 @@ fn scenario_cost(
     let mut objective = Expression::from(0.0);
     for k in 0..problem.horizon.len {
         let price = problem.prices.slots.get(k);
-        // Everything is euros. A carbon price and an autarky premium are what
-        // the household is willing to pay to avoid a kilogram of CO₂ and a
-        // kilowatt-hour of import, so they add to the energy price instead of
-        // replacing it — which is what keeps them comparable with battery wear,
-        // curtailment and discomfort.
-        let carbon_eur = price
-            .and_then(|p| p.co2_g_per_kwh)
-            .unwrap_or(DEFAULT_CO2_G_PER_KWH)
-            / 1000.0
-            * problem.objective.co2_eur_per_kg;
-        let import_eur = price.map_or(
-            DEFAULT_IMPORT_EUR_PER_KWH,
-            hems_tariff::SlotPrice::import_f64,
-        ) + carbon_eur
-            + problem.objective.autarky_eur_per_kwh;
-        let export_eur = price.map_or(
-            DEFAULT_EXPORT_EUR_PER_KWH,
-            hems_tariff::SlotPrice::export_f64,
-        );
+        let (import_eur, export_eur) = connection_prices(problem, k);
         objective += (vars.g_in[k] * import_eur - vars.g_out[k] * export_eur) * SLOT_KWH_PER_W;
         // § 42c: the part of that import the community allocated to this member
         // is billed at the community's price instead of the supplier's, so it
@@ -1484,9 +1645,20 @@ fn balance<M: SolverModel>(
     // indeterminate, and an interior-point solver, asked for the analytic centre
     // of a dual face that is a whole ray, returned 5 986 €/kWh for an ordinary
     // 20 ct hour. See [`shadow_prices`].
-    model.with(constraint!(
+    model = model.with(constraint!(
         vars.g_out[k] <= pv - vars.curtail[k] + vars.b_dis[k]
-    ))
+    ));
+
+    // …and where the objective would *pay* for a round trip, the direction has
+    // to be decided rather than left to the sign of a price. One binary, two
+    // big-Ms, and only in the slots [`direction_binary`] says can pay for it.
+    if let Some(z) = vars.exporting[k] {
+        let import_m = import_cap(problem, realisation, k);
+        let export_m = export_cap(problem, realisation, k);
+        model = model.with(constraint!(vars.g_in[k] <= import_m * (1.0 - z)));
+        model = model.with(constraint!(vars.g_out[k] <= export_m * z));
+    }
+    model
 }
 
 /// The battery: where its charge comes from and where it may go.
@@ -1697,6 +1869,7 @@ fn grid_rules<M: SolverModel>(
         return model;
     };
     let (pv, load) = problem.forecasts_in(realisation, k);
+    let steuve = problem.limits.steuve_devices;
     let row = if pv <= load {
         // No surplus to lift the ceiling with, so the rule is the bare one — and
         // nothing that is *not* a steuerbare Verbrauchseinrichtung belongs on
@@ -1704,9 +1877,25 @@ fn grid_rules<M: SolverModel>(
         // *spend* of the surplus, never against the ceiling itself; with no
         // surplus to spend they do not appear at all, which makes this branch
         // exact.
-        model.add_constraint(constraint!(
-            vars.b_ch[k] + vars.ev[k] + vars.hp[k] - vars.b_dis[k] <= ceiling.get()
-        ))
+        //
+        // Which of the three *controllable* devices belong here is a fact about
+        // the site rather than about the planner: a heat pump group below 4,2 kW
+        // is not a steuerbare Verbrauchseinrichtung and no network operator may
+        // reduce it. See [`crate::model::SteuVeDevices`] — putting it here
+        // anyway made a household with a small heat pump colder than the
+        // Festlegung asks for, on exactly the winter evenings a reduction
+        // happens.
+        let mut left = Expression::from(0.0);
+        if steuve.battery {
+            left += vars.b_ch[k] - vars.b_dis[k];
+        }
+        if steuve.ev {
+            left += vars.ev[k];
+        }
+        if steuve.heat_pump {
+            left += vars.hp[k];
+        }
+        model.add_constraint(constraint!(left <= ceiling.get()))
     } else {
         // With a surplus, everything that consumes it reduces the headroom it
         // buys: the curtailed production that never happened, the tank that took
@@ -1732,6 +1921,12 @@ fn grid_rules<M: SolverModel>(
         // appliance's own rating of headroom in the slots where a surplus is
         // small *and* a reduction is in force. Measured on the reference days it
         // is worth nothing at all, and it was not built.
+        //
+        // [`crate::model::SteuVeDevices`] does **not** appear here, and that is
+        // arithmetic rather than an omission: a device that is not a steuerbare
+        // Verbrauchseinrichtung spends the surplus instead of being bound by the
+        // ceiling, and a spender carries the same `+1` on this row as a
+        // controllable device does. The two readings are the same inequality.
         model.add_constraint(constraint!(
             vars.b_ch[k] + vars.ev[k] + vars.hp[k] - vars.b_dis[k]
                 + vars.curtail[k]

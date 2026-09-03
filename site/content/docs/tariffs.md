@@ -117,10 +117,17 @@ quarters, and must appear in the preliminary price sheet by 15 October of the
 preceding year.
 
 There is **no machine-readable national format** for any of it — a PDF and an
-Excel sheet per network operator — so hems curates the calendars, records where
-each one came from, and validates one before it can reach the optimiser. Window
-membership is decided on **local wall-clock time**, because that is how the price
-sheet is written.
+Excel sheet per network operator — so the installer transcribes the operator's
+calendar into `[tariff.modul3]` and `hemsd run --check` refuses a box whose
+calendar breaks the [Anwendungshilfe](@/docs/grid-rules.md#modul-3-time-variable-network-charges).
+Window membership is decided on **local wall-clock time**, because that is how
+the price sheet is written.
+
+It is worth planning against for a reason the wholesale curve cannot match: the
+windows are fixed **a year in advance**. A household learns tomorrow's spot price
+each afternoon and learns its Hochtarif in the preliminary price sheet of the
+preceding October, so the one flexibility it can schedule around with certainty
+is this one.
 
 ## The Modul advisor
 

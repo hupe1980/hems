@@ -163,6 +163,40 @@ pub struct OutboundEvent {
     pub attempts: i64,
 }
 
+/// One quarter hour as the **box** records it: the MiSpeL registers a settlement
+/// is computed from, and — beside them rather than inside them — what the roof
+/// produced.
+///
+/// [`QuarterHour`] is the Festlegung's own register set and stays that. Its names
+/// are `Z1NB¼`, `Z1NE¼`, `Z2V¼`, `Z2E¼`, and a Nachweis that renames its inputs
+/// is one somebody has to translate before they can check it — and `Z2E¼` is the
+/// **storage system and charge point's** generation, which is not the roof and is
+/// not close to it. Read as the roof it makes a household running off its own sun
+/// report a self-sufficiency of nought all summer, because its export exceeds its
+/// battery's discharge and the subtraction floors at zero.
+///
+/// The absence of a production meter is `None` rather than zero: a box with none
+/// has not measured a dark roof (D124).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Recorded {
+    /// The registers a settlement is computed from.
+    pub registers: QuarterHour,
+    /// What the roof produced in this quarter hour, kWh — `None` where the box
+    /// has no production measurement to read.
+    pub production: Option<rust_decimal::Decimal>,
+}
+
+impl Recorded {
+    /// Registers with no production measurement behind them.
+    #[must_use]
+    pub const fn unmetered(registers: QuarterHour) -> Self {
+        Self {
+            registers,
+            production: None,
+        }
+    }
+}
+
 /// One event as it is held.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredEvent {
@@ -179,8 +213,9 @@ pub struct StoredEvent {
 /// one the fleet was given, so it is owed again.
 const QUARTER_HOUR_UPSERT: &str = "INSERT INTO quarter_hour (
      slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
-     device_generation_kwh, anzulegender_wert_ct, spot_price_ct, recorded_at
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+     device_generation_kwh, anzulegender_wert_ct, spot_price_ct, production_kwh,
+     recorded_at
+ ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
  ON CONFLICT(slot_start) DO UPDATE SET
      grid_draw_kwh          = excluded.grid_draw_kwh,
      grid_feed_in_kwh       = excluded.grid_feed_in_kwh,
@@ -188,15 +223,20 @@ const QUARTER_HOUR_UPSERT: &str = "INSERT INTO quarter_hour (
      device_generation_kwh  = excluded.device_generation_kwh,
      anzulegender_wert_ct   = excluded.anzulegender_wert_ct,
      spot_price_ct          = excluded.spot_price_ct,
+     production_kwh         = excluded.production_kwh,
      recorded_at            = excluded.recorded_at,
      forwarded_at           = NULL";
 
+/// The columns a [`Recorded`] is read back from, in the order
+/// [`Store::read_quarter_hours`] expects them.
+const QUARTER_HOUR_COLUMNS: &str = "slot_start, grid_draw_kwh, grid_feed_in_kwh, \
+     device_consumption_kwh, device_generation_kwh, anzulegender_wert_ct, \
+     spot_price_ct, production_kwh";
+
 /// Its parameters, in the order the statement names them.
-fn quarter_hour_params(
-    q: &QuarterHour,
-    recorded_at: OffsetDateTime,
-) -> [rusqlite::types::Value; 8] {
+fn quarter_hour_params(r: &Recorded, recorded_at: OffsetDateTime) -> [rusqlite::types::Value; 9] {
     use rusqlite::types::Value;
+    let q = &r.registers;
     [
         Value::Integer(q.slot.start().unix_timestamp()),
         Value::Text(q.grid_draw.to_string()),
@@ -205,6 +245,8 @@ fn quarter_hour_params(
         Value::Text(q.device_generation.to_string()),
         Value::Text(q.anzulegender_wert.to_string()),
         Value::Text(q.spot_price.to_string()),
+        r.production
+            .map_or(Value::Null, |p| Value::Text(p.to_string())),
         Value::Integer(recorded_at.unix_timestamp()),
     ]
 }
@@ -395,7 +437,7 @@ impl Store {
     /// [`StoreError::Sql`].
     pub fn put_quarter_hour(
         &self,
-        quarter: &QuarterHour,
+        quarter: &Recorded,
         recorded_at: OffsetDateTime,
     ) -> Result<(), StoreError> {
         self.connection.execute(
@@ -415,7 +457,7 @@ impl Store {
     /// [`StoreError::Sql`]. Nothing is written if any row fails.
     pub fn put_quarter_hours(
         &mut self,
-        quarters: &[QuarterHour],
+        quarters: &[Recorded],
         recorded_at: OffsetDateTime,
     ) -> Result<(), StoreError> {
         let transaction = self.connection.transaction()?;
@@ -514,11 +556,12 @@ impl Store {
     ///
     /// # Errors
     /// [`StoreError::Sql`] or [`StoreError::NotADecimal`].
-    pub fn pending_quarter_hours(&self, limit: usize) -> Result<Vec<QuarterHour>, StoreError> {
+    pub fn pending_quarter_hours(&self, limit: usize) -> Result<Vec<Recorded>, StoreError> {
         self.read_quarter_hours(
-            "SELECT slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
-                    device_generation_kwh, anzulegender_wert_ct, spot_price_ct
-             FROM quarter_hour WHERE forwarded_at IS NULL ORDER BY slot_start LIMIT ?1",
+            &format!(
+                "SELECT {QUARTER_HOUR_COLUMNS} FROM quarter_hour \
+                 WHERE forwarded_at IS NULL ORDER BY slot_start LIMIT ?1"
+            ),
             params![i64::try_from(limit).unwrap_or(i64::MAX)],
         )
     }
@@ -527,11 +570,9 @@ impl Store {
     ///
     /// # Errors
     /// As [`Store::pending_quarter_hours`].
-    pub fn quarter_hours(&self) -> Result<Vec<QuarterHour>, StoreError> {
+    pub fn quarter_hours(&self) -> Result<Vec<Recorded>, StoreError> {
         self.read_quarter_hours(
-            "SELECT slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
-                    device_generation_kwh, anzulegender_wert_ct, spot_price_ct
-             FROM quarter_hour ORDER BY slot_start",
+            &format!("SELECT {QUARTER_HOUR_COLUMNS} FROM quarter_hour ORDER BY slot_start"),
             [],
         )
     }
@@ -664,11 +705,12 @@ impl Store {
         &self,
         from: OffsetDateTime,
         to: OffsetDateTime,
-    ) -> Result<Vec<QuarterHour>, StoreError> {
+    ) -> Result<Vec<Recorded>, StoreError> {
         self.read_quarter_hours(
-            "SELECT slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
-                    device_generation_kwh, anzulegender_wert_ct, spot_price_ct
-             FROM quarter_hour WHERE slot_start >= ?1 AND slot_start < ?2 ORDER BY slot_start",
+            &format!(
+                "SELECT {QUARTER_HOUR_COLUMNS} FROM quarter_hour \
+                 WHERE slot_start >= ?1 AND slot_start < ?2 ORDER BY slot_start"
+            ),
             params![from.unix_timestamp(), to.unix_timestamp()],
         )
     }
@@ -806,12 +848,12 @@ impl Store {
         Ok(samples)
     }
 
-    /// Run a query whose columns are the seven a [`QuarterHour`] is built from.
+    /// Run a query whose columns are [`QUARTER_HOUR_COLUMNS`].
     fn read_quarter_hours(
         &self,
         sql: &str,
         args: impl rusqlite::Params,
-    ) -> Result<Vec<QuarterHour>, StoreError> {
+    ) -> Result<Vec<Recorded>, StoreError> {
         let mut statement = self.connection.prepare(sql)?;
         let rows = statement.query_map(args, |row| {
             Ok((
@@ -822,11 +864,12 @@ impl Store {
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, String>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (unix, draw, feed_in, consumption, generation, aw, spot) = row?;
+            let (unix, draw, feed_in, consumption, generation, aw, spot, production) = row?;
             let quarter =
                 Slot::containing(OffsetDateTime::from_unix_timestamp(unix).map_err(|_| {
                     StoreError::NotADecimal {
@@ -834,14 +877,19 @@ impl Store {
                         value: unix.to_string(),
                     }
                 })?);
-            out.push(QuarterHour {
-                grid_draw: decimal("grid_draw_kwh", &draw)?,
-                grid_feed_in: decimal("grid_feed_in_kwh", &feed_in)?,
-                device_consumption: decimal("device_consumption_kwh", &consumption)?,
-                device_generation: decimal("device_generation_kwh", &generation)?,
-                anzulegender_wert: decimal("anzulegender_wert_ct", &aw)?,
-                spot_price: decimal("spot_price_ct", &spot)?,
-                ..QuarterHour::empty(quarter)
+            out.push(Recorded {
+                registers: QuarterHour {
+                    grid_draw: decimal("grid_draw_kwh", &draw)?,
+                    grid_feed_in: decimal("grid_feed_in_kwh", &feed_in)?,
+                    device_consumption: decimal("device_consumption_kwh", &consumption)?,
+                    device_generation: decimal("device_generation_kwh", &generation)?,
+                    anzulegender_wert: decimal("anzulegender_wert_ct", &aw)?,
+                    spot_price: decimal("spot_price_ct", &spot)?,
+                    ..QuarterHour::empty(quarter)
+                },
+                production: production
+                    .map(|p| decimal("production_kwh", &p))
+                    .transpose()?,
             });
         }
         Ok(out)
@@ -886,10 +934,13 @@ mod tests {
 
     const NOW: OffsetDateTime = datetime!(2026-01-15 17:00:00 UTC);
 
-    fn quarter(at: OffsetDateTime) -> QuarterHour {
-        QuarterHour {
-            grid_draw: Decimal::new(1_234_567, 6),
-            ..QuarterHour::empty(Slot::containing(at))
+    fn quarter(at: OffsetDateTime) -> Recorded {
+        Recorded {
+            registers: QuarterHour {
+                grid_draw: Decimal::new(1_234_567, 6),
+                ..QuarterHour::empty(Slot::containing(at))
+            },
+            production: Some(Decimal::new(2, 1)),
         }
     }
 
@@ -932,7 +983,7 @@ mod tests {
         let store = Store::in_memory().unwrap();
         store.put_quarter_hour(&quarter(NOW), NOW).unwrap();
         assert_eq!(
-            store.quarter_hours().unwrap()[0].grid_draw,
+            store.quarter_hours().unwrap()[0].registers.grid_draw,
             Decimal::new(1_234_567, 6)
         );
     }
@@ -945,7 +996,7 @@ mod tests {
         // fail part-way from outside the store, and a test that cannot fail is
         // not a test. What this pins is that every row arrives.
         let mut store = Store::in_memory().unwrap();
-        let day: Vec<QuarterHour> = (0..96)
+        let day: Vec<Recorded> = (0..96)
             .map(|i| quarter(NOW + time::Duration::minutes(15 * i)))
             .collect();
         store.put_quarter_hours(&day, NOW).unwrap();
@@ -998,7 +1049,7 @@ mod tests {
             .pending_quarter_hours(10)
             .unwrap()
             .iter()
-            .map(|q| q.slot)
+            .map(|q| q.registers.slot)
             .collect();
         store.mark_forwarded(&ids, &slots, NOW).unwrap();
 
@@ -1033,7 +1084,7 @@ mod tests {
             .pending_quarter_hours(3)
             .unwrap()
             .iter()
-            .map(|q| q.slot)
+            .map(|q| q.registers.slot)
             .collect();
         assert_eq!(slots.len(), 3, "the limit is a limit");
         store.mark_forwarded(&[], &slots, NOW).unwrap();
@@ -1052,11 +1103,11 @@ mod tests {
         assert!(store.backlog().unwrap().is_empty());
 
         let mut restated = quarter(NOW);
-        restated.grid_draw = Decimal::new(9_999_999, 6);
+        restated.registers.grid_draw = Decimal::new(9_999_999, 6);
         store.put_quarter_hour(&restated, NOW).unwrap();
         assert_eq!(store.backlog().unwrap().quarter_hours, 1);
         assert_eq!(
-            store.quarter_hours().unwrap()[0].grid_draw,
+            store.quarter_hours().unwrap()[0].registers.grid_draw,
             Decimal::new(9_999_999, 6)
         );
     }

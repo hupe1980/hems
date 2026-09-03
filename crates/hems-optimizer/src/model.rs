@@ -769,6 +769,67 @@ pub struct PlanningLimits {
     /// does not depend on.
     #[cfg_attr(feature = "serde", serde(default))]
     pub direct_control_ceiling: Option<Power>,
+    /// Which of the planner's own devices a § 14a ceiling actually binds.
+    ///
+    /// See [`SteuVeDevices`]. Every one of them by default, which is what this
+    /// planner assumed before the field existed and is the conservative answer.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub steuve_devices: SteuVeDevices,
+}
+
+/// Which of the planner's devices are **steuerbare Verbrauchseinrichtungen**.
+///
+/// A § 14a ceiling binds the netzwirksamer Leistungsbezug *of the controllable
+/// devices*, and a device is one only if it passes the 4,2 kW of `[A1 2.4.1]` —
+/// individually for a charge point and a battery, summed per Fallgruppe for heat
+/// pumps. That is a fact about a site's nameplates and its commissioning dates,
+/// which `hems_grid::classify_at` answers and this crate cannot: it sees a
+/// `BatteryModel`, an `EvSession` and a `ThermalModel`, none of which carries a
+/// Fallgruppe.
+///
+/// It matters only where there is no surplus. In the other branch a device that
+/// *spends* the surplus and a device the ceiling *binds* carry the same `+1` on
+/// the same row; on a winter evening the row is `Σ SteuVE − b⁻ ≤ ceiling`, and a
+/// 3 kW heat pump no operator may reduce charged against it leaves the house
+/// colder than the Festlegung asks for (D121).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SteuVeDevices {
+    /// The stationary battery while it is charging, `[A1 2.4.1.d]`.
+    pub battery: bool,
+    /// The charge point, `[A1 2.4.1.a]`.
+    pub ev: bool,
+    /// The heat pump and its heating rod, `[A1 2.4.1.b]`.
+    pub heat_pump: bool,
+}
+
+impl Default for SteuVeDevices {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl SteuVeDevices {
+    /// Every device under the ceiling — the conservative answer, and the one to
+    /// keep where the site is not known.
+    #[must_use]
+    pub const fn all() -> Self {
+        Self {
+            battery: true,
+            ev: true,
+            heat_pump: true,
+        }
+    }
+
+    /// None of them: no § 14a device behind this connection at all.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            battery: false,
+            ev: false,
+            heat_pump: false,
+        }
+    }
 }
 
 impl PlanningLimits {
@@ -798,6 +859,13 @@ impl PlanningLimits {
     #[must_use]
     pub const fn with_direct_control_ceiling(mut self, ceiling: Power) -> Self {
         self.direct_control_ceiling = Some(ceiling);
+        self
+    }
+
+    /// Say which of the planner's devices the ceiling binds.
+    #[must_use]
+    pub const fn with_steuve_devices(mut self, devices: SteuVeDevices) -> Self {
+        self.steuve_devices = devices;
         self
     }
 

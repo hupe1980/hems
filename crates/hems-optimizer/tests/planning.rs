@@ -9,8 +9,8 @@ use hems_core::prelude::{AssetId, CompressorState, Energy, Horizon, Power, Progr
 use hems_forecast::{Band, Forecast};
 use hems_optimizer::Risk;
 use hems_optimizer::model::{
-    BatteryModel, DhwModel, EvSession, HeatPumpModel, PlanningLimits, Problem, ThermalModel,
-    TimedLimit,
+    BatteryModel, DhwModel, EvSession, HeatPumpModel, PlanningLimits, Problem, SteuVeDevices,
+    ThermalModel, TimedLimit,
 };
 use hems_optimizer::solve::{AssetNames, solve};
 use hems_tariff::levies::Levies;
@@ -575,6 +575,86 @@ fn the_paragraph_14a_ceiling_binds_the_heat_pump_too() {
             steuve <= Power::from_kw(2.0) + Power::new(1e-6),
             "slot {i}: controllable devices drew {steuve} over a 2 kW ceiling"
         );
+    }
+}
+
+#[test]
+fn a_heat_pump_no_operator_may_reduce_is_not_charged_against_the_ceiling() {
+    // The other half of `[A1 2.4.1.b]`, and the one that costs a household
+    // comfort: a heat pump group below 4,2 kW is **not** a steuerbare
+    // Verbrauchseinrichtung, so a § 14a reduction does not reach it. The planner
+    // models device kinds and cannot see a Fallgruppe, so it used to charge
+    // every controllable device against the ceiling — which on a winter evening,
+    // where there is no surplus to hide the difference, left the house colder
+    // than the Festlegung asks for.
+    let h = horizon(8);
+    let p = prices(h, &[10]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-10.0; 8];
+    // Below what holding the comfort band costs at −10 °C, so the ceiling is
+    // what binds rather than the thermostat.
+    let ceiling = PlanningLimits::default().with_steuve(TimedLimit::always(Power::from_kw(1.0)));
+    let free = ceiling.clone().with_steuve_devices(SteuVeDevices {
+        heat_pump: false,
+        ..SteuVeDevices::all()
+    });
+
+    // No battery: a discharging one is local generation and lifts the ceiling
+    // for everything behind it, which would hide the difference this is about.
+    let heat = |limits: PlanningLimits| -> f64 {
+        solve(
+            &Problem::new(h, &p, &pv, &load)
+                .with_thermal(thermal(21.0, true), &outdoor)
+                .with_limits(limits),
+            &names(),
+            T0,
+        )
+        .unwrap()
+        .flows
+        .iter()
+        .map(|f| f.heat_pump.kw())
+        .sum()
+    };
+
+    assert!(
+        heat(free) > heat(ceiling) + 1e-6,
+        "a heat pump outside § 14a should not be reduced by a § 14a limit"
+    );
+}
+
+#[test]
+fn a_surplus_slot_reads_the_same_whether_a_device_is_controllable_or_not() {
+    // The arithmetic that makes the change safe: where a roof is producing, a
+    // device that *spends* the surplus and a device the ceiling *binds* both
+    // carry `+1` on the same row, so the two readings are one inequality and the
+    // plan cannot depend on which it is.
+    let h = horizon(8);
+    let p = prices(h, &[10]);
+    let pv = flat(h, 6000.0);
+    let load = flat(h, 500.0);
+    let outdoor = vec![-10.0; 8];
+    let ceiling = PlanningLimits::default().with_steuve(TimedLimit::always(Power::from_kw(2.0)));
+    let free = ceiling.clone().with_steuve_devices(SteuVeDevices::none());
+
+    let plan = |limits: PlanningLimits| -> Vec<f64> {
+        solve(
+            &Problem::new(h, &p, &pv, &load)
+                .with_thermal(thermal(21.0, true), &outdoor)
+                .with_battery(battery(10.0, 0.5, 0.0))
+                .with_limits(limits),
+            &names(),
+            T0,
+        )
+        .unwrap()
+        .flows
+        .iter()
+        .map(|f| f.heat_pump.kw() + f.battery_charge.kw())
+        .collect()
+    };
+
+    for (a, b) in plan(ceiling).into_iter().zip(plan(free)) {
+        assert!((a - b).abs() < 1e-6, "{a} vs {b}");
     }
 }
 
@@ -2260,4 +2340,199 @@ fn the_baseline_is_in_the_same_community_as_the_plan() {
         baseline(&community, &share) < baseline(&plain, &[]) - 1e-6,
         "the unmanaged household is allocated too"
     );
+}
+
+/// A price stack whose feed-in tariff is above the retail price — a roof
+/// commissioned when the EEG paid 39 ct/kWh, which is still the tariff its owner
+/// is on and is above every import price the household has ever seen.
+fn legacy_prices(h: Horizon, spot_ct: i64, feed_in_ct: i64) -> PriceStack {
+    let spot: BTreeMap<Slot, Decimal> = h.slots().map(|s| (s, Decimal::new(spot_ct, 0))).collect();
+    let tariff = Tariff {
+        energy: EnergyPrice::Dynamic {
+            spot,
+            markup_ct_per_kwh: Decimal::new(3, 0),
+            fallback_ct_per_kwh: Decimal::new(20, 0),
+        },
+        network: NetworkCharge::None {
+            arbeitspreis: Decimal::new(10, 0),
+        },
+        levies: Levies::household_2026(),
+        // No § 51 date: a plant from before the rule keeps being paid, which is
+        // exactly the household this test is about.
+        feed_in: FeedIn::eeg(Decimal::new(feed_in_ct, 0)),
+        sharing: None,
+        standing_charge_eur_per_year: Decimal::ZERO,
+    };
+    PriceStack::build(&tariff, h)
+}
+
+#[test]
+fn a_feed_in_tariff_above_the_import_price_cannot_buy_a_round_trip() {
+    // The failure this is here for: `g_in` and `g_out` are two non-negative
+    // variables whose *difference* the balance fixes, so adding the same watt to
+    // both is always feasible and the objective pays `import − export` for it.
+    // On a legacy 39 ct/kWh roof that difference is negative in every hour, and
+    // the plan used to report a household importing its whole load *and*
+    // exporting its whole roof in the same quarter hour — which one connection
+    // point cannot do — and book the spread as revenue.
+    let h = horizon(4);
+    let p = legacy_prices(h, 8, 39);
+    assert!(
+        p.slots[0].export_f64() > p.slots[0].import_f64(),
+        "the tariff this test is about"
+    );
+    let pv = flat(h, 3000.0);
+    let load = flat(h, 1000.0);
+    let solved = solve(&Problem::new(h, &p, &pv, &load), &names(), T0).unwrap();
+    for f in &solved.flows {
+        assert!(
+            f.grid_import == Power::ZERO || f.grid_export == Power::ZERO,
+            "one connection point cannot import {:?} and export {:?} at once",
+            f.grid_import,
+            f.grid_export
+        );
+        assert_eq!(
+            f.grid_export,
+            Power::new(2000.0),
+            "the surplus, and only it"
+        );
+    }
+}
+
+#[test]
+fn a_negative_import_price_is_soaked_up_rather_than_round_tripped() {
+    // The other tariff that makes the objective concave, and the one that
+    // happens by itself: a deeply negative quarter hour pushes the import price
+    // below zero while § 51 EEG holds the export price at zero. Being paid to
+    // draw is real and the plan should take it — by curtailing the roof, which
+    // is what a household physically does, not by inventing an export it is
+    // simultaneously importing against.
+    let h = horizon(4);
+    let p = prices(h, &[-10]);
+    assert!(p.slots[0].import_f64() < 0.0 && p.slots[0].export_f64() == 0.0);
+    let pv = flat(h, 3000.0);
+    let load = flat(h, 1000.0);
+    let solved = solve(&Problem::new(h, &p, &pv, &load), &names(), T0).unwrap();
+    for f in &solved.flows {
+        assert!(
+            f.grid_import == Power::ZERO || f.grid_export == Power::ZERO,
+            "import {:?} and export {:?} at the same connection point",
+            f.grid_import,
+            f.grid_export
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_tariff_gets_no_direction_binary_and_the_same_plan() {
+    // The economy the fix turns on: a household whose feed-in tariff is below
+    // its import price cannot pay for a round trip, so the model is handed to
+    // the backend exactly as it was — and the plan is the one the rest of this
+    // file asserts about.
+    let h = horizon(8);
+    let p = prices(h, &[30]);
+    let pv = shaped(h, 4000.0, &[0, 1, 2, 3]);
+    let load = flat(h, 500.0);
+    let solved = solve(&Problem::new(h, &p, &pv, &load), &names(), T0).unwrap();
+    for f in &solved.flows {
+        assert!(f.grid_import == Power::ZERO || f.grid_export == Power::ZERO);
+    }
+}
+
+/// The planner's counterpart to the arbiter's own theorem: **no input can make
+/// the plan report a schedule the house could not have run.**
+///
+/// Deliberately one function, like `no_input_can_make_the_arbiter_exceed_a_grid_limit`
+/// in `hems-realtime`: the setup, the randomisation and the four properties
+/// belong together, and splitting them would make a failure harder to read.
+///
+/// It exists because the class of defect it catches is invisible to every other
+/// test in this file. A plan that imports its whole load *and* exports its whole
+/// roof in the same quarter hour is feasible, optimal and impossible, and every
+/// price stack written by hand keeps the feed-in tariff below the import price
+/// *on purpose* — so the case never arose. The tariffs below deliberately
+/// include the two that do arise: a day-ahead price deep enough to push the
+/// import price below zero, and a legacy roof whose feed-in tariff is above
+/// retail in every hour of the year.
+#[test]
+fn no_tariff_or_forecast_can_make_the_plan_report_an_impossible_schedule() {
+    let h = horizon(12);
+    let mut rng: u64 = 0x5EED_1A7E;
+    let mut next = |modulo: u64| {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng % modulo
+    };
+
+    for round in 0..300 {
+        // Spot prices from deeply negative to a scarcity hour, and a feed-in
+        // tariff that ranges from nothing to a 2010 roof's.
+        let spot = next(60) as i64 - 30;
+        let feed_in = next(45) as i64;
+        let p = legacy_prices(h, spot, feed_in);
+        let pv = flat(h, next(9) as f64 * 1000.0);
+        let load = flat(h, next(5) as f64 * 500.0);
+        let mut limits = PlanningLimits::default();
+        if next(2) == 0 {
+            limits = limits.with_steuve(TimedLimit::always(Power::from_kw(next(8) as f64 * 0.7)));
+        }
+        if next(2) == 0 {
+            limits = limits.with_feed_in(TimedLimit::always(Power::from_kw(next(8) as f64)));
+        }
+        let mut problem = Problem::new(h, &p, &pv, &load).with_limits(limits.clone());
+        if next(2) == 0 {
+            problem = problem.with_battery(battery(10.0, 0.5, 0.08));
+        }
+
+        let solved = match solve(&problem, &names(), T0) {
+            Ok(s) => s,
+            // A refusal is an answer; an impossible plan is not.
+            Err(e) => panic!("round {round}: spot {spot}, feed-in {feed_in}: {e}"),
+        };
+
+        for (k, f) in solved.flows.iter().enumerate() {
+            let where_ = format!("round {round}, slot {k}: spot {spot} ct, feed-in {feed_in} ct");
+
+            // One connection point runs one way at a time.
+            assert!(
+                f.grid_import.get().min(f.grid_export.get()) < 1e-6,
+                "{where_}: importing {:?} while exporting {:?}",
+                f.grid_import,
+                f.grid_export
+            );
+
+            // The energy balance closes on the numbers that are reported, not
+            // on the ones the solver held.
+            let (production, consumption) = problem.forecasts_at(k);
+            let net = f.grid_import.get() - f.grid_export.get();
+            let sinks = consumption + f.battery_charge.get() - f.battery_discharge.get()
+                + f.ev_charge.get()
+                + f.heat_pump.get()
+                + f.dhw.get()
+                + f.shiftable.get()
+                - (production - f.curtailed.get());
+            assert!(
+                (net - sinks).abs() < 1e-3,
+                "{where_}: the balance is off by {} W",
+                net - sinks
+            );
+
+            // Nothing is thrown away that was never produced.
+            assert!(
+                f.curtailed.get() <= production + 1e-6,
+                "{where_}: curtailed {:?} of {production} W",
+                f.curtailed
+            );
+
+            // And a feed-in ceiling is a ceiling.
+            if let Some(ceiling) = h.get(k).and_then(|s| limits.feed_in_at(s)) {
+                assert!(
+                    f.grid_export <= ceiling + Power::new(1e-6),
+                    "{where_}: exported {:?} over {ceiling:?}",
+                    f.grid_export
+                );
+            }
+        }
+    }
 }

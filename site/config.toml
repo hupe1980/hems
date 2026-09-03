@@ -36,7 +36,7 @@ tagline    = "open-source home energy management for the German grid"
 # `cargo xtask check-citations`, `cargo test --workspace --all-features`, the
 # `just purity` crate list, `just demo-all`, and `ControlSettings::horizon_slots`.
 stat_rules   = "378"
-stat_tests   = "845"
+stat_tests   = "869"
 stat_crates  = "10"
 stat_days    = "7"
 stat_horizon = "192"

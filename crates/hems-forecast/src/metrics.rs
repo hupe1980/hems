@@ -227,17 +227,6 @@ impl Calibration {
         }
     }
 
-    /// Score a back-test: one entry per day.
-    #[must_use]
-    pub fn back_test<I>(days: impl IntoIterator<Item = I>) -> Self
-    where
-        I: IntoIterator<Item = (Band, f64)>,
-    {
-        days.into_iter()
-            .map(Self::score)
-            .fold(Self::default(), Self::merge)
-    }
-
     /// Whether the band is about as wide as it should be.
     ///
     /// A 10–90 band ought to contain four outcomes in five. Outside `[0,6, 0,95]`
@@ -258,6 +247,24 @@ impl Calibration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Score `days` and merge them, one [`Calibration::episodes`] each.
+    ///
+    /// A **test** helper rather than API. It was public, and its only callers
+    /// were the four tests below: a fold over `score` and `merge` is two lines
+    /// at any call site that wants one, and `hemsd backtest` — the one thing in
+    /// the workspace that produces independent days — cannot use it anyway,
+    /// because it merges as it goes rather than holding a sweep in memory. A
+    /// second way to do what the daemon does by hand is a second thing to keep
+    /// right (R20).
+    fn back_test<I>(days: impl IntoIterator<Item = I>) -> Calibration
+    where
+        I: IntoIterator<Item = (Band, f64)>,
+    {
+        days.into_iter()
+            .map(Calibration::score)
+            .fold(Calibration::default(), Calibration::merge)
+    }
 
     #[test]
     fn pinball_punishes_the_two_directions_differently() {
@@ -303,7 +310,7 @@ mod tests {
                 )
             })
         };
-        let c = Calibration::back_test((0..CALIBRATION_DAYS).map(|_| day()));
+        let c = back_test((0..CALIBRATION_DAYS).map(|_| day()));
         assert!((c.coverage - 0.9).abs() < 1e-9);
         assert!(c.is_well_calibrated());
     }
@@ -345,7 +352,7 @@ mod tests {
             c.coverage
         );
         // Twenty such days are a calibration, and they say the band is right.
-        let year = Calibration::back_test((0..CALIBRATION_DAYS).map(|_| day()));
+        let year = back_test((0..CALIBRATION_DAYS).map(|_| day()));
         assert!(year.is_well_calibrated());
         assert_eq!(year.skipped, 66 * CALIBRATION_DAYS);
     }
@@ -424,11 +431,11 @@ mod tests {
                 )
             })
         };
-        let nineteen = Calibration::back_test((0..19).map(|_| day()));
+        let nineteen = back_test((0..19).map(|_| day()));
         assert_eq!(nineteen.episodes, 19);
         assert!(!nineteen.is_well_calibrated());
 
-        let twenty = Calibration::back_test((0..20).map(|_| day()));
+        let twenty = back_test((0..20).map(|_| day()));
         assert_eq!(twenty.episodes, 20);
         assert_eq!(twenty.samples, 96 * 20);
         assert!(twenty.is_well_calibrated());

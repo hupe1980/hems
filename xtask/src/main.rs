@@ -363,6 +363,11 @@ fn check_wire(root: &Path) -> Result<()> {
 
             if stack.last().copied().unwrap_or(false)
                 && let Some(name) = decimal_field(trimmed)
+                // A field that never travels has no wire form to state, and
+                // demanding one would push a caller towards `serde(with)` on a
+                // shape that cannot be written at all — a `BTreeMap` keyed by a
+                // struct, say, whose JSON keys would have to be strings.
+                && !is_skipped(&lines[..i])
             {
                 checked += 1;
                 if !states_its_form(&lines[..i]) {
@@ -421,6 +426,27 @@ fn check_wire(root: &Path) -> Result<()> {
 /// lines, so this walks back over the whole block rather than looking at one
 /// line — which is the difference between a guard and a guard that has to be
 /// switched off.
+/// Whether the field on this line is `serde(skip)`ped, and therefore never
+/// travels at all.
+fn is_skipped(before: &[&str]) -> bool {
+    for line in before.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.contains("serde(skip)") || trimmed.contains("serde(skip_serializing)") {
+            return true;
+        }
+        if !(trimmed.starts_with("//")
+            || trimmed.starts_with("#[")
+            || trimmed.starts_with(')')
+            || trimmed.starts_with("feature = ")
+            || trimmed.starts_with("serde(")
+            || trimmed.is_empty())
+        {
+            return false;
+        }
+    }
+    false
+}
+
 fn states_its_form(before: &[&str]) -> bool {
     for line in before.iter().rev() {
         let trimmed = line.trim();

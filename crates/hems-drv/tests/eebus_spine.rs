@@ -241,6 +241,18 @@ fn a_steuerbox_discovers_the_box_and_writes_a_limit_that_reaches_the_guard() {
         Some(Power::from_kw(4.2)),
         "the limit is in force on the household's own state machine"
     );
+
+    // Nothing is still waiting to be applied. This is the silent failure the
+    // whole exchange is vulnerable to: discovery, the bindings, the
+    // subscription and the heartbeats can all succeed while no limit is ever
+    // written, and there is nothing on the wire that says why. Under § 14a a
+    // requirement that stays here is one the network operator is owed an answer
+    // about, so an empty list is part of what "the reduction arrived" means.
+    assert!(
+        wire.guard.deferred_requirements().next().is_none(),
+        "a requirement still waiting is a limit that was never written"
+    );
+
     let reported = wire.ceilings();
     let last = reported
         .last()

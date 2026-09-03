@@ -11,6 +11,14 @@
 //! disagree with the record it points at, which is two sources of truth about
 //! one obligation.
 //!
+//! # Two records, one link
+//!
+//! There are **two** things the fleet's copy is for, and they leave on the same
+//! loop: the `[A1 7.2]` control events, which are what a network operator may
+//! come back and ask about, and the quarter-hour **registers**, which are what
+//! MiSpeL's Abgrenzung and § 42c's allocation are computed from. Both are
+//! tracked by `forwarded_at` on their own row.
+//!
 //! # Forwarded is not deleted
 //!
 //! The two years are the household's, not the fleet's. An acknowledgement moves
@@ -249,6 +257,17 @@ impl Outbox {
         store: &Arc<Mutex<crate::store::Store>>,
         now: time::OffsetDateTime,
     ) -> Result<usize, crate::store::StoreError> {
+        let events = self.drain_events(store, now).await?;
+        let registers = self.drain_registers(store, now).await?;
+        Ok(events + registers)
+    }
+
+    /// The § 14a control events, `[A1 7.2]`.
+    async fn drain_events(
+        &self,
+        store: &Arc<Mutex<crate::store::Store>>,
+        now: time::OffsetDateTime,
+    ) -> Result<usize, crate::store::StoreError> {
         let pending = store.lock().await.pending_events(self.batch)?;
         if pending.is_empty() {
             return Ok(0);
@@ -272,6 +291,53 @@ impl Outbox {
         }
         store.lock().await.mark_forwarded(&accepted, &[], now)?;
         Ok(accepted.len())
+    }
+
+    /// The quarter-hour registers a settlement is computed from.
+    ///
+    /// A **batch** rather than a row at a time, because that is the shape
+    /// `histd` serves and because ninety-six requests to place one day is a
+    /// household's WAN spent on framing. It is all-or-nothing on purpose: the
+    /// route writes the batch in one transaction, so a partial acknowledgement
+    /// would be a claim about rows nobody can point at.
+    async fn drain_registers(
+        &self,
+        store: &Arc<Mutex<crate::store::Store>>,
+        now: time::OffsetDateTime,
+    ) -> Result<usize, crate::store::StoreError> {
+        let pending = store.lock().await.pending_quarter_hours(self.batch)?;
+        if pending.is_empty() {
+            return Ok(0);
+        }
+        // The **registers** and not the box's own record of the roof beside
+        // them: `histd` holds what a settlement is computed from, and the
+        // production figure is a KPI the day report already carries (D124).
+        let registers: Vec<hems_grid::mispel::QuarterHour> =
+            pending.iter().map(|r| r.registers).collect();
+        if let Err(error) = self.put_quarter_hours(&registers).await {
+            tracing::warn!(%error, "the fleet did not take the quarter-hour registers; keeping them");
+            return Ok(0);
+        }
+        let slots: Vec<hems_core::prelude::Slot> = registers.iter().map(|q| q.slot).collect();
+        store.lock().await.mark_forwarded(&[], &slots, now)?;
+        Ok(slots.len())
+    }
+
+    /// One batch of registers, to the endpoint `histd` already serves.
+    async fn put_quarter_hours(
+        &self,
+        quarters: &[hems_grid::mispel::QuarterHour],
+    ) -> anyhow::Result<()> {
+        let response = self
+            .client
+            .post(format!("{}/v1/sites/{}/quarter-hours", self.url, self.site))
+            .bearer_auth(&self.token)
+            .json(quarters)
+            .send()
+            .await?;
+        let status = response.status();
+        anyhow::ensure!(status.is_success(), "the fleet answered {status}");
+        Ok(())
     }
 
     /// One event, to the endpoint `histd` already serves.

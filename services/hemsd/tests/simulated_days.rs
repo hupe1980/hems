@@ -502,6 +502,16 @@ fn without_a_planner_the_house_still_runs_off_its_own_roof() {
         "self-sufficiency {:.0} %",
         r.self_sufficiency * 100.0
     );
+    // …and **not** a hundred per cent, because it drew from the grid. The
+    // figure this replaced put `production − export` over the loads it could
+    // see, so a June day whose surplus went into a battery counted the charging
+    // in the numerator and not the denominator, passed one, and clamped —
+    // reporting perfect autarky and 2,6 kWh of import in the same table (D125).
+    assert!(
+        r.self_sufficiency < 1.0,
+        "a household that imported {:.1} kWh is not wholly self-sufficient",
+        r.imported_kwh
+    );
     assert!(r.battery_throughput_kwh > 5.0, "the store was not used");
     assert!(r.ev_charged_kwh > 10.0, "the car took no surplus");
 }
@@ -1081,6 +1091,26 @@ fn a_switchable_charge_point_is_the_whole_session_in_the_shoulder_season() {
         switchable.saving_eur(),
         fixed.saving_eur()
     );
+
+    // And the seam this day is the one that exercises. A contactor switches on
+    // whole conductors, so the surplus tracker keeps asking for values that fall
+    // between what three conductors and one can hold — and
+    // `hems_device::realisable` answers each with zero, correctly and silently.
+    // On every other reference day this number is nought; here it is the cost of
+    // the mechanism, and it has to stay visible rather than being absorbed into
+    // "the car charged a bit less than it might have".
+    assert!(
+        switchable.clipped_ticks > 0 && switchable.clipped_kwh > 0.0,
+        "a switching wallbox spends part of the shoulder season being asked for \
+         power it cannot hold: {} ticks, {:.2} kWh",
+        switchable.clipped_ticks,
+        switchable.clipped_kwh
+    );
+    assert!(
+        switchable.clipped_kwh < 1.0,
+        "but it is a rounding error rather than a lost session: {:.2} kWh",
+        switchable.clipped_kwh
+    );
 }
 
 #[test]
@@ -1381,7 +1411,13 @@ fn the_day_the_household_would_be_asked_about_survives_the_process() {
         let mut store = hemsd::store::Store::open(&path).unwrap();
         for quarter in &r.quarter_hours {
             store
-                .put_quarter_hour(quarter, r.quarter_hours[0].slot.start())
+                .put_quarter_hour(
+                    &hemsd::store::Recorded {
+                        registers: *quarter,
+                        production: r.production_kwh_by_slot.get(&quarter.slot).copied(),
+                    },
+                    r.quarter_hours[0].slot.start(),
+                )
                 .unwrap();
         }
         for event in &r.evidence {
@@ -1535,13 +1571,24 @@ fn a_box_closes_its_day_from_what_it_wrote_down() {
                 grid_draw: rust_decimal::Decimal::new(15, 2),
                 grid_feed_in: rust_decimal::Decimal::new(5, 2),
                 device_consumption: rust_decimal::Decimal::ZERO,
-                device_generation: rust_decimal::Decimal::new(10, 2),
+                // The storage system, giving back something quite unlike the
+                // sun — so a report that read `Z2E¼` as production would fail
+                // here rather than quietly halving a household's roof (D124).
+                device_generation: rust_decimal::Decimal::new(90, 2),
                 storage_consumption: None,
                 storage_generation: None,
                 anzulegender_wert: rust_decimal::Decimal::new(786, 2),
                 spot_price: rust_decimal::Decimal::new(1250, 2),
             };
-            store.put_quarter_hour(&quarter, midnight).unwrap();
+            store
+                .put_quarter_hour(
+                    &hemsd::store::Recorded {
+                        registers: quarter,
+                        production: Some(rust_decimal::Decimal::new(10, 2)),
+                    },
+                    midnight,
+                )
+                .unwrap();
         }
     }
 
@@ -1552,6 +1599,7 @@ fn a_box_closes_its_day_from_what_it_wrote_down() {
         "reference-household",
         day,
         hemsd::runtime::day::Unplanned::watching(),
+        hemsd::runtime::day::Clipping::default(),
         &hemsd::runtime::day::Scored::default(),
     )
     .unwrap()

@@ -280,6 +280,29 @@ effect, so `W / (1 − ThrotPct)` recovers what the array would deliver
 unthrottled. A device that publishes it earns `reports_available_power`; one that
 does not, says so.
 
+### The walk is bounded, because the device decides where it goes
+
+Each step of the chain walk reads two registers the *device* chose — a model
+identifier and a length — and looks for the next header at `address + 2 +
+length`. So the device, not the driver, decides how long the walk is. A firmware
+that answers a length of **zero** advances it by two registers a step and never
+reaches the end-of-chain sentinel; one whose length overflows the address space
+pins it at the top and re-reads it for ever.
+
+Neither is dangerous — every step is a Modbus round trip rather than a tight
+loop, and a driver that never finishes discovery reports no models, so the guard
+falls back to the device's nameplate, which is the safe direction. It is simply a
+box that reads one device for ever and never manages it. So there are three ways
+the chain ends and only the first is the tidy one: the sentinel, a header with no
+body (a model *is* its body), and running past sixty-four models or off the end
+of the address space. The largest real device this workspace has met publishes
+eleven.
+
+It is the same argument the **scale factor** makes one layer down: `10^exponent`
+with an exponent read straight off a wire is an infinity waiting to happen, so an
+exponent outside the specification's own −10…10 is treated as no scaling at all.
+Both are refusals to invent a number on behalf of hardware nobody here controls.
+
 ## `eebus` — the § 14a side
 
 The **Controllable System** of *Limitation of Power Consumption*: the role a
@@ -310,6 +333,32 @@ loss, the failsafe and the release. An operator's limit and a household
 restraining itself because nobody is talking to it are reported as **different
 events**, because they are different things in the evidence record of
 `[A1 7.2]`.
+
+### What the box publishes, and the fourth feature
+
+A Controllable System announces four features on one entity, and only three of
+them are obvious:
+
+| Feature | Role | What it is for |
+|---|---|---|
+| `LoadControl` | server | the limit itself — what the Energy Guard writes to |
+| `DeviceConfiguration` | server | the failsafe value and its minimum duration |
+| `DeviceDiagnosis` | server | this box's own operating state |
+| `DeviceDiagnosis` | **client** | subscribing to the *guard's* heartbeat |
+
+The fourth is the interesting one, and its absence fails in the worst possible
+way. A SPINE subscription runs **client → server** (§ 5.3.6), so a box that
+subscribed to the guard's heartbeat from its own *server* feature is refused by
+any peer that checks the role — and a Controllable System with no heartbeat then
+correctly refuses every limit, for want of one. Discovery succeeds, the bindings
+settle, the subscription appears to be requested, and no limit is ever written,
+with nothing on the wire to say why. Under § 14a that is an installation that
+looks commissioned and silently is not.
+
+The same shape of failure is why the actor cannot be built except through a
+builder that ends at `install`: a device that skipped it answers everything and
+publishes no limit *description*, so the guard reads an empty list, finds no
+`limitId` to write to, and sends nothing.
 
 ### The bytes are SPINE datagrams
 
@@ -345,6 +394,12 @@ its Steuerbox after a power cut.
 An unapproved peer still completes TLS — it has to, so its SKI can be shown to
 somebody — and is held short of the data phase. That is the whole of SHIP's trust
 model, and it is what stops anyone on the household's network reducing the house.
+
+The handshake also settles a **SHIP version**, and the box logs which one. It is
+not a detail: 1.0.1 is the certification minimum and 1.1 is what carries
+`accessMethods.id`, the field a peer would be dialled back with — so an installer
+reading a log after a reconnect that did not happen is owed the fact rather than
+left to infer it.
 
 ## One crate, protocols behind features
 

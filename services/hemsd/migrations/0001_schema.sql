@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS quarter_hour (
     device_generation_kwh  TEXT    NOT NULL,
     anzulegender_wert_ct   TEXT    NOT NULL,
     spot_price_ct          TEXT    NOT NULL,
+    -- What the roof produced, kWh. **Not** a MiSpeL register and deliberately
+    -- beside them: `device_generation_kwh` is `Z2E¼`, the storage system and the
+    -- charge point's generation, and reading it as the roof made a household
+    -- running off its own sun report a self-sufficiency of nought (D124).
+    --
+    -- Nullable, because a box with no production measurement has not measured a
+    -- dark roof.
+    production_kwh         TEXT,
     -- A register may be restated — a substitute value replaced by a real one, a
     -- correction from the metering point operator — and a settlement rerun has
     -- to be able to ask what was known on the day rather than what is known now.

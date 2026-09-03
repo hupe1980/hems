@@ -142,6 +142,29 @@ devices would be told it may produce nineteen kilowatts above the § 9 EEG cap
 because it is probably using them — so the export side counts only what a meter
 actually saw.
 
+### And a small device is not a controllable one
+
+A device is a steuerbare Verbrauchseinrichtung only if it passes the 4,2 kW of
+`[A1 2.4.1]` — individually for a charge point and a battery, **summed per
+Fallgruppe** for heat pumps, so two 3 kW heat pumps behind one connection are one
+6 kW controllable device. A 3 kW heat pump on its own, or a 0,5 kW battery, is
+ordinary load: a network operator may not reduce it, and it never appears against
+the ceiling. What it does instead is *spend the surplus*, like the hot-water tank
+and the dishwasher.
+
+That is a fact about a site's nameplates and its commissioning dates, and getting
+it wrong is expensive in both directions. Counting a device in when it is out
+leaves the household **colder than the Festlegung asks for** on the winter
+evenings a reduction actually happens; counting it out when it is in **overstates
+the surplus** and therefore understates the netzwirksamer Leistungsbezug, which
+is the one direction a compliance record may never be wrong in.
+
+So there is exactly one function that answers it — `hems_grid::classify_at`, from
+the site's own assets and the day — and everything asks it: the guard every tick,
+the planner through
+[`PlanningLimits::steuve_devices`](@/docs/optimizer.md#the-ss-14a-constraint-is-on-the-netzwirksamer-leistungsbezug-per-slot),
+and the evidence record when it writes down what crossed the connection point.
+
 ## Where the § 14a limit is not the only shared one
 
 A § 14a ceiling is spent only by the controllable devices. The main fuse **in
@@ -400,8 +423,30 @@ at least two quarters, and must appear in the preliminary price sheet by 15
 October of the preceding year.
 
 There is no machine-readable national format for any of it — a PDF and an Excel
-sheet per network operator — so hems curates the calendars, records where each
-one came from, and validates it before it can reach the optimiser.
+sheet per network operator — so whoever commissions the box **transcribes** the
+operator's calendar into its configuration, records where it came from, and the
+box refuses to start unless it conforms:
+
+```console
+$ hemsd run --check --config /etc/hemsd/hemsd.toml
+📅 Modul 3 `NB-14A-3-2026` for 2026 conforms — HT 17:00–20:00, NT 22:00–06:00, billed in Q1, Q4
+   transcribed from https://www.example-netz.de/preisblatt-2026.pdf#modul3
+```
+
+Transcribing is not inventing, and the refusal is what keeps the difference. The
+seven rules are checked before a byte moves — three levels that are all
+**reachable**, a day with no gaps, at least two hours of Hochtarif on every day
+class, windows identical all year, at least two billed quarters, one calendar
+year of validity, and the three preconditions of § 1 — and a `source` is required,
+because when a household queries a bill the first question is which document said
+so.
+
+The reachability rule is the one worth stating on its own, because its failure is
+silent. A Niedertarif band written as a single wrapping window leaves that level
+**declared and unreachable**: the register appears, the day is still fully covered
+by the fallback, every other rule passes, and the calendar reads as a conforming
+three-level tariff while the household is billed for a module whose cheap hours
+it can never be in.
 
 Window membership is decided on **local wall-clock time**, because that is how
 the price sheet is written. On the long October day the repeated hour is inside

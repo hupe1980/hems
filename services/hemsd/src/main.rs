@@ -238,6 +238,12 @@ enum Day {
     Capped,
 }
 
+/// Minutes of a local day as `HH:MM`, for the one line an installer reads back
+/// against a price sheet.
+fn clock(minutes: u16) -> String {
+    format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60)
+}
+
 /// The box on the wall: configuration in, sockets open, guard and arbiter
 /// running until somebody stops it.
 ///
@@ -292,6 +298,26 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
                 n => format!(", {n} it cannot express"),
             }
         );
+        // The one thing an installer transcribes by hand from a PDF, and
+        // therefore the one most likely to be a typo. `assemble` has already
+        // refused a calendar that breaks the Anwendungshilfe; this says which
+        // one passed, and where it came from, so the check leaves a record of
+        // the document the household will be billed against.
+        if let Some(m) = &settings.tariff.modul3 {
+            println!(
+                "📅 Modul 3 `{}` for {} conforms — HT {}–{}, NT {}–{}, billed in {}",
+                m.id,
+                m.year,
+                clock(m.hochtarif_minutes[0]),
+                clock(m.hochtarif_minutes[1]),
+                clock(m.niedertarif_minutes[0]),
+                clock(m.niedertarif_minutes[1]),
+                m.billed_quarters.join(", "),
+            );
+            if let Some(source) = &m.source {
+                println!("   transcribed from {source}");
+            }
+        }
         return Ok(());
     }
 
@@ -509,7 +535,15 @@ fn record_day(
     now: time::OffsetDateTime,
 ) -> anyhow::Result<()> {
     let mut store = hemsd::store::Store::open(path)?;
-    store.put_quarter_hours(&result.quarter_hours, now)?;
+    let recorded: Vec<hemsd::store::Recorded> = result
+        .quarter_hours
+        .iter()
+        .map(|q| hemsd::store::Recorded {
+            registers: *q,
+            production: result.production_kwh_by_slot.get(&q.slot).copied(),
+        })
+        .collect();
+    store.put_quarter_hours(&recorded, now)?;
     for event in &result.evidence {
         store.put_control_event(event)?;
     }
@@ -944,6 +978,14 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
     row(
         "minutes without a plan",
         format!("{}", r.minutes_without_a_plan),
+    );
+    // The other seam between the arbiter and the world: how often a device could
+    // not hold the command it was given. A charge point is off or above 6 A with
+    // nothing in between, so this is never structurally zero — and a day where it
+    // is large is a day the planner was modelling a device that does not exist.
+    row(
+        "commands the hardware clipped",
+        format!("{} ticks ({:.2} kWh)", r.clipped_ticks, r.clipped_kwh),
     );
     // What the plan that opened the day thought the day would cost, against what
     // it did. The seam between a forecast and a meter, in the currency everything

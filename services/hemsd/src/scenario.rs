@@ -920,6 +920,14 @@ pub struct DayResult {
     /// tolerance, the house runs on the fallback for part of every cycle without
     /// anything saying so.
     pub minutes_without_a_plan: i64,
+    /// Control ticks in which a device could not hold the command it was given.
+    ///
+    /// See [`hems_core::report::DayKpis::clipped_ticks`] — the seam between the
+    /// arbiter and the hardware, which `hems_device::realisable` closes
+    /// correctly and silently.
+    pub clipped_ticks: i64,
+    /// The energy the hardware refused over those ticks, kWh.
+    pub clipped_kwh: f64,
     /// Energy the store lent the controllable devices under a § 14a ceiling, kWh.
     ///
     /// `[A1 2.3]` measures what the controllable devices draw *from the grid*,
@@ -1034,6 +1042,21 @@ pub struct DayResult {
     /// cannot say afterwards how much of its feed-in was grey has done half the
     /// job.
     pub quarter_hours: Vec<MispelQuarterHour>,
+    /// What the roof produced in each of them, kWh.
+    ///
+    /// Beside the registers rather than inside them, exactly as the box records
+    /// it: `Z2E¼` is the storage system and the charge point's generation and
+    /// not the sun's, and a day report that read one as the other told a
+    /// household running off its own roof that it was self-sufficient to no
+    /// degree at all (D124).
+    ///
+    /// **Never serialised**, and not as a convenience: a `Slot` is a struct and
+    /// a JSON object's keys are strings, so writing this map is a runtime error
+    /// rather than a shape somebody dislikes. It exists to pair the registers
+    /// with the roof on the way into the box's own store, and the day's total is
+    /// [`DayResult::produced_kwh`].
+    #[serde(skip)]
+    pub production_kwh_by_slot: BTreeMap<Slot, Decimal>,
     /// The day's § 14a control events, closed, each with its whole
     /// minute-resolution compliance trace — `[A1 7.2]`.
     ///
@@ -1081,6 +1104,8 @@ impl DayResult {
             respected_the_grid: self.grid_event_respected,
             worst_overshoot_w: self.worst_overshoot_w,
             minutes_without_a_plan: u32::try_from(self.minutes_without_a_plan).unwrap_or(u32::MAX),
+            clipped_ticks: u32::try_from(self.clipped_ticks).unwrap_or(u32::MAX),
+            clipped_kwh: self.clipped_kwh,
             control_events: self.control_events,
             below_minimum_commanded: self.commanded_below_minimum,
             forecast: Some(hems_core::report::ForecastScores {
@@ -1455,6 +1480,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     &limits,
                     lpc.limit_ends_at(),
                     site,
+                    now,
                 ))
                 .in_community(&horizon_share);
 
@@ -1958,6 +1984,10 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             register.grid_feed_in += kwh(grid.outflow());
             register.device_consumption += kwh(battery_actual.inflow() + evse_actual.inflow());
             register.device_generation += kwh(battery_actual.outflow() + evse_actual.outflow());
+            *result
+                .production_kwh_by_slot
+                .entry(slot)
+                .or_insert(Decimal::ZERO) += kwh(pv_now.outflow());
         }
         result.produced_kwh += pv_now.outflow().kw() * hours;
         result.consumed_kwh += load_now.inflow().kw() * hours;
@@ -1973,6 +2003,17 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 .is_none_or(|p| p.is_stale(now, arbiter.config().max_plan_age))
         {
             result.minutes_without_a_plan += 1;
+        }
+        // What the hardware would not take. Counted here rather than inferred
+        // from the meter afterwards, because the meter cannot tell a device that
+        // refused a command from one that was never asked.
+        if !decision.clipped.is_empty() {
+            result.clipped_ticks += 1;
+            result.clipped_kwh += decision
+                .clipped
+                .values()
+                .map(|p| p.kw() * hours)
+                .sum::<f64>();
         }
         result.battery_soc_min = result.battery_soc_min.min(battery.soc().fraction());
         result.ev_charged_kwh += evse_actual.inflow().kw() * hours;
@@ -2019,6 +2060,26 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             .iter()
             .flat_map(|s| s.assets.iter().cloned())
             .collect();
+        // The three controllable devices, split by whether a network operator
+        // may actually reduce them. A device below the threshold of
+        // `[A1 2.4.1]` is ordinary load: it spends the surplus like any other
+        // and never appears against the ceiling.
+        let (steuve_consumption, other_consumption) = [
+            (&household.battery, battery_actual),
+            (&household.evse, evse_actual),
+            (&household.heat_pump, hp_actual),
+        ]
+        .into_iter()
+        .fold(
+            (Power::ZERO, Power::ZERO),
+            |(steuve, other), (id, actual)| {
+                if steuve_ids.contains(id) {
+                    (steuve + actual.inflow(), other)
+                } else {
+                    (steuve, other + actual.inflow())
+                }
+            },
+        );
         evidence.observe(
             Observation {
                 ceiling: limits.steuve_ceiling,
@@ -2036,9 +2097,28 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 // roof over-reports the Nachweis figure — and once the guard
                 // started lending a discharge to the § 14a budget it reported a
                 // reduction as breached on a day when it was respected.
+                //
+                // **Which** of the three is a steuerbare Verbrauchseinrichtung
+                // is the classification's answer, not a fixed triple (D122). It used to
+                // be a fixed triple, and on the no-store household — whose
+                // battery is deliberately below the 4,2 kW of `[A1 2.4.1]` — that
+                // charged an ordinary load against a network operator's ceiling
+                // in the evidence record. It stayed invisible only because the
+                // *planner* was making the same mistake in the other direction
+                // (D121), so a record that over-counted was compared against a
+                // plan that over-restrained. Two wrongs, one seam.
+                //
+                // And **every** non-controllable consumer is on the other side,
+                // the tank and the appliance included. Leaving them out
+                // overstates the surplus available to cover the controllable
+                // devices, which understates the netzwirksamer Leistungsbezug —
+                // the one direction a compliance record may never be wrong in.
                 netzwirksam: hems_grid::netzwirksamer_leistungsbezug(
-                    battery_actual.inflow() + evse_actual.inflow() + hp_actual.inflow(),
-                    load_now.inflow(),
+                    steuve_consumption,
+                    load_now.inflow()
+                        + appliance_now.inflow()
+                        + dhw_actual.inflow()
+                        + other_consumption,
                     pv_now.outflow() + battery_actual.outflow() + evse_actual.outflow(),
                 ),
                 applied: !decision.setpoints.is_empty(),
@@ -2270,15 +2350,15 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         result.s2_undescribed = described.undescribed.len();
     }
 
-    let self_used = (result.produced_kwh - result.exported_kwh).max(0.0);
-    let total_consumed = result.consumed_kwh
-        + result.ev_charged_kwh
-        + result.heat_pump_kwh
-        + result.dhw_kwh
-        + result.appliance_kwh;
-    if total_consumed > 0.0 {
-        result.self_sufficiency = (self_used / total_consumed).clamp(0.0, 1.0);
-    }
+    // The **same** arithmetic a box on a wall runs, from the same three metered
+    // energies, and not the sum of the loads this simulator happens to be able
+    // to see. The two had drifted, and a fleet that averages a simulated day
+    // beside a real one was averaging two different questions (D125).
+    result.self_sufficiency = hems_core::report::self_sufficiency(
+        result.imported_kwh,
+        result.produced_kwh,
+        result.exported_kwh,
+    );
     Ok(result)
 }
 

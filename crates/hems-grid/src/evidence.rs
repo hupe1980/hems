@@ -313,15 +313,6 @@ impl EvidenceRecorder {
         }
     }
 
-    /// A recorder with a different sampling interval.
-    #[must_use]
-    pub fn sampling_every(sample_every: Duration) -> Self {
-        Self {
-            sample_every,
-            ..Self::default()
-        }
-    }
-
     /// Record one tick.
     ///
     /// Returns a reference to the record that was just closed, if this tick

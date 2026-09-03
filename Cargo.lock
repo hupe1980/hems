@@ -924,9 +924,9 @@ dependencies = [
 
 [[package]]
 name = "eebus"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55c662286d8d4f7e3710e581250dab79d53acff8e2f16483fe22995ff2a03da8"
+checksum = "eb6734f4eff546db5cbbf1499c5b6d6161a27654460829d91fd0f0fd43c87d9a"
 dependencies = [
  "futures-util",
  "rcgen",

@@ -44,7 +44,7 @@ metering     = { version = "0.22", features = ["serde"] }
 # EEBUS: SHIP + SPINE + the certifiable use cases. Taken with `default-features
 # = false` so the domain side gets the sans-I/O cores and nothing else — no
 # tokio, no TLS, no mDNS. `hemsd` is where a socket is allowed to exist.
-eebus        = { version = "0.2", default-features = false, features = ["std"] }
+eebus        = { version = "0.3", default-features = false, features = ["std"] }
 
 # SunSpec's generated model definitions. Taken with `default-features = false`
 # so the tokio-modbus client stays out: what hems wants is `Model::parse`, which

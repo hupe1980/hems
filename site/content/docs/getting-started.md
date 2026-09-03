@@ -142,9 +142,20 @@ it. A box with no drivers measures nothing, so the guard would assume every
 controllable device was at its nameplate, for ever.
 
 `--check` builds the site and the drivers and stops before opening a socket. It
-is what an installer runs before leaving, and it refuses the five mistakes that
-are otherwise silent for months — including a § 14a household with nothing that
-could hear a reduction.
+is what an installer runs before leaving, and it refuses the mistakes that are
+otherwise silent for months — including a § 14a household with nothing that could
+hear a reduction, and a **Modul 3 calendar that breaks the Anwendungshilfe**:
+
+```console
+📅 Modul 3 `NB-14A-3-2026` for 2026 conforms — HT 17:00–20:00, NT 22:00–06:00, billed in Q1, Q4
+   transcribed from https://www.example-netz.de/preisblatt-2026.pdf#modul3
+```
+
+That is the one thing in the file copied by hand out of a PDF, so it is the one
+most likely to be a typo — and the failures are quiet. A Hochtarif ten minutes
+short of two hours is a tariff nobody may sell; a Niedertarif band written as a
+single wrapping window leaves the cheap level **unreachable** while every other
+rule passes, and the household pays for a module it can never be in.
 
 It also prints the box's **SKI**:
 

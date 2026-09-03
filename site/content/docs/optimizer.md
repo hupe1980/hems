@@ -43,17 +43,25 @@ ev_on·min_charge ≤ ev ≤ ev_on·max_charge, ev_on ∈ {0,1}        (6 A or n
 app[k] = Σ_i Σ_j start[i][j]·programme_i[k − j]                (its own shape)
 b_ch + ev + hp − b_dis + curtail + dhw + app ≤ ceiling[k] + (pv − load)
                                                     while pv > load
-b_ch + ev + hp − b_dis                ≤ ceiling[k]  otherwise   (§ 14a)
+Σ SteuVE − b_dis                      ≤ ceiling[k]  otherwise   (§ 14a)
 g_out ≤ feed-in ceiling[k]                                     (§ 9 EEG, LPP)
 g_out ≤ pv − curtail + b_dis                                   (no invented export)
+g_in ≤ M_in·(1 − z[k]),  g_out ≤ M_out·z[k],  z ∈ {0,1}         (one direction,
+                                     only where export price > import price       at a time)
 ```
 
-There is deliberately **no mirror** of that last line. "Imported power has to go
-into the house or a store" is implied by it and the energy balance, so it
+There is deliberately **no mirror** of the export bound. "Imported power has to
+go into the house or a store" is implied by it and the energy balance, so it
 constrains nothing — and it is always tight whenever the household is not
 exporting, which gives it a free non-negative dual that absorbs the energy
 balance's own. With it in the model every shadow price below is meaningless: an
 ordinary 20 ct hour came back at 5 986 €/kWh.
+
+`Σ SteuVE` is the devices a network operator may actually reduce, not every
+device the planner models: a heat pump group below 4,2 kW is not a steuerbare
+Verbrauchseinrichtung. That is a fact about a site's nameplates and its
+commissioning dates, which `hems-grid` answers and the planner is told — see
+[the § 14a section](#the-ss-14a-constraint-is-on-the-netzwirksamer-leistungsbezug-per-slot).
 
 minimising, in euros throughout,
 
@@ -69,7 +77,7 @@ minimising, in euros throughout,
   − terminal value of what is left in the battery, the building and the tank
 ```
 
-## Fourteen decisions worth explaining
+## Fifteen decisions worth explaining
 
 ### Battery wear is a cost, not a constraint
 
@@ -94,11 +102,23 @@ get back out.
 
 ### You cannot import and export at the same instant
 
-Stating it as two physical bounds — exported power comes from the roof or the
-battery, imported power goes into the house or a store — keeps the model a pure
-linear program, which matters on a gateway box. Without them the model is
-*unbounded* wherever export earns more than import costs, and it will invent an
-infinite round trip through a meter.
+`g_in` and `g_out` are two non-negative variables whose *difference* the energy
+balance fixes, so adding the same watt to both is always feasible. The objective
+charges `import − export` for that watt, which is the whole of the defence — and
+only a defence while importing costs more than exporting earns.
+
+Two ordinary German tariffs invert that. A deeply negative day-ahead quarter hour
+pushes the import price below zero while [§ 51 EEG](@/docs/tariffs.md) holds the
+export price at zero, and a legacy feed-in tariff — a 2010 roof at 39 ct/kWh — is
+above retail in every hour of the year. There the export bound keeps the model
+*bounded* and cannot make it *right*: its mirror is algebraically itself, so
+there is no inequality left to add, and one connection point running one way at a
+time is a disjunction.
+
+So hems declares a direction binary, big-Ms taken from what the household could
+draw and what the roof and the battery could deliver, **only in the slots where
+the price could pay for the round trip** — no slots at all on a modern feed-in
+tariff, which is the economy the MILP-HEMS literature uses.
 
 ### The § 14a constraint is on the netzwirksamer Leistungsbezug, per slot
 
@@ -107,7 +127,7 @@ Not on consumption. The surplus a roof is producing raises the ceiling exactly a
 a reduction — lawfully. The same arithmetic runs in the guard once a second
 against measurements; here it runs against the forecast.
 
-Three details, and each is easy to get backwards.
+Four details, and each is easy to get backwards.
 
 Curtailed production is on the *left*-hand side, not subtracted from the
 surplus: throwing energy away cannot buy headroom. A hot-water tank is on the
@@ -121,6 +141,22 @@ out of a store never crossed the connection point. Charging and discharging
 appear with opposite signs, so no round trip through the battery can manufacture
 headroom — and the plan stops refusing to charge a car under a teatime reduction
 while a full battery sits behind the meter.
+
+`Σ SteuVE` is the devices the ceiling **actually binds**, and the planner cannot
+work that out for itself. A device is a steuerbare Verbrauchseinrichtung only if
+it passes the 4,2 kW of `[A1 2.4.1]` — individually for a charge point and a
+battery, summed per Fallgruppe for heat pumps — which is a fact about a site's
+nameplates and its commissioning dates. `hems-optimizer` takes no site: it sees a
+battery model, a charging session and a thermal model, none of which carries a
+Fallgruppe. Assuming all three are controllable is harmless while a roof is
+producing, where a device that *spends* the surplus and a device the ceiling
+*binds* carry the same `+1` on the same row — and it is wrong on a winter
+evening, where the row has no surplus term at all and a 3 kW heat pump no network
+operator may reduce was charged against a ceiling it is not under. The household
+was made colder than the Festlegung asks for, in exactly the hours a reduction
+happens. `hems-grid::classify_at` is what answers it, `hemsd` asks, and
+`PlanningLimits::steuve_devices` is how the answer reaches the plan. The guard
+never had this problem: it classifies the real site every tick.
 
 And the ceiling is read **per slot**. A reduction has a duration — `[LPC-909]`
 sends one with the limit, and the failsafe releases after its own minimum — and
@@ -574,7 +610,9 @@ constrains nothing, which is why such a row survives; and it is tight whenever
 the household is not exporting, which is most of the time. An always-tight
 redundant row has a free dual that absorbs the energy balance's along with it, so
 the price of a kilowatt-hour is not inaccurate but **indeterminate**: an ordinary
-20 ct hour comes back at 5 986 €/kWh.
+20 ct hour comes back at 5 986 €/kWh. (That the row constrains nothing is also
+why it could not fix the round trip it looks like it forbids — see
+[the direction binary](#you-cannot-import-and-export-at-the-same-instant).)
 
 **Conditioning that a simplex method hides.** Watts and euros put a variable at
 10³ and its objective coefficient at 10⁻⁵ — a condition number near 10⁸. Simplex

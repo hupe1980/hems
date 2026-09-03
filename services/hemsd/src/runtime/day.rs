@@ -169,6 +169,39 @@ impl Unplanned {
     }
 }
 
+/// What the hardware would not take, accumulated across a day.
+///
+/// The counterpart of [`Unplanned`] on the other seam: not "the arbiter had no
+/// plan" but "the arbiter had one and the device could not hold it". Kept in
+/// memory for the same reason — it is two numbers a day, and a row per tick of
+/// ordinary operation would be a lot of rows to answer them.
+///
+/// Unlike [`Unplanned`] a restart is **not** reported as an absence: a partial
+/// count of clipped ticks is still a true statement about the ticks it saw, and
+/// the failure it is watching for is a device that refuses commands *often*
+/// rather than one that refused exactly `n` of them. Under-reporting after a
+/// reboot understates a problem; refusing to report understates it to zero.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Clipping {
+    ticks: u32,
+    kwh: f64,
+}
+
+impl Clipping {
+    /// Add one control period.
+    pub fn tick(&mut self, refused: hems_core::units::Power, period_s: u32) {
+        if refused > hems_core::units::Power::ZERO {
+            self.ticks = self.ticks.saturating_add(1);
+            self.kwh += refused.kw() * f64::from(period_s) / 3600.0;
+        }
+    }
+
+    /// Begin a new day.
+    pub fn roll(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Build the KPIs for the Berlin calendar day `date`, from what the box wrote
 /// down.
 ///
@@ -190,6 +223,7 @@ pub fn kpis(
     site: &str,
     date: Date,
     unplanned: Unplanned,
+    clipping: Clipping,
     scored: &Scored,
 ) -> Result<Option<DayKpis>, StoreError> {
     let from = metering::calendar::day_start_utc(date);
@@ -204,19 +238,22 @@ pub fn kpis(
         use rust_decimal::prelude::ToPrimitive;
         d.to_f64().unwrap_or(0.0)
     };
-    let imported_kwh: f64 = registers.iter().map(|q| kwh(q.grid_draw)).sum();
-    let exported_kwh: f64 = registers.iter().map(|q| kwh(q.grid_feed_in)).sum();
-    let produced_kwh: f64 = registers.iter().map(|q| kwh(q.device_generation)).sum();
+    let imported_kwh: f64 = registers.iter().map(|q| kwh(q.registers.grid_draw)).sum();
+    let exported_kwh: f64 = registers
+        .iter()
+        .map(|q| kwh(q.registers.grid_feed_in))
+        .sum();
+    // The **roof**, which is a quantity of its own and not one of the MiSpeL
+    // registers. `Z2E¼` — `device_generation` — is the storage system and the
+    // charge point's generation, and reading it as production is what made a
+    // household running almost entirely off its own sun report a
+    // self-sufficiency of nought: on a summer day its export exceeds its
+    // battery's discharge and the subtraction below floors at zero (D124).
+    let produced_kwh: f64 = registers.iter().filter_map(|q| q.production).map(kwh).sum();
 
-    // What the household consumed = what it drew from the grid, plus what it
-    // produced and did not export. The registers are the only place this can be
-    // computed from, and it is the same arithmetic the settlement uses.
-    let consumed_kwh = imported_kwh + (produced_kwh - exported_kwh).max(0.0);
-    let self_sufficiency = if consumed_kwh > 0.0 {
-        ((consumed_kwh - imported_kwh) / consumed_kwh).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+    // One arithmetic, in one place: the simulator asks the same function.
+    let self_sufficiency =
+        hems_core::report::self_sufficiency(imported_kwh, produced_kwh, exported_kwh);
 
     let events = store.control_events_between(from, to)?;
     let worst_overshoot_w = events
@@ -250,6 +287,8 @@ pub fn kpis(
         minutes_without_a_plan: unplanned.minutes().unwrap_or(0),
         control_events: events.len(),
         below_minimum_commanded: events.iter().any(|s| s.event.below_minimum()),
+        clipped_ticks: clipping.ticks,
+        clipped_kwh: clipping.kwh,
         foresight_was_perfect: false,
     }))
 }
@@ -260,23 +299,33 @@ mod tests {
     use rust_decimal::Decimal;
     use time::macros::date;
 
+    /// One recorded quarter hour. `produced` is the **roof**, which is a
+    /// quantity of its own — the `device_generation` register beside it is the
+    /// storage system's, and this fixture keeps them different numbers so that
+    /// a report reading one for the other fails here (D124).
     fn register(
         slot_from: time::OffsetDateTime,
         i: i64,
         draw: i64,
         feed: i64,
         produced: i64,
-    ) -> hems_grid::mispel::QuarterHour {
-        hems_grid::mispel::QuarterHour {
-            slot: hems_core::prelude::Slot::containing(slot_from + time::Duration::minutes(15 * i)),
-            grid_draw: Decimal::new(draw, 2),
-            grid_feed_in: Decimal::new(feed, 2),
-            device_consumption: Decimal::ZERO,
-            device_generation: Decimal::new(produced, 2),
-            storage_consumption: None,
-            storage_generation: None,
-            anzulegender_wert: Decimal::new(786, 2),
-            spot_price: Decimal::new(1250, 2),
+    ) -> crate::store::Recorded {
+        crate::store::Recorded {
+            registers: hems_grid::mispel::QuarterHour {
+                slot: hems_core::prelude::Slot::containing(
+                    slot_from + time::Duration::minutes(15 * i),
+                ),
+                grid_draw: Decimal::new(draw, 2),
+                grid_feed_in: Decimal::new(feed, 2),
+                device_consumption: Decimal::ZERO,
+                // The battery, discharging something quite unlike the sun.
+                device_generation: Decimal::new(900, 2),
+                storage_consumption: None,
+                storage_generation: None,
+                anzulegender_wert: Decimal::new(786, 2),
+                spot_price: Decimal::new(1250, 2),
+            },
+            production: Some(Decimal::new(produced, 2)),
         }
     }
 
@@ -290,6 +339,7 @@ mod tests {
             "haus-1",
             date!(2026 - 01 - 15),
             Unplanned::watching(),
+            Clipping::default(),
             &Scored::default(),
         )
         .unwrap();
@@ -311,6 +361,7 @@ mod tests {
             "haus-1",
             date!(2026 - 01 - 15),
             Unplanned::watching(),
+            Clipping::default(),
             &Scored::default(),
         )
         .unwrap()
@@ -318,7 +369,11 @@ mod tests {
 
         assert!((day.imported_kwh - 4.0).abs() < 1e-9, "4 × 1,00 kWh");
         assert!((day.exported_kwh - 1.0).abs() < 1e-9);
-        assert!((day.produced_kwh - 2.0).abs() < 1e-9);
+        assert!(
+            (day.produced_kwh - 2.0).abs() < 1e-9,
+            "the roof, not the 36 kWh the battery gave back: {}",
+            day.produced_kwh
+        );
         assert_eq!(
             day.economics, None,
             "a box meters; the money is modelled and it does not model it"
@@ -345,6 +400,7 @@ mod tests {
             "haus-1",
             date!(2026 - 01 - 15),
             Unplanned::watching(),
+            Clipping::default(),
             &Scored::default(),
         )
         .unwrap()

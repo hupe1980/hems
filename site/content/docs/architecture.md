@@ -137,7 +137,7 @@ battery has always done: cover the house from the roof and the store rather than
 from the grid, in both directions. Absorbing surplus and stopping there leaves an
 offline box buying the evening peak at the retail price with a full battery
 sitting behind the meter. `just demo offline` runs a whole June day that way:
-100 % self-sufficiency, 2,7 kWh imported, no planner at all.
+95 % self-sufficiency, 2,6 kWh imported, no planner at all.
 
 It also knows the word *enough*: the charge point carries the household's own
 Ladelimit and the fallback stops there, rather than pushing production into a car
@@ -159,6 +159,18 @@ the tolerance: at thirty-minute re-planning against a twenty-minute tolerance th
 house runs on the fallback for ten minutes in every thirty, nothing fails, and
 the day costs €1,50 more. `DayResult::minutes_without_a_plan` is what makes that
 visible, and a test pins it at zero.
+
+**And a device may not be able to hold what it was told.** A charge point is off
+or above the 6 A of IEC 61851 with nothing in between; a hot-water relay is on or
+off. So the arbiter routinely decides a value a device cannot hold, and
+`hems_device::realisable` resolves it — correctly, and *silently*. Every layer
+above then believes the decided value: the energy tracker counts it as delivered,
+the plan falls behind by exactly that much and compensates in the next slot, and
+the only place the truth appears is the meter. `DayKpis::clipped_ticks` and
+`clipped_kwh` are the numbers, `obsd` names the days rather than averaging them,
+and a household whose wallbox refuses a third of its commands is an installation
+problem no property test could report — because every line of it behaves exactly
+as specified.
 
 #### One conductor or three
 

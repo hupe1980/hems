@@ -48,6 +48,14 @@ $ just demo-all
 | `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,72 |
 | `capped` | a clear May day on a 20 kWp roof, the § 9 EEG cap binding at 12,06 of 12,00 kW | €1,31 |
 
+`autumn` is also the only one of the seven where the seam between the arbiter and
+the wiring shows: a switching wallbox spends the afternoon being asked for power
+that falls between what three conductors and one can hold, and
+`hems_device::realisable` answers each of those with zero — correctly, and
+silently. The day reports **19 ticks and 0,18 kWh** of it against nought on the
+other six, and its own test pins that, which is what keeps the number from being
+structurally zero.
+
 Two of those are chosen rather than obvious. `capped` is in **May**, not June,
 because the cap is a fraction of *direct-current* power and how close a roof gets
 to it is decided by cell temperature. `shared` removes the store rather than

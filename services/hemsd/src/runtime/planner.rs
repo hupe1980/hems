@@ -429,7 +429,7 @@ async fn attempt(
         planner.wear_eur_per_kwh,
     );
 
-    let limits = crate::site::planning_limits(&observed.limits, None, site);
+    let limits = crate::site::planning_limits(&observed.limits, None, site, now);
     // The names are decided from the same three facts the problem is built from,
     // right here, so the two cannot disagree about whether there is a battery.
     // See the module note on why naming an asset the problem does not model is

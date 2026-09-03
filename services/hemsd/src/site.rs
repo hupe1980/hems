@@ -5,7 +5,7 @@ use hems_core::asset::{
     HeatPumpControl, LoadKind, Programme, PvArray,
 };
 use hems_core::prelude::*;
-use hems_optimizer::model::{PlanningLimits, TimedLimit};
+use hems_optimizer::model::{PlanningLimits, SteuVeDevices, TimedLimit};
 use hems_optimizer::solve::AssetNames;
 use hems_realtime::guard::GridLimits;
 use hems_tariff::levies::Levies;
@@ -430,9 +430,17 @@ pub fn planning_limits(
     limits: &GridLimits,
     ends_at: Option<OffsetDateTime>,
     site: &Site,
+    now: OffsetDateTime,
 ) -> PlanningLimits {
     let mut planning = PlanningLimits::default()
         .with_import_ceiling(site.grid.import_ceiling())
+        // Which of the planner's three controllable devices a § 14a ceiling
+        // actually binds, answered by the same function the guard asks every
+        // tick. A heat pump below 4,2 kW is not a steuerbare
+        // Verbrauchseinrichtung, and a planner that charged one against the
+        // ceiling anyway left the house colder than the Festlegung asks for on
+        // exactly the evenings a reduction happens.
+        .with_steuve_devices(steuve_devices(site, now))
         // What the *baseline* household lives under while the same reduction is
         // in force. It has no energy manager, so it cannot be addressed as one
         // `[A1 4.4.b]`: its Steuerbox turns each device down on its own
@@ -452,17 +460,41 @@ pub fn planning_limits(
     planning
 }
 
+/// Which of the planner's devices `hems_grid::classify_at` calls steuerbare
+/// Verbrauchseinrichtungen on this site today.
+///
+/// The classification is per **asset**, and the planner models device *kinds* —
+/// so a site with two charge points, one of them 3,7 kW, answers `true` if any
+/// of them is controllable. That is the safe direction and it is also the honest
+/// one: the planner's single `ev` variable stands for whatever the site's charge
+/// points do between them.
+fn steuve_devices(site: &Site, now: OffsetDateTime) -> SteuVeDevices {
+    let classified = hems_grid::classify_at(&site.assets, now);
+    let has = |fallgruppe| classified.iter().any(|s| s.fallgruppe == fallgruppe);
+    SteuVeDevices {
+        battery: has(Fallgruppe::Stromspeicher),
+        ev: has(Fallgruppe::Ladepunkt),
+        heat_pump: has(Fallgruppe::Waermepumpe),
+    }
+}
+
 /// The § 14a network-charge modules this household could choose between.
 ///
 /// The first is the reference — what it is on today — and the rest are what
-/// [`hems_tariff::compare_moduls`] prices against it. Modul 3 is deliberately
-/// absent: it needs the network operator's own Zählzeitdefinition, and this
-/// workspace refuses to invent one. A curated calendar per operator is
-/// `tariffd`'s job.
+/// [`hems_tariff::compare_moduls`] prices against it.
+///
+/// **Modul 3 appears only where the household has a calendar.** It is not a
+/// module anybody can be advised into in the abstract: its value is the shape of
+/// one network operator's own windows, and a comparison against invented ones
+/// would be a recommendation computed from a guess. Where the box *has* been
+/// given the operator's calendar — transcribed by whoever commissioned it, and
+/// refused at start-up unless it conforms — the comparison is real and is worth
+/// making, because shifting out of the Hochtarif is the one flexibility a
+/// household knows about a year in advance.
 #[must_use]
 pub fn modul_choices(current: &Tariff) -> Vec<hems_tariff::ModulChoice> {
     let arbeitspreis = Decimal::new(1000, 2);
-    vec![
+    let mut choices = vec![
         hems_tariff::ModulChoice {
             label: "Modul 1".into(),
             tariff: current.clone(),
@@ -486,7 +518,30 @@ pub fn modul_choices(current: &Tariff) -> Vec<hems_tariff::ModulChoice> {
                 ..current.clone()
             },
         },
-    ]
+    ];
+    // The household's own calendar, priced against the flat charge it would
+    // otherwise pay. Only where it has one: the comparison is the shape of one
+    // operator's windows and cannot be made against invented ones.
+    if let NetworkCharge::Modul3 { .. } = &current.network {
+        choices.insert(
+            0,
+            hems_tariff::ModulChoice {
+                label: "Modul 3".into(),
+                tariff: current.clone(),
+            },
+        );
+        choices[1] = hems_tariff::ModulChoice {
+            label: "Modul 1".into(),
+            tariff: Tariff {
+                network: NetworkCharge::Modul1 {
+                    arbeitspreis,
+                    reduction_eur_per_year: -current.network.annual_fixed_eur(),
+                },
+                ..current.clone()
+            },
+        };
+    }
+    choices
 }
 
 /// A dynamic tariff with the given day-ahead prices, in ct/kWh per slot.

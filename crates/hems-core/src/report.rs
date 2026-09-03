@@ -73,6 +73,31 @@ pub struct Economics {
     pub baseline: CostBreakdown,
 }
 
+/// The Autarkiegrad implied by three metered energies, in `[0, 1]`.
+///
+/// `(consumption − import) / consumption`, with consumption taken as
+/// `import + max(0, production − export)` — everything drawn from the grid, plus
+/// everything produced that did not leave. It lives here because there are two
+/// callers and a fleet averages both: two arithmetics would be a mean over two
+/// different questions (D125).
+///
+/// It counts a store's **round-trip losses** as consumption. Energy that went
+/// into a battery and came back smaller is on both sides of the fraction,
+/// because a connection point cannot tell a kilowatt-hour that heated water from
+/// one that warmed a cell. Every commercial home energy manager reports it the
+/// same way and the effect is under a percentage point — but it is an
+/// approximation rather than an identity, and a figure quoted to a customer
+/// should say so.
+#[must_use]
+pub fn self_sufficiency(imported_kwh: f64, produced_kwh: f64, exported_kwh: f64) -> f64 {
+    let self_used = (produced_kwh - exported_kwh).max(0.0);
+    let consumed = imported_kwh.max(0.0) + self_used;
+    if consumed <= 0.0 {
+        return 0.0;
+    }
+    (self_used / consumed).clamp(0.0, 1.0)
+}
+
 /// One site's day, as the fleet is told about it.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -92,6 +117,10 @@ pub struct DayKpis {
     /// Produced, kWh.
     pub produced_kwh: f64,
     /// The share of consumption the site covered from its own roof and store.
+    ///
+    /// Always [`self_sufficiency`], never a second arithmetic. A fleet averages
+    /// these across boxes and simulations alike, and two definitions in one mean
+    /// is a number about nothing.
     pub self_sufficiency: f64,
     /// Allocated by a § 42c community, kWh.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -127,6 +156,23 @@ pub struct DayKpis {
     /// `[A1 4.5]`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub below_minimum_commanded: bool,
+    /// Control ticks in which a device could not hold the command it was given.
+    ///
+    /// The seam between the arbiter and the hardware. A charge point is off or
+    /// above 6 A with nothing in between, so the arbiter routinely decides a
+    /// value a device cannot hold and `hems_device::realisable` resolves it
+    /// correctly and **silently**. No property test can report that — every line
+    /// of it behaves exactly as specified — so the day counts it instead.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub clipped_ticks: u32,
+    /// The energy the hardware refused over those ticks, kWh.
+    ///
+    /// The count says how often; this says whether it mattered. A wallbox
+    /// clipped for one tick at the tail of a slot whose energy is already
+    /// delivered is a rounding error; one clipped for an hour is a plan built on
+    /// a device that does not exist.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub clipped_kwh: f64,
 
     // ── Forecast ────────────────────────────────────────────────────────────
     /// How the day's own forecasts scored, where the box scored them.
@@ -168,6 +214,8 @@ impl Default for DayKpis {
             minutes_without_a_plan: 0,
             control_events: 0,
             below_minimum_commanded: false,
+            clipped_ticks: 0,
+            clipped_kwh: 0.0,
             forecast: None,
             foresight_was_perfect: false,
         }
@@ -317,6 +365,38 @@ mod a_day_a_box_can_actually_report {
             ..measured()
         };
         assert_eq!(scored.forecast.map(|f| f.pv_coverage), Some(0.81));
+    }
+
+    #[test]
+    fn a_household_that_imported_anything_is_not_wholly_self_sufficient() {
+        // The property the arithmetic this replaced could violate, and did. The
+        // simulator's own version summed the loads it could see for the
+        // denominator and put `production − export` over them — so on a June day
+        // where the surplus went into a battery the numerator counted charging
+        // as self-consumption and the denominator did not, the fraction passed
+        // one, and it clamped. `just demo offline` reported **100 %
+        // self-sufficiency and 2,6 kWh imported** in the same table.
+        let ss = self_sufficiency(2.6, 51.4, 6.2);
+        assert!(ss < 1.0, "2,6 kWh came off the grid: {ss}");
+        assert!((ss - 45.2 / 47.8).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_house_with_no_roof_covers_none_of_itself_and_one_with_no_meter_is_not_a_division() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        assert!(close(self_sufficiency(10.0, 0.0, 0.0), 0.0));
+        assert!(
+            close(self_sufficiency(0.0, 0.0, 0.0), 0.0),
+            "and no NaN from an unplugged box"
+        );
+        assert!(
+            close(self_sufficiency(0.0, 8.0, 0.0), 1.0),
+            "a day entirely off its own roof"
+        );
+        assert!(
+            close(self_sufficiency(0.0, 8.0, 9.0), 0.0),
+            "and exporting more than it made is a meter fault, not a negative share"
+        );
     }
 
     #[test]

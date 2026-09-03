@@ -194,12 +194,24 @@ Three questions, and they are not the same shape.
 
 | Question | Shape | Why it matters |
 |---|---|---|
-| “How are we doing?” | an **average** — saving, self-sufficiency, forecast scores | an average over enough days is the only honest way to quote any of them |
+| “How are we doing?” | an **average** — saving, self-sufficiency, forecast scores | an average over enough days is the only honest way to quote any of them, and each has the denominator its own question needs |
 | “Who is broken?” | a **count** | one household in ten thousand that failed to respect a reduction is an incident with a name and a date; “99,99 % compliance” reads as success |
 | “Is the forecast honest?” | **neither** | one day's coverage figure is a coin toss reported to three significant figures, and only the merge of many days can be compared with the 80 % the band promises |
 
+The averages do **not** share a denominator, and that is the second thing worth
+saying. A *saving* is a counterfactual: it needs a baseline, only a simulator can
+re-run a household as an unmanaged one, and a day the planner was shown the
+weather is an upper bound rather than a result — so it is a mean over the days
+that have one. *Self-sufficiency* is three meter readings, and every box has
+them. Sharing the two meant a fleet of real households published nought while
+every box in it was reporting a perfectly good figure.
+
 So the summary carries breaches as a **list of sites** and never as a rate — and a
-box reports its scores rather than judging them.
+box reports its scores rather than judging them. The same shape covers the two
+seam numbers: the days a box spent without a plan, and the days a device could
+not hold a command the arbiter gave it, are **named days** rather than fleet
+percentages. A wallbox refusing a third of its commands is one household with one
+installation problem, and an average puts it at half a per cent.
 
 `obsd` holds a **window, not a history**. The record is `histd`'s; what lives here
 is derived, bounded and rebuildable, and losing it costs a dashboard rather than
@@ -297,7 +309,11 @@ household nothing at all.
 
 The storage half of the same idea is on the box. `[A1 7.3]` keeps a control event
 for two years, so `hemsd` holds its **own** copy and forwards second: what the
-fleet has not acknowledged is an outbox that grows, not a gap. A record that
+fleet has not acknowledged is an outbox that grows, not a gap. Two things travel
+on that loop — the `[A1 7.2]` control events, and the quarter-hour **registers**
+MiSpeL's Abgrenzung and § 42c's allocation are computed from — and a drain that
+sent one and silently kept the other would look exactly like a box with nothing
+to say, which is why a test asserts both arrive. A record that
 exists only once it has been uploaded is an intention with a network dependency —
 and the day a network operator asks about is the day the link was down.
 

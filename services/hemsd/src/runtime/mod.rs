@@ -76,6 +76,14 @@ pub enum StartError {
         /// Why not.
         detail: String,
     },
+    /// The household is on Modul 3 and its calendar is not one anybody may bill.
+    ///
+    /// A refusal rather than a warning, and the argument is the same one every
+    /// other refusal here makes: a box that started anyway would price a year of
+    /// somebody's electricity in windows the Anwendungshilfe does not allow, and
+    /// would look exactly like a box that was working.
+    #[error("the Modul 3 calendar is not one this household may be billed on: {0}")]
+    Modul3(String),
 }
 
 /// Everything a running box holds.
@@ -117,6 +125,7 @@ pub fn assemble(settings: &Settings, now: time::OffsetDateTime) -> Result<Runnin
         registry.register(built, &household.site)?;
     }
     registry.validate(&household.site, now)?;
+    check_modul3(settings, now)?;
 
     Ok(Running {
         ski: None,
@@ -125,6 +134,89 @@ pub fn assemble(settings: &Settings, now: time::OffsetDateTime) -> Result<Runnin
         registry: Arc::new(Mutex::new(registry)),
         status: Arc::new(Mutex::new(Status::default())),
     })
+}
+
+/// Check a Modul 3 household's calendar against the Anwendungshilfe
+/// (`specs/bnetza/bdew-awh-modul-3-v1.1-20250207.pdf`) and against its own
+/// delivery point.
+///
+/// There is no machine-readable national format for one — a PDF or an Excel
+/// sheet per network operator — so it is transcribed by whoever commissions the
+/// box, and this is what makes transcribing safe rather than a second way to be
+/// wrong (D126). The failures are quiet: a Niedertarif band written as one
+/// wrapping window leaves that register declared and **unreachable**, the day
+/// still covered by the fallback and every other rule passing, so the household
+/// is billed for a module whose cheap hours it can never be in.
+///
+/// [`Modul3Conformance::Unknown`] is **not** a refusal: it means a rule could not
+/// be checked rather than that one was broken, and refusing on it would tie the
+/// box's willingness to start to how much `metering` knows this release.
+fn check_modul3(settings: &Settings, now: time::OffsetDateTime) -> Result<(), StartError> {
+    use hems_grid::modul3::{Modul3Conformance, Modul3Eligibility};
+
+    if settings.tariff.modul != crate::config::Modul::Modul3 {
+        // A calendar nothing reads is a calendar nobody notices is wrong.
+        if settings.tariff.modul3.is_some() {
+            return Err(StartError::Modul3(
+                "a `[tariff.modul3]` calendar is configured and `modul` is not `modul3`,                  so nothing would ever read it"
+                    .into(),
+            ));
+        }
+        return Ok(());
+    }
+
+    let Some(configured) = settings.tariff.modul3.as_ref() else {
+        return Err(StartError::Modul3(
+            "`modul = \"modul3\"` needs a `[tariff.modul3]` calendar; without one the box              would price every hour the same and shift nothing"
+                .into(),
+        ));
+    };
+    let Some(calendar) = configured.calendar() else {
+        return Err(StartError::Modul3(format!(
+            "`billed_quarters` must be drawn from Q1, Q2, Q3 and Q4, and this says {:?}",
+            configured.billed_quarters
+        )));
+    };
+    if configured.source.is_none() {
+        return Err(StartError::Modul3(
+            "`source` is required: when a household queries a bill, the first question is \
+             which document said so, and a calendar nobody can trace is one nobody can \
+             defend"
+                .into(),
+        ));
+    }
+
+    // § 1 of the Anwendungshilfe: Modul 3 only together with Modul 1, only with
+    // an intelligent metering system, and only without registrierende
+    // Leistungsmessung. The metering system is a fact about the site, so it is
+    // read from the site rather than declared twice.
+    let household = settings.site.household()?;
+    let eligibility = Modul3Eligibility {
+        has_modul_1: true,
+        has_imsys: household.para9.imsys_since.is_some(),
+        has_rlm: false,
+    };
+    if !eligibility.is_eligible_on(metering::calendar::local_day(now)) {
+        return Err(StartError::Modul3(
+            "this delivery point may not be billed on Modul 3: it needs Modul 1, an              intelligent metering system, and no registrierende Leistungsmessung — and the              module has only been orderable since 01.04.2025"
+                .into(),
+        ));
+    }
+
+    let (verdict, findings) = calendar.assess(&eligibility.as_context());
+    match verdict {
+        Modul3Conformance::Violates => Err(StartError::Modul3(format!(
+            "{findings:?} — see specs/bnetza/bdew-awh-modul-3-v1.1-20250207.pdf"
+        ))),
+        Modul3Conformance::Unknown => {
+            tracing::warn!(
+                ?findings,
+                "the Modul 3 calendar breaks no rule this build can check, and something                  could not be checked"
+            );
+            Ok(())
+        }
+        Modul3Conformance::Conforms => Ok(()),
+    }
 }
 
 /// One configured driver, built.
@@ -545,3 +637,112 @@ fn array_of(site: &Site, settings: &crate::config::SiteSettings) -> hems_forecas
 
 /// What every asset was last commanded, for the API.
 pub type Commanded = BTreeMap<AssetId, Power>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Modul, Modul3Settings, Settings};
+
+    const NOW: time::OffsetDateTime = time::macros::datetime!(2026-06-15 10:00:00 UTC);
+
+    /// A calendar an installer would transcribe correctly: a three-hour
+    /// Hochtarif, a Niedertarif that wraps past midnight, and two billed
+    /// quarters.
+    fn calendar() -> Modul3Settings {
+        Modul3Settings {
+            id: "NB-14A-3-2026".into(),
+            year: 2026,
+            hochtarif_minutes: [17 * 60, 20 * 60],
+            niedertarif_minutes: [22 * 60, 6 * 60],
+            billed_quarters: vec!["Q1".into(), "Q4".into()],
+            ht_ct_per_kwh: 18.0,
+            st_ct_per_kwh: 10.0,
+            nt_ct_per_kwh: 4.0,
+            source: Some("https://example-netz.de/preisblatt-2026.pdf".into()),
+        }
+    }
+
+    fn on_modul_3(modul3: Option<Modul3Settings>) -> Settings {
+        let mut settings = Settings::default();
+        settings.tariff.modul = Modul::Modul3;
+        settings.tariff.modul3 = modul3;
+        settings
+    }
+
+    #[test]
+    fn a_transcribed_calendar_that_conforms_lets_the_box_start() {
+        check_modul3(&on_modul_3(Some(calendar())), NOW).expect("it conforms");
+    }
+
+    #[test]
+    fn a_module_with_no_calendar_and_a_calendar_with_no_module_are_both_refused() {
+        // Both halves or neither. A box told to bill in windows and given none
+        // would price every hour the same and shift nothing, which is a
+        // household paying for a module it is not getting; a calendar with no
+        // module is one nothing reads, and therefore one nobody notices is
+        // wrong.
+        assert!(check_modul3(&on_modul_3(None), NOW).is_err());
+
+        let mut orphan = Settings::default();
+        orphan.tariff.modul = Modul::Modul1;
+        orphan.tariff.modul3 = Some(calendar());
+        assert!(check_modul3(&orphan, NOW).is_err());
+    }
+
+    #[test]
+    fn a_hochtarif_under_two_hours_is_not_a_calendar_anybody_may_be_billed_on() {
+        // The Anwendungshilfe's own floor. A box that started on this would
+        // shift a household's load out of ninety minutes it is barely charged
+        // extra for.
+        let settings = on_modul_3(Some(Modul3Settings {
+            hochtarif_minutes: [17 * 60, 18 * 60 + 30],
+            ..calendar()
+        }));
+        let error = check_modul3(&settings, NOW).expect_err("ninety minutes is not two hours");
+        assert!(
+            format!("{error}").contains("HochtarifBelowTwoHours"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn one_billed_quarter_is_refused_because_the_rule_asks_for_two() {
+        let settings = on_modul_3(Some(Modul3Settings {
+            billed_quarters: vec!["Q1".into()],
+            ..calendar()
+        }));
+        assert!(check_modul3(&settings, NOW).is_err());
+    }
+
+    #[test]
+    fn a_quarter_that_is_not_one_of_the_four_is_a_typo_and_not_an_empty_list() {
+        // Reporting a mistyped quarter as "the operator did not say" names the
+        // wrong problem: `BilledQuartersUnknown` is a real finding about a real
+        // gap, and a typo is neither.
+        let settings = on_modul_3(Some(Modul3Settings {
+            billed_quarters: vec!["Q1".into(), "Q5".into()],
+            ..calendar()
+        }));
+        let error = check_modul3(&settings, NOW).expect_err("there is no Q5");
+        assert!(format!("{error}").contains("Q5"), "{error}");
+    }
+
+    #[test]
+    fn a_calendar_nobody_can_trace_to_a_document_is_refused() {
+        let settings = on_modul_3(Some(Modul3Settings {
+            source: None,
+            ..calendar()
+        }));
+        assert!(check_modul3(&settings, NOW).is_err());
+    }
+
+    #[test]
+    fn a_household_with_no_intelligent_metering_system_may_not_take_modul_3() {
+        // § 1 of the Anwendungshilfe. The fact is a property of the *plant* and
+        // is read from the site rather than declared a second time on the
+        // tariff, so the two can never disagree.
+        let mut settings = on_modul_3(Some(calendar()));
+        settings.site.imsys_since = None;
+        assert!(check_modul3(&settings, NOW).is_err());
+    }
+}

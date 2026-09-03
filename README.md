@@ -77,9 +77,11 @@ $ cargo run -p hemsd -- run --config /etc/hems/hemsd.toml
 `--check` builds the site and the drivers and stops before opening a socket — the
 command an installer runs before leaving the cellar. It refuses a driver for an
 asset the site does not have, two drivers for one asset, a controllable device
-whose driver cannot command it, and a § 14a household with nothing that could
-hear a reduction. Each of those is silent at runtime and loud at start-up, which
-is the right way round.
+whose driver cannot command it, a § 14a household with nothing that could hear a
+reduction, and a **Modul 3 calendar the household may not be billed on** — the
+one thing in the file that is transcribed by hand from a PDF, checked against
+the seven rules of the BDEW Anwendungshilfe. Each of those is silent at runtime
+and loud at start-up, which is the right way round.
 
 Rust 1.94 and [`just`](https://just.systems). Nothing else: the default solver is
 pure Rust, so there is no C++ toolchain and no system library to install.
@@ -175,6 +177,7 @@ $ cargo run -p hemsd -- simulate --day winter
   self-restraint records                          1
   slowest reaction                   0 s, commanded
   minutes without a plan                          0
+  commands the hardware clipped      0 ticks (0.00 kWh)
   the opening plan expected          20.05 €, off by +1.03
   without an Energy Guard                     3 min
   limit respected throughout                    yes
@@ -340,7 +343,7 @@ instruction not to use it. `hems-sim` still stands in for those.
 
 | Works today | |
 |---|---|
-| The domain model and the German grid rules | § 14a, § 9 EEG, § 51, Modul 3, MiSpeL, § 42c, the two-year evidence record — all cited |
+| The domain model and the German grid rules | § 14a, § 9 EEG, § 51, Modul 3 (transcribed from the operator's price sheet, and the box refuses to start on a calendar that breaks the Anwendungshilfe), MiSpeL, § 42c, the two-year evidence record — all cited |
 | The guard, the allocator and the one-second arbiter | with the § 14a precedence as a property test over a thousand randomised households |
 | The receding-horizon MILP | wear, comfort, hot water, placed appliances, per-slot grid limits, a shadow price per asset, and planning against three futures |
 | Forecasting, and being scored on it | solar geometry, a residual corrector that learns *this* roof, CRPS and calibration beside the money |
@@ -351,8 +354,8 @@ instruction not to use it. `hems-sim` still stands in for those.
 | The driver registry | `hemsd` checks the drivers against the site *before* a byte moves |
 | **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided and what it could not hear |
 | **A receding-horizon plan on a real box** | prices from `tariffd`, the sky from `forecastd`, this roof modelled locally and corrected by what it has actually delivered, the battery read off its own meter, the solve off the runtime — and what it learns kept in its own store, so a reboot does not cost a fortnight |
-| **The § 14a record, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
-| **A box reports what it metered** | `hemsd run` closes each Berlin calendar day from the rows it already wrote — so a restart at 23:50 still reports the whole day — and carries the energies and the § 14a record. No cost and no baseline: a baseline is a counterfactual only a simulator can re-run, and five of the six cost terms are modelled. The fleet counts those days apart rather than averaging them in as days that saved nothing |
+| **The § 14a record and the quarter-hour registers, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
+| **A box reports what it metered** | `hemsd run` closes each Berlin calendar day from the rows it already wrote — so a restart at 23:50 still reports the whole day — and carries the energies, the § 14a record, the seam numbers and the scores of its own forecast bands. No cost and no baseline: a baseline is a counterfactual only a simulator can re-run, and five of the six cost terms are modelled. The fleet counts those days apart rather than averaging them in as days that saved nothing |
 | **The day report, queued before it is sent** | a signed CloudEvent to `obsd` is a row in the box's own store until the fleet takes it, signed **at each attempt** — Standard Webhooks covers the timestamp, so one made when the row was written is stale by the time a box back from an outage sends it. A `5xx` or a refused connection keeps the day; a `4xx` that is not a rate limit is `obsd` having read it and refused it, and asking again changes nothing |
 | **The household's own say** | `boost`, `pause` and `away` per asset, expiring on their own — the one write on the local API, and safe because an override is a *desire* the guard still narrows |
 | The fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
@@ -369,7 +372,7 @@ instruction not to use it. `hems-sim` still stands in for those.
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-845 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+869 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
 clock, the whole suite, the workspace guards (378 citations across five document
 families, each resolving to a document the index carries; 121 quantities,
@@ -392,7 +395,9 @@ hems consumes rather than reimplements: [`s2energy`](https://crates.io/crates/s2
 standard's own authors), [`metering`](https://github.com/hupe1980/metering)
 (Europe/Berlin calendar, OBIS, § 14a minimum power and netzwirksamer
 Leistungsbezug, Modul 3 calendars and their conformance rules, the VDE-AR-N 4100
-Unsymmetrieleistung, the allocation identity § 42b/c settle on), [`eebus`](https://github.com/hupe1980/eebus),
+Unsymmetrieleistung, the allocation identity § 42b/c settle on),
+[`eebus`](https://github.com/hupe1980/eebus) (SHIP and SPINE sans-I/O, the LPC/LPP
+limitation machine, and a conformance suite over all four certifiable use cases),
 [`ocpp-kit`](https://github.com/hupe1980/ocpp-kit), [`iso15118`](https://github.com/hupe1980/iso15118)
 and [`mako`](https://github.com/hupe1980/mako) (the market side).
 

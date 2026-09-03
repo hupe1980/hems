@@ -79,6 +79,14 @@ fn default_deadband() -> Power {
     Power::new_const(50.0)
 }
 
+/// How far a command may miss what the hardware can hold before it counts as
+/// having been clipped.
+///
+/// One watt, for the same reason `hems_grid::evidence::COMPLIANCE_TOLERANCE` is:
+/// the two values come out of a chain of arithmetic on measurements, and a
+/// picowatt of its own noise is not a device refusing an instruction.
+const CLIP_EPSILON: Power = Power::new_const(1.0);
+
 impl Default for ArbiterConfig {
     fn default() -> Self {
         Self {
@@ -179,6 +187,20 @@ pub struct Decision {
     /// How far the measured grid power is from the sum of the measured assets.
     /// A residual that is not near zero means a meter is missing or mis-signed.
     pub balance_residual: Option<Power>,
+    /// What the hardware could **not** take, per asset — the decided value minus
+    /// the one the device can actually hold, as a positive magnitude. Only
+    /// assets that were clipped appear.
+    ///
+    /// A charge point is off or above the 6 A of IEC 61851 with nothing in
+    /// between, and a hot-water relay is on or off, so the arbiter routinely
+    /// decides a value a device cannot hold and [`hems_device::realisable`]
+    /// resolves it — correctly, and silently. Every layer above then believes
+    /// the decided value: the energy tracker counts it as delivered, the plan
+    /// falls behind by that much and compensates next slot, and the truth
+    /// appears only at the meter. A household whose charge point is clipped in a
+    /// third of its ticks has a wallbox the planner is modelling wrongly, and
+    /// nothing else would say so (D123).
+    pub clipped: BTreeMap<AssetId, Power>,
 }
 
 /// The one-second control loop.
@@ -234,6 +256,7 @@ impl Arbiter {
         // ── 4. Smooth, and 5. explain ──────────────────────────────────────
         let mut setpoints = Vec::new();
         let mut commanded = BTreeMap::new();
+        let mut clipped = BTreeMap::new();
 
         for (id, (want, _)) in &desires.wants {
             let Some(asset) = tick.site.asset(id) else {
@@ -264,6 +287,12 @@ impl Arbiter {
             // exceedance. `realisable` therefore takes the envelope.
             let smoothed = hems_device::realisable(asset, ramped, mode, envelope);
             commanded.insert(id.clone(), smoothed);
+            // What the hardware could not hold. Recorded rather than swallowed:
+            // see `Decision::clipped`.
+            let short = (ramped - smoothed).abs();
+            if short > CLIP_EPSILON {
+                clipped.insert(id.clone(), short);
+            }
 
             // A change smaller than the deadband is not worth a message — unless
             // a guard rule is what is holding the value, in which case the
@@ -303,6 +332,7 @@ impl Arbiter {
             balance_residual: Self::balance_residual(&tick, max_age),
             verdict,
             phases,
+            clipped,
         }
     }
 
@@ -1411,6 +1441,64 @@ mod tests {
             !d.setpoints.iter().any(|s| s.asset.as_str() == "haushalt"),
             "the household base load is not ours to command"
         );
+    }
+
+    #[test]
+    fn a_command_the_hardware_cannot_hold_is_counted_rather_than_swallowed() {
+        // The seam between the arbiter and the wiring, and the reason it needs a
+        // number of its own: `hems_device::realisable` resolves a command a
+        // device cannot hold — correctly, and silently — and every layer above
+        // then believes the value that was decided. A § 14a ceiling that cuts a
+        // three-phase charge point below the 4,14 kW it needs to start is the
+        // ordinary way this happens.
+        let slot = Slot::containing(NOW);
+        let f = Fixture {
+            limits: GridLimits {
+                steuve_ceiling: Some(Power::from_kw(3.0)),
+                steuve_since: Some(NOW),
+                ..GridLimits::default()
+            },
+            ..Fixture::new()
+        }
+        .grid(0.0);
+        let plan = Plan {
+            slots: vec![SlotPlan {
+                flexibility_eur_per_kwh: None,
+                slot,
+                targets: vec![AssetTarget {
+                    marginal_eur_per_kwh: None,
+                    asset: AssetId::new("wallbox").unwrap(),
+                    power: Power::from_kw(11.0),
+                    envelope: Envelope::new(Power::ZERO, Power::from_kw(11.0)),
+                }],
+                marginal_eur_per_kwh: None,
+            }],
+            ..Plan::empty(Horizon::new(slot.start(), 1), NOW)
+        };
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), Some(&plan));
+
+        let wallbox = AssetId::new("wallbox").unwrap();
+        assert_eq!(
+            commanded(&d, "wallbox"),
+            Power::ZERO,
+            "below 6 A a charge point is idle, not slow"
+        );
+        let refused = d.clipped.get(&wallbox).copied().unwrap_or(Power::ZERO);
+        assert!(
+            refused > Power::from_kw(1.0),
+            "the kilowatts the guard left it and it could not take have to be \
+             reported, not swallowed: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_clipped_when_every_device_can_hold_what_it_was_told() {
+        // The other half, and the one that keeps the number honest: an ordinary
+        // tick reports nothing, so a day with a large figure is a day something
+        // is wrong rather than a day the counter exists.
+        let f = Fixture::new().grid(0.5).measure("haushalt", 0.5);
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
+        assert!(d.clipped.is_empty(), "{:?}", d.clipped);
     }
 
     #[test]

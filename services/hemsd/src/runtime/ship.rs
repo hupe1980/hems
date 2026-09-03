@@ -220,9 +220,15 @@ pub async fn run(
                 continue;
             }
         };
+        // The negotiated version is worth a line, because 1.0 and 1.1 differ in
+        // a way that shows up much later: only 1.1 carries `accessMethods.id`,
+        // which is what a peer would be dialled back with. An installer reading
+        // a log after a failed reconnect is owed the fact here rather than
+        // inferring it.
         tracing::info!(
             %from,
             peer = %connection.peer(),
+            ship_version = connection.ship_version().map(|v| v.to_string()).as_deref().unwrap_or("unknown"),
             "a Steuerbox completed the SHIP handshake"
         );
         session(connection, &registry, &asset, &shutdown).await;

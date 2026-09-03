@@ -51,8 +51,8 @@ use crate::{
 use eebus::model::{DeviceType, EntityType};
 use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::usecases::limitation::{
-    ControllableSystem, ControllableSystemActor, CsConfig, EffectiveLimit, LimitationState,
-    LocalDecision,
+    ControllableSystem, ControllableSystemActor, CsConfig, CsFeatures, EffectiveLimit,
+    LimitationState, LocalDecision,
 };
 use eebus::usecases::{limitation, lpc, lpp};
 
@@ -210,12 +210,11 @@ impl Lpc {
     ) -> Result<Self, DriverError> {
         let config = CsConfig::new(failsafe.get().max(0.0), failsafe_for).on_cem();
         let system = ControllableSystem::new(config, StdDuration::ZERO);
-        let (mut engine, actor) = build(which, system, identity)?;
-        // Published once, here: the descriptions and the current values a peer
-        // reads before it writes anything. A Controllable System that answered
-        // a discovery with nothing would be discovered as a device that plays no
-        // use case at all.
-        actor.install(&mut engine, StdDuration::ZERO);
+        // `build` ends at the builder's `install`, which is what publishes the
+        // descriptions and the current values a peer reads before it writes
+        // anything. A Controllable System that answered a discovery with nothing
+        // would be discovered as a device that plays no use case at all.
+        let (engine, actor) = build(which, system, identity)?;
         Ok(Self {
             asset,
             which,
@@ -457,17 +456,28 @@ fn build(
         ))
     })?;
 
+    // The fourth feature is a **client**-role `DeviceDiagnosis`, and it is not
+    // optional. A subscription runs client → server (SPINE § 5.3.6), so an
+    // appliance that subscribed to the Energy Guard's heartbeat from its own
+    // server feature is refused by any peer that checks the role — and a
+    // Controllable System with no heartbeat from its guard then refuses every
+    // limit, for want of one. The failure is silent on the wire: discovery,
+    // bindings and subscriptions all succeed and no limit is ever written.
     let entity = LocalEntity::new([1], EntityType::CEM)
         .with_feature(limitation::load_control_feature(1))
         .with_feature(limitation::device_configuration_feature(2))
-        .with_feature(limitation::device_diagnosis_feature(3));
+        .with_feature(limitation::device_diagnosis_feature(3))
+        .with_feature(limitation::device_diagnosis_client_feature(4));
     device
         .add_entity(entity)
         .expect("entity [1] is the first one added");
 
-    let load_control = device.address_of(&[1], 1);
-    let configuration = device.address_of(&[1], 2);
-    let diagnosis = device.address_of(&[1], 3);
+    let features = CsFeatures {
+        load_control: device.address_of(&[1], 1),
+        device_configuration: device.address_of(&[1], 2),
+        device_diagnosis: device.address_of(&[1], 3),
+        device_diagnosis_client: device.address_of(&[1], 4),
+    };
 
     let mut engine = Engine::new(device);
     let (descriptor, direction) = match which {
@@ -476,8 +486,12 @@ fn build(
     };
     engine.add_use_case([1], 1, descriptor);
 
-    let actor =
-        ControllableSystemActor::new(system, direction, load_control, configuration, diagnosis);
+    // The builder is the only way to obtain an actor, and `install` is where it
+    // publishes what it serves. The previous shape let a caller forget that and
+    // produce a device that answers everything and describes no limit — so an
+    // Energy Guard finds no `limitId` to write to and never sends one.
+    let actor = ControllableSystemActor::builder(system, direction, features)
+        .install(&mut engine, StdDuration::ZERO);
     Ok((engine, actor))
 }
 
@@ -538,7 +552,11 @@ impl Driver for Lpc {
         let elapsed = self.since_start(now);
         match state {
             LinkState::Up => {
-                self.actor.install(&mut self.engine, elapsed);
+                // Re-published rather than re-installed: a new session's peer
+                // has read nothing yet, and what it must find is what this
+                // actor holds *now* rather than what it held when the process
+                // started.
+                self.actor.publish(&mut self.engine, elapsed);
                 self.discover(elapsed);
                 self.consume_engine_events(elapsed);
             }

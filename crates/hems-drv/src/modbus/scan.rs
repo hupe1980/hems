@@ -157,11 +157,35 @@ pub struct Discovery {
 enum State {
     /// Probing base address `BASES[i]` for the marker.
     Probing(usize),
-    /// Reading the header of the model at `address`.
-    Walking { address: u16 },
+    /// Reading the header of the model at `address`, `seen` models in.
+    Walking {
+        /// Where the next header should be.
+        address: u16,
+        /// How many headers this walk has already taken, so a device cannot
+        /// drive it for ever. See [`MAX_MODELS`].
+        seen: u16,
+    },
     /// The chain has been walked.
     Done,
 }
+
+/// The most models one walk will follow before giving up on the chain.
+///
+/// Every step is driven by two registers the **device** chose — an identifier
+/// and a length — and the next header is `address + 2 + length`, so the device
+/// decides how long the walk is. A length of zero advances it two registers a
+/// step and never reaches the sentinel; a length that overflows the address
+/// space pins it at the top. Neither is dangerous (a driver that never finishes
+/// discovery reports no models, and the guard falls back to a nameplate) and
+/// both are a box that reads one device for ever and never manages it. The same
+/// reasoning as `super::decode::scaled`: bound what hardware nobody here
+/// controls can ask for (D128).
+///
+/// Sixty-four is far above anything real; the largest device this workspace has
+/// met publishes eleven. Stopping needs no log line to be visible — a truncated
+/// walk declares fewer [`crate::DriverCapabilities`], and `/v1/status` already
+/// names an asset whose driver cannot say what it could produce.
+const MAX_MODELS: u16 = 64;
 
 impl Default for Discovery {
     fn default() -> Self {
@@ -198,7 +222,7 @@ impl Discovery {
                 Some((base, 2, Purpose::Marker(base)))
             }
             // A header is two registers: the model id and its length.
-            State::Walking { address } => Some((address, 2, Purpose::Header(address))),
+            State::Walking { address, .. } => Some((address, 2, Purpose::Header(address))),
             State::Done => None,
         }
     }
@@ -207,7 +231,10 @@ impl Discovery {
     pub(crate) fn saw_marker(&mut self, base: u16, regs: &[u16], _models: &mut ModelMap) {
         if regs.len() >= 2 && regs[0] == MARKER[0] && regs[1] == MARKER[1] {
             // The chain starts immediately after the marker.
-            self.state = State::Walking { address: base + 2 };
+            self.state = State::Walking {
+                address: base + 2,
+                seen: 0,
+            };
         } else {
             self.try_next_base(base);
         }
@@ -215,11 +242,29 @@ impl Discovery {
 
     /// The device answered a model header.
     pub(crate) fn saw_header(&mut self, address: u16, regs: &[u16], models: &mut ModelMap) {
+        let seen = match self.state {
+            State::Walking { seen, .. } => seen,
+            _ => 0,
+        };
         let (Some(&id), Some(&len)) = (regs.first(), regs.get(1)) else {
             self.state = State::Done;
             return;
         };
-        if id == END_OF_CHAIN {
+        // Three ways a chain ends, and only the first is the tidy one.
+        //
+        // The **sentinel** is what a well-behaved device sends. A **zero-length**
+        // header is not a model: the body is what a model is, and a header
+        // claiming none of it advances the walk by two registers for ever. And a
+        // chain that would run off the end of the address space, or that has
+        // already produced more models than any real device publishes, is a
+        // device answering something other than the question — see
+        // [`MAX_MODELS`].
+        let next = address.checked_add(2).and_then(|a| a.checked_add(len));
+        let (Some(next), false, true) = (next, id == END_OF_CHAIN, len > 0) else {
+            self.state = State::Done;
+            return;
+        };
+        if seen >= MAX_MODELS {
             self.state = State::Done;
             return;
         }
@@ -227,7 +272,8 @@ impl Discovery {
         // after the body.
         models.insert(id, address + 2, len);
         self.state = State::Walking {
-            address: address.saturating_add(2).saturating_add(len),
+            address: next,
+            seen: seen + 1,
         };
     }
 
@@ -252,5 +298,72 @@ impl Discovery {
             // behaviour: the device may be booting.
             State::Probing(0)
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Walk a chain whose headers come from `answer`, and say how many reads it
+    /// took to finish. `None` means it did not.
+    fn walk(mut answer: impl FnMut(u16) -> [u16; 2]) -> Option<(usize, ModelMap)> {
+        let mut discovery = Discovery::new();
+        let mut models = ModelMap::default();
+        for step in 0..10_000 {
+            let Some((address, _, purpose)) = discovery.next_step(&models) else {
+                return Some((step, models));
+            };
+            match purpose {
+                Purpose::Marker(base) => discovery.saw_marker(base, &MARKER, &mut models),
+                _ => discovery.saw_header(address, &answer(address), &mut models),
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn an_ordinary_chain_is_walked_to_its_sentinel() {
+        // Two models and the end marker, at the lengths a real inverter
+        // publishes.
+        let models = walk(|address| match address {
+            40_002 => [1, 66],
+            40_070 => [103, 50],
+            _ => [END_OF_CHAIN, 0],
+        });
+        let (_, found) = models.expect("it ends");
+        assert!(found.has(1) && found.has(103));
+    }
+
+    #[test]
+    fn a_device_that_answers_a_length_of_zero_does_not_walk_for_ever() {
+        // The failure this bound exists for. Every step of the walk is driven by
+        // two registers the *device* chose, and a header claiming a body of no
+        // registers advances the address by two and never reaches the sentinel:
+        // a box that reads one device for ever and never manages it, with
+        // nothing saying why. A model is its body, so a header with none of one
+        // ends the chain.
+        let (steps, found) = walk(|_| [1, 0]).expect("it stops");
+        assert!(steps < 8, "it stopped immediately, not after {steps} reads");
+        assert!(!found.has(1), "and a body-less header is not a model");
+    }
+
+    #[test]
+    fn a_device_that_never_sends_the_sentinel_stops_at_the_bound() {
+        // The other shape: every header is plausible and the chain simply never
+        // ends. Sixty-four models is far more than any real device publishes.
+        let (steps, _) = walk(|_| [1, 4]).expect("it stops");
+        assert!(
+            steps <= usize::from(MAX_MODELS) + 4,
+            "it followed {steps} headers"
+        );
+    }
+
+    #[test]
+    fn a_chain_that_would_run_off_the_end_of_the_address_space_stops() {
+        // `40_000 + 2` and a length that overflows `u16`. Saturating here would
+        // pin the address at the top and re-read it for ever.
+        let (steps, _) = walk(|_| [1, u16::MAX - 40_000]).expect("it stops");
+        assert!(steps < 8, "it stopped after {steps} reads");
     }
 }

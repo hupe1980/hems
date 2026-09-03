@@ -130,12 +130,22 @@ impl Fleet {
                 // rather than a result, and averaging it into a saving figure
                 // produces a number no household can reach. It is counted and
                 // then left out.
+                // Self-sufficiency is **metered**, so it is averaged over every
+                // day on record rather than over the ones a saving can be
+                // computed from. The two exclusions below exist because a saving
+                // is a *counterfactual* — an upper bound, or a baseline nobody
+                // re-ran — and neither says anything about how much of its own
+                // electricity a household made. Tying it to `measured_days`
+                // meant a fleet of real boxes, which never carry economics
+                // (D116), reported a self-sufficiency of **nought** while every
+                // one of them was reporting a perfectly good figure from its own
+                // three meters (D127).
+                summary.self_sufficiency += day.self_sufficiency;
                 match (day.saving_eur(), day.bill_saving_eur()) {
                     (Some(saving), Some(bill)) if day.is_measurable() => {
                         summary.measured_days += 1;
                         summary.saving_eur += saving;
                         summary.bill_saving_eur += bill;
-                        summary.self_sufficiency += day.self_sufficiency;
                     }
                     // Counted apart, because they are excluded for different
                     // reasons and an operator needs to know which. A foresight
@@ -177,6 +187,22 @@ impl Fleet {
                         detail: format!("{} minutes on the fallback", day.minutes_without_a_plan),
                     });
                 }
+                // The other seam between a decision and the world. A **named**
+                // day rather than a rate, like every other finding here: a
+                // wallbox that refuses a third of its commands is one household
+                // with one installation problem, and a fleet average would put
+                // it at half a per cent and read as fine.
+                summary.clipped_kwh += day.clipped_kwh;
+                if day.clipped_ticks > 0 {
+                    summary.sites_clipping.push(Finding {
+                        site: name.clone(),
+                        date: day.date,
+                        detail: format!(
+                            "{} commands the hardware could not hold ({:.2} kWh)",
+                            day.clipped_ticks, day.clipped_kwh
+                        ),
+                    });
+                }
             }
         }
 
@@ -184,7 +210,9 @@ impl Fleet {
             let n = summary.measured_days as f64;
             summary.saving_eur /= n;
             summary.bill_saving_eur /= n;
-            summary.self_sufficiency /= n;
+        }
+        if summary.days > 0 {
+            summary.self_sufficiency /= summary.days as f64;
         }
         summary.pv_coverage = pv.coverage;
         summary.pv_crps = pv.crps;
@@ -251,7 +279,14 @@ pub struct Summary {
     pub saving_eur: f64,
     /// The same on the electricity bill alone.
     pub bill_saving_eur: f64,
-    /// The mean self-sufficiency.
+    /// The mean self-sufficiency, over **[`Summary::days`]** — every day on
+    /// record, not the ones a saving can be computed from.
+    ///
+    /// Its denominator is deliberately not [`Summary::measured_days`]. A saving
+    /// is a counterfactual and needs a baseline; how much of its own electricity
+    /// a household made is three meter readings, and every box reports them. The
+    /// two were shared, and the consequence was that a fleet of real boxes —
+    /// which never carry economics (D116) — reported nought (D127).
     pub self_sufficiency: f64,
 
     /// **Every** day a network operator's instruction was not respected.
@@ -269,6 +304,19 @@ pub struct Summary {
     pub sites_without_a_plan: Vec<Finding>,
     /// How many minutes that came to across the fleet.
     pub unplanned_minutes: u64,
+    /// Every day a device could not hold a command the arbiter gave it.
+    ///
+    /// The seam between the control loop and the wiring: a charge point is off
+    /// or above the 6 A of IEC 61851 with nothing in between, so the arbiter
+    /// routinely decides a value a device cannot hold and
+    /// `hems_device::realisable` resolves it — correctly, and silently, while
+    /// every layer above goes on believing the decided value. A **named** day
+    /// rather than a rate, for the same reason `breached` is: a wallbox that
+    /// refuses a third of its commands is one household with one installation
+    /// problem, and a fleet average puts it at half a per cent.
+    pub sites_clipping: Vec<Finding>,
+    /// How much energy that came to across the fleet, kWh.
+    pub clipped_kwh: f64,
     /// Sites that have not reported recently.
     pub silent: Vec<String>,
 
@@ -545,6 +593,51 @@ mod what_a_real_box_reports {
             (summary.saving_eur - 0.0).abs() < f64::EPSILON,
             "a mean over nothing is zero, and `measured_days` is what says it is \
              a mean over nothing"
+        );
+        // …and the **metered** half is still reported. Self-sufficiency shared
+        // `measured_days` as its denominator, so a fleet of real households — the
+        // only kind there will ever be — published nought while every box was
+        // reporting 31 % off its own three meters (D127). A saving is a
+        // counterfactual; how much of its own electricity a house made is not.
+        assert!(
+            (summary.self_sufficiency - 0.31).abs() < 1e-9,
+            "the meters answered even though the money could not: {}",
+            summary.self_sufficiency
+        );
+    }
+
+    #[test]
+    fn the_metered_and_the_modelled_halves_have_different_denominators() {
+        // A mixed fleet is the case that separates them: two households with a
+        // simulator behind them and three real ones. The saving is a mean over
+        // the two that have a baseline; the self-sufficiency is a mean over all
+        // five, because all five metered it.
+        let mut fleet = Fleet::new(60);
+        for i in 0..2 {
+            fleet.record(from_the_simulator(&format!("sim-{i}"), 15), NOW);
+        }
+        for i in 0..3 {
+            fleet.record(
+                DayKpis {
+                    self_sufficiency: 0.61,
+                    ..from_a_box(&format!("haus-{i}"), 15)
+                },
+                NOW,
+            );
+        }
+        let summary = fleet.summarise(NOW, SILENT_AFTER);
+
+        assert_eq!(summary.days, 5);
+        assert_eq!(summary.measured_days, 2);
+        assert!(
+            (summary.saving_eur - 3.04).abs() < 1e-9,
+            "over the two with a counterfactual: {}",
+            summary.saving_eur
+        );
+        assert!(
+            (summary.self_sufficiency - (0.31 * 2.0 + 0.61 * 3.0) / 5.0).abs() < 1e-9,
+            "over all five: {}",
+            summary.self_sufficiency
         );
     }
 

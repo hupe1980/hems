@@ -132,11 +132,36 @@ fallback_ct_per_kwh = 20.0
 # fixed_ct_per_kwh = 28.5
 
 network_ct_per_kwh = 10.0
-# "none", "modul1" or "modul2". Modul 3 is deliberately not offered: it needs
-# the network operator's own Zählzeitdefinition, and this workspace will not
-# invent one.
+# "none", "modul1", "modul2" or "modul3".
 modul = "modul1"
 modul_1_reduction_eur_per_year = 120.0
+
+# ── Modul 3, where the household is on it ────────────────────────────────────
+#
+# Time-variable network charges, and the one flexibility a household knows about
+# a **year in advance**. There is no machine-readable national format — a PDF or
+# an Excel sheet per network operator — so whoever commissions the box
+# transcribes the operator's calendar here, and `hemsd run --check` refuses to
+# start on one that breaks the BDEW Anwendungshilfe.
+#
+# Uncomment together with `modul = "modul3"`. Both halves or neither.
+#
+# [tariff.modul3]
+# id = "NB-14A-3-2026"
+# year = 2026
+# # Minutes of the local day. At least two hours of Hochtarif on every day class
+# # the definition distinguishes; the Niedertarif band may wrap past midnight.
+# hochtarif_minutes  = [1020, 1200]   # 17:00–20:00
+# niedertarif_minutes = [1320, 360]   # 22:00–06:00
+# # The operator's Wahlrecht, published on the price sheet. At least two.
+# billed_quarters = ["Q1", "Q4"]
+# # The operator's own three working prices, ct/kWh.
+# ht_ct_per_kwh = 18.0
+# st_ct_per_kwh = 10.0
+# nt_ct_per_kwh = 4.0
+# # Required. When a household queries a bill, the first question is which
+# # document said so.
+# source = "https://www.example-netz.de/preisblatt-2026.pdf#modul3"
 
 feed_in_ct_per_kwh = 7.86
 standing_charge_eur_per_year = 120.0

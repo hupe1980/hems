@@ -188,6 +188,12 @@ pub struct TariffSettings {
     pub network_ct_per_kwh: f64,
     /// The § 14a module the household is on.
     pub modul: Modul,
+    /// The network operator's Modul 3 calendar, where the household is on one.
+    ///
+    /// Required by [`Modul::Modul3`] and refused with any other module, because
+    /// a calendar nothing reads is a calendar nobody notices is wrong.
+    #[serde(default)]
+    pub modul3: Option<Modul3Settings>,
     /// Modul 1's annual reduction, euros.
     ///
     /// A lump sum, so it never changes a marginal price and never changes what
@@ -209,6 +215,7 @@ impl Default for TariffSettings {
             fixed_ct_per_kwh: None,
             network_ct_per_kwh: 10.0,
             modul: Modul::Modul1,
+            modul3: None,
             modul_1_reduction_eur_per_year: 120.0,
             feed_in_ct_per_kwh: 7.86,
             standing_charge_eur_per_year: 120.0,
@@ -254,6 +261,31 @@ impl TariffSettings {
                     remaining_share: Decimal::new(4, 1),
                     metering_eur_per_year: Decimal::new(25, 0),
                 },
+                // A household on Modul 3 with no calendar is refused at
+                // start-up (`Config::check`), so reaching this arm without one
+                // is a box that was started past its own gate. The flat charge
+                // is the conservative answer rather than an invented set of
+                // windows: it prices every hour the same, so the plan shifts
+                // nothing for a spread it cannot see.
+                Modul::Modul3 => match self
+                    .modul3
+                    .as_ref()
+                    .and_then(|m| m.calendar().map(|c| (m, c)))
+                {
+                    Some((m, calendar)) => NetworkCharge::Modul3 {
+                        calendar,
+                        ht: ct(m.ht_ct_per_kwh),
+                        st: ct(m.st_ct_per_kwh),
+                        nt: ct(m.nt_ct_per_kwh),
+                        // Modul 3 is only available together with Modul 1
+                        // (§ 1 of the Anwendungshilfe), so the annual reduction
+                        // comes with it and is the same lump sum.
+                        reduction_eur_per_year: ct(self.modul_1_reduction_eur_per_year),
+                    },
+                    None => NetworkCharge::None {
+                        arbeitspreis: ct(self.network_ct_per_kwh),
+                    },
+                },
             },
             levies: Levies::household_2026(),
             feed_in: if self.feed_in_ct_per_kwh > 0.0 {
@@ -277,11 +309,19 @@ impl TariffSettings {
 
 /// Which § 14a network-charge module the household chose.
 ///
-/// Modul 3 is deliberately absent, and the absence is a refusal rather than an
-/// omission: it needs the network operator's own Zählzeitdefinition, and this
-/// workspace will not invent one. A curated calendar per operator is `tariffd`'s
-/// job, and until a box can be handed one, a household on Modul 3 is better
-/// planned as Modul 1 than as an invented set of windows.
+/// # Modul 3 is transcribed, never invented
+///
+/// There is no machine-readable national format for a Modul 3 calendar: it is a
+/// PDF or an Excel sheet per network operator. This workspace will not invent
+/// one — but an installer standing in a cellar with the operator's price sheet
+/// can *transcribe* it, and [`Modul3Settings`] is where. What makes that safe
+/// rather than a second way to be wrong is that the box **refuses to start** on
+/// a calendar that breaks the Anwendungshilfe: `run --check` runs
+/// `hems_grid::modul3::Modul3Calendar::assess` before a byte moves, and a
+/// household billed on a non-conformant calendar is a year of somebody's
+/// electricity priced against a tariff nobody may sell.
+///
+/// See `concepts/DECISIONS.md` D126.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Modul {
@@ -292,6 +332,98 @@ pub enum Modul {
     Modul1,
     /// 60 % off the working price, at a Marktlokation of its own.
     Modul2,
+    /// Time-variable network charges, on the operator's own calendar.
+    ///
+    /// Needs `[tariff.modul3]`; a box configured for it without one refuses to
+    /// start rather than falling back to a flat charge, because a household that
+    /// asked to be billed in windows and is planned on an average is one whose
+    /// energy manager is moving load for a spread it is not charged.
+    Modul3,
+}
+
+/// The network operator's Modul 3 calendar, as an installer transcribes it.
+///
+/// Two bands in minutes of the local day, the quarters the operator bills the
+/// levels in, and **where the numbers came from** — a price-sheet URL or a
+/// document hash. The last is not decoration: when a household is billed on a
+/// calendar, "which document said so" is the first question anybody asks.
+///
+/// The Europe/Berlin calendar, the Bundesland's statutory holidays and the two
+/// awkward days of the year are `metering`'s
+/// (`hems_grid::modul3::Modul3Calendar`), so a Sunday is not a Hochtarif, the
+/// repeated hour of the long October day is inside the same window twice, and
+/// the skipped hour of the short March day is inside none.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Modul3Settings {
+    /// The operator's own identifier for the Zählzeitdefinition.
+    pub id: String,
+    /// The calendar year the windows are fixed for. § 2 of the Anwendungshilfe
+    /// fixes them per year, and a definition that spans two is refused.
+    pub year: i32,
+    /// The Hochtarif band, `[from, to]` in minutes of the local day.
+    ///
+    /// At least two hours on every day class the definition distinguishes, or
+    /// the calendar breaks the Anwendungshilfe and the box says so.
+    pub hochtarif_minutes: [u16; 2],
+    /// The Niedertarif band, the same way. It may wrap past midnight.
+    pub niedertarif_minutes: [u16; 2],
+    /// The calendar quarters the three levels are billed in — the operator's
+    /// Wahlrecht, published on the price sheet and **not** derivable from the
+    /// windows. At least two of `"Q1"`, `"Q2"`, `"Q3"`, `"Q4"`.
+    pub billed_quarters: Vec<String>,
+    /// The Hochtarif working price, ct/kWh.
+    ///
+    /// Three absolute prices rather than a surcharge and a discount, because
+    /// three absolute prices are what a price sheet publishes — and a delta
+    /// against `network_ct_per_kwh` would make the household's bill depend on a
+    /// number that has nothing to do with its module.
+    pub ht_ct_per_kwh: f64,
+    /// The Standardtarif working price, ct/kWh.
+    pub st_ct_per_kwh: f64,
+    /// The Niedertarif working price, ct/kWh.
+    pub nt_ct_per_kwh: f64,
+    /// Where the calendar was transcribed from — a price-sheet URL, a document
+    /// hash. Optional to parse and **required to pass `--check`**: a calendar
+    /// nobody can trace back to a document is one nobody can defend when the
+    /// bill is queried.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+impl Modul3Settings {
+    /// The calendar these settings describe, or `None` where a quarter is not
+    /// one of the four.
+    ///
+    /// A bad quarter is a *parse* failure rather than an empty list, because an
+    /// empty `billed_quarters` is itself a conformance finding
+    /// (`BilledQuartersUnknown`) and reporting a typo as "the operator did not
+    /// say" would name the wrong problem.
+    #[must_use]
+    pub fn calendar(&self) -> Option<hems_grid::modul3::Modul3Calendar> {
+        let quarters = self
+            .billed_quarters
+            .iter()
+            .map(|q| match q.trim().to_ascii_uppercase().as_str() {
+                "Q1" => Some(hems_grid::modul3::Quarter::Q1),
+                "Q2" => Some(hems_grid::modul3::Quarter::Q2),
+                "Q3" => Some(hems_grid::modul3::Quarter::Q3),
+                "Q4" => Some(hems_grid::modul3::Quarter::Q4),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let calendar = hems_grid::modul3::Modul3Calendar::new(
+            self.id.clone(),
+            self.year,
+            (self.hochtarif_minutes[0], self.hochtarif_minutes[1]),
+            (self.niedertarif_minutes[0], self.niedertarif_minutes[1]),
+            quarters,
+        );
+        Some(match &self.source {
+            Some(source) => calendar.from_source(source.clone()),
+            None => calendar,
+        })
+    }
 }
 
 /// Where the box asks for prices and weather.
