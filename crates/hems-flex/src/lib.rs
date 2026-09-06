@@ -44,6 +44,7 @@
 pub mod describe;
 pub mod instruct;
 pub mod map;
+pub mod session;
 pub mod site;
 
 pub use describe::{
@@ -52,8 +53,12 @@ pub use describe::{
     describe_heat_pump, describe_programme, describe_pv, resource_manager_details,
 };
 pub use instruct::{
-    InstructError, battery_power, dhw_power, envelope_command, envelope_now, heat_pump_state,
-    programme_start,
+    Direction, InstructError, actuator_factor, battery_power, dhw_power, envelope_command,
+    envelope_now, heat_pump_state, programme_start,
 };
 pub use map::{ControlType, control_type_for, roles_for};
-pub use site::{DescribeContext, SiteDescription, describe_site};
+pub use session::{
+    CloseReason, Instructed, Offer, Ratings, Report, Session, SessionEvent, SessionState,
+    profile_status,
+};
+pub use site::{DescribeContext, SiteDescription, describe_site, sessions_for};

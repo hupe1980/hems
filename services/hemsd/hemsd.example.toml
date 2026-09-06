@@ -40,6 +40,12 @@ shutdown_grace_s = 20
 # The guard and the arbiter. The guard needs this as arithmetic and not only as
 # a schedule: a bound on a *state* — a backup reserve, a full battery — is only
 # a bound on a *rate* once you know how long the rate will be held for.
+#
+# It also decides how much of the household's own consumption the guard is
+# willing to lend the roof as § 9 EEG feed-in headroom. A loan is outstanding
+# until the guard next runs, so a heat pump answering its own thermostat puts
+# the connection point over a statutory ceiling for one of these. At a second
+# the whole draw is lendable; raising this number curtails the roof instead.
 tick_period_s = 1
 # The planner, on a receding horizon.
 replan_every_s = 300
@@ -50,14 +56,60 @@ horizon_slots = 192
 # household wants if it needs the same inputs to give the same plan every time.
 solve_budget_s = 10.0
 
+# How the planner treats the fact that its forecasts are wrong.
+#
+#   median       one future, the median of both forecasts. The default, and what
+#                every figure in this project is measured against.
+#   expected     three futures from the band the forecast already carries,
+#                minimising the expected cost across them.
+#   hedged       the same three, with a third of the objective on the worst.
+#   pessimistic  one pessimistic quantile of each — the cheap robustness knob,
+#                and the inferior construction: it is optimal against a world
+#                nobody expects, and the household pays the hedge every ordinary
+#                day with no credit on the bad one.
+#
+# Measured over twenty seeded weathers on each of two days: three futures beat
+# the median on the *mean* where a service is at risk (€2,96 against €2,81) and
+# take the undelivered charge from €0,07 to €0,01 — and cost €1,04 a day where
+# nothing is at risk, while improving no worst day at all. They also cost about
+# seven times the solve. Which is why the default is one median and why this is
+# a household's decision rather than an inherited one.
+risk = "median"
+
+# What this household will pay to avoid something other than money.
+#
+# Both default to zero, which is the plain economic plan — and both are terms the
+# planner's objective has always read while *nothing could set them*, so a
+# household that had bought a battery for independence had no way to say so.
+#
+# They are prices rather than a "mode", and that is deliberate: an enum of goals
+# (cost / carbon / self-sufficiency) swaps the energy price for grams and leaves
+# battery wear, comfort and curtailment in euros, so the plan ends up minimising
+# a sum of two currencies. As prices they are comparable with every other term
+# and they add up.
+[control.preferences]
+# 55 €/t — the German price for heating and transport fuels — is 0.055. It only
+# does something different from the dial below where the tariff carries a
+# per-slot carbon intensity, which `tariffd` serves from Energy-Charts: with a
+# flat intensity a carbon price *is* an autarky premium, because every hour is
+# equally dirty.
+co2_eur_per_kg = 0.0
+# The self-sufficiency dial, honest about its price: near the day's spread it
+# makes the plan prefer its own roof even where importing would be marginally
+# cheaper, and the difference is what independence cost.
+autarky_eur_per_kwh = 0.0
+
 # ── The house ────────────────────────────────────────────────────────────────
 #
 # Every field carries its unit in its name. A configuration file is read by a
 # person with a clipboard standing in a cellar.
-# A size of zero describes a device of no size rather than the absence of one:
-# the site model always builds the same assets, so the arbiter still decides for
-# a 0 kWp roof and `/v1/status` still lists it under `undriven` if nothing speaks
-# for it.
+#
+# **A size of zero means the household has no such device, and the site says
+# so**: `pv_kwp = 0` builds no roof, `battery_kwh = 0` no battery,
+# `evse_max_a = 0` no charge point, `heat_pump_kw = 0` no heat pump,
+# `dhw_litres = 0` no tank. An absent asset is never decided for, never appears
+# in the S2 description, and a driver configured for one is refused at start-up
+# — which is the mismatch `run --check` exists to catch.
 [site]
 pv_kwp = 9.8
 pv_ac_kw = 8.0
@@ -82,12 +134,29 @@ altitude_m = 34.0
 
 heat_pump_kw = 5.0
 heat_pump_modulating = true
+# How the unit takes instructions: "power-ceiling" (EEBUS LPC or a vendor
+# register), "sg-ready" (two relay contacts), "operation-modes", or "compressor"
+# (EEBUS OHPCF). The first three are all bounds — they can only ask the unit to
+# do less, so a plan that wants it to pre-heat into a cheap hour cannot say so.
+# "compressor" is the one that starts a process, and it needs an
+# `eebus-heat-pump` driver below.
+heat_pump_control = "power-ceiling"
+# How far the house may drift. This is the trade the whole heating plan turns
+# on: widen it and the box can carry the house through an expensive evening on
+# what it banked at noon; narrow it and the heating is its own thermostat's
+# business again. The planner only moves the building at all where a driver
+# reports an indoor temperature — a plan built on a guessed one decides when to
+# heat from a number nobody read.
 comfort_min_c = 20.0
 comfort_max_c = 23.0
 
 dhw_litres = 300.0
 dhw_heater_kw = 0.5
 
+# The charge point's largest current per conductor. 16 A three-phase is the
+# ordinary "11 kW" wallbox, 32 A the "22 kW" one; zero says the household has
+# no charge point at all.
+evse_max_a = 16.0
 # Almost every wallbox sold in Germany since about 2022 can drop to one
 # conductor, and it decides whether 2 kW of surplus charges a car or is
 # exported: three-phase charging cannot start below 4,14 kW.
@@ -243,13 +312,25 @@ ship_id = "hems_hems-1"
 # of the data phase. Merged with whatever the store already trusts, so a pairing
 # done through a screen is not undone by a deployment that did not know about it.
 trust = []
+# Announce this box on the local network as `_ship._tcp` (SHIP § 6), so an Energy
+# Guard can find it rather than being given an address by hand. The record
+# carries the SHIP ID, the WebSocket path and the SKI, which is also what a
+# certification lab asks to see. The announcement is withdrawn for the length of
+# a session, because a Controllable System has exactly one Energy Guard and a
+# second one that found this box would be refused. Turn it off on a segmented
+# network, or where something else announces on this box's behalf.
+announce = true
 
 # ── What speaks to the hardware ──────────────────────────────────────────────
 #
 # One entry per device, and `asset` has to name an asset the site above has.
-# A driver for an asset that does not exist, two drivers for one asset, or a
-# controllable asset whose driver cannot take commands are all refused at
-# start-up rather than discovered months later by a limit that never arrived.
+#
+# An asset may have **two** drivers: one that commands it and one that measures
+# it — a wallbox driven over Modbus and read over EEBUS EVCC/EVSOC, a heat pump
+# started over OHPCF and read through its register map. What is refused is two of
+# either, along with a driver for an asset that does not exist and a controllable
+# asset no driver can command: all at start-up, rather than months later by a
+# limit that never arrived.
 
 # The inverter, over SunSpec on Modbus TCP.
 [[drivers]]
@@ -281,6 +362,116 @@ listens_only = true
 
 # The network operator's Steuerbox, over EEBUS. The session it arrives on is
 # `[ship]` above.
+# The hot-water tank, over EEBUS MDT — the other direction entirely. § 14a is a
+# network operator dialling *this* box; a hot-water circuit is a device on the
+# household's own network that this box dials. Uncomment it where the tank has
+# one: the planner has modelled a hot-water store since the optimiser was
+# written and has never been given one on a running box, for want of a single
+# number — how warm the water is now. Without it the tank is left out of the
+# plan entirely rather than guessed at, because a store whose state of charge is
+# assumed is one the plan will decide not to heat on exactly the mornings it
+# matters.
+#
+# `ski` is required and is the whole of the trust decision: TLS proves a peer's
+# SKI, and a box that dialled whatever answered would take a tank temperature
+# from anything on the network that offered one.
+#
+# The car, over EEBUS EVCC and EVSOC — whether one is plugged in and how full it
+# is. This is the fact the plan was always missing about a charge point: the
+# arbiter has commanded amperes since the first day, and nothing reported an
+# arrival, so `EvSession` was in the optimiser and never built on a running box.
+#
+# `departure` and `target_soc` are the household's, not the car's: no EEBUS use
+# case carries either, and a car that published a departure time would be
+# publishing a guess about its driver. `target_soc` is below 1,0 on purpose —
+# the last fifteen per cent of a charge is the slowest and least useful part of
+# a session, and asking for a full battery every night is paid for on every one.
+#
+# It reads and never commands. The charge point is already commanded, over
+# Modbus or through the § 14a envelope, and two drivers commanding one wallbox
+# is one wallbox nobody can predict.
+#
+# [[drivers]]
+# kind = "eebus-ev"
+# asset = "wallbox"
+# address = "192.168.1.50:4712"
+# ski = "0000000000000000000000000000000000000000"
+# departure = "07:00"
+# target_soc = 0.8
+
+# The hot-water circuit, over EEBUS. It reads the tank's temperature (MDT) and
+# asks for a one-time loading (CDSF) — the button in the bathroom, pressed over
+# the wire, which is the shortest path there is from "the roof is exporting" to
+# "the tank is absorbing it". One driver, because SHIP grants one session per
+# peer pair.
+#
+# [[drivers]]
+# kind = "eebus-dhw"
+# asset = "warmwasser"
+# address = "192.168.1.40:4712"
+# ski = "0000000000000000000000000000000000000000"
+
+# A device read through the vendor's own register map.
+#
+# Everything that answers Modbus and publishes no SunSpec model list: the
+# register numbers are in a PDF and every unit's are different. It reads and
+# never writes — a map that could write is one where a typo in this file starts a
+# compressor — so it pairs with whatever commands the device, and is refused
+# alone on a controllable asset.
+#
+# For a heat pump it is the **alternative** to `eebus-heat-pump` above rather
+# than a companion: both measure, and two measuring drivers for one asset is two
+# sources of truth with nothing that could tell which to believe.
+#
+# `space` is "holding" (the default) or "input"; most vendors put sensors in the
+# input space that SunSpec never touches, and the two are separately addressed,
+# so reading the wrong one returns a plausible number from somewhere else.
+# `word` is u16 (default), s16, u32, s32, u32_swapped or s32_swapped — the
+# swapped pair are the word orders many gateways use, and getting it wrong is the
+# most common way a map reads plausibly and is several orders of magnitude out.
+# `scale` multiplies the raw value into the field's own unit, and a negative one
+# is how a vendor that reports generation as positive becomes this workspace's
+# load convention. `field` is power, temperature_c or soc.
+#
+# The **indoor temperature** is why this driver exists: the planner models the
+# building, learns it from the household's own record and can pre-heat into a
+# cheap hour, and all of it is gated on a number no EEBUS use case carries.
+#
+# [[drivers]]
+# kind = "registers"
+# asset = "waermepumpe"
+# address = "192.0.2.30:502"
+# unit = 1
+# poll_ms = 1000
+# timeout_ms = 5000
+# points = [
+#   { space = "input", register = 507, word = "s16", scale = 0.1, field = "temperature_c" },
+#   { register = 2240, word = "u32", field = "power" },
+# ]
+
+# The heat pump, over EEBUS. Three use cases on one session, because they are
+# three parts of one decision:
+#
+#   OHPCF — starts and stops the compressor's process. The only lever in the
+#           whole set that can ask an appliance to consume *more*: everything
+#           else on the grid side is a ceiling, and a ceiling an appliance is
+#           already under changes nothing. Set `heat_pump_control = "compressor"`
+#           under [site] to have the planner's decision reach it.
+#   MRT   — the air temperature of each room the unit monitors, averaged. This is
+#           the state the thermal plan is integrated from, and the unit has been
+#           measuring it all along: its own heating curve runs on it.
+#   MOT   — the outdoor temperature, from the sensor on this building rather than
+#           a forecast for the grid square. The plan still uses the forecast, but
+#           the box identifies *which house this is* from the thermometer.
+#
+# It does not report power: what the unit draws is the site meter's business.
+#
+# [[drivers]]
+# kind = "eebus-heat-pump"
+# asset = "waermepumpe"
+# address = "192.168.1.60:4712"
+# ski = "0000000000000000000000000000000000000000"
+
 [[drivers]]
 kind = "eebus-lpc"
 asset = "netzanschluss"

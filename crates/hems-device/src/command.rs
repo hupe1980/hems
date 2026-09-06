@@ -266,6 +266,15 @@ fn heat_pump_commands(hp: &HeatPump, decision: Decision) -> Vec<Command> {
         HeatPumpControl::PowerCeiling => {
             vec![Command::ConsumptionCeiling(decision.power.inflow())]
         }
+        HeatPumpControl::Compressor => {
+            // A process, not a level: the arbiter's power is the plan's answer
+            // to "should this unit be running in this slot", and the only two
+            // things OHPCF takes are start and stop. A guard limit reads as
+            // "not now" for the same reason it reads as SG Ready state 1 —
+            // there is no smaller amount of a process to ask for.
+            let wanted = !decision.guard_limited && decision.power.inflow().get() > 0.0;
+            vec![Command::OnOff(wanted)]
+        }
         HeatPumpControl::OperationModes => {
             // A digital interface with named modes, ordered by how much the unit
             // is being asked to do. Without a device profile this is the same
@@ -317,6 +326,9 @@ mod tests {
             heating_rod: None,
             control,
             modulating: true,
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            cop: CopCurve::air_source(),
         })
     }
 
@@ -393,6 +405,34 @@ mod tests {
         assert_eq!(
             commands_for(&hp, Decision::new(Power::from_kw(3.0))),
             vec![Command::ConsumptionCeiling(Power::from_kw(3.0))]
+        );
+    }
+
+    #[test]
+    fn a_compressor_is_started_and_stopped_rather_than_bounded() {
+        // The one heat-pump interface that can ask for *more*. The other three
+        // are ceilings, and a ceiling a unit is already under changes nothing —
+        // so this is the only way a plan's decision to pre-heat leaves the box.
+        let hp = heat_pump(HeatPumpControl::Compressor);
+        assert_eq!(
+            commands_for(&hp, Decision::new(Power::from_kw(3.0))),
+            vec![Command::OnOff(true)]
+        );
+        assert_eq!(
+            commands_for(&hp, Decision::new(Power::ZERO)),
+            vec![Command::OnOff(false)]
+        );
+    }
+
+    #[test]
+    fn a_grid_limited_compressor_is_stopped_rather_than_turned_down() {
+        // There is no smaller amount of a process to ask for, so a reduction
+        // reads as "not now" — the same thing it means to an SG Ready unit,
+        // which goes to state 1 rather than to a proportion of one.
+        let hp = heat_pump(HeatPumpControl::Compressor);
+        assert_eq!(
+            commands_for(&hp, Decision::new(Power::from_kw(3.0)).guard_limited(true)),
+            vec![Command::OnOff(false)]
         );
     }
 

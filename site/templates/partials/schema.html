@@ -1,0 +1,38 @@
+{#- The project and the site, as one JSON-LD graph.
+
+    Included rather than written in both templates: `page.html` overrides the
+    schema block to add its own article and breadcrumb, and two copies of the
+    project's identity are two things that can disagree about what hems is. The
+    `@id`s are what let a page's article point at them instead of repeating them.
+
+    `extra` is whatever the caller wants appended to the graph, already
+    JSON-encoded and starting with its own comma. -#}
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareSourceCode",
+      "@id": "{{ config.base_url }}/#project",
+      "name": "{{ config.title }}",
+      "description": {{ config.description | json_encode | safe }},
+      "url": "{{ config.base_url }}",
+      "image": "{{ get_url(path='og.png') }}",
+      "codeRepository": "{{ config.extra.repository }}",
+      "programmingLanguage": "Rust",
+      "runtimePlatform": "Rust",
+      "license": "https://spdx.org/licenses/MIT.html",
+      "applicationCategory": "Home energy management",
+      "keywords": {{ config.extra.keywords | json_encode | safe }}
+    },
+    {
+      "@type": "WebSite",
+      "@id": "{{ config.base_url }}/#website",
+      "url": "{{ config.base_url }}",
+      "name": "{{ config.title }}",
+      "description": {{ config.description | json_encode | safe }},
+      "inLanguage": "en"
+    }{{ extra | default(value="") | safe }}
+  ]
+}
+</script>

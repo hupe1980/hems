@@ -207,7 +207,7 @@ flowchart TB
   hot water                            3.1 kWh
   dishwasher                    1.1 kWh, 75 min later
   battery throughput                  15.5 kWh
-  imported                            55.7 kWh
+  imported                            55.6 kWh
   exported                             0.3 kWh
   curtailed                            0.0 kWh
   peak feed-in, per quarter hour  0.12 of 5.88 kW
@@ -221,21 +221,22 @@ flowchart TB
   production forecast, CRPS     192 W (81 % of 32 lit)
   load forecast, CRPS           18 W (85 % covered)
 
-  electricity bill                     21.08 €
+  electricity bill                     21.03 €
   battery life spent                    0.62 €
   comfort given up                      0.19 €
   borrowed from the stores              0.14 €
-  cost of the day                      22.02 €
+  cost of the day                      21.97 €
   without optimisation                 24.12 €
-  saved                                 2.09 €
-  …of it on the bill                    3.39 €
+  saved                                 2.14 €
+  …of it on the bill                    3.44 €
 
   § 14a limit in force                  90 min
   …against a minimum of                10.5 kW
   …covered by the store                1.4 kWh
   slowest reaction              0 s, commanded
   minutes without a plan                     0
-  limit respected throughout               yes
+  § 14a limit respected                    yes
+  § 9 EEG ceiling respected                yes
 
   described in S2                  6 resources
   relief from § 14a was worth       0.00 €/kWh
@@ -253,7 +254,7 @@ flowchart TB
         </li>
         <li>
           <h3>saved, against …of it on the bill</h3>
-          <p>€2,09 against €3,39. The saving counts the battery life, the comfort
+          <p>€2,14 against €3,44. The saving counts the battery life, the comfort
           and the service the plan actually spent. The bill alone is the
           flattering number every other system quotes.</p>
         </li>
@@ -266,7 +267,7 @@ flowchart TB
         <li>
           <h3>relief from § 14a was worth</h3>
           <p>The shadow price of the network operator’s own ceiling. Nothing
-          here, because the store lends the headroom; <strong>€3,93/kWh</strong>
+          here, because the store lends the headroom; <strong>€1,20/kWh</strong>
           on the same evening in a household with no store whose car would
           otherwise leave short. Aggregators price both at “30 % of nominal”.</p>
         </li>
@@ -274,8 +275,8 @@ flowchart TB
           <h3>The three forecast lines are the evidence for the money lines</h3>
           <p>The planner is given only what six weeks of the box’s own metering
           could have taught it. <code>--perfect-foresight</code> shows what a
-          saving quoted without that measures: <strong>€5,25 against
-          €2,09</strong> on this day.</p>
+          saving quoted without that measures: <strong>€5,28 against
+          €2,14</strong> on this day.</p>
         </li>
       </ul>
     </div>

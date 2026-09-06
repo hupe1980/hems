@@ -33,7 +33,7 @@
 //! number actually is, which is an average over that hour, and it is the same
 //! zero-order hold the planner already assumes about every other input it has.
 
-use hems_core::prelude::Slot;
+use hems_core::prelude::{Horizon, Slot};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -148,6 +148,37 @@ impl WeatherSeries {
     #[must_use]
     pub fn outdoor_c(&self) -> Vec<f64> {
         self.slots.iter().map(|(_, p)| p.temperature_c).collect()
+    }
+
+    /// The same, laid out over a horizon rather than over the run's own slots.
+    ///
+    /// `Problem::outdoor_at` indexes the vector by slot **number**, so a series
+    /// that starts an hour before the horizon — which every three-hourly model
+    /// run does, most of the time — would put four in the wrong place and every
+    /// one after it an hour out. Realigning here is the only place that knows
+    /// both.
+    ///
+    /// A slot past the end of the run takes the last temperature there is. That
+    /// is a real approximation and the honest one available: a horizon runs two
+    /// days, ICON-D2 runs less far, and the alternative — zero — is a planner
+    /// that pre-heats for a night at −273 °C.
+    #[must_use]
+    pub fn outdoor_c_over(&self, horizon: Horizon) -> Vec<f64> {
+        let by_slot: std::collections::BTreeMap<Slot, f64> = self
+            .slots
+            .iter()
+            .map(|(slot, point)| (*slot, point.temperature_c))
+            .collect();
+        let mut last = by_slot.values().next().copied().unwrap_or(0.0);
+        horizon
+            .slots()
+            .map(|slot| {
+                if let Some(found) = by_slot.get(&slot) {
+                    last = *found;
+                }
+                last
+            })
+            .collect()
     }
 }
 
@@ -435,5 +466,55 @@ mod tests {
         assert!(production[0].1 > 3000.0, "midsummer noon: {production:?}");
         assert_eq!(production[1].1, 0.0, "no irradiance, no production");
         assert_eq!(series.outdoor_c(), vec![25.0, 12.0]);
+    }
+
+    #[test]
+    fn a_run_that_starts_before_the_horizon_is_realigned_rather_than_shifted() {
+        // ICON-D2 runs every three hours and the planner starts whenever it
+        // starts, so the two almost never begin on the same quarter hour.
+        // `Problem::outdoor_at` indexes by slot number, so a series handed over
+        // unaligned puts every temperature in the wrong slot.
+        let start = time::macros::datetime!(2026-01-12 06:00:00 UTC);
+        let series = WeatherSeries {
+            slots: (0..8)
+                .map(|k| {
+                    (
+                        Slot::containing(start + time::Duration::minutes(15 * k)),
+                        WeatherPoint {
+                            ghi_w_per_m2: 0.0,
+                            #[allow(clippy::cast_precision_loss)]
+                            temperature_c: k as f64,
+                            cloud_cover: None,
+                        },
+                    )
+                })
+                .collect(),
+            published_minutes: 15,
+        };
+        // A horizon starting two slots into the run.
+        let horizon = Horizon::new(start + time::Duration::minutes(30), 4);
+        assert_eq!(series.outdoor_c_over(horizon), vec![2.0, 3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn a_horizon_past_the_end_of_the_run_holds_the_last_temperature() {
+        // The horizon runs two days and the model run does not. Zero would be a
+        // planner pre-heating for a night that never comes.
+        let start = time::macros::datetime!(2026-01-12 06:00:00 UTC);
+        let series = WeatherSeries {
+            slots: vec![(
+                Slot::containing(start),
+                WeatherPoint {
+                    ghi_w_per_m2: 0.0,
+                    temperature_c: -4.0,
+                    cloud_cover: None,
+                },
+            )],
+            published_minutes: 15,
+        };
+        assert_eq!(
+            series.outdoor_c_over(Horizon::new(start, 3)),
+            vec![-4.0, -4.0, -4.0]
+        );
     }
 }

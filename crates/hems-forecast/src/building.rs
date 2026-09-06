@@ -46,7 +46,7 @@
 //! planner then goes on using the prior — refusing to answer in the one place where
 //! guessing is genuinely worse than admitting ignorance.
 
-use hems_core::prelude::{Rc2, ThermalState};
+use hems_core::prelude::{Rc2, Slot, ThermalState};
 use time::Duration;
 
 /// One measured step of the building's life.
@@ -282,6 +282,161 @@ pub fn identify(samples: &[ThermalSample], dt: Duration, prior: Rc2) -> Option<I
     (identified.improvement() >= MIN_IMPROVEMENT).then_some(identified)
 }
 
+/// How many samples the record keeps.
+///
+/// A fortnight at a quarter-hour step. Long enough to hold a cold spell and a
+/// mild one, short enough that a house whose windows were replaced in March is
+/// re-learned by April.
+pub const WINDOW: usize = 96 * 14;
+
+/// A house watching itself.
+///
+/// [`identify`] takes a record and answers; this is what keeps the record. The
+/// two are separate because identification is a pure function of a slice and
+/// belongs to whoever wants to run it — a laboratory fit on a CSV, a simulator,
+/// or this — and because the awkward part of the job is not the fit at all. It
+/// is that a sample spans **two** observations: the box sees an indoor
+/// temperature now and learns what it predicts only a quarter hour later.
+///
+/// So an observation is held open until the next one closes it, and a gap —
+/// a restart, a sensor that dropped out, a box that was off for a day — closes
+/// nothing and starts again. A pair stitched across a gap would teach the model
+/// that four hours of cooling happened in fifteen minutes, which is a house made
+/// of tissue paper.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Record {
+    /// Closed samples, oldest first.
+    samples: std::collections::VecDeque<ThermalSample>,
+    /// The observation waiting for the next one to close it.
+    open: Option<Observation>,
+    /// The building in force, fitted or prior.
+    building: Rc2,
+    /// What the last accepted fit said, for anyone reporting on it.
+    fitted: Option<Identified>,
+}
+
+/// One reading, before the next one turns it into a sample.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+struct Observation {
+    /// The slot this reading covers.
+    slot: Slot,
+    indoor_c: f64,
+    outdoor_c: f64,
+    heat_kw: f64,
+}
+
+impl Default for Record {
+    fn default() -> Self {
+        Self::new(Rc2::house())
+    }
+}
+
+impl Record {
+    /// A record of a house nobody has watched yet, starting from `prior`.
+    #[must_use]
+    pub fn new(prior: Rc2) -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            open: None,
+            building: prior,
+            fitted: None,
+        }
+    }
+
+    /// The building to plan against — the fit if there is one, else the prior.
+    #[must_use]
+    pub const fn building(&self) -> Rc2 {
+        self.building
+    }
+
+    /// What the last accepted identification concluded, if any.
+    #[must_use]
+    pub const fn fitted(&self) -> Option<&Identified> {
+        self.fitted.as_ref()
+    }
+
+    /// How many closed samples the record holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    /// Whether it holds none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    /// One completed slot: how warm it was inside and out, and the **thermal**
+    /// power that went into the air over it.
+    ///
+    /// Thermal rather than electrical, because that is what the model's `heat_kw`
+    /// means — a heat pump drawing a kilowatt at a coefficient of three puts
+    /// three into the house, and a record that fed it the meter reading would
+    /// identify a building three times as leaky as the real one.
+    ///
+    /// A slot that does not directly follow the open observation discards it and
+    /// starts again; so does any non-finite reading.
+    pub fn observe(&mut self, slot: Slot, indoor_c: f64, outdoor_c: f64, heat_kw: f64) {
+        if ![indoor_c, outdoor_c, heat_kw].iter().all(|v| v.is_finite()) {
+            self.open = None;
+            return;
+        }
+        let now = Observation {
+            slot,
+            indoor_c,
+            outdoor_c,
+            heat_kw,
+        };
+        if let Some(previous) = self.open.take() {
+            if previous.slot.next() == slot {
+                // The fabric is a hidden state `identify` re-derives for itself,
+                // so it is seeded from the air here rather than invented.
+                self.push(ThermalSample {
+                    indoor_c: previous.indoor_c,
+                    mass_c: previous.indoor_c,
+                    heat_kw: previous.heat_kw,
+                    outdoor_c: previous.outdoor_c,
+                    next_indoor_c: indoor_c,
+                });
+            } else {
+                // A gap. Everything before it stays — it was measured — and the
+                // pair that would have spanned the gap is simply never made.
+                self.open = None;
+            }
+        }
+        self.open = Some(now);
+    }
+
+    fn push(&mut self, sample: ThermalSample) {
+        if self.samples.len() == WINDOW {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(sample);
+    }
+
+    /// Re-identify the house from everything the record holds.
+    ///
+    /// Returns what was adopted, or `None` where [`identify`] refused — too
+    /// little data, a heat input that never moved, or a fit that did not beat
+    /// what the box is already using. A refusal leaves the building alone, which
+    /// is the point: the prior is a documented default and a fit that ties with
+    /// it has learned nothing worth swapping it for.
+    ///
+    /// The **current** building is the prior, not [`Rc2::house`], so a box that
+    /// has learned its house does not have to re-earn the same improvement from
+    /// scratch every time.
+    pub fn refit(&mut self, dt: Duration) -> Option<Identified> {
+        let samples: Vec<ThermalSample> = self.samples.iter().copied().collect();
+        let found = identify(&samples, dt, self.building)?;
+        self.building = found.building;
+        self.fitted = Some(found);
+        Some(found)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +551,122 @@ mod tests {
         for (v, (lo, hi)) in to_vec(&fit.building).iter().zip(BOUNDS) {
             assert!((lo..=hi).contains(v), "{v} outside [{lo}, {hi}]");
         }
+    }
+
+    /// Play a house into a [`Record`] the way the control loop does — one slot
+    /// at a time, indoor temperature only, no fabric.
+    fn watched(truth: Rc2, slots: usize, from: Slot) -> Record {
+        let d = truth.discretise(SLOT);
+        let mut state = ThermalState::uniform(20.0);
+        let mut record = Record::new(Rc2::house());
+        let mut slot = from;
+        for k in 0..slots {
+            #[allow(clippy::cast_precision_loss)]
+            let t = k as f64;
+            let heat_kw = if (k / 6) % 2 == 0 { 4.0 } else { 0.0 };
+            let outdoor_c = 2.0 + 4.0 * (t / 96.0 * std::f64::consts::TAU).sin();
+            record.observe(slot, state.indoor_c, outdoor_c, heat_kw);
+            state = d.step(state, heat_kw, outdoor_c);
+            slot = slot.next();
+        }
+        record
+    }
+
+    fn midnight() -> Slot {
+        Slot::containing(time::macros::datetime!(2026-01-12 00:00:00 UTC))
+    }
+
+    #[test]
+    fn a_box_watching_its_own_house_learns_it() {
+        // The whole chain the daemon runs: one reading a quarter hour, each one
+        // closing the last, and a fit at the end of it.
+        let truth = Rc2 {
+            air_capacity_kwh_per_k: 0.35,
+            mass_capacity_kwh_per_k: 25.0,
+            r_air_out_k_per_kw: 3.5,
+            r_air_mass_k_per_kw: 0.25,
+        };
+        let mut record = watched(truth, 4 * 96, midnight());
+        assert_eq!(
+            record.len(),
+            4 * 96 - 1,
+            "each reading closes the one before"
+        );
+        assert_eq!(
+            record.building(),
+            Rc2::house(),
+            "nothing adopted until asked"
+        );
+
+        let fit = record
+            .refit(SLOT)
+            .expect("a house this different is learnable");
+        assert!(fit.improvement() > MIN_IMPROVEMENT);
+        assert_eq!(record.building(), fit.building);
+        // The fabric capacity is what decides whether pre-heating pays, and the
+        // prior is out by a factor of two on this house.
+        let learned = record.building().mass_capacity_kwh_per_k;
+        assert!(
+            (learned - truth.mass_capacity_kwh_per_k).abs()
+                < (Rc2::house().mass_capacity_kwh_per_k - truth.mass_capacity_kwh_per_k).abs(),
+            "the fit moved towards the real fabric, not away from it: {learned}"
+        );
+    }
+
+    #[test]
+    fn a_gap_does_not_become_a_sample() {
+        // The one mistake that would poison the fit rather than merely slow it:
+        // a box that was off for four hours pairing the reading before with the
+        // reading after teaches a house that cools sixteen times as fast as it
+        // does.
+        let mut record = Record::new(Rc2::house());
+        let first = midnight();
+        record.observe(first, 21.0, 0.0, 4.0);
+        record.observe(first.next(), 21.1, 0.0, 4.0);
+        assert_eq!(record.len(), 1);
+
+        // Four hours later.
+        let after = (0..16).fold(first, |s, _| s.next());
+        record.observe(after, 18.0, 0.0, 0.0);
+        assert_eq!(record.len(), 1, "the pair spanning the gap was never made");
+
+        record.observe(after.next(), 17.9, 0.0, 0.0);
+        assert_eq!(record.len(), 2, "and the record picks straight back up");
+    }
+
+    #[test]
+    fn a_sensor_that_drops_out_breaks_the_chain_rather_than_poisoning_it() {
+        let mut record = Record::new(Rc2::house());
+        let s = midnight();
+        record.observe(s, 21.0, 0.0, 4.0);
+        record.observe(s.next(), f64::NAN, 0.0, 4.0);
+        record.observe(s.next().next(), 21.2, 0.0, 4.0);
+        assert!(
+            record.is_empty(),
+            "neither pair touches a reading nobody took"
+        );
+    }
+
+    #[test]
+    fn a_house_nobody_can_learn_keeps_the_prior() {
+        // No excitation: the heating never moved. `identify` refuses, and the
+        // refusal has to leave the planner's building alone rather than adopt
+        // whatever the search wandered into.
+        let mut record = Record::new(Rc2::house());
+        let mut slot = midnight();
+        for k in 0..(3 * 96) {
+            let drift = 20.0 + f64::from(k) * 0.001;
+            record.observe(slot, drift, 5.0, 2.0);
+            slot = slot.next();
+        }
+        assert!(record.refit(SLOT).is_none());
+        assert_eq!(record.building(), Rc2::house());
+        assert!(record.fitted().is_none());
+    }
+
+    #[test]
+    fn the_record_forgets_the_oldest_quarter_hour_rather_than_growing() {
+        let record = watched(Rc2::house(), WINDOW + 200, midnight());
+        assert_eq!(record.len(), WINDOW);
     }
 }

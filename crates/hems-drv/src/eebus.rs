@@ -45,16 +45,19 @@
 use core::time::Duration as StdDuration;
 
 use crate::{
-    Driver, DriverCapabilities, DriverError, DriverEvent, GridLimit, LimitDirection, LimitSource,
-    LinkState,
+    Driver, DriverCapabilities, DriverError, DriverEvent, FeedInFactor, GridLimit, LimitDirection,
+    LimitSource, LinkState,
 };
 use eebus::model::{DeviceType, EntityType};
-use eebus::spine::{Engine, LocalDevice, LocalEntity};
+use eebus::spine::{Engine, LocalDevice, LocalEntity, SpineEvent};
 use eebus::usecases::limitation::{
-    ControllableSystem, ControllableSystemActor, CsConfig, CsFeatures, EffectiveLimit,
+    ControllableSystem, ControllableSystemActor, CsConfig, CsEvent, CsFeatures, EffectiveLimit,
     LimitationState, LocalDecision,
 };
-use eebus::usecases::{limitation, lpc, lpp};
+use eebus::usecases::monitoring::{
+    self, MonitoringApplianceActor, MonitoringEvent, locate as locate_monitored,
+};
+use eebus::usecases::{descriptor, limitation, lpc, lpp, mgcp};
 
 /// What the Energy Guard wrote, and what a Controllable System answers.
 ///
@@ -62,7 +65,7 @@ use eebus::usecases::{limitation, lpc, lpp};
 /// build a limit and read an outcome, and a second set of types that meant the
 /// same thing would be one more place for the two to drift.
 pub use eebus::usecases::limitation::{LimitWrite, WriteOutcome};
-use hems_core::prelude::{AssetId, Power};
+use hems_core::prelude::{AssetId, Measurement, Power};
 use hems_grid::lpc::LpcState;
 use time::OffsetDateTime;
 
@@ -156,6 +159,28 @@ pub struct Lpc {
     /// every tick — the guard is edge-driven and a repeated event is noise in an
     /// evidence record.
     last_reported: Option<EffectiveLimit>,
+    /// The Monitoring Appliance side of the box: MGCP scenario 1, the § 9 EEG
+    /// feed-in limitation factor `[MGCP-011]`.
+    ///
+    /// A second actor on the same engine and the same session, because it is the
+    /// same peer: a Steuerbox that reduces the household is also the thing that
+    /// knows what the network operator configured at the connection.
+    ///
+    /// It is the *crate's* actor rather than a hand-rolled read, and the
+    /// difference is three defects this driver had for exactly one release. A
+    /// Monitoring Appliance never writes, so there is **no binding** — asking
+    /// for one is asking a peer for write access to its configuration. Its
+    /// client functionality goes through **one `Generic` feature** whatever the
+    /// server type (LPC implementation guide § 3.3), not a `DeviceConfiguration`
+    /// client mirroring the server. And the **description read is not
+    /// optional**: MGCP Table 23 spells the `keyId` `<k1#(1..1)>`, so it is the
+    /// *device's own* number, and a factor read out of a hard-coded key 1 is
+    /// still a number between 0 and 100 — it just becomes the wrong export
+    /// ceiling, silently.
+    monitor: MonitoringApplianceActor,
+    /// Whether the connection point has been attached, so a re-discovery does
+    /// not restart the exchange on every heartbeat.
+    monitoring: bool,
     events: Vec<DriverEvent>,
 }
 
@@ -214,12 +239,14 @@ impl Lpc {
         // descriptions and the current values a peer reads before it writes
         // anything. A Controllable System that answered a discovery with nothing
         // would be discovered as a device that plays no use case at all.
-        let (engine, actor) = build(which, system, identity)?;
+        let (engine, actor, monitor) = build(which, system, identity)?;
         Ok(Self {
             asset,
             which,
             engine,
             actor,
+            monitor,
+            monitoring: false,
             started_at,
             last_reported: None,
             events: Vec::new(),
@@ -383,7 +410,103 @@ impl Lpc {
     /// that arrived and was not acted on.
     fn consume_engine_events(&mut self, elapsed: StdDuration) {
         while let Some(event) = self.engine.poll_event() {
-            let _ = self.actor.handle_event(&mut self.engine, &event, elapsed);
+            self.watch_curtailment(&event, elapsed);
+            let decided = self.actor.handle_event(&mut self.engine, &event, elapsed);
+            self.watch_failsafe(decided.as_ref(), elapsed);
+        }
+    }
+
+    /// Report a failsafe the network operator has just written.
+    ///
+    /// The one value in the § 14a exchange that outlives the session that set
+    /// it — it is what the box holds when there *is* no session — and until this
+    /// was here every `CsEvent` was discarded. The limit did not care: the
+    /// driver reads that back out of the state machine on every tick. The
+    /// failsafe did, because nothing reads it back: a box that came up after a
+    /// power cut restored the value from its own configuration file and threw
+    /// away the one the operator wrote, which is `[LPC-021]` ignored and
+    /// `ATC_LPC_COM_PT_CSInit_003` failed.
+    ///
+    /// Only an **accepted** write is reported. A refused one changed nothing,
+    /// and journalling it as a new failsafe would have the box keep a value it
+    /// told the operator it would not hold.
+    fn watch_failsafe(&mut self, event: Option<&CsEvent>, elapsed: StdDuration) {
+        let Some(CsEvent::FailsafeDecided { outcome, .. }) = event else {
+            return;
+        };
+        if !outcome.is_accepted() {
+            return;
+        }
+        let config = self.actor.system().config();
+        let Ok(minimum) = time::Duration::try_from(config.failsafe_duration) else {
+            return;
+        };
+        self.events.push(DriverEvent::Failsafe(crate::Failsafe {
+            direction: self.which.direction(),
+            power: Power::new(config.failsafe_watts),
+            minimum,
+            at: self.started_at + elapsed,
+        }));
+    }
+
+    /// Follow MGCP scenario 1 on whatever peer publishes it.
+    ///
+    /// hems is the **Monitoring Appliance** and never the server: the factor is
+    /// set by whoever configures the connection point, and MGCP marks no write
+    /// on it. The actor does the exchange — two description reads, a value read
+    /// and a subscription — and resolves every notification against what the
+    /// descriptions said, which is the half that cannot be skipped: the `keyId`
+    /// is the device's own, and a factor read out of the wrong one is still a
+    /// number between 0 and 100.
+    fn watch_curtailment(&mut self, event: &SpineEvent, elapsed: StdDuration) {
+        // Discovery is what names the features, and it is retried on every
+        // update until it succeeds: a peer may gain the use case later — a
+        // Steuerbox whose firmware is updated, or one that only publishes the
+        // factor once the network operator has configured it.
+        if !self.monitoring
+            && let SpineEvent::UseCasesUpdated { device } | SpineEvent::DiscoveryUpdated { device } =
+                event
+            && let Some(remote) = self.engine.peer(device)
+            && let Some(peer) = locate_monitored(
+                remote,
+                descriptor::names::MGCP,
+                descriptor::actors::GRID_CONNECTION_POINT,
+            )
+        {
+            self.monitoring = true;
+            self.monitor.attach(&mut self.engine, peer, elapsed);
+        }
+
+        let at = self.started_at + time::Duration::try_from(elapsed).unwrap_or_default();
+        match self.monitor.handle_event(event) {
+            Some(MonitoringEvent::CurtailmentChanged { factor_percent, .. }) => {
+                self.events.push(DriverEvent::FeedInFactor(FeedInFactor {
+                    percent: factor_percent,
+                    at,
+                }));
+            }
+            // MGCP scenario 2, and it is the most useful number in the whole use
+            // case: the momentary power **at the connection point** is what
+            // `[A1 2.3]` is measured against, so a household whose Steuerbox
+            // publishes it has a grid meter without owning one. Load convention
+            // throughout `[MPC-001]` — consumption positive, production negative
+            // — which is also hems's, so nothing is flipped on the way through.
+            Some(MonitoringEvent::Measured { unit, .. }) => {
+                // The **unit**, not the device: since 0.7 one peer may monitor
+                // several — four rooms on one thermostat — so a lookup by device
+                // would answer with whichever of them the actor happened to
+                // hold first.
+                if let Some(watts) = self
+                    .monitor
+                    .readings(&unit)
+                    .and_then(monitoring::Readings::total_power)
+                {
+                    let mut measurement = Measurement::at(at);
+                    measurement.power = Some(Power::new(watts));
+                    self.events.push(DriverEvent::Measured(measurement));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -443,7 +566,7 @@ fn build(
     which: Use,
     system: ControllableSystem,
     identity: &SpineIdentity,
-) -> Result<(Engine, ControllableSystemActor), DriverError> {
+) -> Result<(Engine, ControllableSystemActor, MonitoringApplianceActor), DriverError> {
     let mut device = LocalDevice::new(
         &identity.vendor,
         &identity.unique,
@@ -467,11 +590,19 @@ fn build(
         .with_feature(limitation::load_control_feature(1))
         .with_feature(limitation::device_configuration_feature(2))
         .with_feature(limitation::device_diagnosis_feature(3))
-        .with_feature(limitation::device_diagnosis_client_feature(4));
+        .with_feature(limitation::device_diagnosis_client_feature(4))
+        // The fifth is the Monitoring Appliance's end of MGCP scenario 1, and it
+        // is a **`Generic` client**: the LPC implementation guide § 3.3 asks an
+        // actor to use one client feature for all its client functionality
+        // rather than mirroring each server feature it reads. A
+        // `DeviceConfiguration` client beside it would make "which feature is
+        // the Monitoring Appliance" a question with two answers.
+        .with_feature(limitation::client_feature(MGCP_CLIENT_FEATURE));
     device
         .add_entity(entity)
         .expect("entity [1] is the first one added");
 
+    let device_address = device.address_of(&[1], MGCP_CLIENT_FEATURE);
     let features = CsFeatures {
         load_control: device.address_of(&[1], 1),
         device_configuration: device.address_of(&[1], 2),
@@ -485,6 +616,19 @@ fn build(
         Use::Lpp => (&lpp::CONTROLLABLE_SYSTEM, lpp::DIRECTION),
     };
     engine.add_use_case([1], 1, descriptor);
+    // Announced with scenario 1 alone. `useCaseScenarioSupport` is what a peer
+    // plans against, and claiming the six monitoring scenarios this box does not
+    // serve would send a Steuerbox looking for measurements nobody publishes.
+    // Scenario 1 is the § 9 limitation factor and scenario 2 the momentary power
+    // at the connection point. `useCaseScenarioSupport` is what a peer plans
+    // against, so the four this box does not read — the two energies, the phase
+    // details, the frequency — are left out rather than claimed.
+    engine.add_use_case_scenarios(
+        [1],
+        MGCP_CLIENT_FEATURE,
+        &mgcp::MONITORING_APPLIANCE,
+        &[1, 2],
+    );
 
     // The builder is the only way to obtain an actor, and `install` is where it
     // publishes what it serves. The previous shape let a caller forget that and
@@ -492,8 +636,12 @@ fn build(
     // Energy Guard finds no `limitId` to write to and never sends one.
     let actor = ControllableSystemActor::builder(system, direction, features)
         .install(&mut engine, StdDuration::ZERO);
-    Ok((engine, actor))
+    let monitor = MonitoringApplianceActor::new(device_address);
+    Ok((engine, actor, monitor))
 }
+
+/// The feature address the Monitoring Appliance side of MGCP runs from.
+const MGCP_CLIENT_FEATURE: u32 = 5;
 
 /// The driver contract, over SPINE datagrams.
 ///
@@ -613,6 +761,78 @@ impl Driver for Lpc {
     }
 }
 
+/// How far a peer's own clock may be ahead of this box's before its timestamps
+/// are not believed.
+///
+/// Two minutes. A household device sets its clock from NTP or from nothing at
+/// all, and the second is common: a heat pump that has never had a route to the
+/// internet reports 1970, or its own uptime, or the hour it was installed. What
+/// is being guarded is not tidiness — `Measurement::at` is what the guard ages a
+/// reading by, so a timestamp from a wrong clock is a reading the guard either
+/// refuses for ever or trusts for ever.
+const CLOCK_SKEW: time::Duration = time::Duration::minutes(2);
+
+/// How far behind, before the same applies.
+///
+/// An hour, and it is deliberately generous: a value that really was measured
+/// forty minutes ago is one the *consumer* should decide about, and refusing to
+/// carry it here would be this layer making that decision silently.
+const CLOCK_LAG: time::Duration = time::Duration::hours(1);
+
+/// When a peer says it took a reading, as this box's clock sees it.
+///
+/// SPINE's `AbsoluteOrRelativeTime` is `xs:duration` or `xs:dateTime`, and the
+/// two mean different things: a span is **how long ago**, so it is subtracted
+/// from the moment the value arrived, and an instant is a claim about a wall
+/// clock.
+///
+/// An instant is believed only where it is close enough to this box's own clock
+/// to be a measurement rather than a mistake. That is not pedantry: most
+/// household devices have no reliable time, and `Measurement::at` is what the
+/// guard ages a reading by — so an unbelieved timestamp is a reading refused for
+/// ever, or one trusted for ever.
+///
+/// Absent, unparseable or implausible, the answer is when it **arrived**, which
+/// is what every driver here did before there was a timestamp to have.
+pub(crate) fn taken_at(
+    stamp: Option<&eebus::model::AbsoluteOrRelativeTime>,
+    arrived: OffsetDateTime,
+) -> OffsetDateTime {
+    let Some(stamp) = stamp else {
+        return arrived;
+    };
+    match stamp.parse() {
+        // A span, and it is an age: `PT30S` is "half a minute ago".
+        Some(eebus::model::TimeValue::Relative(ago)) => {
+            time::Duration::try_from(ago).map_or(arrived, |ago| arrived - ago)
+        }
+        Some(eebus::model::TimeValue::Absolute(instant)) => {
+            // `unix_seconds`, which is `None` for a value that carries no zone —
+            // `2026-09-05T08:15:00` is a valid `xs:dateTime` and fixes no
+            // instant. Assuming UTC there would land a household hours out of
+            // place, twice a year in the wrong direction; the arrival time is
+            // the honest answer for a wall clock nobody can place.
+            //
+            // This is also why the parse is the crate's rather than RFC 3339's:
+            // `xs:dateTime` makes the offset optional, permits `24:00:00`, and
+            // allows years outside four digits, so an RFC 3339 parser rejects a
+            // conformant peer — which from the outside looks exactly like a peer
+            // that sent nothing.
+            let Some(seconds) = instant.unix_seconds() else {
+                return arrived;
+            };
+            let Ok(instant) = OffsetDateTime::from_unix_timestamp(seconds) else {
+                return arrived;
+            };
+            if instant > arrived + CLOCK_SKEW || instant < arrived - CLOCK_LAG {
+                return arrived;
+            }
+            instant
+        }
+        None => arrived,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,11 +874,155 @@ mod tests {
     /// arrived in the last sixty seconds (implementation guide §2.11), so a test
     /// that skipped them would be testing a rejection.
     fn heartbeat_through(d: &mut Lpc, from: i64, to: i64) {
+        // The specification's own cadence rather than a 60 written here: it is
+        // `[LPC-005]`'s "at least every", and a test that had typed it would go
+        // on passing if the number ever moved.
+        let every = i64::try_from(limitation::HEARTBEAT_PERIOD.as_secs()).unwrap_or(60);
         let mut t = from;
         while t <= to {
             d.on_heartbeat(at(t));
-            t += 60;
+            t += every;
         }
+    }
+
+    #[test]
+    fn the_only_thing_this_box_may_time_out_on_is_a_heartbeat() {
+        // `DriverCapabilities::reports_on_change` decides whether the registry
+        // may judge a driver by the age of its last reading (D149), and until
+        // `eebus` 0.9 it was a hand-written list of which of hems's own drivers
+        // subscribe. The specifications now answer it: every scenario of every
+        // use case here is subscription-driven, and what separates them is
+        // whether the notification comes on a **clock**.
+        //
+        // So the declaration is held to the source. A driver that gains a use
+        // case with a heartbeat — and stops being one whose silence is
+        // meaningless — fails here rather than in a household.
+        use eebus::usecases::descriptor::UseCaseDescriptor;
+        use eebus::usecases::hvac::{cdsf, mdt, mot, mrt};
+        use eebus::usecases::ohpcf;
+
+        let asset = AssetId::new("waermepumpe").expect("a valid identifier");
+        let identity = SpineIdentity::default();
+        let tank = crate::eebus_dhw::DhwTank::new(asset.clone(), START, &identity)
+            .expect("the default identity is a valid device address");
+        let pump = crate::eebus_heat_pump::HeatPump::new(asset, START, &identity)
+            .expect("the default identity is a valid device address");
+
+        // Every use case a driver consumes, beside what it claims about silence.
+        let drivers: [(&str, bool, &[&UseCaseDescriptor]); 3] = [
+            (
+                "the hot-water circuit",
+                tank.capabilities().reports_on_change,
+                &[&mdt::MONITORING_APPLIANCE, &cdsf::CONFIGURATION_APPLIANCE],
+            ),
+            (
+                "the heat pump",
+                pump.capabilities().reports_on_change,
+                &[
+                    &ohpcf::CEM,
+                    &mrt::MONITORING_APPLIANCE,
+                    &mot::MONITORING_APPLIANCE,
+                ],
+            ),
+            (
+                "the § 14a Controllable System",
+                lpc().capabilities().reports_on_change,
+                &[&lpc::CONTROLLABLE_SYSTEM, &mgcp::MONITORING_APPLIANCE],
+            ),
+        ];
+
+        for (what, declared, played) in drivers {
+            let ticks = played
+                .iter()
+                .any(|d| d.periodic_functions().next().is_some());
+            assert_eq!(
+                declared,
+                !ticks,
+                "{what}: it declares reports_on_change = {declared}, and its use                  cases {} a function on a clock",
+                if ticks { "put" } else { "put no" }
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_that_says_when_it_measured_is_believed() {
+        use eebus::model::AbsoluteOrRelativeTime;
+
+        let arrived = at(3_600);
+        // A span is an age: `PT30S` is "half a minute ago".
+        assert_eq!(
+            taken_at(
+                Some(&AbsoluteOrRelativeTime::from_duration(
+                    StdDuration::from_secs(30)
+                )),
+                arrived
+            ),
+            arrived - time::Duration::seconds(30)
+        );
+        // An instant is a claim about a wall clock, and a plausible one stands.
+        let stamp = AbsoluteOrRelativeTime(
+            (arrived - time::Duration::seconds(90))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("a formattable instant"),
+        );
+        assert_eq!(
+            taken_at(Some(&stamp), arrived),
+            arrived - time::Duration::seconds(90)
+        );
+        // And nothing said is when it arrived, which is what every driver here
+        // did before MDT carried a timestamp.
+        assert_eq!(taken_at(None, arrived), arrived);
+    }
+
+    #[test]
+    fn a_peer_with_a_wrong_clock_is_not_believed() {
+        use eebus::model::AbsoluteOrRelativeTime;
+
+        // The case that decides whether this is worth having at all. A household
+        // device sets its clock from NTP or from nothing, and the second is
+        // common: a heat pump with no route to the internet reports 1970.
+        //
+        // `Measurement::at` is what the guard ages a reading by, so believing a
+        // wrong clock is a reading refused for ever — or, the other way, one
+        // trusted for ever.
+        let arrived = at(7_200);
+        for wrong in ["1970-01-01T00:00:00Z", "2099-01-01T00:00:00Z", "not a time"] {
+            assert_eq!(
+                taken_at(Some(&AbsoluteOrRelativeTime(wrong.to_owned())), arrived),
+                arrived,
+                "`{wrong}` is a clock nobody set, not a measurement"
+            );
+        }
+    }
+
+    #[test]
+    fn a_timestamp_with_no_zone_is_a_wall_clock_and_not_an_instant() {
+        use eebus::model::AbsoluteOrRelativeTime;
+
+        // `xs:dateTime` makes the offset **optional**, so this is a conformant
+        // measurement that fixes no point in time. Assuming UTC would land a
+        // household hours out of place, and twice a year in the wrong direction.
+        //
+        // It is also the reason this does not parse RFC 3339, which is what an
+        // earlier version of this function did: an RFC 3339 parser rejects a
+        // conformant peer, and from the outside that looks exactly like a peer
+        // that sent no timestamp at all — which is the same answer for the wrong
+        // reason, right up until the day the peer sends one with a zone.
+        let arrived = at(7_200);
+        let bare = AbsoluteOrRelativeTime("2026-01-15T02:00:00".to_owned());
+        assert!(bare.is_absolute(), "it is the absolute half of the union");
+        assert_eq!(taken_at(Some(&bare), arrived), arrived);
+
+        // …and the same instant *with* a zone, close enough to be believed, is.
+        let stamped = AbsoluteOrRelativeTime(
+            (arrived - time::Duration::seconds(45))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("a formattable instant"),
+        );
+        assert_eq!(
+            taken_at(Some(&stamped), arrived),
+            arrived - time::Duration::seconds(45)
+        );
     }
 
     #[test]

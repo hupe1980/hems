@@ -29,13 +29,28 @@ use tokio::sync::RwLock;
 #[derive(Clone)]
 pub struct Prices {
     cache: Arc<RwLock<PriceCache>>,
+    carbon: Arc<RwLock<hems_tariff::cache::CarbonCache>>,
 }
 
 impl Prices {
     /// A handle onto a shared cache.
     #[must_use]
     pub fn new(cache: Arc<RwLock<PriceCache>>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            carbon: Arc::new(RwLock::new(hems_tariff::cache::CarbonCache::new())),
+        }
+    }
+
+    /// Also serve the grid's carbon intensity from this cache.
+    ///
+    /// Separate from [`Prices::new`] because a deployment that has not
+    /// configured Energy-Charts has no intensity to serve, and an empty series
+    /// is the honest answer rather than a route that is missing.
+    #[must_use]
+    pub fn with_carbon(mut self, carbon: Arc<RwLock<hems_tariff::cache::CarbonCache>>) -> Self {
+        self.carbon = carbon;
+        self
     }
 }
 
@@ -44,6 +59,7 @@ pub fn router(prices: Prices) -> Router {
     Router::new()
         .route("/v1/prices", get(prices_handler))
         .route("/v1/prices/coverage", get(coverage_handler))
+        .route("/v1/carbon", get(carbon_handler))
         .with_state(prices)
 }
 
@@ -133,4 +149,60 @@ async fn coverage_handler(
         "coverage": cache.coverage(horizon),
         "cached_slots": cache.len(),
     }))
+}
+
+/// One quarter hour's carbon intensity, as it is served.
+#[derive(Debug, serde::Serialize)]
+pub struct CarbonPoint {
+    /// The quarter hour's start.
+    #[serde(with = "time::serde::rfc3339")]
+    pub slot: OffsetDateTime,
+    /// Grams of carbon dioxide per kilowatt-hour drawn from the grid.
+    pub g_per_kwh: f64,
+}
+
+/// What the grid's carbon intensity is over a window.
+///
+/// The other half of a price signal, and the reason it is worth a route of its
+/// own: the intensity and the price **disagree**. A still winter evening is dear
+/// and dirty and both point the same way; a windy night is cheap and only
+/// moderately clean, while a sunny midday is cheap *and* clean. A household that
+/// prices carbon therefore moves flexible load out of the night and into the
+/// middle of the day, which no price signal on its own would ask for.
+///
+/// Absent quarter hours are **absent** rather than filled with an average, for
+/// the same reason a missing price is: the planner's fallback for an unknown
+/// intensity is an explicit, documented annual figure, and quietly substituting
+/// a neighbour would hide an outage behind a plausible number.
+#[derive(Debug, serde::Serialize)]
+pub struct Carbon {
+    /// The points that are known, in order.
+    pub points: Vec<CarbonPoint>,
+    /// How much of the window has an intensity, in `[0, 1]`.
+    pub coverage: f64,
+}
+
+async fn carbon_handler(
+    State(prices): State<Prices>,
+    Query(window): Query<Window>,
+) -> (StatusCode, axum::Json<Carbon>) {
+    let now = OffsetDateTime::now_utc();
+    let horizon = window.horizon(now);
+    let carbon = prices.carbon.read().await;
+    let points: Vec<CarbonPoint> = horizon
+        .slots()
+        .filter_map(|slot| {
+            carbon.at(slot).map(|g_per_kwh| CarbonPoint {
+                slot: slot.start(),
+                g_per_kwh,
+            })
+        })
+        .collect();
+    #[allow(clippy::cast_precision_loss)]
+    let coverage = if horizon.len == 0 {
+        0.0
+    } else {
+        points.len() as f64 / horizon.len as f64
+    };
+    (StatusCode::OK, axum::Json(Carbon { points, coverage }))
 }

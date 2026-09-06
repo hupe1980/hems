@@ -9,6 +9,7 @@
 use hems_core::asset::{Battery, DhwTank};
 use hems_core::prelude::*;
 use hems_device::SgReadyState;
+use s2energy::common::Id;
 use s2energy::{frbc, ombc, pebc, ppbc};
 use time::OffsetDateTime;
 
@@ -56,16 +57,59 @@ pub fn battery_power(
     instruction: &frbc::Instruction,
     battery: &Battery,
 ) -> Result<Power, InstructError> {
-    if instruction.actuator_id != description.actuator {
+    let (_, direction, factor) = actuator_factor(
+        &description.actuator,
+        &description.charge,
+        Some(&description.discharge),
+        instruction,
+    )?;
+    Ok(match direction {
+        Direction::In => Power::new(battery.max_charge.get() * factor),
+        // Load convention: discharging is negative.
+        Direction::Out => Power::new(-battery.max_discharge.get() * factor),
+    })
+}
+
+/// Which way an FRBC actuator was told to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    /// Into the store: charging, heating.
+    In,
+    /// Out of it. Only a two-way resource has one.
+    Out,
+}
+
+/// The raw decision inside an `FRBC.Instruction`: which mode, which way, how
+/// hard.
+///
+/// The bottom of the decode, and the reason it is public: [`battery_power`] and
+/// [`dhw_power`] multiply it by a *rating* they get from the asset, and
+/// [`crate::session`] multiplies it by one it is handed — but the arithmetic
+/// that turns a message into "charge, four fifths" must not be written twice, or
+/// a session and a planner will one day disagree about what a factor of zero in
+/// the discharge mode meant.
+///
+/// `discharge` is `None` for a one-way resource — a hot-water tank, a
+/// unidirectional charge point — and naming its mode is then the same error as
+/// naming somebody else's.
+///
+/// # Errors
+/// [`InstructError`] when the instruction names an actuator or a mode this
+/// description does not carry, or a factor outside `[0, 1]`.
+pub fn actuator_factor(
+    actuator: &Id,
+    charge: &Id,
+    discharge: Option<&Id>,
+    instruction: &frbc::Instruction,
+) -> Result<(Id, Direction, f64), InstructError> {
+    if instruction.actuator_id != *actuator {
         return Err(InstructError::UnknownActuator);
     }
     let f = factor(instruction.operation_mode_factor)?;
-
-    if instruction.operation_mode == description.charge {
-        Ok(Power::new(battery.max_charge.get() * f))
-    } else if instruction.operation_mode == description.discharge {
-        // Load convention: discharging is negative.
-        Ok(Power::new(-battery.max_discharge.get() * f))
+    if instruction.operation_mode == *charge {
+        Ok((instruction.id.clone(), Direction::In, f))
+    } else if discharge.is_some_and(|d| instruction.operation_mode == *d) {
+        Ok((instruction.id.clone(), Direction::Out, f))
     } else {
         Err(InstructError::UnknownOperationMode)
     }
@@ -84,15 +128,8 @@ pub fn dhw_power(
     instruction: &frbc::Instruction,
     tank: &DhwTank,
 ) -> Result<Power, InstructError> {
-    if instruction.actuator_id != description.actuator {
-        return Err(InstructError::UnknownActuator);
-    }
-    let f = factor(instruction.operation_mode_factor)?;
-    if instruction.operation_mode == description.heat {
-        Ok(Power::new(tank.heater.get() * f))
-    } else {
-        Err(InstructError::UnknownOperationMode)
-    }
+    let (_, _, f) = actuator_factor(&description.actuator, &description.heat, None, instruction)?;
+    Ok(Power::new(tank.heater.get() * f))
 }
 
 /// When a `PPBC.ScheduleInstruction` says the programme should start.
@@ -517,6 +554,9 @@ mod tests {
             heating_rod: None,
             control: HeatPumpControl::SgReady,
             modulating: true,
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            cop: CopCurve::air_source(),
         }
     }
 

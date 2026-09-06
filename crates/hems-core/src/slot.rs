@@ -21,6 +21,7 @@
 
 use core::fmt;
 
+use metering::holiday::Bundesland;
 use time::{Date, Duration, OffsetDateTime};
 
 /// The length of one slot.
@@ -295,5 +296,41 @@ mod tests {
         assert_eq!(h.index_of(s), Some(100));
         assert_eq!(h.index_of(h.first.prev()), None);
         assert_eq!(h.end(), datetime!(2026-05-03 08:00:00 UTC));
+    }
+}
+
+/// The kind of day a slot falls on.
+///
+/// It lives here rather than beside the load profile that first needed it,
+/// because two independent estimators bucket by it — a household's own quarter
+/// hours (`hems_forecast::LoadProfile`) and the § 14a reductions its network
+/// operator sends (`hems_grid::stress`) — and two definitions of "is this a
+/// working day" are two things that can disagree about Fronleichnam.
+///
+/// Three classes, because that is what the data supports: a household's Saturday
+/// differs from its Tuesday, and a public holiday behaves like a Sunday. Using
+/// the metering layer's holiday calendar means hems and the settlement layer
+/// never disagree about which days those are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum DayType {
+    /// Monday to Friday, excluding public holidays.
+    Workday,
+    /// Saturday.
+    Saturday,
+    /// Sunday and public holidays.
+    Sunday,
+}
+
+impl DayType {
+    /// The day type of `slot` in `land`.
+    #[must_use]
+    pub fn of(slot: Slot, land: Bundesland) -> Self {
+        match metering::holiday::slp_day_type(slot.local_date(), land) {
+            metering::load_profile::SlpDayType::Samstag => DayType::Saturday,
+            metering::load_profile::SlpDayType::SonnFeiertag => DayType::Sunday,
+            metering::load_profile::SlpDayType::Werktag => DayType::Workday,
+        }
     }
 }

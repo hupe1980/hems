@@ -16,11 +16,13 @@ fn main() -> Result<()> {
         Some("check-events") => check_events(&root),
         Some("check-manifests") => check_manifests(&root),
         Some("check-wire") => check_wire(&root),
+        Some("check-vital") => check_vital(&root),
         Some("check-all") => {
             check_citations(&root)?;
             check_events(&root)?;
             check_manifests(&root)?;
-            check_wire(&root)
+            check_wire(&root)?;
+            check_vital(&root)
         }
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -47,6 +49,8 @@ cargo xtask <task>
   check-wire        every serialisable quantity, instant and date names how it
                     travels, so a value that becomes money or a Nachweis cannot
                     go through an f64 or come back as a tuple
+  check-vital       a daemon's background loops are spawned through
+                    Health::vital, so /livez can actually fail
   check-all         all of the above
 "
     );
@@ -185,6 +189,78 @@ fn check_citations(root: &Path) -> Result<()> {
 /// happy — until the day somebody runs `cargo publish` and finds that six of the
 /// crates cannot be packaged. Which is exactly what an audit of this workspace
 /// found.
+/// Every long-running task a daemon spawns from `main` goes through
+/// `hems_service::Health::vital`, so `/livez` can fail.
+///
+/// # Why this is a guard rather than a review note
+///
+/// `Health::set_live` had no caller for the life of the project, so every
+/// daemon's `/livez` returned 200 as long as its HTTP server was answering —
+/// including one whose control loop had panicked half an hour before. That is a
+/// liveness probe that is worse than none: the orchestrator told to restart on it
+/// never restarts anything, and the fault is invisible *because* the process
+/// looks healthy. D132 named it and `Health::vital` fixed it — in `hemsd`.
+///
+/// Three fleet daemons kept the defect for months afterwards: `tariffd`'s and
+/// `forecastd`'s fetch loops and `histd`'s retention sweep were plain
+/// `tokio::spawn`s, so a tariffd whose poller had died went on serving
+/// yesterday's prices to every box in the fleet with a green liveness probe. The
+/// primitive was right and nobody called it, which is exactly the shape D132 is
+/// about — so remembering is not the mechanism. This is.
+///
+/// The one exception is the signal handler: `shutdown::on_signal` is *supposed*
+/// to return, and failing liveness when it does would fail every clean shutdown.
+fn check_vital(root: &Path) -> Result<()> {
+    let mut bare = Vec::new();
+    let mut checked = 0usize;
+    let services = root.join("services");
+    if !services.exists() {
+        println!("check-vital: no services to check");
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(&services)? {
+        let main = entry?.path().join("src/main.rs");
+        if !main.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&main)?;
+        for (n, line) in text.lines().enumerate() {
+            let Some(rest) = line.split_once("tokio::spawn(").map(|(_, r)| r) else {
+                continue;
+            };
+            checked += 1;
+            // The signal handler is the one task that ends on purpose.
+            if rest.contains("on_signal") {
+                continue;
+            }
+            bare.push(format!(
+                "  {}:{}: {}",
+                main.strip_prefix(root).unwrap_or(&main).display(),
+                n + 1,
+                line.trim()
+            ));
+        }
+    }
+
+    if bare.is_empty() {
+        println!("check-vital: {checked} spawns in daemon mains, every long-running one vital");
+        Ok(())
+    } else {
+        eprintln!(
+            "check-vital: a daemon spawns a task outside `Health::vital`, so `/livez` cannot \
+             fail when it dies (D132):"
+        );
+        for b in &bare {
+            eprintln!("{b}");
+        }
+        eprintln!(
+            "  use `health.vital(name, shutdown, task)`, or `shutdown::on_signal` if the task \
+             is meant to return."
+        );
+        bail!("{} background task(s) outside Health::vital", bare.len())
+    }
+}
+
 fn check_manifests(root: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut checked = 0usize;

@@ -34,9 +34,9 @@ The same list, in the same order, that CI runs:
 | `deny` | licences and advisories |
 | `doc` | rustdoc with warnings as errors |
 
-`guards` is the unusual one. It resolves **378 regulatory citations** across five
+`guards` is the unusual one. It resolves **405 regulatory citations** across five
 document families against an index of primary sources and fails the build if one
-names a document the index does not carry; and it checks that each of **121**
+names a document the index does not carry; and it checks that each of **122**
 quantities, instants and dates says how it travels on the wire.
 
 ## Watch a day
@@ -58,13 +58,13 @@ Seven days, and six comparisons run against them. The days:
 
 | Day | What it shows | Saved |
 |---|---|---|
-| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €2,09 |
-| `summer` | more production than the house can use, and four quarter hours of negative prices | €8,61 |
-| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,51 |
-| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,28 |
-| `offline` | **the planner switched off** — what the box does on its own | €7,94 |
-| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,72 |
-| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,06 of 12,00 kW — the 60 W over is the inverter's own settling time, not a decision | €1,31 |
+| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €2,14 |
+| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,65 |
+| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,56 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,33 |
+| `offline` | **the planner switched off** — what the box does on its own | €7,90 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,77 |
+| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 11,78 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €1,27 |
 
 What each comparison isolates, and why a reference day is built the way it is,
 are on [simulation and evaluation](@/docs/simulation.md).
@@ -141,9 +141,26 @@ a default; the `[[drivers]]` list does not, and `run` refuses to start without
 it. A box with no drivers measures nothing, so the guard would assume every
 controllable device was at its nameplate, for ever.
 
+A size of zero is the absence of the device: `battery_kwh = 0` describes a
+household with **no** battery, not a battery of no size — the asset is simply
+not built, so nothing decides for it, the S2 description never names it, and a
+driver configured for it is refused at start-up.
+
 `--check` builds the site and the drivers and stops before opening a socket. It
 is what an installer runs before leaving, and it refuses the mistakes that are
-otherwise silent for months — including a § 14a household with nothing that could
+otherwise silent for months. It also checks the **physics**: that the building
+model the planner is about to integrate contracts at the quarter-hour step, and
+that the heat pump can hold the comfort band at the design outdoor temperature
+with its heating rod counted in. The first is a refusal — parameters it fails
+for are parameters whose predicted temperatures diverge — though it cannot fail
+while the building is still a fixed prior, and it is in place for when the
+fabric becomes a fitted quantity. The second is a warning, because an undersized
+heat pump is a comfort problem the plan already prices rather than a reason to
+refuse to manage a house.
+
+The refusals are the mistakes that are otherwise silent for months — a driver
+for an asset the site does not have, two drivers that both command or both
+measure one asset, a controllable device no driver can command, a § 14a household with nothing that could
 hear a reduction, and a **Modul 3 calendar that breaks the Anwendungshilfe**:
 
 ```console
@@ -172,13 +189,16 @@ reboot, and the pairing is done once.
 Once it is running, the box says what it is doing:
 
 ```console
-$ curl -s localhost:8080/v1/status | jq '{silent, undriven, steuve_budget_kw, minutes_without_a_plan, plan_expected_eur}'
+$ curl -s localhost:8080/v1/status | jq '{silent, undriven, disobedient, steuve_budget_kw, minutes_without_a_plan, plan_expected_eur}'
 ```
 
 `silent` is the devices it cannot hear from and `undriven` the controllable ones
 nothing speaks for — each of those is a device the guard is being conservative
-about, and being conservative costs money. `minutes_without_a_plan` is `null`
-until the box has published one, and the readiness probe says why:
+about, and being conservative costs money. `disobedient` is the third and the
+least obvious: a device that is answering perfectly well and not acting on what
+it was told, which the box knows because it reads the setpoint back off the
+device rather than trusting the acknowledgement. `minutes_without_a_plan` is
+`null` until the box has published one, and the readiness probe says why:
 
 ```console
 $ curl -s localhost:8080/readyz | jq '.probes.planner'
@@ -229,12 +249,15 @@ fortnight of it. And a box that cannot reach either service keeps the house safe
 and lawful and loses the plan, which is a cost in euros rather than in
 compliance.
 
-**The plan is a battery.** The car, the building and the hot-water tank are not
-in it, because nothing reports an arrival, an indoor temperature or a tank
-temperature yet — each waits on a driver rather than on a planner change. They
-are also left out of the *names* the plan may command, because an asset a plan
-names but does not model gets an envelope pinned at zero, and the arbiter obeys
-that as an instruction not to use it.
+**A store enters the plan only where a driver measured it.** The battery off its
+own meter; the hot-water tank over EEBUS MDT; the car when an `EV` entity appears
+under the `EVSE`, which is the whole of EVCC scenario 1; and the building from an
+**indoor temperature** — the one state a thermal model is integrated from —
+which arrives over EEBUS MRT or from a vendor's register map.
+
+An unmeasured one is left out of the *names* the plan may command, not guessed
+at: an asset a plan names but does not model gets an envelope pinned at zero, and
+the arbiter obeys that as an instruction not to use it.
 
 ## Run the fleet
 
@@ -266,7 +289,7 @@ energy manager — a counterfactual only a simulator can re-run. A day from
 fleet counts those in `unmeasurable_days` rather than averaging them in as days
 that saved nothing.
 
-`saving_eur` is the reference winter day's own €2,09, which is the point: the
+`saving_eur` is the reference winter day's own €2,14, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.

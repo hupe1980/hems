@@ -72,7 +72,14 @@ pub fn control_type_for(asset: &Asset, has_deadline: bool) -> ControlType {
         // see is really storage, but S2 wants the *store* described by whoever
         // owns it, and a heat pump rarely exposes its buffer.
         Asset::HeatPump(hp) => match hp.control {
-            HeatPumpControl::SgReady | HeatPumpControl::OperationModes => ControlType::Ombc,
+            // A process the manager starts and stops is two operation modes,
+            // and the minimum runtime and minimum rest are the transition
+            // timers OMBC already has a place for. Not PPBC: a profile is a
+            // *shape* the manager schedules and then leaves alone, and this is
+            // one the manager may stop halfway through.
+            HeatPumpControl::SgReady
+            | HeatPumpControl::OperationModes
+            | HeatPumpControl::Compressor => ControlType::Ombc,
             HeatPumpControl::PowerCeiling => ControlType::Pebc,
         },
 
@@ -188,6 +195,9 @@ mod tests {
                 heating_rod: None,
                 control,
                 modulating: true,
+                comfort_min_c: 20.0,
+                comfort_max_c: 23.0,
+                cop: CopCurve::air_source(),
             })
         };
         assert_eq!(

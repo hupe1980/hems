@@ -27,6 +27,11 @@ const T0: OffsetDateTime = datetime!(2026-05-15 12:00:00 UTC);
 struct Inverter {
     map: std::collections::BTreeMap<u16, u16>,
     curtailed_to: Option<u16>,
+    /// A floor the device clips `WMaxLimPct` to, the way a real inverter with a
+    /// minimum curtailment step does.
+    clips_below: Option<u16>,
+    /// Whether the device stores `WMaxLimPct` and leaves `WMaxLim_Ena` at zero.
+    ignores_enable: bool,
 }
 
 impl Inverter {
@@ -71,7 +76,21 @@ impl Inverter {
         Self {
             map,
             curtailed_to: None,
+            clips_below: None,
+            ignores_enable: false,
         }
+    }
+
+    /// A device that will not go below `floor` per cent.
+    fn clipping_below(mut self, floor: u16) -> Self {
+        self.clips_below = Some(floor);
+        self
+    }
+
+    /// A device that stores the setpoint and never switches it on.
+    fn ignoring_the_enable_flag(mut self) -> Self {
+        self.ignores_enable = true;
+        self
     }
 
     /// Answer one request, the way a device would.
@@ -99,7 +118,21 @@ impl Inverter {
             }
             0x10 => {
                 let count = u16::from_be_bytes([bytes[10], bytes[11]]);
-                self.curtailed_to = Some(u16::from_be_bytes([bytes[13], bytes[14]]));
+                // Stored into the map, because a device that answers a write
+                // and does not change its registers is a device no read-back
+                // could ever catch out.
+                for i in 0..count {
+                    let at = usize::from(i) * 2;
+                    let mut v = u16::from_be_bytes([bytes[13 + at], bytes[14 + at]]);
+                    if i == 0 {
+                        v = self.clips_below.map_or(v, |floor| v.max(floor));
+                    }
+                    if i == 4 && self.ignores_enable {
+                        v = 0;
+                    }
+                    self.map.insert(address + i, v);
+                }
+                self.curtailed_to = self.map.get(&address).copied();
                 let mut pdu = vec![0x10];
                 pdu.extend_from_slice(&address.to_be_bytes());
                 pdu.extend_from_slice(&count.to_be_bytes());
@@ -297,18 +330,128 @@ fn a_curtailment_reaches_the_device_as_a_percentage_of_its_rating() {
 
     d.command(&Command::ProductionCeiling(Power::from_kw(6.0)), T0)
         .expect("a ceiling on a device with a rating and a model 123");
-    let out = d.poll_transmit().expect("a write went out");
-    let reply = device.answer(&out);
-    d.on_bytes(&reply, T0).expect("the device acknowledged");
+    exchange(&mut d, &mut device, T0, 8);
 
     assert_eq!(
         device.curtailed_to,
         Some(60),
         "6 kW of a 10 kW inverter is sixty per cent, because model 123 curtails          in per cent of WMax and not in watts"
     );
-    let accepted = std::iter::from_fn(|| d.poll_event())
-        .any(|e| matches!(e, DriverEvent::Command(o) if o.accepted));
-    assert!(accepted, "and the acknowledgement is reported");
+    let outcome = command_outcome(&mut d).expect("the command is reported");
+    assert!(outcome.accepted, "and the acknowledgement is reported");
+    assert_eq!(
+        outcome.confirmed,
+        Some(Power::from_kw(6.0)),
+        "read back off the device's own registers rather than assumed from what \
+         was written: a Modbus write answer echoes the address and the count and \
+         never the values"
+    );
+    assert_eq!(
+        outcome.detail, None,
+        "nothing to say about a device that obeyed"
+    );
+}
+
+/// The first `CommandOutcome` the driver has to offer.
+fn command_outcome(d: &mut SunSpec) -> Option<hems_drv::CommandOutcome> {
+    std::iter::from_fn(|| d.poll_event()).find_map(|e| match e {
+        DriverEvent::Command(o) => Some(o),
+        _ => None,
+    })
+}
+
+/// A curtailed inverter that reads back where it was put, and the two ways it
+/// does not.
+fn curtailed(device: &mut Inverter) -> Option<hems_drv::CommandOutcome> {
+    let mut d = SunSpec::new(
+        AssetId::new("wechselrichter").expect("a valid identifier"),
+        1,
+        Cadence::default(),
+    )
+    .with_rating(Power::from_kw(10.0));
+    d.on_timeout(T0);
+    exchange(&mut d, device, T0, 60);
+    while d.poll_event().is_some() {}
+
+    d.command(&Command::ProductionCeiling(Power::from_kw(2.0)), T0)
+        .expect("a ceiling on a device with a rating and a model 123");
+    exchange(&mut d, device, T0, 8);
+    command_outcome(&mut d)
+}
+
+#[test]
+fn a_device_that_clips_the_setpoint_says_so_rather_than_agreeing() {
+    // A real inverter with a minimum curtailment step takes 20 % and answers
+    // the write exactly as one that obeyed — the Modbus write response echoes
+    // the address and the quantity and never the values. The plan asked for
+    // 2 kW and the roof will deliver 3, and every layer above would have gone
+    // on believing 2 until the meter disagreed.
+    let mut device = Inverter::new().clipping_below(30);
+    let outcome = curtailed(&mut device).expect("the command is reported");
+
+    assert!(
+        outcome.accepted,
+        "the limit is in force, so the command was obeyed — just not to the \
+         value that was asked for"
+    );
+    assert_eq!(
+        outcome.confirmed,
+        Some(Power::from_kw(3.0)),
+        "30 % of a 10 kW inverter, which is what the device actually holds"
+    );
+    assert!(
+        outcome.detail.is_some_and(|d| d.contains("clipped")),
+        "and it is named, because the difference between commanded and \
+         confirmed is where a plan and a house stop agreeing"
+    );
+}
+
+#[test]
+fn a_setpoint_stored_but_never_switched_on_is_not_an_accepted_command() {
+    // The classic way to curtail nothing at all and believe otherwise:
+    // `WMaxLimPct` is written, `WMaxLim_Ena` stays at zero, and the device
+    // acknowledges the write. Nothing about the answer distinguishes it from
+    // obedience, and a § 14a Nachweis built on it would record a reduction that
+    // never happened.
+    let mut device = Inverter::new().ignoring_the_enable_flag();
+    let outcome = curtailed(&mut device).expect("the command is reported");
+
+    assert!(
+        !outcome.accepted,
+        "a limit that is not in force is not accepted"
+    );
+    assert!(
+        outcome.detail.is_some_and(|d| d.contains("WMaxLim_Ena")),
+        "and the reason is the register that says so"
+    );
+}
+
+#[test]
+fn a_command_the_device_never_answers_is_reported_as_a_failure() {
+    // Silence at this seam is the dangerous case: nothing contradicts the
+    // ceiling, so it reaches the evidence record as one that was issued and
+    // obeyed. A command that was never answered was not obeyed, and the driver
+    // is the only layer that knows.
+    let mut d = SunSpec::new(
+        AssetId::new("wechselrichter").expect("a valid identifier"),
+        1,
+        Cadence::default(),
+    )
+    .with_rating(Power::from_kw(10.0));
+    let mut device = Inverter::new();
+    d.on_timeout(T0);
+    exchange(&mut d, &mut device, T0, 60);
+    while d.poll_event().is_some() {}
+
+    d.command(&Command::ProductionCeiling(Power::from_kw(6.0)), T0)
+        .expect("a ceiling on a device with a rating and a model 123");
+    let _ = d.poll_transmit().expect("a write went out");
+    // …and nothing comes back.
+    d.on_timeout(T0 + time::Duration::minutes(5));
+
+    let outcome = command_outcome(&mut d).expect("the command is reported");
+    assert!(!outcome.accepted);
+    assert_eq!(outcome.confirmed, None);
 }
 
 #[test]
@@ -376,6 +519,7 @@ fn the_frame_codec_and_the_device_agree() {
         transaction: 42,
         unit: 1,
         body: RequestBody::Read {
+            space: hems_drv::modbus::frame::Space::Holding,
             address: 40_000,
             count: 2,
         },

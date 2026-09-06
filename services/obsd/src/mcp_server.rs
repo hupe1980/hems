@@ -107,13 +107,18 @@ impl Handler {
         json(&serde_json::to_value(&summary).unwrap_or_default())
     }
 
-    /// Every day a network operator's instruction was not respected.
+    /// Every day a statutory limit on a connection point was not respected.
     #[tool(
-        description = "Every day a household did not respect a network operator's § 14a \
-                       reduction, with the site and the date. A LIST and never a rate: one \
-                       household in ten thousand is an incident with a name, and a \
-                       percentage reads as success. An empty list is the ordinary answer and \
-                       means no breach was reported, not that none was possible.",
+        description = "Every day a household crossed one of the two statutory limits on its \
+                       connection point, with the site and the date: a network operator's \
+                       § 14a reduction (`breached`), and the § 9 EEG ceiling on what may be \
+                       fed in (`over_feed_in_ceiling`). They are separate lists because they \
+                       are separate rules and are answered by different parties — § 14a is an \
+                       instruction the household did not carry out, § 9 EEG applies by force \
+                       of law whether or not anybody ever sent anything. LISTS and never \
+                       rates: one household in ten thousand is an incident with a name, and a \
+                       percentage reads as success. Empty lists are the ordinary answer and \
+                       mean no breach was reported, not that none was possible.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_breaches(
@@ -129,8 +134,9 @@ impl Handler {
         );
         json(&serde_json::json!({
             "breached": summary.breached,
+            "over_feed_in_ceiling": summary.over_feed_in_ceiling,
             "below_minimum": summary.below_minimum,
-            "count": summary.breached.len(),
+            "count": summary.breached.len() + summary.over_feed_in_ceiling.len(),
             "days_on_record": summary.days,
         }))
     }
@@ -138,8 +144,8 @@ impl Handler {
     /// One household's own days.
     #[tool(
         description = "One site's reported days, most recent first: the saving, the \
-                       self-sufficiency, whether a § 14a instruction was respected and how \
-                       long it spent without a plan. A site that has never reported is \
+                       self-sufficiency, whether the § 14a and § 9 EEG limits were respected \
+                       and how long it spent without a plan. A site that has never reported is \
                        absent rather than empty.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]

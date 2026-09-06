@@ -35,9 +35,40 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hems_core::prelude::{AssetId, Measurement, Power, Site};
 use hems_core::setpoint::Setpoint;
-use hems_drv::{Driver, DriverError, DriverEvent, LimitDirection, LimitSource, LinkState};
+use hems_drv::{
+    CommandOutcome, Driver, DriverError, DriverEvent, LimitDirection, LimitSource, LinkState,
+};
 use hems_realtime::guard::{GridLimits, SiteState};
 use time::{Duration, OffsetDateTime};
+
+/// Which registered driver, as distinct from which asset.
+///
+/// An asset may have two: one that **commands** it and one that **measures**
+/// it. The wallbox is the case the workspace already documented and could not
+/// configure — commanded over Modbus, and read over EEBUS EVCC/EVSOC for
+/// whether there is a car on the cable and how full it is — and the heat pump
+/// is the second, commanded over OHPCF and measured wherever a room temperature
+/// comes from. Both drivers have their own socket, their own link state and
+/// their own deadline, so a transport keyed by asset would have run one of them
+/// and silently starved the other.
+///
+/// Opaque, and handed back by [`Registry::register`] in registration order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DriverId(usize);
+
+/// A registered driver together with the asset it speaks for.
+///
+/// The two travel together everywhere a transport does — the identity says
+/// which driver's socket this is, and the asset is what a log line has to name
+/// for the fault to be actionable — and passing them separately is passing two
+/// values that must agree and that nothing checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attached {
+    /// Which registered driver.
+    pub driver: DriverId,
+    /// What it speaks for.
+    pub asset: AssetId,
+}
 
 /// Why a set of drivers does not describe this site.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -45,9 +76,14 @@ pub enum RegistryError {
     /// A driver names an asset the site does not have.
     #[error("a driver speaks for `{0}`, which this site does not have")]
     NoSuchAsset(String),
-    /// Two drivers claim the same asset.
-    #[error("two drivers speak for `{0}`")]
-    Duplicate(String),
+    /// Two drivers claim to command one asset.
+    ///
+    /// Two drivers that *measure* one asset is the same fault for the same
+    /// reason — two sources of truth and nothing downstream that could tell
+    /// which to believe — and they are one error because an installer fixes
+    /// them the same way: delete one.
+    #[error("two drivers {1} `{0}`, and nothing downstream could tell which to believe")]
+    Duplicate(String, &'static str),
     /// A controllable asset has a driver that cannot command it.
     #[error(
         "`{0}` is controllable and its driver cannot take commands, so the arbiter \
@@ -80,9 +116,19 @@ pub struct Registry {
     entries: Vec<Entry>,
     /// The limits the grid drivers have reported, as the guard wants them.
     limits: GridLimits,
+    /// The failsafe values the network operator has written, per direction.
+    ///
+    /// Kept apart from [`Registry::limits`] because it is not a limit: it is
+    /// what the household holds when there is **no** limit and no session to
+    /// carry one, and `[LPC-021]` makes it the operator's to change. The guard
+    /// never reads it — the driver enforces it — so the only reason it is here
+    /// is that something has to write it down before the next power cut.
+    failsafe: BTreeMap<hems_drv::LimitDirection, hems_drv::Failsafe>,
 }
 
 struct Entry {
+    /// Which driver this is, for the transport that owns its socket.
+    id: DriverId,
     /// `Send`, because on a real box a driver lives in a task that owns its
     /// socket. The bound belongs **here** rather than on `hems_drv::Driver`: a
     /// driver is a state machine and a state machine has no business declaring
@@ -105,6 +151,30 @@ struct Entry {
     pending: Vec<DriverEvent>,
     /// The conductors it reports, for a switchable charge point.
     phases: Option<hems_core::prelude::PhaseMode>,
+    /// Whether a car is plugged into this charge point, and what it has said.
+    ///
+    /// `None` on a driver that cannot tell — every charge point hems speaks to
+    /// over Modbus, which reports power and has no idea what is on the end of
+    /// the cable. Absence is therefore "nobody knows" and not "no car", and the
+    /// planner has to treat the two differently: an unknown session is one to
+    /// leave out, and an empty one is a socket to stop reserving energy for.
+    vehicle: Option<hems_drv::VehiclePresence>,
+    /// How the last command to this device turned out.
+    ///
+    /// A device that answered a setpoint and did not act on it is the one
+    /// failure the layers above cannot see: the guard commanded, nothing
+    /// errored, and the disagreement only surfaces when the meter contradicts
+    /// the plan — hours later, on a household nobody is watching. It is kept
+    /// per asset rather than folded into one flag because *which* device
+    /// stopped obeying is the whole of the diagnosis.
+    last_command: Option<CommandOutcome>,
+    /// What this appliance last said it could do, where it can say so.
+    ///
+    /// `None` on every driver that has no such use case, and absence means
+    /// "nobody knows" rather than "no flexibility" — the same distinction
+    /// [`Entry::vehicle`] draws. A planner reads it to replace its configured
+    /// minimum runtimes with the appliance's own.
+    flex: Option<hems_drv::Flexibility>,
 }
 
 impl Entry {
@@ -120,6 +190,39 @@ impl Entry {
         if !self.link.is_usable() {
             return false;
         }
+        // A driver that does not measure cannot be judged by the age of a
+        // measurement. The § 14a grid driver is the case: `[A1 4.6]` is an
+        // *instruction*, so it reports limits and link state and nothing else,
+        // and asking it for a recent reading counted a perfectly connected
+        // Steuerbox as a device nobody could hear — for ever, on every box that
+        // has one. The readiness probe then stays bad on a box that is working,
+        // which is the state in which nobody looks at it again.
+        //
+        // A driver that *can* measure is still judged by the age: a device may
+        // stop updating a register while its socket stays open, and only the
+        // timestamp says so.
+        let caps = self.driver.capabilities();
+        if !caps.measures {
+            return true;
+        }
+        // And a driver whose peer **notifies** it cannot be judged that way
+        // either, for a reason one step further in. A subscription delivers a
+        // value when it *changes*, so a hot-water tank holding 52 °C and a room
+        // holding 21 °C are silent for hours — which is the protocol working.
+        // Judging them by the age of the last reading dropped both from the
+        // site's state seconds after every reading, so the tank and the building
+        // were in the plan only in the moments just after they moved, which is
+        // the opposite of when a plan needs them.
+        //
+        // What such a driver owes instead is a **link**, and it reports one on
+        // its own initiative: a SHIP session that goes away takes the driver's
+        // link with it, which the branch above already catches. Where the peer
+        // stamps its readings the age is meaningful again, and the driver puts
+        // the peer's own instant on the measurement — so this is a fallback for
+        // the peers that send none rather than a blanket exemption.
+        if caps.reports_on_change {
+            return self.latest.is_some();
+        }
         self.latest.is_some_and(|m| now - m.at <= SILENCE)
     }
 }
@@ -129,6 +232,7 @@ impl std::fmt::Debug for Registry {
         f.debug_struct("Registry")
             .field("drivers", &self.entries.len())
             .field("limits", &self.limits)
+            .field("failsafe", &self.failsafe)
             .finish()
     }
 }
@@ -146,6 +250,7 @@ impl Registry {
         Self {
             entries: Vec::new(),
             limits: GridLimits::default(),
+            failsafe: BTreeMap::new(),
         }
     }
 
@@ -163,39 +268,67 @@ impl Registry {
 
     /// Add a driver, checking that it and the site agree about what it is for.
     ///
+    /// # An asset may have two drivers, and only two
+    ///
+    /// One that **commands** it and one that **measures** it. What is refused is
+    /// two of either: two commanders is a device nobody can predict, and two
+    /// meters is two sources of truth with nothing downstream that could tell
+    /// which to believe. A driver that does both is simply both.
+    ///
+    /// Whether a *controllable* asset has a commanding driver at all is not
+    /// asked here, because it cannot be: the commanding driver may be the second
+    /// one registered. [`Registry::validate`] asks it once, when the set is
+    /// complete.
+    ///
     /// # Errors
-    /// [`RegistryError`] for any of the four mismatches in the module note.
+    /// [`RegistryError`] for any of the mismatches in the module note.
     pub fn register(
         &mut self,
         driver: Box<dyn Driver + Send>,
         site: &Site,
-    ) -> Result<(), RegistryError> {
+    ) -> Result<DriverId, RegistryError> {
         let asset = driver.asset().clone();
         let caps = driver.capabilities();
 
         // A grid driver speaks for the connection point, which is not one of the
         // site's assets — so only a device driver has to name one that exists.
-        if !caps.reports_grid_limits {
-            let Some(found) = site.asset(&asset) else {
-                return Err(RegistryError::NoSuchAsset(asset.to_string()));
-            };
-            if hems_realtime::guard::is_controllable(found) && !caps.accepts_commands {
-                return Err(RegistryError::CannotCommand(asset.to_string()));
+        if !caps.reports_grid_limits && site.asset(&asset).is_none() {
+            return Err(RegistryError::NoSuchAsset(asset.to_string()));
+        }
+        for (already, role) in [
+            (caps.accepts_commands, "command"),
+            (caps.measures, "measure"),
+        ] {
+            if already && self.role(&asset, role).is_some() {
+                return Err(RegistryError::Duplicate(asset.to_string(), role));
             }
         }
-        if self.entries.iter().any(|e| e.asset == asset) {
-            return Err(RegistryError::Duplicate(asset.to_string()));
-        }
 
+        let id = DriverId(self.entries.len());
         self.entries.push(Entry {
+            id,
             driver,
             asset,
             link: LinkState::Down,
             latest: None,
             pending: Vec::new(),
             phases: None,
+            vehicle: None,
+            last_command: None,
+            flex: None,
         });
-        Ok(())
+        Ok(id)
+    }
+
+    /// The driver that plays `role` for `asset`, where one does.
+    fn role(&self, asset: &AssetId, role: &str) -> Option<&Entry> {
+        self.entries.iter().find(|e| {
+            e.asset == *asset
+                && match role {
+                    "command" => e.driver.capabilities().accepts_commands,
+                    _ => e.driver.capabilities().measures,
+                }
+        })
     }
 
     /// Check the registered set against what the site expects of it.
@@ -204,12 +337,34 @@ impl Registry {
     /// be answered driver by driver, because it is about the *absence* of one.
     ///
     /// # Errors
-    /// [`RegistryError::Uncommissioned`] where nothing is registered at all, and
-    /// [`RegistryError::NoGridDriver`] where the site takes part in the
-    /// netzorientierte Steuerung and nothing can hear a reduction.
+    /// [`RegistryError::Uncommissioned`] where nothing is registered at all,
+    /// [`RegistryError::CannotCommand`] where a controllable asset has drivers
+    /// and none of them can move it, and [`RegistryError::NoGridDriver`] where
+    /// the site takes part in the netzorientierte Steuerung and nothing can hear
+    /// a reduction.
     pub fn validate(&self, site: &Site, now: OffsetDateTime) -> Result<(), RegistryError> {
         if self.entries.is_empty() {
             return Err(RegistryError::Uncommissioned);
+        }
+        // Asked here rather than at registration, because the commanding driver
+        // may be the second one registered: a wallbox read over EEBUS and
+        // commanded over Modbus is a household that is perfectly well managed,
+        // and judging each driver as it arrived refused the pair on the strength
+        // of the order they were listed in.
+        //
+        // An asset with **no** driver at all is a different fact and not this
+        // one — `undriven` reports it, and a partially commissioned box is
+        // allowed to run — so only an asset something already speaks for is
+        // checked.
+        for asset in &site.assets {
+            let id = asset.meta().id.clone();
+            if !hems_realtime::guard::is_controllable(asset) {
+                continue;
+            }
+            let spoken_for = self.entries.iter().any(|e| e.asset == id);
+            if spoken_for && self.role(&id, "command").is_none() {
+                return Err(RegistryError::CannotCommand(id.to_string()));
+            }
         }
         let participates = !hems_grid::classify_at(&site.assets, now).is_empty();
         let hears = self
@@ -255,11 +410,11 @@ impl Registry {
     /// where the socket is.
     pub fn on_bytes(
         &mut self,
-        asset: &AssetId,
+        driver: DriverId,
         bytes: &[u8],
         now: OffsetDateTime,
     ) -> Result<(), DriverError> {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.asset == *asset) else {
+        let Some(entry) = self.entry_mut(driver) else {
             return Ok(());
         };
         entry.driver.on_bytes(bytes, now)
@@ -271,8 +426,8 @@ impl Registry {
     /// of bytes cannot carry: a reconnect invalidates a half-frame, a request
     /// waiting for its answer and a discovered peer, and the first bytes of the
     /// new socket look exactly like the continuation of the old one.
-    pub fn on_link(&mut self, asset: &AssetId, state: LinkState, now: OffsetDateTime) {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.asset == *asset) else {
+    pub fn on_link(&mut self, driver: DriverId, state: LinkState, now: OffsetDateTime) {
+        let Some(entry) = self.entry_mut(driver) else {
             return;
         };
         entry.driver.on_link(state, now);
@@ -300,37 +455,38 @@ impl Registry {
     /// What a per-driver transport task calls: each socket has its own deadline,
     /// and waking every driver because one of them had a timeout would make a
     /// slow inverter's cadence the cadence of the Steuerbox.
-    pub fn on_timeout_of(&mut self, asset: &AssetId, now: OffsetDateTime) {
-        if let Some(entry) = self.entries.iter_mut().find(|e| e.asset == *asset) {
+    pub fn on_timeout_of(&mut self, driver: DriverId, now: OffsetDateTime) {
+        if let Some(entry) = self.entry_mut(driver) {
             entry.driver.on_timeout(now);
         }
     }
 
     /// The next bytes to put on a wire, and which driver's wire it is.
-    pub fn poll_transmit(&mut self) -> Option<(AssetId, Vec<u8>)> {
+    pub fn poll_transmit(&mut self) -> Option<(DriverId, Vec<u8>)> {
         for entry in &mut self.entries {
             if let Some(bytes) = entry.driver.poll_transmit() {
-                return Some((entry.asset.clone(), bytes));
+                return Some((entry.id, bytes));
             }
         }
         None
     }
 
+    /// One entry, by the identity registration handed back.
+    fn entry_mut(&mut self, driver: DriverId) -> Option<&mut Entry> {
+        self.entries.iter_mut().find(|e| e.id == driver)
+    }
+
     /// The next bytes for one driver's own wire.
-    pub fn poll_transmit_of(&mut self, asset: &AssetId) -> Option<Vec<u8>> {
-        self.entries
-            .iter_mut()
-            .find(|e| e.asset == *asset)?
-            .driver
-            .poll_transmit()
+    pub fn poll_transmit_of(&mut self, driver: DriverId) -> Option<Vec<u8>> {
+        self.entry_mut(driver)?.driver.poll_transmit()
     }
 
     /// When one driver wants waking.
     #[must_use]
-    pub fn deadline_of(&self, asset: &AssetId) -> Option<OffsetDateTime> {
+    pub fn deadline_of(&self, driver: DriverId) -> Option<OffsetDateTime> {
         self.entries
             .iter()
-            .find(|e| e.asset == *asset)?
+            .find(|e| e.id == driver)?
             .driver
             .poll_deadline()
     }
@@ -342,7 +498,15 @@ impl Registry {
     /// command that would otherwise be dropped in silence, and the difference
     /// between a device that is idle and one that is unreachable.
     pub fn command(&mut self, setpoint: &Setpoint, now: OffsetDateTime) -> Result<(), DriverError> {
-        let Some(entry) = self.entries.iter_mut().find(|e| e.asset == setpoint.asset) else {
+        // The **commanding** driver, which may not be the only one that speaks
+        // for this asset: a wallbox read over EEBUS and commanded over Modbus
+        // has two, and sending a setpoint to whichever was registered first
+        // would deliver half of them to a driver that measures.
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.asset == setpoint.asset && e.driver.capabilities().accepts_commands)
+        else {
             return Err(DriverError::NoDriver(setpoint.asset.to_string()));
         };
         entry.driver.command(&setpoint.command, now)
@@ -393,7 +557,34 @@ impl Registry {
                             self.limits.feed_in_ceiling = limit.ceiling;
                         }
                     },
-                    DriverEvent::Command(_) => {}
+                    DriverEvent::Command(outcome) => entry.last_command = Some(outcome.clone()),
+                    // `[MGCP-011]`, and it is a *factor* rather than a ceiling:
+                    // the watts it means depend on the roof, which the guard
+                    // knows and the driver does not.
+                    DriverEvent::FeedInFactor(factor) => {
+                        self.limits.mgcp_factor = Some(factor.percent / 100.0);
+                    }
+                    // Whether there is a car on the charge point, which is a
+                    // fact about the *session* rather than a measurement: a
+                    // socket with nothing in it is working perfectly and has no
+                    // state of charge to report.
+                    DriverEvent::Vehicle(presence) => entry.vehicle = Some(*presence),
+                    // What the appliance says it *could* do, which is the one
+                    // thing a ceiling can never carry. Kept rather than only
+                    // journalled because the two numbers in it — how long the
+                    // compressor must run once started and how long it must then
+                    // rest — are the planner's minimum-runtime constraints, and
+                    // a figure the machine states beats the same figure typed
+                    // into a configuration file.
+                    DriverEvent::Flexibility(offer) => entry.flex = Some(offer.clone()),
+                    // Not a limit, and kept for one reason: it has to outlive
+                    // the process. `[LPC-021]` lets the operator change what
+                    // this household falls back to, and a box that held the new
+                    // value only in memory would come back from a power cut on
+                    // whatever its own file says.
+                    DriverEvent::Failsafe(failsafe) => {
+                        self.failsafe.insert(failsafe.direction, *failsafe);
+                    }
                 }
                 entry.pending.push(event);
             }
@@ -404,6 +595,15 @@ impl Registry {
     #[must_use]
     pub fn limits(&self) -> GridLimits {
         self.limits.clone()
+    }
+
+    /// What the network operator has said this household falls back to.
+    ///
+    /// Empty until an operator writes one, which is the ordinary case: the
+    /// configured value stands until somebody changes it.
+    #[must_use]
+    pub fn failsafe(&self) -> &BTreeMap<hems_drv::LimitDirection, hems_drv::Failsafe> {
+        &self.failsafe
     }
 
     /// What the house is doing, as far as the drivers can tell.
@@ -483,6 +683,23 @@ impl Registry {
             .filter(move |e| !e.is_heard(now))
             .map(|e| &e.asset)
     }
+
+    /// Devices whose last command was not carried out, and what they said.
+    ///
+    /// Distinct from [`Registry::silent`], and the distinction is the one worth
+    /// having: a silent device is not being heard from at all, while one of
+    /// these is answering perfectly well and not doing what it was told. The
+    /// first is a network fault; the second is a device that has to be
+    /// commanded some other way, and treating them as the same thing sends an
+    /// installer to the wrong end of the house.
+    pub fn disobedient(&self) -> impl Iterator<Item = (&AssetId, &CommandOutcome)> {
+        self.entries.iter().filter_map(|e| {
+            e.last_command
+                .as_ref()
+                .filter(|o| !o.accepted)
+                .map(|o| (&e.asset, o))
+        })
+    }
 }
 
 /// How long a driver may be silent before the registry stops believing it.
@@ -498,7 +715,7 @@ impl Registry {
 pub const SILENCE: Duration = Duration::seconds(10);
 
 /// Everything the drivers said, in the shape the control planes read.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Observed {
     /// What the house is doing.
     pub state: SiteState,
@@ -508,6 +725,12 @@ pub struct Observed {
     pub silent: BTreeSet<AssetId>,
     /// Devices whose available power is a nameplate rather than a reading.
     pub assumed_available: BTreeSet<AssetId>,
+    /// Devices that answered their last setpoint and did not act on it, and why.
+    pub disobedient: BTreeMap<AssetId, String>,
+    /// Charge points that can say whether a car is on them, and what it said.
+    pub vehicles: BTreeMap<AssetId, hems_drv::VehiclePresence>,
+    /// Appliances that can announce what they could do, and what they announced.
+    pub flexibility: BTreeMap<AssetId, hems_drv::Flexibility>,
 }
 
 impl Registry {
@@ -529,6 +752,28 @@ impl Registry {
             limits: self.limits(),
             silent: self.silent(now).cloned().collect(),
             assumed_available: self.assumed_available_power().cloned().collect(),
+            vehicles: self
+                .entries
+                .iter()
+                .filter_map(|e| e.vehicle.map(|v| (e.asset.clone(), v)))
+                .collect(),
+            flexibility: self
+                .entries
+                .iter()
+                .filter_map(|e| e.flex.clone().map(|f| (e.asset.clone(), f)))
+                .collect(),
+            disobedient: self
+                .disobedient()
+                .map(|(asset, outcome)| {
+                    (
+                        asset.clone(),
+                        outcome
+                            .detail
+                            .clone()
+                            .unwrap_or_else(|| "the device did not carry it out".into()),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -623,6 +868,191 @@ mod tests {
         }
     }
 
+    /// A device that acknowledges every setpoint and acts on none of them.
+    ///
+    /// The failure mode that has no error in it anywhere: the write is
+    /// accepted, the driver reports it, and the device holds where it was.
+    #[derive(Debug)]
+    struct Nodding {
+        asset: AssetId,
+        pending: Option<hems_drv::CommandOutcome>,
+    }
+
+    impl Driver for Nodding {
+        fn asset(&self) -> &AssetId {
+            &self.asset
+        }
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities::device()
+        }
+        fn on_bytes(&mut self, _: &[u8], _: OffsetDateTime) -> Result<(), DriverError> {
+            Ok(())
+        }
+        fn on_timeout(&mut self, _: OffsetDateTime) {}
+        fn command(
+            &mut self,
+            _: &hems_core::setpoint::Command,
+            at: OffsetDateTime,
+        ) -> Result<(), DriverError> {
+            self.pending = Some(hems_drv::CommandOutcome {
+                accepted: false,
+                confirmed: None,
+                at,
+                detail: Some("the setpoint was stored and never switched on".into()),
+            });
+            Ok(())
+        }
+        fn poll_event(&mut self) -> Option<DriverEvent> {
+            self.pending.take().map(DriverEvent::Command)
+        }
+        fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+        fn poll_deadline(&self) -> Option<OffsetDateTime> {
+            None
+        }
+    }
+
+    /// A grid driver that publishes nothing but the § 9 curtailment factor.
+    #[derive(Debug)]
+    struct Announcing {
+        asset: AssetId,
+        pending: Vec<DriverEvent>,
+    }
+
+    impl Driver for Announcing {
+        fn asset(&self) -> &AssetId {
+            &self.asset
+        }
+        fn capabilities(&self) -> DriverCapabilities {
+            DriverCapabilities::grid()
+        }
+        fn on_bytes(&mut self, _: &[u8], _: OffsetDateTime) -> Result<(), DriverError> {
+            Ok(())
+        }
+        fn on_timeout(&mut self, _: OffsetDateTime) {}
+        fn command(
+            &mut self,
+            c: &hems_core::setpoint::Command,
+            _: OffsetDateTime,
+        ) -> Result<(), DriverError> {
+            Err(DriverError::Unsupported(format!("{c:?}")))
+        }
+        fn poll_event(&mut self) -> Option<DriverEvent> {
+            (!self.pending.is_empty()).then(|| self.pending.remove(0))
+        }
+        fn poll_transmit(&mut self) -> Option<Vec<u8>> {
+            None
+        }
+        fn poll_deadline(&self) -> Option<OffsetDateTime> {
+            None
+        }
+    }
+
+    #[test]
+    fn a_grid_driver_that_measures_nothing_is_not_therefore_unheard() {
+        // A § 14a driver reports limits, not measurements — `[A1 4.6]` is an
+        // instruction and not a reading. Judging it by the age of a measurement
+        // it never sends counts a perfectly connected Steuerbox as a device
+        // nobody can hear, for ever: the readiness probe stays bad on a box that
+        // is working, which is the state in which nobody looks at it again.
+        let s = site();
+        let mut r = Registry::new();
+        r.register(
+            Box::new(Announcing {
+                asset: id("netzanschluss"),
+                pending: vec![DriverEvent::Link(LinkState::Up)],
+            }),
+            &s,
+        )
+        .expect("the connection point");
+
+        let observed = r.observe(None, NOW);
+
+        assert!(
+            observed.silent.is_empty(),
+            "it said its link is up and it has nothing else to say: {:?}",
+            observed.silent
+        );
+    }
+
+    #[test]
+    fn the_curtailment_factor_reaches_the_guard_as_a_fraction() {
+        // `[MGCP-011]` crosses the wire as a *percentage* and `hems-grid` reads
+        // a *fraction*, because that is what multiplies an inverter rating.
+        // A factor of 70 arriving where 0,7 was meant is a roof allowed
+        // seventy times what the connection point permits, and both numbers
+        // look like a plausible configuration.
+        let s = site();
+        let mut r = Registry::new();
+        r.register(
+            Box::new(Announcing {
+                asset: id("netzanschluss"),
+                pending: vec![DriverEvent::FeedInFactor(hems_drv::FeedInFactor {
+                    percent: 70.0,
+                    at: NOW,
+                })],
+            }),
+            &s,
+        )
+        .expect("the connection point");
+
+        let observed = r.observe(None, NOW);
+
+        assert_eq!(observed.limits.mgcp_factor, Some(0.7));
+    }
+
+    #[test]
+    fn a_device_that_nods_and_does_nothing_is_named_rather_than_believed() {
+        // `Ok(())` from `command` means the driver got the setpoint out, and
+        // nothing more. The device then answers it, stores it and holds where
+        // it was — which reaches every layer above as a house that was
+        // commanded and is not doing it, hours before the meter says so. It is
+        // *not* silent, and that distinction is the diagnosis: this device is
+        // answering perfectly well.
+        let s = site();
+        let mut r = Registry::new();
+        r.register(
+            Box::new(Nodding {
+                asset: id("wallbox"),
+                pending: None,
+            }),
+            &s,
+        )
+        .expect("the wallbox");
+
+        assert!(
+            r.observe(None, NOW).disobedient.is_empty(),
+            "nothing has been commanded yet, and a device nobody asked is not \
+             one that refused"
+        );
+
+        r.command(
+            &Setpoint {
+                asset: id("wallbox"),
+                command: hems_core::setpoint::Command::ChargingCurrent(Current::new(10.0)),
+                reason: hems_core::setpoint::Reason::Fallback(
+                    hems_core::setpoint::FallbackCause::NoPlan,
+                ),
+                at: NOW,
+            },
+            NOW,
+        )
+        .expect("the driver took it");
+
+        let observed = r.observe(None, NOW);
+        assert!(
+            observed.silent.contains(&id("wallbox")),
+            "it reports no measurement, so it is silent too — but that is the \
+             other fault"
+        );
+        assert_eq!(
+            observed.disobedient.get(&id("wallbox")).map(String::as_str),
+            Some("the setpoint was stored and never switched on"),
+            "and what the device said about it is the whole of the diagnosis"
+        );
+    }
+
     fn mute(asset: &str, caps: DriverCapabilities) -> Box<dyn Driver + Send> {
         Box::new(Mute {
             asset: id(asset),
@@ -643,29 +1073,80 @@ mod tests {
     }
 
     #[test]
-    fn two_drivers_for_one_asset_are_refused() {
-        // Two sources of truth about one meter, and nothing downstream that
-        // could tell which of them to believe.
+    fn two_drivers_that_both_command_one_asset_are_refused() {
+        // One wallbox, two managers, and nothing downstream that could tell
+        // which of them the contactor is obeying.
         let s = site();
         let mut r = Registry::new();
         r.register(mute("wallbox", DriverCapabilities::device()), &s)
             .expect("the first");
         let err = r
-            .register(mute("wallbox", DriverCapabilities::device()), &s)
+            .register(mute("wallbox", DriverCapabilities::commanding()), &s)
             .expect_err("the second");
-        assert!(matches!(err, RegistryError::Duplicate(_)), "{err}");
+        assert!(
+            matches!(err, RegistryError::Duplicate(_, "command")),
+            "{err}"
+        );
     }
 
     #[test]
-    fn a_controllable_asset_whose_driver_cannot_command_it_is_refused() {
+    fn two_drivers_that_both_measure_one_asset_are_refused() {
+        // Two sources of truth about one meter, which is the same fault with
+        // the other sign: the registry would keep whichever spoke last.
+        let s = site();
+        let mut r = Registry::new();
+        r.register(mute("wallbox", DriverCapabilities::device()), &s)
+            .expect("the first");
+        let err = r
+            .register(mute("wallbox", DriverCapabilities::meter()), &s)
+            .expect_err("the second");
+        assert!(
+            matches!(err, RegistryError::Duplicate(_, "measure")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn one_driver_may_command_an_asset_while_another_reads_it() {
+        // The configuration this workspace documented and could not run. The
+        // charge point is commanded over Modbus and read over EEBUS EVCC/EVSOC —
+        // whether there is a car on the cable and how full it is — and until the
+        // rule was two-per-role rather than one-per-asset, `eebus-ev` could not
+        // be registered on any household at all: alone it failed
+        // `CannotCommand`, and beside its Modbus driver it failed `Duplicate`.
+        let s = site();
+        let mut r = Registry::new();
+        r.register(mute("wallbox", DriverCapabilities::commanding()), &s)
+            .expect("the one that drives it");
+        r.register(mute("wallbox", DriverCapabilities::meter()), &s)
+            .expect("and the one that watches it");
+        r.register(mute("netzanschluss", DriverCapabilities::grid()), &s)
+            .expect("a § 14a household needs something that hears the operator");
+        r.validate(&s, NOW)
+            .expect("a commanded and watched wallbox is a well-driven wallbox");
+        assert_eq!(r.len(), 3, "and both of its drivers are kept, not merged");
+    }
+
+    #[test]
+    fn a_controllable_asset_no_driver_can_command_is_refused() {
         // The check that is worth the most: the arbiter would spend every tick
         // computing a setpoint for this device, the driver would drop it, and
         // nothing anywhere would say so. It is exactly the shape of the defects
         // this workspace keeps finding in itself.
+        //
+        // Asked once the set is complete rather than driver by driver, because
+        // the commanding driver may be the second one registered — judging each
+        // as it arrived refused a perfectly good pair on the strength of the
+        // order somebody listed them in.
+        let s = site();
         let mut r = Registry::new();
+        r.register(mute("wallbox", DriverCapabilities::meter()), &s)
+            .expect("a meter alone is not yet a fault");
+        r.register(mute("netzanschluss", DriverCapabilities::grid()), &s)
+            .expect("and something hears the operator");
         let err = r
-            .register(mute("wallbox", DriverCapabilities::meter()), &site())
-            .expect_err("a meter cannot drive a wallbox");
+            .validate(&s, NOW)
+            .expect_err("nothing can drive the wallbox");
         assert!(matches!(err, RegistryError::CannotCommand(_)), "{err}");
     }
 
@@ -732,11 +1213,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_device_that_notifies_on_change_is_not_silent_while_nothing_changes() {
+        // The defect this capability exists for, and it was live on every
+        // household with a hot-water tank. A subscription delivers a value when
+        // it *changes*; a tank holding 52 °C and a room holding 21 °C change
+        // nothing for hours. Judging them by the age of the last reading dropped
+        // both from `SiteState` ten seconds after every reading — so
+        // `dhw_model` saw no tank and `heat_pump_model` no house, and the two
+        // stores the box had just learned to read were in the plan only in the
+        // moments just after they moved.
+        let s = site();
+        let mut r = Registry::new();
+        let mut driver = Chatty::new(id("warmwasser"));
+        driver.caps = DriverCapabilities::device().on_change();
+        driver.say_temperature(NOW, 52.0);
+        r.register(Box::new(driver), &s).expect("a device driver");
+        let _ = r.drain();
+
+        let hours_later = NOW + Duration::hours(3);
+        let quiet = r.observe(None, hours_later);
+        assert!(
+            quiet.silent.is_empty(),
+            "a tank that has not changed is not a tank nobody can hear"
+        );
+        assert_eq!(
+            quiet
+                .state
+                .asset(&id("warmwasser"))
+                .and_then(|m| m.temperature_c),
+            Some(52.0),
+            "and the plan still has a tank to move"
+        );
+    }
+
+    #[test]
+    fn a_device_that_notifies_on_change_and_has_never_spoken_is_still_silent() {
+        // The other half, and the one the exemption must not swallow: a peer
+        // that connected and said nothing at all is a peer nobody has heard
+        // from. Only a reading that *arrived* is one that can still be true.
+        let s = site();
+        let mut r = Registry::new();
+        let mut driver = Chatty::new(id("warmwasser"));
+        driver.caps = DriverCapabilities::device().on_change();
+        r.register(Box::new(driver), &s).expect("a device driver");
+        let _ = r.drain();
+
+        let quiet = r.observe(None, NOW + Duration::hours(3));
+        assert!(quiet.silent.contains(&id("warmwasser")));
+    }
+
+    #[test]
+    fn a_polled_device_is_still_judged_by_the_age_of_its_reading() {
+        // The exemption is for the drivers whose peers notify them, and for no
+        // others: a SunSpec inverter reads every second, so a reading older than
+        // a few of those means the device stopped answering while its socket
+        // stayed open — which only the timestamp can say.
+        let s = site();
+        let mut r = Registry::new();
+        let mut driver = Chatty::new(id("pv"));
+        driver.say(NOW, Power::from_kw(3.0));
+        r.register(Box::new(driver), &s).expect("a device driver");
+        let _ = r.drain();
+        assert!(
+            r.observe(None, NOW + SILENCE + Duration::seconds(1))
+                .silent
+                .contains(&id("pv"))
+        );
+    }
+
     /// A driver that reports whatever it is told to, so the registry's own
     /// bookkeeping can be tested without a protocol.
     #[derive(Debug)]
     struct Chatty {
         asset: AssetId,
+        caps: DriverCapabilities,
         events: Vec<hems_drv::DriverEvent>,
     }
 
@@ -744,8 +1295,16 @@ mod tests {
         fn new(asset: AssetId) -> Self {
             Self {
                 asset,
+                caps: DriverCapabilities::device(),
                 events: vec![hems_drv::DriverEvent::Link(LinkState::Up)],
             }
+        }
+
+        /// A temperature rather than a power — what a tank and a room report.
+        fn say_temperature(&mut self, at: OffsetDateTime, degrees: f64) {
+            let mut m = Measurement::at(at);
+            m.temperature_c = Some(degrees);
+            self.events.push(hems_drv::DriverEvent::Measured(m));
         }
 
         /// Report `power`, observed at `at`.
@@ -761,7 +1320,7 @@ mod tests {
             &self.asset
         }
         fn capabilities(&self) -> DriverCapabilities {
-            DriverCapabilities::device()
+            self.caps
         }
         fn on_bytes(&mut self, _: &[u8], _: OffsetDateTime) -> Result<(), DriverError> {
             Ok(())

@@ -37,6 +37,33 @@ use hems_service::{Health, Shutdown};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
+/// How often this household has been reduced, and when.
+///
+/// Counted over the box's own `[A1 7.2]` record. Only a **network operator's**
+/// reduction counts: a record opened because the manager was holding *itself* at
+/// its failsafe value is a fact about a lost heartbeat, and reporting it here
+/// would tell a household the operator intervened on a day nobody did.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
+pub struct Exposure {
+    /// How many days of record the figures are drawn from.
+    ///
+    /// The denominator, on the report. A share whose denominator is invisible
+    /// cannot be wrong, which is the lesson the forecast scores learned.
+    pub days_of_record: i64,
+    /// Hours the household was reduced for, over that record.
+    pub hours_reduced: f64,
+    /// The quarter hour of the local day it happens in most often — `None`
+    /// where it has never happened.
+    ///
+    /// The single most useful sentence a household can be told about § 14a:
+    /// *your operator reduces you at teatime, four times in five.*
+    pub busiest_quarter_hour: Option<u32>,
+    /// How often a reduction is in force in that quarter hour, in `[0, 1]`.
+    pub busiest_frequency: f64,
+    /// The ceiling typically commanded there.
+    pub typical_ceiling_kw: Option<f64>,
+}
+
 use crate::config::ControlSettings;
 use crate::drivers::Observed;
 use crate::runtime::transport::Shared;
@@ -56,6 +83,17 @@ pub struct Status {
     pub silent: Vec<AssetId>,
     /// Devices whose available power is a nameplate rather than a reading.
     pub assumed_available: Vec<AssetId>,
+    /// Devices that answered their last setpoint and did not act on it, with
+    /// what they said about it.
+    ///
+    /// The seam this whole loop is otherwise blind at. A driver that reports a
+    /// refusal is easy; a device that acknowledges a write, stores the
+    /// setpoint and never switches it on answers exactly like one that obeyed,
+    /// and the disagreement surfaces hours later as a meter that will not
+    /// match the plan. It is separate from `silent` on purpose: a silent device
+    /// is a network fault, and one of these is a device that has to be
+    /// commanded some other way.
+    pub disobedient: std::collections::BTreeMap<AssetId, String>,
     /// Controllable assets no driver speaks for.
     ///
     /// The arbiter decides a setpoint for each of these on every tick and has
@@ -84,6 +122,21 @@ pub struct Status {
     pub minutes_without_a_plan: i64,
     /// How many ticks took longer than a control period.
     pub overruns: u64,
+    /// How exposed this household is to § 14a control, from its own record.
+    ///
+    /// `None` until the box has looked. It is the household's own question —
+    /// *how often does my operator actually reduce me, and when* — and the box
+    /// is the only thing that can answer it: `[A1 8.4]`'s publication is a
+    /// monthly aggregate per Netzbereich with no timestamps in it, so the only
+    /// window-shaped record of what happened to **this** connection is the
+    /// `[A1 7.2]` evidence the box keeps for two years anyway.
+    ///
+    /// It is reported and **not planned against**, and that is a measurement
+    /// rather than a reservation: planning around it was built, measured on four
+    /// scenarios and removed, because a § 14a reduction lands in the evening
+    /// peak — which is exactly where a dynamic tariff has already told the plan
+    /// not to be (D129).
+    pub exposure: Option<Exposure>,
     /// What the plan in force expects the horizon to cost, euros.
     ///
     /// The plan's own arithmetic, and every term of the objective is a term of
@@ -114,12 +167,16 @@ pub struct Managed {
     pub grid_meter: Option<AssetId>,
     /// The controllable assets no driver speaks for, as found at start-up.
     pub undriven: Vec<AssetId>,
-    /// Which asset the roof is.
-    pub pv: AssetId,
-    /// The storage system, whose own flows MiSpeL counts apart.
-    pub battery: AssetId,
+    /// Which asset the roof is, where the household has one.
+    pub pv: Option<AssetId>,
+    /// The storage system, whose own flows MiSpeL counts apart — where the
+    /// household has one.
+    pub battery: Option<AssetId>,
     /// The charge point, likewise.
-    pub evse: AssetId,
+    pub evse: Option<AssetId>,
+    /// The heat pump, whose draw and room temperature are what identify the
+    /// building — where the household has one and something is measuring it.
+    pub heat_pump: Option<AssetId>,
     /// How the network operator addresses this site, `[A1 4.4]` — which the
     /// evidence record has to state, because the minimum a reduction may not go
     /// below depends on it.
@@ -137,6 +194,12 @@ pub struct Managed {
     /// The forecast that was **acted on**, not a fresh one: a score of a band
     /// nobody planned against says nothing about the plan (D117).
     pub bands: Arc<tokio::sync::RwLock<crate::runtime::day::PublishedBands>>,
+    /// The outdoor temperature the plan was made against, by slot.
+    ///
+    /// The house is learned from it. Same argument as `modelled_pv`: a loop
+    /// that fetched its own weather on the slot boundary would identify the
+    /// building against one series and plan it against another.
+    pub outdoor: Arc<tokio::sync::RwLock<BTreeMap<Slot, f64>>>,
 }
 
 /// The state this loop shares with the rest of the box.
@@ -208,6 +271,8 @@ pub async fn run(
     let started = OffsetDateTime::now_utc();
 
     let mut carried = Carried {
+        exposure: None,
+        exposure_at: None,
         previous: BTreeMap::new(),
         phases: BTreeMap::new(),
         delivered: BTreeMap::new(),
@@ -218,16 +283,23 @@ pub async fn run(
         // "nobody was looking" (D116).
         unplanned: crate::runtime::day::Unplanned::resumed(),
         clipping: crate::runtime::day::Clipping::default(),
+        feed_in: crate::runtime::day::FeedIn::default(),
         scored: crate::runtime::day::Scored::default(),
         overruns: 0,
         pv_wh: 0.0,
         pv_samples: 0,
         load_wh: 0.0,
+        indoor_c_sum: 0.0,
+        indoor_samples: 0,
+        outdoor_c_sum: 0.0,
+        outdoor_samples: 0,
+        heat_pump_wh: 0.0,
         samples: 0,
         grid_draw_wh: 0.0,
         grid_feed_wh: 0.0,
         device_draw_wh: 0.0,
         device_feed_wh: 0.0,
+        failsafe: None,
         evidence: hems_grid::evidence::EvidenceRecorder::new(),
     };
 
@@ -274,20 +346,44 @@ pub async fn run(
                 "a control tick took longer than its period"
             );
         }
+        report_health(&health, &screen, silent, now);
         *status.lock().await = screen;
+    }
+}
 
-        // Liveness is the loop; readiness is whether the house is actually being
-        // measured. A box whose every driver is silent is running perfectly and
-        // managing nothing, and a probe that could not tell those apart would be
-        // a probe nobody should route on.
-        if silent == 0 {
-            health.good("drivers", now);
-        } else {
-            health.bad(
-                "drivers",
-                format!("{silent} of the configured devices are not being heard from"),
-            );
-        }
+/// Say whether the box is managing the house, in the two ways it can fail to.
+///
+/// Liveness is the loop; readiness is whether the house is actually being
+/// measured and actually obeying. A box whose every driver is silent is running
+/// perfectly and managing nothing, and a probe that could not tell those apart
+/// is a probe nobody should route on.
+///
+/// They are **two** checks because they are two faults with two remedies. A
+/// silent device is not being heard from and that is a network problem; a
+/// disobedient one is answering its socket perfectly well and not doing what it
+/// is told, which is a device that has to be commanded some other way. Reporting
+/// the second as the first sends an installer to the wrong end of the house.
+/// Nor does the second flap: a device that stops answering goes stale and is
+/// counted as silent instead.
+fn report_health(health: &Health, screen: &Status, silent: usize, now: OffsetDateTime) {
+    if silent == 0 {
+        health.good("drivers", now);
+    } else {
+        health.bad(
+            "drivers",
+            format!("{silent} of the configured devices are not being heard from"),
+        );
+    }
+
+    if screen.disobedient.is_empty() {
+        health.good("commands", now);
+    } else {
+        let refusing: Vec<String> = screen
+            .disobedient
+            .iter()
+            .map(|(asset, why)| format!("{asset}: {why}"))
+            .collect();
+        health.bad("commands", refusing.join("; "));
     }
 }
 
@@ -391,9 +487,10 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
     let Some(load) = crate::drivers::household_load(observed) else {
         return;
     };
-    let measured_pv = observed
-        .state
-        .asset(&managed.pv)
+    let measured_pv = managed
+        .pv
+        .as_ref()
+        .and_then(|pv| observed.state.asset(pv))
         .and_then(|m| m.power)
         .map(Power::outflow);
     let pv = measured_pv.unwrap_or(Power::ZERO);
@@ -407,6 +504,30 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
     carried.load_wh += load.get() * hours;
     carried.samples += 1;
 
+    // The house itself, where something measures it. Its own reading rather than
+    // the household's: the identification needs the heat that went into *this*
+    // building, and the rest of the load is not it.
+    if let Some(measured) = managed
+        .heat_pump
+        .as_ref()
+        .and_then(|id| observed.state.asset(id))
+    {
+        if let Some(indoor_c) = measured.temperature_c {
+            carried.indoor_c_sum += indoor_c;
+            carried.indoor_samples += 1;
+        }
+        // The weather at *this* building, where the unit has its own sensor —
+        // which a heat pump nearly always does, because its defrost logic runs
+        // on nothing else.
+        if let Some(outdoor_c) = measured.outdoor_c {
+            carried.outdoor_c_sum += outdoor_c;
+            carried.outdoor_samples += 1;
+        }
+        if let Some(power) = measured.power {
+            carried.heat_pump_wh += power.inflow().get() * hours;
+        }
+    }
+
     // …and the four registers a settlement is computed from. The connection
     // point in both directions, and what the storage system and the charge
     // point drew and gave — `Z1NB¼`, `Z1NE¼`, `Z2V¼`, `Z2E¼`.
@@ -414,7 +535,7 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
         carried.grid_draw_wh += grid.inflow().get() * hours;
         carried.grid_feed_wh += grid.outflow().get() * hours;
     }
-    for asset in [&managed.battery, &managed.evse] {
+    for asset in [&managed.battery, &managed.evse].into_iter().flatten() {
         let Some(p) = observed.state.asset(asset).and_then(|m| m.power) else {
             continue;
         };
@@ -460,9 +581,11 @@ async fn close_the_day(
     carried.local_day = today;
     let unplanned = carried.unplanned;
     let clipping = carried.clipping;
+    let feed_in = carried.feed_in;
     let scored = carried.scored.clone();
     carried.unplanned.roll();
     carried.clipping.roll();
+    carried.feed_in.roll();
     carried.scored.roll();
 
     let Some(store) = store else {
@@ -474,7 +597,9 @@ async fn close_the_day(
 
     let site = managed.site.id.to_string();
     let mut guard = store.lock().await;
-    let built = crate::runtime::day::kpis(&guard, &site, finished, unplanned, clipping, &scored);
+    let built = crate::runtime::day::kpis(
+        &guard, &site, finished, unplanned, clipping, feed_in, &scored,
+    );
     match built {
         Ok(Some(day)) => {
             let event = hems_events::Event::new(
@@ -594,6 +719,11 @@ async fn teach(
     carried: &mut Carried,
     period: std::time::Duration,
 ) {
+    // The house first, because it is the one of the three that survives a
+    // silent grid meter. A household whose meter dropped out for a quarter hour
+    // still has a room that got warmer, and the building is identified from
+    // that and not from the connection point.
+    teach_the_house(managed, learned, carried, period).await;
     if carried.samples == 0 {
         return;
     }
@@ -634,8 +764,166 @@ async fn teach(
         .observe(published.get(&carried.delivered_slot), pv, load.get());
 }
 
+/// Send what the arbiter decided to the drivers that speak for each asset.
+///
+/// A command that fails is loud, because a command nobody sends and nobody
+/// reports is how a device quietly stops being managed — and under a § 14a
+/// reduction it is how a household quietly stops complying.
+///
+/// With one exception, and it is the difference between a fault and a fact.
+/// `NoDriver` says this asset has no driver, which is equally true on every
+/// tick; it is named once at start-up and counted on the status surface, so a
+/// partially commissioned box does not write one line per asset per second and
+/// bury the real fault inside it.
+async fn deliver(
+    registry: &Shared,
+    setpoints: &[hems_core::prelude::Setpoint],
+    now: OffsetDateTime,
+) {
+    let mut guard = registry.lock().await;
+    for setpoint in setpoints {
+        if let Err(error) = guard.command(setpoint, now)
+            && !matches!(error, hems_drv::DriverError::NoDriver(_))
+        {
+            tracing::warn!(
+                asset = %setpoint.asset,
+                reason = ?setpoint.reason,
+                %error,
+                "a setpoint could not be delivered"
+            );
+        }
+    }
+}
+
+/// Write down a failsafe the network operator has changed.
+///
+/// The one value in the § 14a exchange that has to outlive the process: it is
+/// what restrains the household when there is no session at all, so a box that
+/// held it only in memory would come back from a power cut on its own
+/// configuration file and quietly undo the operator's write. That is
+/// `ATC_LPC_COM_PT_CSInit_003` failed, and a house held to the wrong number with
+/// nobody talking to it.
+///
+/// Written on **change** rather than every tick, because a tick is a second and
+/// this store is an SD card.
+async fn keep_the_failsafe(
+    reported: Option<hems_drv::Failsafe>,
+    carried: &mut Carried,
+    store: Option<&Arc<Mutex<crate::store::Store>>>,
+) {
+    let Some(failsafe) = reported else {
+        return;
+    };
+    if carried.failsafe == Some(failsafe) {
+        return;
+    }
+    carried.failsafe = Some(failsafe);
+    let Some(store) = store else {
+        return;
+    };
+    let kept = crate::store::StoredFailsafe {
+        watts: failsafe.power.get(),
+        minimum_s: failsafe.minimum.whole_seconds(),
+    };
+    if let Err(error) = store.lock().await.put_eebus_failsafe(
+        crate::runtime::FAILSAFE_CONSUMPTION,
+        &kept,
+        failsafe.at,
+    ) {
+        // Loud, and not fatal. The value is in force either way — the driver is
+        // holding it — and what has been lost is the next reboot, which is worth
+        // a warning rather than stopping a box that is controlling a house.
+        tracing::error!(%error, "the operator's failsafe could not be written down");
+    } else {
+        tracing::info!(
+            watts = failsafe.power.get(),
+            seconds = failsafe.minimum.whole_seconds(),
+            "the network operator changed this household's failsafe"
+        );
+    }
+}
+
+/// How cold it was outside over the quarter hour just finished.
+///
+/// The appliance's own sensor first, and the forecast only where there is none.
+/// A forecast is for a grid square; the sensor is on the wall of *this*
+/// building, in its own shade and its own wind, and the difference is several
+/// degrees on the days it matters — which the fit would otherwise attribute to
+/// the fabric, because heat loss is what the two are told apart by.
+///
+/// `None` where neither exists, and the caller then teaches nothing: a sample
+/// with no outdoor temperature is one whose heat loss is unattributable.
+async fn outdoor_over(managed: &Managed, carried: &Carried) -> Option<f64> {
+    if carried.outdoor_samples > 0 {
+        return Some(carried.outdoor_c_sum / f64::from(carried.outdoor_samples));
+    }
+    managed
+        .outdoor
+        .read()
+        .await
+        .get(&carried.delivered_slot)
+        .copied()
+}
+
+/// One quarter hour of the building, where the box can see one.
+///
+/// Three things that arrive together or not at all: how warm it was inside, how
+/// warm outside, and how much heat went in. A household with no room sensor has
+/// none of them and teaches nothing — which leaves the planner on the documented
+/// prior, and is the right answer rather than a gap.
+///
+/// The heat is **thermal**: the meter reads electrical watts and the house
+/// receives them multiplied by the coefficient of performance, so a record fed
+/// the meter reading would identify a building three times as leaky as the real
+/// one. The coefficient is taken at the slot's own outdoor temperature, from the
+/// series the plan was made against.
+async fn teach_the_house(
+    managed: &Managed,
+    learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
+    carried: &Carried,
+    period: std::time::Duration,
+) {
+    if carried.indoor_samples == 0 {
+        return;
+    }
+    let Some(id) = managed.heat_pump.as_ref() else {
+        return;
+    };
+    let Some(hems_core::prelude::Asset::HeatPump(hp)) = managed.site.asset(id) else {
+        return;
+    };
+    // The appliance's own sensor first, and the forecast only where there is
+    // none. A forecast is for a grid square; the sensor is on the wall of this
+    // building, in its own shade and its own wind, and the difference is several
+    // degrees on the days it matters — which the fit would otherwise attribute
+    // to the fabric, since heat loss is what the two are told apart by.
+    let Some(outdoor_c) = outdoor_over(managed, carried).await else {
+        return;
+    };
+    let indoor_c = carried.indoor_c_sum / f64::from(carried.indoor_samples);
+    // The mean over what was actually observed, like the load teacher: a box
+    // restarted mid-slot saw a fraction of it.
+    let covered_hours = f64::from(carried.indoor_samples) * period.as_secs_f64() / 3600.0;
+    if covered_hours <= 0.0 {
+        return;
+    }
+    let heat_kw = carried.heat_pump_wh / covered_hours / 1000.0 * hp.cop.at(outdoor_c);
+    learned
+        .lock()
+        .await
+        .observe_house(carried.delivered_slot, indoor_c, outdoor_c, heat_kw);
+}
+
 /// What one tick hands to the next.
 struct Carried {
+    /// How exposed this household is to § 14a control, refreshed slowly.
+    ///
+    /// A summary of up to two years of record, and a tick is a second, so it is
+    /// carried rather than recomputed — see [`Exposure`] and
+    /// [`Carried::refresh_exposure`].
+    exposure: Option<Exposure>,
+    /// When it was last built.
+    exposure_at: Option<OffsetDateTime>,
     /// What every asset was told last tick, for ramping and the deadband.
     previous: BTreeMap<AssetId, Power>,
     /// The conductor policy for each switchable charge point.
@@ -650,6 +938,8 @@ struct Carried {
     unplanned: crate::runtime::day::Unplanned,
     /// What the hardware would not take today.
     clipping: crate::runtime::day::Clipping,
+    /// The furthest the connection point went over its § 9 EEG ceiling today.
+    feed_in: crate::runtime::day::FeedIn,
     /// How today's forecasts have scored against what actually happened.
     scored: crate::runtime::day::Scored,
     /// How many ticks have overrun their period.
@@ -662,6 +952,28 @@ struct Carried {
     pv_samples: usize,
     /// The household's own load over the same, watt-hours.
     load_wh: f64,
+    /// Indoor temperature summed over the quarter hour, °C, and how many ticks
+    /// of it there were.
+    ///
+    /// Kept apart from `samples` for the same reason `pv_samples` is: a house
+    /// with no room sensor is not a house at 0 °C, and the building learns
+    /// nothing from a quarter hour rather than the wrong thing.
+    indoor_c_sum: f64,
+    indoor_samples: u32,
+    /// The same for the outdoor temperature, where the appliance measures one.
+    ///
+    /// Kept apart from the forecast the plan was made against, and preferred
+    /// over it when the building is taught: a forecast is for a grid square and
+    /// this is the wall of one house. The **plan** still uses the forecast,
+    /// because the future cannot be measured.
+    outdoor_c_sum: f64,
+    outdoor_samples: u32,
+    /// What the heat pump drew over the same, watt-hours **electrical**.
+    ///
+    /// Electrical here and thermal at the slot boundary: the conversion needs
+    /// the coefficient of performance at the slot's outdoor temperature, and
+    /// that is not known until the planner has published the slot's weather.
+    heat_pump_wh: f64,
     /// How many ticks contributed to those two.
     samples: u32,
     /// The quarter hour's metered flows, watt-hours, in the four registers
@@ -675,12 +987,110 @@ struct Carried {
     grid_feed_wh: f64,
     device_draw_wh: f64,
     device_feed_wh: f64,
+    /// The failsafe last written down, so an unchanged one is not rewritten.
+    failsafe: Option<hems_drv::Failsafe>,
     /// The § 14a record, built as the loop runs.
     ///
     /// `[A1 7.2]` is a document about what a household *did* while a reduction
     /// was in force, and the only place that can be built is here: a record
     /// reconstructed afterwards from logs that were never kept is not a record.
     evidence: hems_grid::evidence::EvidenceRecorder,
+}
+
+impl Carried {
+    /// How far back the exposure figure looks.
+    ///
+    /// Ninety days, and the figure comes from the Festlegung's own publication
+    /// rules rather than from taste: the BDEW format for `[A1 8.4]` notes that a
+    /// SteuVE's assignment to a Netzbereich can change, and that a change
+    /// lasting **more than three months** has to be made transparent to the
+    /// plant's operator. About that length is therefore the longest window over
+    /// which "my area behaves like this" is a statement about *one* area.
+    const EXPOSURE_LOOKBACK: time::Duration = time::Duration::days(90);
+
+    /// How often it is rebuilt.
+    ///
+    /// Six hours. A household's control events change a few times a day at
+    /// most, so rebuilding it on every tick would read the same few hundred
+    /// rows eighty-six thousand times a day to reach the same answer.
+    const EXPOSURE_REFRESH: time::Duration = time::Duration::hours(6);
+
+    /// Rebuild the § 14a exposure figure from the box's own record.
+    ///
+    /// Rebuilt rather than accumulated, and that is the point: the `[A1 7.2]`
+    /// events are already kept for two years because the Festlegung requires
+    /// it, so a second copy counted tick by tick would be a thing that can
+    /// disagree with the record it came from.
+    async fn refresh_exposure(
+        &mut self,
+        store: Option<&Arc<Mutex<crate::store::Store>>>,
+        learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
+        now: OffsetDateTime,
+    ) {
+        let Some(store) = store else { return };
+        if self
+            .exposure_at
+            .is_some_and(|at| now - at < Self::EXPOSURE_REFRESH)
+        {
+            return;
+        }
+        let from = now - Self::EXPOSURE_LOOKBACK;
+        let events = match store.lock().await.control_events_between(from, now) {
+            Ok(events) => events,
+            Err(error) => {
+                tracing::warn!(%error, "the § 14a exposure figure could not be rebuilt");
+                return;
+            }
+        };
+        // The Bundesland the profile buckets by is the one the load profile is
+        // already configured with — two spellings of "which holidays count
+        // here" would be two things that can disagree about Fronleichnam.
+        let land = learned.lock().await.load.land;
+        let mut profile = hems_grid::stress::StressProfile::new(land);
+        let seen: Vec<_> = events.into_iter().map(|e| e.event).collect();
+        // The window is the **denominator** and only this layer knows it: every
+        // quarter hour of it that no event covers is one the household was not
+        // reduced in. A box that was off for part of it therefore reports
+        // *less* exposure than it had, which is the safe direction for a figure
+        // a household reads.
+        profile.observe((from, now), &seen);
+
+        let busiest = profile.busiest();
+        self.exposure = Some(Exposure {
+            days_of_record: Self::EXPOSURE_LOOKBACK.whole_days(),
+            hours_reduced: profile.hours_reduced(),
+            busiest_quarter_hour: busiest.map(|b| b.index),
+            busiest_frequency: busiest.map_or(0.0, |b| b.frequency),
+            typical_ceiling_kw: busiest.and_then(|b| b.ceiling).map(Power::kw),
+        });
+        self.exposure_at = Some(now);
+    }
+}
+
+/// Record how far the connection point went over its § 9 EEG ceiling.
+///
+/// The guard derives that ceiling from the site on every tick — § 9 Abs. 2
+/// applies to the plant by force of law rather than arriving on a wire — so this
+/// asks it the same question and compares the answer with what the meter
+/// actually saw.
+///
+/// § 14a is kept as *events*, because an instruction has a beginning and an end
+/// and `[A1 7.2]` asks for a record of it. § 9 Abs. 2 has no event to open, so
+/// there was nothing for a day report to be built from and the fleet's answer
+/// about one of the two statutory limits on this connection point was silence.
+fn watch_feed_in(managed: &Managed, carried: &mut Carried, observed: &Observed) {
+    let Some(grid) = observed.state.grid.and_then(|m| m.power) else {
+        return;
+    };
+    carried.feed_in.tick(
+        grid.outflow(),
+        hems_grid::para9::site_feed_in_ceiling(
+            &managed.site,
+            observed.limits.mgcp_factor,
+            observed.limits.feed_in_ceiling,
+        )
+        .map(|(power, _)| power),
+    );
 }
 
 /// One turn of the loop: drain the drivers, decide, command, account.
@@ -717,6 +1127,11 @@ async fn tick(
         carried.pv_wh = 0.0;
         carried.pv_samples = 0;
         carried.load_wh = 0.0;
+        carried.indoor_c_sum = 0.0;
+        carried.indoor_samples = 0;
+        carried.outdoor_c_sum = 0.0;
+        carried.outdoor_samples = 0;
+        carried.heat_pump_wh = 0.0;
         carried.grid_draw_wh = 0.0;
         carried.grid_feed_wh = 0.0;
         carried.device_draw_wh = 0.0;
@@ -734,7 +1149,7 @@ async fn tick(
     );
 
     // ── 1. What the drivers said ────────────────────────────────────────────
-    let observed: Observed = {
+    let (observed, failsafe): (Observed, _) = {
         let mut guard = registry.lock().await;
         // Taken rather than merely folded: the § 14a evidence record is built
         // from exactly these, and an event nobody journals is a control action
@@ -742,12 +1157,17 @@ async fn tick(
         for (asset, event) in guard.drain() {
             tracing::debug!(%asset, ?event, "a driver reported");
         }
+        let failsafe = guard
+            .failsafe()
+            .get(&hems_drv::LimitDirection::Consumption)
+            .copied();
         // The connection point is named rather than guessed: `[A1 2.3]` is
         // measured *there*, and a registry that had to work out which of its
         // meters was the grid one would be inferring the most important fact in
         // the system from an asset kind.
-        guard.observe(managed.grid_meter.as_ref(), now)
+        (guard.observe(managed.grid_meter.as_ref(), now), failsafe)
     };
+    keep_the_failsafe(failsafe, carried, store).await;
 
     // ── 2. The decision ─────────────────────────────────────────────────────
     let decision = arbiter.tick(Tick {
@@ -768,31 +1188,7 @@ async fn tick(
     });
 
     // ── 3. Back to the hardware ─────────────────────────────────────────────
-    {
-        let mut guard = registry.lock().await;
-        for setpoint in &decision.setpoints {
-            // A command that fails is loud, because a command nobody sends and
-            // nobody reports is how a device quietly stops being managed — and
-            // under a § 14a reduction it is how a household quietly stops
-            // complying.
-            //
-            // With one exception, and it is the difference between a fault and a
-            // fact. `NoDriver` says this asset has no driver, which is equally
-            // true on every tick; it is named once at start-up and counted on
-            // the status surface, so a partially commissioned box does not write
-            // one line per asset per second and bury the real fault inside it.
-            if let Err(error) = guard.command(setpoint, now)
-                && !matches!(error, hems_drv::DriverError::NoDriver(_))
-            {
-                tracing::warn!(
-                    asset = %setpoint.asset,
-                    reason = ?setpoint.reason,
-                    %error,
-                    "a setpoint could not be delivered"
-                );
-            }
-        }
-    }
+    deliver(registry, &decision.setpoints, now).await;
 
     // The energy each asset has moved since the slot began, which is what turns
     // a plan into a commitment. Accumulated from what was *commanded* rather
@@ -818,6 +1214,9 @@ async fn tick(
         u32::try_from(period.as_secs()).unwrap_or(u32::MAX),
     );
 
+    // …and whether the § 9 EEG ceiling held.
+    watch_feed_in(managed, carried, &observed);
+
     // ── 4. The record `[A1 7.2]` asks for ──────────────────────────────────
     //
     // Built as the loop runs, because a record reconstructed afterwards from
@@ -835,6 +1234,7 @@ async fn tick(
     // this tick, and nothing is invented: a house nobody measured did not use
     // nothing.
     meter(managed, carried, &observed, seconds);
+    carried.refresh_exposure(store, learned, now).await;
 
     carried.previous.clone_from(&decision.commanded);
     carried.phases.clone_from(&decision.phases);
@@ -843,9 +1243,14 @@ async fn tick(
     (
         Status {
             at: Some(now),
+            // Carried rather than recomputed: the exposure is a summary of two
+            // years of record and a tick is a second. `Carried::exposure` is
+            // refreshed on its own slow cadence.
+            exposure: carried.exposure.clone(),
             commanded: decision.commanded,
             silent: observed.silent.iter().cloned().collect(),
             assumed_available: observed.assumed_available.iter().cloned().collect(),
+            disobedient: observed.disobedient.clone(),
             undriven: managed.undriven.clone(),
             steuve_ceiling: observed.limits.steuve_ceiling,
             steuve_budget: decision.verdict.steuve_budget,

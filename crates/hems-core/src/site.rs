@@ -38,9 +38,16 @@ pub struct GridConnection {
     /// The Netzbereich the operator has assigned the connection to.
     ///
     /// `[BK6-22-300 A1 8.2.b]` requires the operator to tell the customer which
-    /// one it is, and `[A1 8.4]` requires a monthly machine-readable list of
-    /// control actions per area. Knowing the area is what lets the planner
-    /// anticipate where and when reductions cluster.
+    /// one it is, and `[A1 8.4]` publishes a monthly aggregate per area. It is
+    /// what lets a household find *its own row* in that publication — and
+    /// nothing more than that: the publication carries no timestamps, so it
+    /// cannot say when a reduction will come, and the planner does not try to
+    /// anticipate one (D129). What this household actually saw is its own
+    /// `[A1 7.2]` record, which `hems_grid::stress` reads.
+    ///
+    /// Unread today, with `malo`, `melo` and `dso_code`: they are the
+    /// identifiers a Marktkommunikation message is addressed with, and that
+    /// bridge is unbuilt.
     #[cfg_attr(feature = "serde", serde(default))]
     pub netzbereich: Option<String>,
     /// The main fuse rating per outer conductor.

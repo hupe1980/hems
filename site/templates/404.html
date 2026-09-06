@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+
+{#- A 404 keeps the site's chrome, so a reader who mistyped a URL can still
+    navigate — and tells a crawler not to index it, which the inherited
+    `index, follow` would otherwise do to every wrong link on the internet. -#}
+{% block robots %}<meta name="robots" content="noindex, follow">{% endblock %}
+
+{% block content %}
+<div class="docs-shell">
+  <article>
+    <h1>That page is not here</h1>
+    <p class="lead">The link may be old, or the page may have been renamed.</p>
+    <p>
+      The <a href="{{ get_url(path='@/docs/_index.md') }}">documentation index</a>
+      lists every page in the order they build on each other, and
+      <a href="{{ get_url(path='@/docs/getting-started.md') }}">getting started</a>
+      is the one to read first. The
+      <a href="{{ config.extra.repository }}" rel="noopener">source</a> is the
+      other place to look.
+    </p>
+  </article>
+</div>
+{% endblock %}

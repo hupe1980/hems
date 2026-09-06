@@ -25,7 +25,7 @@ enum Command {
         day: Day,
         /// How many weathers to run it under.
         ///
-        /// Small on purpose: three futures cost seven times the solve, so this
+        /// Small on purpose: three futures cost five to seven times the solve, so this
         /// is minutes rather than seconds. Enough to see a sign, not enough to
         /// quote a figure.
         #[arg(long, default_value_t = 4)]
@@ -120,6 +120,26 @@ enum Command {
         /// How the planner treats the fact that its forecasts are wrong.
         #[arg(long, value_enum, default_value_t = Risk::Median)]
         risk: Risk,
+        /// Price carbon dioxide at this many euros per kilogram, so the plan
+        /// prefers the hours the grid is clean and not only the hours it is
+        /// cheap.
+        ///
+        /// Zero — the default — is the plain economic plan. 55 €/t, the German
+        /// price for heating and transport fuels, is `0.055`. The intensity
+        /// itself comes from the price stack, so what this buys is a plan that
+        /// moves load towards clean hours and a figure for what that cost.
+        #[arg(long)]
+        co2_eur_per_kg: Option<f64>,
+        /// Pay this many euros per kilowatt-hour to avoid taking one from the
+        /// grid at all — the self-sufficiency dial.
+        ///
+        /// It is honest about its price: near the day's spread it makes the plan
+        /// prefer its own roof even where importing would be marginally
+        /// cheaper, and the difference is what independence cost. Somebody who
+        /// bought a battery for autarky wants exactly that, and it belongs in
+        /// the objective rather than in a marketing figure.
+        #[arg(long)]
+        autarky_eur_per_kwh: Option<f64>,
         /// Give every asset the same allocation weight.
         ///
         /// Without per-asset shadow prices the guard's *weighted* max-min
@@ -200,10 +220,7 @@ impl Risk {
     fn model(self) -> hems_optimizer::Risk {
         match self {
             Risk::Median | Risk::Adaptive => hems_optimizer::Risk::deterministic(),
-            Risk::Expected => hems_optimizer::Risk {
-                cvar_weight: 0.0,
-                ..hems_optimizer::Risk::hedged()
-            },
+            Risk::Expected => hems_optimizer::Risk::expected(),
             Risk::Hedged => hems_optimizer::Risk::hedged(),
         }
     }
@@ -264,7 +281,11 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
 
     if check {
         let now = time::OffsetDateTime::now_utc();
-        let running = hemsd::runtime::assemble(&settings, now)?;
+        // No store: `run --check` validates the *configuration*, and reaching
+        // into the box's record would make the answer depend on what an
+        // operator happened to have written — which is exactly the thing the
+        // installer is not checking here.
+        let running = hemsd::runtime::assemble(&settings, None, now)?;
         // The SKI, printed rather than only logged: it is what an installer has
         // to give the metering point operator before a Steuerbox can be told to
         // trust this box, and it is the step field reports say goes wrong most
@@ -277,7 +298,7 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
                 ))),
                 None => None,
             };
-            let (_, ski) =
+            let (_, ski, _key) =
                 hemsd::runtime::ship::identity(&settings.ship, store.as_ref(), now).await?;
             println!("🔑 SKI  {}", ski.to_display_string());
             println!("   give this to the metering point operator, so the Steuerbox trusts it");
@@ -342,6 +363,7 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
             site,
             running.ski,
             running.overrides,
+            running.trust,
         )),
     )
     .run_until(signal)
@@ -376,6 +398,8 @@ async fn main() -> anyhow::Result<()> {
             perfect_foresight,
             risk,
             uniform_weights,
+            co2_eur_per_kg,
+            autarky_eur_per_kwh,
             report_to,
             report_secret,
             store,
@@ -383,30 +407,44 @@ async fn main() -> anyhow::Result<()> {
             sharing,
         } => {
             let mut config = HouseholdConfig::default();
-            if let Some(wear) = wear_eur_per_kwh {
-                config.battery_wear_eur_per_kwh = wear;
+            if let (Some(wear), Some(battery)) = (wear_eur_per_kwh, &mut config.battery) {
+                battery.wear_eur_per_kwh = wear;
             }
-            config.evse_switchable = !no_phase_switching;
-            config.heat_pump_modulating = !heat_pump_on_off;
-            if imsys {
+            if let Some(evse) = &mut config.evse {
+                evse.switchable = !no_phase_switching;
+            }
+            if let Some(heat_pump) = &mut config.heat_pump {
+                heat_pump.modulating = !heat_pump_on_off;
+            }
+            if imsys && let Some(pv) = &mut config.pv {
                 // The network operator's first successful Ansteuerbarkeit test
                 // — which is what § 9 Abs. 2 EEG actually waits for, and the
                 // only thing this flag changes. The intelligent metering system
                 // itself has been in since 2024 on both sides of the comparison,
                 // so § 51's negative quarter hours are held constant and what
                 // moves is the 60 % cap alone.
-                config.para9.relief = hems_core::prelude::CapRelief::ImsysWithControl;
+                pv.para9.relief = hems_core::prelude::CapRelief::ImsysWithControl;
             }
             let mut scenario = scenario_for(day, config);
             if perfect_foresight {
                 scenario.weather = hemsd::WeatherSpec::PERFECT;
             }
             scenario.per_asset_weights = !uniform_weights;
+            if let Some(price) = co2_eur_per_kg {
+                scenario.objective = scenario.objective.with_carbon_price(price);
+            }
+            if let Some(premium) = autarky_eur_per_kwh {
+                scenario.objective = scenario.objective.with_autarky_premium(premium);
+            }
             if sharing {
                 // Three roofs' worth of neighbours on the same street: the
                 // household's own array times three, an equal third of the key.
                 scenario.community = Some(hemsd::CommunityMembership::mehrfamilienhaus(
-                    scenario.config.pv_kwp * 3.0,
+                    scenario
+                        .config
+                        .pv
+                        .map_or(hems_core::prelude::Power::ZERO, |pv| pv.kwp)
+                        * 3.0,
                 ));
             }
             scenario.risk = risk.model();
@@ -987,6 +1025,27 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         "commands the hardware clipped",
         format!("{} ticks ({:.2} kWh)", r.clipped_ticks, r.clipped_kwh),
     );
+    // The § 51 EEG hours the day contained, and the carbon behind what the
+    // household drew. Both are numbers the objective's own terms owe a day
+    // (R20): § 51 is applied per slot inside the price stack and no day used to
+    // say whether it had bound, and the carbon term could be priced with
+    // nothing reporting its effect. The intensity is the *import-weighted* one
+    // rather than the grid's average, because moving load from the evening ramp
+    // into the middle of the day changes the first and leaves the second alone.
+    row(
+        "quarter hours § 51 EEG zeroed",
+        format!("{}", r.para51_hours),
+    );
+    if r.imported_co2_kg > 0.0 {
+        row(
+            "carbon behind the imports",
+            format!(
+                "{:.1} kg ({:.0} g/kWh)",
+                r.imported_co2_kg,
+                r.imported_co2_kg / r.imported_kwh.max(1e-9) * 1000.0
+            ),
+        );
+    }
     // What the plan that opened the day thought the day would cost, against what
     // it did. The seam between a forecast and a meter, in the currency everything
     // else in this report is in — and structurally zero for as long as the
@@ -1016,13 +1075,35 @@ fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
         format!("{} min", r.failsafe_minutes),
     );
     row(
-        "limit respected throughout",
+        "§ 14a limit respected",
         if r.grid_event_respected {
             "yes".to_string()
         } else {
             format!("NO, by {:.0} W", r.worst_overshoot_w)
         },
     );
+    // § 9 EEG is the other statutory limit on this connection point and it used
+    // to have no line of its own: the peak feed-in was printed beside its
+    // ceiling and left for the reader to compare, and it sat above it while the
+    // § 14a line said the day had been compliant throughout. Two rules, two
+    // answers.
+    if r.feed_in_ceiling_kw.is_some() {
+        row(
+            "§ 9 EEG ceiling respected",
+            if r.worst_feed_in_overshoot_w <= 0.0 {
+                "yes".to_string()
+            } else {
+                // Named for what it is: the connection point crossed the
+                // ceiling between two runs of the guard, which is the control
+                // period rather than a decision. A real box ticks once a
+                // second; this day ticks once a minute.
+                format!(
+                    "{:.0} W for {} min, one control period behind a load step",
+                    r.worst_feed_in_overshoot_w, r.feed_in_over_minutes
+                )
+            },
+        );
+    }
     println!();
     if r.risk_re_solves > 0 {
         row(

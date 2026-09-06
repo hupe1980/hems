@@ -11,6 +11,7 @@ rust-version.workspace = true
 
 [dependencies]
 hems-core    = { workspace = true }
+hems-grid    = { workspace = true, features = ["serde"] }
 hems-service = { workspace = true }
 http          = { workspace = true }
 rmcp         = { workspace = true }

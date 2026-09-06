@@ -1,6 +1,6 @@
 base_url = "https://hupe1980.github.io/hems"
 title = "hems"
-description = "The open-source home energy management platform for the German market: § 14a EnWG, § 9 EEG, MiSpeL and Modul 3 as executable, cited rules; a guard the optimiser cannot argue with; EEBUS and S2 native; written in Rust."
+description = "Open-source home energy management for the German grid: § 14a EnWG, § 9 EEG, MiSpeL and Modul 3 as executable, cited rules. EEBUS and S2 native, in Rust."
 default_language = "en"
 compile_sass = false
 build_search_index = true
@@ -35,8 +35,8 @@ tagline    = "open-source home energy management for the German grid"
 # that changing one is a one-line diff against the thing that produced it:
 # `cargo xtask check-citations`, `cargo test --workspace --all-features`, the
 # `just purity` crate list, `just demo-all`, and `ControlSettings::horizon_slots`.
-stat_rules   = "378"
-stat_tests   = "869"
+stat_rules   = "459"
+stat_tests   = "1019"
 stat_crates  = "10"
 stat_days    = "7"
 stat_horizon = "192"

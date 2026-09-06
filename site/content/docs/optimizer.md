@@ -77,7 +77,7 @@ minimising, in euros throughout,
   − terminal value of what is left in the battery, the building and the tank
 ```
 
-## Fifteen decisions worth explaining
+## Sixteen decisions worth explaining
 
 ### Battery wear is a cost, not a constraint
 
@@ -119,6 +119,26 @@ So hems declares a direction binary, big-Ms taken from what the household could
 draw and what the roof and the battery could deliver, **only in the slots where
 the price could pay for the round trip** — no slots at all on a modern feed-in
 tariff, which is the economy the MILP-HEMS literature uses.
+
+### "Never charged from the grid" is a disjunction, not an inequality
+
+A household on MiSpeL's **Ausschließlichkeitsoption** has promised that no grid
+electricity ever enters its store — the option that keeps every kilowatt-hour
+through it green and needs no separation arithmetic at all. The Festlegung
+measures the promise as `(1)¼ = MIN[Z1NB¼ ; Z2V¼]`: import and charging in the
+same quarter hour.
+
+The obvious constraint is `b_ch ≤ pv`, and it reads like the same sentence. It is
+not. With a roof making 3 kW, a house drawing 1 kW and a battery taking all 3 it
+holds perfectly — while the meter runs, and every kilowatt-hour in that battery
+is grey. A plan that believed it was honouring the household's claim would have
+spent it.
+
+`min(g_in, b_ch) = 0` is a union of two half-spaces, so no inequality implies it
+and it costs a binary per slot. hems declares one **only** for a battery whose
+household chose the option; every other household gets the model it always had,
+which is what keeps figures measured before this comparable with figures measured
+after it.
 
 ### The § 14a constraint is on the netzwirksamer Leistungsbezug, per slot
 
@@ -323,10 +343,10 @@ $ just risk deadline 20
 ```
 
 Over twenty seeded weathers on each of two days, scenarios **pay where a service
-is at risk** — three futures beat the median on the mean, €2,96 against €2,81,
-and take the undelivered charge from €0,07 to €0,01. They **cost €1,04 a day
+is at risk** — three futures beat the median on the mean, €3,01 against €2,85,
+and take the undelivered charge from €0,07 to €0,01. They **cost €1,03 a day
 where nothing is at risk**. And **no** policy improves the worst day: on the
-ordinary day the hedge takes it from €1,18 to €0,32. So the default is one
+ordinary day the hedge takes it from €1,21 to €0,37. So the default is one
 median.
 
 Every one of those figures moved when the sweep grew from four weathers to
@@ -589,7 +609,7 @@ right conditioning: the arbiter is not going to re-open them either.
 
 The last one answers a different question from the rest — not what a household
 *holds* but what a *limit costs it* — and it is the number this market does not
-have. €3,93/kWh on a household with no store whose car will otherwise leave
+have. €1,20/kWh on a household with no store whose car will otherwise leave
 short; **nothing at all** on the same household with a battery, because the store
 lends the controllable devices all the headroom `[A1 2.3]` allows and the ceiling
 stops binding. A limit that costs a household nothing is a limit nobody should be

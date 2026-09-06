@@ -117,3 +117,46 @@ mod tests {
         assert_eq!(serde_json::from_str::<Tariff>(&json).unwrap(), tariff);
     }
 }
+
+#[cfg(test)]
+mod carbon_wire {
+    /// The carbon curve is a `BTreeMap<Slot, f64>`, and a map **key** is the one
+    /// shape this workspace has already been caught by.
+    ///
+    /// D98's defect was exactly this: a `BTreeMap<(DayType, u32), _>` is
+    /// something JSON cannot express as a key, so the derive compiled, every
+    /// other format accepted it, and the one a box actually stores in failed at
+    /// run time with no symptom but a model that never improved.
+    ///
+    /// `Slot` serialises as a single scalar, so it *is* a valid key — and the
+    /// value is an `f64` rather than a `Decimal`, deliberately: grams per
+    /// kilowatt-hour is a physical estimate nobody is billed on, and P3 puts the
+    /// exact arithmetic where money and a Nachweis are. This asserts both halves
+    /// rather than trusting that the derive compiling means anything.
+    #[test]
+    fn a_tariff_with_a_carbon_curve_survives_json() {
+        use hems_core::prelude::Slot;
+        use rust_decimal::Decimal;
+
+        let now = time::macros::datetime!(2026-06-21 12:00:00 UTC);
+        let mut tariff = crate::tariff::Tariff::fixed(Decimal::new(30, 0), Decimal::new(10, 0));
+        tariff.carbon_g_per_kwh = (0..4)
+            .map(|i| {
+                (
+                    Slot::containing(now + time::Duration::minutes(15 * i)),
+                    300.0 + i as f64,
+                )
+            })
+            .collect();
+
+        let json = serde_json::to_string(&tariff).expect("a tariff serialises");
+        let back: crate::tariff::Tariff =
+            serde_json::from_str(&json).expect("and reads back as itself");
+        assert_eq!(
+            back.carbon_g_per_kwh.len(),
+            4,
+            "a Slot has to be expressible as a JSON key: {json}"
+        );
+        assert_eq!(back, tariff);
+    }
+}

@@ -29,6 +29,8 @@ use serde::Serialize;
 use tokio::sync::Mutex;
 
 use crate::runtime::control::Status;
+use crate::runtime::ship::Trust;
+use time::OffsetDateTime;
 
 /// What the API needs to answer.
 #[derive(Clone)]
@@ -37,6 +39,11 @@ pub struct Local {
     site: String,
     ski: Option<String>,
     overrides: crate::runtime::overrides::Overrides,
+    /// Approving a Steuerbox without restarting the box.
+    ///
+    /// `None` where this household has no EEBUS identity at all, which is a box
+    /// with no § 14a driver and nothing to pair.
+    trust: Option<crate::runtime::ship::Trust>,
 }
 
 impl Local {
@@ -47,12 +54,14 @@ impl Local {
         site: String,
         ski: Option<String>,
         overrides: crate::runtime::overrides::Overrides,
+        trust: Option<crate::runtime::ship::Trust>,
     ) -> Self {
         Self {
             status,
             site,
             ski,
             overrides,
+            trust,
         }
     }
 }
@@ -81,6 +90,16 @@ pub struct StatusBody {
     /// *could* produce is one whose curtailment lifts on an assumption, and a
     /// household is entitled to know which of its devices are in that position.
     pub assumed_available: Vec<String>,
+    /// Devices that answered their last setpoint and did not act on it, with
+    /// what they said about it.
+    ///
+    /// The one fault the box is otherwise blind to. A driver that reports a
+    /// refusal is easy to see; a device that acknowledges the write, stores the
+    /// setpoint and never switches it on answers exactly like one that obeyed,
+    /// and the disagreement only surfaces as a meter that will not match the
+    /// plan. Separate from `silent`, because a silent device is a network fault
+    /// and this one is a device that has to be commanded some other way.
+    pub disobedient: std::collections::BTreeMap<String, String>,
     /// Controllable devices no driver speaks for.
     ///
     /// The first thing to look at when a device is not doing what this page says
@@ -113,12 +132,42 @@ pub struct StatusBody {
     pub plan_baseline_eur: Option<f64>,
     /// How many control ticks took longer than a control period.
     pub overruns: u64,
+    /// How exposed this connection is to § 14a control — `null` until the box
+    /// has any record to draw on.
+    pub exposure: Option<ExposureBody>,
+}
+
+/// How often the operator reduces *this* household, and when.
+///
+/// The question `[A1 8.4]` cannot answer. What the operator publishes is a
+/// monthly aggregate over a whole Netzbereich with no timestamps in it, so the
+/// only record of when this connection was reduced is the one the box keeps for
+/// `[A1 7.2]` anyway. Reported, and deliberately not planned against (D129).
+#[derive(Debug, Serialize)]
+pub struct ExposureBody {
+    /// How many days of record the figures are drawn from.
+    ///
+    /// The denominator, on the page. A share whose denominator is invisible
+    /// cannot be checked, which is R28.
+    pub days_of_record: i64,
+    /// Hours the household was reduced for, over that record.
+    pub hours_reduced: f64,
+    /// The quarter hour of the local day it happens in most often, as `HH:MM` —
+    /// `null` where it has never happened.
+    pub busiest_quarter_hour: Option<String>,
+    /// How often a reduction is in force in that quarter hour, in `[0, 1]`.
+    pub busiest_frequency: f64,
+    /// The ceiling typically commanded there, kW.
+    pub typical_ceiling_kw: Option<f64>,
 }
 
 /// The routes this daemon adds to the shared health surface.
 pub fn router(local: Local) -> axum::Router {
     axum::Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/pairing", get(list_trusted).post(approve_peer))
+        .route("/v1/pairing/{ski}", axum::routing::delete(forget_peer))
+        .route("/v1/pairing/{ski}/refuse", axum::routing::post(refuse_peer))
         .route("/v1/overrides", get(list_overrides).delete(clear_overrides))
         .route(
             "/v1/overrides/{asset}",
@@ -243,6 +292,11 @@ async fn status(State(local): State<Local>) -> Json<StatusBody> {
             .iter()
             .map(ToString::to_string)
             .collect(),
+        disobedient: held
+            .disobedient
+            .iter()
+            .map(|(id, why)| (id.to_string(), why.clone()))
+            .collect(),
         undriven: held.undriven.iter().map(ToString::to_string).collect(),
         steuve_ceiling_kw: held.steuve_ceiling.map(hems_core::prelude::Power::kw),
         steuve_budget_kw: held.steuve_budget.map(hems_core::prelude::Power::kw),
@@ -257,5 +311,191 @@ async fn status(State(local): State<Local>) -> Json<StatusBody> {
         plan_expected_eur: held.plan_expected_eur,
         plan_baseline_eur: held.plan_baseline_eur,
         overruns: held.overruns,
+        exposure: held.exposure.as_ref().map(|e| ExposureBody {
+            days_of_record: e.days_of_record,
+            hours_reduced: e.hours_reduced,
+            busiest_quarter_hour: e.busiest_quarter_hour.map(quarter_hour),
+            busiest_frequency: e.busiest_frequency,
+            typical_ceiling_kw: e.typical_ceiling_kw,
+        }),
     })
+}
+
+/// A quarter-hour index of the local day as the clock face it names.
+///
+/// `71` is not a time anybody reads; `17:45` is.
+fn quarter_hour(index: u32) -> String {
+    format!("{:02}:{:02}", index / 4, (index % 4) * 15)
+}
+
+#[cfg(test)]
+mod exposure_tests {
+    use super::*;
+    use crate::runtime::control::Exposure;
+
+    /// The figures survive the transcription into JSON.
+    ///
+    /// A DTO built field by field out of a domain struct is the shape that
+    /// loses one silently: the field is added to `Status`, the control loop
+    /// fills it, and the handler that was written before it exists carries on
+    /// serialising everything else. `hours_reduced` reading zero on a household
+    /// that has been reduced for eleven hours looks like a household nobody
+    /// touched.
+    #[tokio::test]
+    async fn what_the_box_learned_about_its_own_exposure_reaches_the_page() {
+        let held = Status {
+            exposure: Some(Exposure {
+                days_of_record: 90,
+                hours_reduced: 11.5,
+                busiest_quarter_hour: Some(71),
+                busiest_frequency: 0.8,
+                typical_ceiling_kw: Some(4.2),
+            }),
+            ..Status::default()
+        };
+        let local = Local::new(
+            Arc::new(Mutex::new(held)),
+            "haus".into(),
+            None,
+            crate::runtime::overrides::Overrides::default(),
+            None,
+        );
+
+        let Json(body) = status(State(local)).await;
+        let seen = body.exposure.expect("an exposure that was set");
+
+        assert_eq!(seen.days_of_record, 90);
+        assert!((seen.hours_reduced - 11.5).abs() < f64::EPSILON);
+        assert!((seen.busiest_frequency - 0.8).abs() < f64::EPSILON);
+        assert_eq!(seen.typical_ceiling_kw, Some(4.2));
+        // Quarter hour 71 of the local day is a quarter to six in the evening,
+        // and 71 is not a time anybody can act on.
+        assert_eq!(seen.busiest_quarter_hour.as_deref(), Some("17:45"));
+    }
+
+    /// A box that has never been reduced says so with `null` rather than zeroes.
+    ///
+    /// Nought hours out of nought days is not the same claim as nought hours out
+    /// of ninety, and only one of them is evidence.
+    #[tokio::test]
+    async fn a_box_with_no_record_reports_nothing_rather_than_a_clean_sheet() {
+        let local = Local::new(
+            Arc::new(Mutex::new(Status::default())),
+            "haus".into(),
+            None,
+            crate::runtime::overrides::Overrides::default(),
+            None,
+        );
+
+        let Json(body) = status(State(local)).await;
+
+        assert!(body.exposure.is_none());
+    }
+}
+
+/// Who this box is, who it will talk to, and who is asking.
+#[derive(Debug, Serialize)]
+pub struct PairingBody {
+    /// This box's own SKI — what the metering point operator has to be given.
+    pub ski: Option<String>,
+    /// The SKIs this box will exchange data with.
+    pub trusted: Vec<String>,
+    /// The peers whose handshake is **waiting on a decision right now**.
+    ///
+    /// The third side of the commissioning exchange and the one that used to be
+    /// missing. An unapproved peer completes TLS — so its SKI is *proved* rather
+    /// than claimed — and SHIP holds it pending precisely so a person can compare
+    /// it with the label on the device in front of them. Without it the SKI had
+    /// to be read off the Steuerbox instead, which is the step field reports name
+    /// as the most common § 14a commissioning failure.
+    pub waiting: Vec<crate::runtime::ship::Waiting>,
+}
+
+/// A SKI an installer has read off a Steuerbox.
+#[derive(Debug, serde::Deserialize)]
+pub struct Approval {
+    /// Forty hexadecimal characters, as printed on the peer.
+    pub ski: String,
+}
+
+/// Both halves of the § 14a commissioning exchange, on one page.
+///
+/// The two directions fail differently and an installer needs both in front of
+/// them: this box's SKI is what the metering point operator has to be given, and
+/// the trusted list is what this box will accept.
+async fn list_trusted(State(local): State<Local>) -> Json<PairingBody> {
+    Json(PairingBody {
+        ski: local.ski.clone(),
+        trusted: local.trust.as_ref().map(Trust::peers).unwrap_or_default(),
+        waiting: local.trust.as_ref().map(Trust::waiting).unwrap_or_default(),
+    })
+}
+
+/// Approve a Steuerbox, on a box that is already running.
+///
+/// The session it completes may already be waiting: an unapproved peer completes
+/// TLS — which proves its SKI rather than taking its word — and is held in the
+/// SHIP pending state, and an approval added meanwhile lets it through. So an
+/// installer approves the SKI printed on the Steuerbox and the reduction path is
+/// live, with no restart and no edited file.
+async fn approve_peer(
+    State(local): State<Local>,
+    Json(approval): Json<Approval>,
+) -> Result<Json<PairingBody>, (axum::http::StatusCode, String)> {
+    let Some(trust) = local.trust.as_ref() else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "this box has no EEBUS identity, so there is nothing to pair with".into(),
+        ));
+    };
+    trust
+        .approve(&approval.ski, OffsetDateTime::now_utc())
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(list_trusted(State(local)).await)
+}
+
+/// Turn down a peer that is waiting.
+///
+/// Distinct from [`forget_peer`]: this one is about a handshake happening *now*,
+/// and answering it means the peer aborts with `hello: aborted` and learns it was
+/// refused instead of timing out. It says nothing about the future — the peer may
+/// ask again — and nothing at all about a peer that is not currently waiting.
+async fn refuse_peer(
+    State(local): State<Local>,
+    axum::extract::Path(ski): axum::extract::Path<String>,
+) -> Result<Json<PairingBody>, (axum::http::StatusCode, String)> {
+    let Some(trust) = local.trust.as_ref() else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "this box has no EEBUS identity, so there is nothing to pair with".into(),
+        ));
+    };
+    trust
+        .refuse(&ski)
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(list_trusted(State(local)).await)
+}
+
+/// Withdraw approval from a peer.
+///
+/// Its session is not torn down: the § 14a session is how a reduction arrives,
+/// and dropping it the instant somebody revokes a SKI would take the household
+/// out of contact with its network operator on a keystroke. It cannot
+/// reconnect, which is what revocation means.
+async fn forget_peer(
+    State(local): State<Local>,
+    axum::extract::Path(ski): axum::extract::Path<String>,
+) -> Result<Json<PairingBody>, (axum::http::StatusCode, String)> {
+    let Some(trust) = local.trust.as_ref() else {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "this box has no EEBUS identity, so there is nothing to pair with".into(),
+        ));
+    };
+    trust
+        .forget(&ski, OffsetDateTime::now_utc())
+        .await
+        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(list_trusted(State(local)).await)
 }

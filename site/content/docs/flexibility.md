@@ -185,9 +185,58 @@ control type is merely not `NotControllable` produces a figure that goes up when
 device is added and never notices that no description was ever written for it — so
 a device can sit inside the count for versions with nothing to send.
 
+## Describing is half of it
+
+A device that says what it can do and then ignores the answer has made S2's
+argument and declined the consequence. The other half is `hems_flex::session` —
+the Resource Manager's whole side of a conversation:
+
+1. the RM speaks first, and its `Handshake` is the one that must list versions
+   (S2 makes that mandatory for the RM and optional for the CEM, because the RM
+   is the constrained side and the manager is the one that adapts);
+2. the CEM answers, picks a version from that list, and gets the
+   `ResourceManagerDetails`;
+3. it selects a control type; the `SystemDescription` follows;
+4. from then on the RM owes statuses — a `PowerMeasurement`, an `ActuatorStatus`
+   or `Status` saying which operation mode it is in and how far into it, a
+   `StorageStatus` for anything with a fill level — and the CEM may instruct.
+
+**Every message is acknowledged and an instruction is answered twice.** The
+`ReceptionStatus` is about the wire; the `InstructionStatusUpdate` is about the
+household, and they are different questions — a tank told to heat while its own
+thermostat holds it off has received the message perfectly and is not going to
+carry it out. `INVALID_CONTENT` is how a Resource Manager says *that actuator is
+not mine* to a manager that has confused two devices, and a session that answered
+`OK` to everything would let a CEM believe it was driving something.
+
+**It has no socket.** Messages in, messages out, and `now` is a parameter — the
+same contract every protocol core in this workspace holds to. A whole
+negotiation, a CEM that picks a control type nobody offered, an instruction for
+somebody else's actuator: each is an assertion rather than a WebSocket and a
+sleep.
+
+**And it does not obey.** A decoded instruction becomes an *event*, and what
+happens to it is the arbiter's decision. A Customer Energy Manager is one more
+voice with an opinion about a device, and it ranks below the guard exactly as the
+planner does — a session that wrote setpoints straight to hardware would be a
+second control plane with no § 14a precedence in it.
+
+One session is **one resource**, because that is what the standard says:
+`ResourceManagerDetails` identifies a single resource and the CEM selects a
+single control type for it, so a household is several sessions rather than one
+multiplexed connection. `sessions_for` builds them from the site, pairing each
+description with the ratings its statuses are a fraction of.
+
 ## Standing on the authors' work
 
 The wire types come from [`s2energy`](https://crates.io/crates/s2energy),
 generated from the official JSON schema by TNO and Flexiblepower — the people who
 wrote S2. Writing our own would be a second opinion about a wire format, which is
 the one thing a standard exists to prevent.
+
+Every message this crate produces is round-tripped through JSON in its own tests
+— **by value**, not by message type — which checks the whole of it against the
+standard's schema for the price of one assertion. That needs `serde_json`'s
+`float_roundtrip` feature, which is not one of its defaults: without it, reading
+a float back is a fast approximation and a battery's fill rate does not survive
+the trip.

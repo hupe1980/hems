@@ -83,10 +83,20 @@ pub struct Readiness {
 ///
 /// Cheap to clone: the state is behind an `Arc`, so every task holds the same
 /// one and a probe set from a background task is visible to the next request.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Health {
     probes: Arc<RwLock<BTreeMap<String, Probe>>>,
     live: Arc<RwLock<bool>>,
+}
+
+impl Default for Health {
+    /// The same thing [`Health::new`] builds, and written out rather than
+    /// derived because they disagreed: a derived `Default` starts `live` at
+    /// `false`, so a daemon built that way reported itself dead from its first
+    /// request while an identical one built with `new` reported itself alive.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Health {
@@ -135,6 +145,50 @@ impl Health {
         if let Ok(mut flag) = self.live.write() {
             *flag = live;
         }
+    }
+
+    /// Run a task the process cannot do its job without, and fail `/livez` if
+    /// it ever stops.
+    ///
+    /// `set_live` had no caller for the life of the project, so `/livez`
+    /// returned 200 from any process whose HTTP server was still answering —
+    /// including one whose control loop had panicked half an hour earlier. That
+    /// is the shape of liveness probe that is worse than none: an orchestrator
+    /// told to restart a wedged process never restarts it, and the fault is
+    /// invisible precisely because the daemon looks healthy.
+    ///
+    /// A **clean** end is not a fault. A vital task that returns because
+    /// shutdown was asked for is a process on its way out, and failing liveness
+    /// then would have an orchestrator send `SIGKILL` in the middle of a drain.
+    /// So the flag drops on a panic, on a cancellation, and on a vital task that
+    /// returned while nobody asked it to — which is the case a restart clears
+    /// and nothing else notices.
+    ///
+    /// `cargo xtask check-vital` fails the build on a daemon that spawns a
+    /// background loop without this, because three of them did for months after
+    /// D132 was written and the symptom of each was a green liveness probe
+    /// (D146).
+    pub fn vital<F>(
+        &self,
+        name: &'static str,
+        shutdown: crate::shutdown::Shutdown,
+        task: F,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let health = self.clone();
+        tokio::spawn(async move {
+            let outcome = tokio::spawn(task).await;
+            if shutdown.is_triggered() && outcome.is_ok() {
+                return;
+            }
+            match outcome {
+                Ok(()) => tracing::error!(task = name, "a vital task ended on its own"),
+                Err(e) => tracing::error!(task = name, error = %e, "a vital task did not survive"),
+            }
+            health.set_live(false);
+        })
     }
 
     /// Whether the process is alive.
@@ -214,5 +268,48 @@ mod tests {
         let readiness = health.readiness();
         assert!(readiness.ready);
         assert_eq!(readiness.probes["prices"].detail, None);
+    }
+
+    /// A vital task that panics takes the process's liveness with it.
+    #[tokio::test]
+    async fn a_control_loop_that_dies_makes_the_process_restartable() {
+        // `/livez` returned 200 from a wedged process for the life of the
+        // project, because nothing ever set the flag. A liveness probe that
+        // cannot fail is worse than none: the orchestrator that was told to
+        // restart on it never does, and the daemon looks healthy the whole time.
+        let health = Health::new();
+        let (shutdown, _trigger) = crate::shutdown::Shutdown::channel();
+        assert!(health.is_live(), "it starts alive");
+
+        health
+            .vital("control", shutdown, async { panic!("the loop fell over") })
+            .await
+            .expect("the supervisor itself survives");
+
+        assert!(!health.is_live(), "and the process is now one to restart");
+    }
+
+    /// Shutting down is not dying.
+    #[tokio::test]
+    async fn a_vital_task_ending_on_a_shutdown_is_not_a_fault() {
+        // Failing liveness during a drain has an orchestrator send SIGKILL in
+        // the middle of it, which costs exactly the graceful shutdown the
+        // daemon was in.
+        let health = Health::new();
+        let (shutdown, trigger) = crate::shutdown::Shutdown::channel();
+        trigger.trigger();
+
+        health
+            .vital("control", shutdown, async {})
+            .await
+            .expect("clean");
+
+        assert!(health.is_live());
+    }
+
+    /// The two constructors agree.
+    #[test]
+    fn a_default_daemon_is_as_alive_as_a_new_one() {
+        assert_eq!(Health::default().is_live(), Health::new().is_live());
     }
 }

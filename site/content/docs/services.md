@@ -1,6 +1,6 @@
 +++
 title = "The fleet"
-description = "The services around one box: prices, weather, the two years of § 14a evidence, enrolment and signed releases, and a fleet view that counts breaches rather than averaging them — and why none of them is a trust anchor."
+description = "The services around one box: day-ahead prices, weather, two years of § 14a evidence, enrolment, signed releases, and a fleet view that counts breaches."
 weight = 11
 +++
 
@@ -61,6 +61,19 @@ whose upstream price source is down is not *broken*, and restarting it does not
 bring ENTSO-E back. Answering the second with the first is the mistake that makes
 a fleet oscillate.
 
+And `livez` has to be able to **fail**. It could not: nothing in the workspace
+ever cleared the flag, so every daemon answered 200 as long as its HTTP server
+was answering — including one whose control loop had panicked half an hour
+earlier. That is the shape of liveness probe that is worse than none, because
+the orchestrator told to restart on it never does and the daemon looks healthy
+throughout. So a task the process cannot do its job without is spawned as
+*vital*: if it panics or is cancelled, `/livez` fails and the process is one to
+restart. On the box that is the control loop — a `hemsd` with no guard, no
+arbiter and no evidence record is not a running energy manager whatever it will
+tell you over HTTP. Ending because a shutdown was asked for is not a fault:
+failing liveness during a drain has an orchestrator send `SIGKILL` in the middle
+of it.
+
 **Readiness names every dependency and when it was last good**, so the first
 click in an incident is also the last:
 
@@ -88,10 +101,33 @@ arriving after an ENTSO-E one would overwrite it.
 
 | | |
 |---|---|
-| Endpoints | `/v1/prices?from=…&slots=96`, `/v1/prices/coverage` |
-| Authentication | **none, on purpose** — a day-ahead curve is a published auction result |
+| Endpoints | `/v1/prices?from=…&slots=96`, `/v1/prices/coverage`, `/v1/carbon`, `/v1/modul3/{netzbetreiber}` |
+| Authentication | **none, on purpose** — a day-ahead curve and a published price sheet are nobody's household data |
 | Agents | `/mcp`, when switched on |
-| Holds | two days each way |
+| Holds | two days each way, plus the curated Modul 3 catalogue |
+
+It also serves the grid's **carbon intensity**, and that route exists because
+the chain behind it was dead end to end: the Energy-Charts parser had no
+consumer, the fetch loop dropped the series it had just fetched, the price
+stack's own intensity field was hard-coded absent, and the planner's carbon term
+could therefore only ever see a flat annual constant — which makes a carbon
+price algebraically the same thing as an autarky premium, because every hour is
+equally dirty. Two dials, one behaviour.
+
+The reason to have it is that intensity and price **disagree**. A still winter
+evening is dear *and* dirty and both signals point the same way; a windy night
+is cheap and only moderately clean, while a sunny midday is cheap *and* clean.
+So a household that prices carbon moves flexible load out of the cheap night and
+into the cheap middle of the day, which no price signal on its own would ask
+for — and in the evening peak, where the two agree, the dial correctly changes
+nothing.
+
+It also carries the **curated Modul 3 catalogue**: one transcription of each
+network operator's Zählzeitdefinition per year — the identical shape a single
+box takes as `[tariff.modul3]` — validated against the BDEW Anwendungshilfe at
+start-up. A calendar that breaks a rule refuses the daemon, because a fleet
+serving windows nobody may sell prices a whole Netzgebiet against a tariff
+nobody may be billed on.
 
 The fetching is behind an `Upstream` trait. In production it is `reqwest`; in
 every test it is a table of captured responses, so the whole daemon — schedule,
@@ -142,16 +178,54 @@ Keeping them apart is most of the design, and three things fall out of it:
 
 | | |
 |---|---|
-| Endpoints | `/v1/sites/{site}/quarter-hours`, `/v1/sites/{site}/events`, `/v1/sites/{site}/nachweis`, `/v1/sites/{site}/export` |
+| Endpoints | `/v1/sites/{site}/quarter-hours`, `/v1/sites/{site}/events`, `/v1/sites/{site}/nachweis`, `/v1/sites/{site}/export`, `/v1/sites/{site}/mispel` |
 | Authentication | per site, and a box may write only **its own** |
 | Agents | `/mcp`, authorising each caller as itself — see below |
 
-The two exports are authorised differently on purpose. A **Nachweis** is the
+The three exports are authorised differently on purpose. A **Nachweis** is the
 record of what the network operator itself commanded and what the connection
 point drew, and it is theirs to check. The **export** is the household's data
 under Data Act Article 4 — everything the product generated, including when the
 shower ran and which fortnight nobody was in. Article 4 is a right of the *user*,
 and a fleet token is not a household.
+
+### The MiSpeL settlement
+
+The third, and until recently the arithmetic had no caller at all: the box wrote
+the registers, this service kept them for two years, and **nothing ever settled
+them** — the whole formula set of Anlage 1's (1)–(33) and Anlage 2's (P1)–(P15)
+was reachable only from a unit test, so it could have been wrong in every
+release without a single day noticing. From 01.10.2026 that document is what a
+household's levy privileges (§ 21 EnFG) and its EEG support depend on.
+
+Three things about it are the design rather than the plumbing:
+
+- **The option is declared per site, and an undeclared site is refused.** The
+  Festlegung has the household choose between Ausschließlichkeit, Abgrenzung and
+  Pauschal, and each produces a *different* Nachweis from the same registers —
+  so one computed under a guessed Basisfall is arithmetically perfect and about
+  somebody else's installation. Ausschließlichkeit settles nothing and is still
+  **checked**: it is a claim that no quarter hour shows grid draw and storage
+  charging at the same time, the Festlegung's own `(1)¼ = MIN[Z1NB¼ ; Z2V¼]` is
+  what measures it, and the export reports that figure and names the quarter
+  hours that break it. A Nachweis that is only a declaration is the one Nachweis
+  nobody can check.
+- **The period comes from the calendar, not from the caller.** The arithmetic
+  needs exactly one calendar month and cannot check that it got one, so the
+  route takes a year and a month and builds the window itself. A boundary at a
+  fixed `+01:00` would lose an hour every March and double one every October —
+  on the two months a settlement is most likely to be queried.
+- **The denominator is on the document.** A quarter hour the box could not price
+  gets no register at all, so a month legitimately has gaps, and a settlement
+  summed over 2 800 of a month's 2 980 quarter hours under-reports every
+  quantity in it while looking exactly like a whole one. `quarter_hours_expected`,
+  `quarter_hours_present` and `complete` sit beside the figures, because a number
+  whose denominator is invisible cannot fail.
+
+It is the **household's** document rather than the operator's, so it sits beside
+the Data Act export and off the agent surface: the Festlegung has the
+Anlagenbetreiber produce and submit it, and a § 14a operator credential that
+could read every household's storage economics is a reach nothing granted it.
 
 SQLite (bundled) is what is here now, because it needs no server and no system
 library: every query is exercised against a *real* database in `cargo test`
@@ -217,6 +291,14 @@ installation problem, and an average puts it at half a per cent.
 is derived, bounded and rebuildable, and losing it costs a dashboard rather than
 a Nachweis.
 
+There are **two** statutory limits on a household's connection point, and the
+fleet lists them apart. § 14a arrives as an instruction and leaves a record, so a
+breach can be read back out of the store; § 9 Abs. 2 EEG applies to the plant by
+force of law and leaves nothing, so the box measures the instantaneous
+Einspeiseleistung against the ceiling the guard derives on every tick and reports
+the worst excess of the day. `over_feed_in_ceiling` sits beside `breached` rather
+than mixed into it: different rules, answered by different parties.
+
 ### A day only arrives signed
 
 ```console
@@ -232,7 +314,7 @@ $ curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet | jq '{sit
 }
 ```
 
-`saving_eur` is the reference winter day's own €2,09, which is the point: the
+`saving_eur` is the reference winter day's own €2,14, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.

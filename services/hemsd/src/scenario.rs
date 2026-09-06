@@ -178,7 +178,7 @@ pub struct Scenario {
     /// argument. Over twenty seeded weathers on each of two days: planning
     /// against three futures costs **€1,04 a day** on an ordinary winter day —
     /// where the household has a battery, a tank, slack everywhere and nothing
-    /// whatever to insure — and seven times the solve. On the evening a car
+    /// whatever to insure — and five to seven times the solve. On the evening a car
     /// arrives *as* a § 14a reduction starts it **beats** the median on the mean,
     /// €2,96 against €2,81, and takes the undelivered charge from €0,07 to
     /// €0,01. Something has to decide which day it is.
@@ -204,6 +204,15 @@ pub struct Scenario {
     /// and weights nothing. A named comparison, because the difference is what
     /// the mechanism is worth.
     pub per_asset_weights: bool,
+    /// What this household will pay to avoid something other than money.
+    ///
+    /// [`hems_optimizer::model::Objective::cost`] on every reference day, so
+    /// every figure in this
+    /// workspace is the plain economic plan. It is here so that a carbon price
+    /// and an autarky premium can be **measured** rather than merely settable:
+    /// both are terms the solver has always read and nothing could switch on, so
+    /// nobody knew what either was worth or what it cost.
+    pub objective: hems_optimizer::model::Objective,
     /// The § 42c energy-sharing community this household belongs to, if any.
     ///
     /// A named comparison, like `risk` and `per_asset_weights`: the difference
@@ -356,6 +365,9 @@ impl Scenario {
             steuerbox_outage: None,
             planner: true,
             per_asset_weights: true,
+            // Every reference figure in this workspace is the plain economic
+            // plan; a preference is a comparison to ask for by name.
+            objective: hems_optimizer::model::Objective::cost(),
             prices_ct: winter_prices(),
             // Home at teatime, gone by seven in the morning with 20 kWh more in
             // it than it arrived with — so the plan has to find the cheap hours
@@ -508,13 +520,16 @@ impl Scenario {
     #[must_use]
     pub fn winter_evening_no_store(config: &HouseholdConfig) -> Self {
         let household = HouseholdConfig {
-            // Not quite zero: a household with no battery at all has no asset to
+            // Not absent: a household with no battery at all has no asset to
             // model, and what is being tested is the *sharing*, not the absence.
             // Below the 4,2 kW of `[A1 2.4.1]` it is not a steuerbare
             // Verbrauchseinrichtung either, so the household is owed the
             // two-device minimum of 7,56 kW rather than the three-device 10,5.
-            battery_kwh: Energy::from_kwh(1.0),
-            battery_power: Power::from_kw(0.5),
+            battery: config.battery.map(|b| crate::site::BatteryConfig {
+                kwh: Energy::from_kwh(1.0),
+                power: Power::from_kw(0.5),
+                ..b
+            }),
             ..config.clone()
         };
         let ceiling = lawful_minimum(&household, time::macros::date!(2026 - 01 - 15));
@@ -557,6 +572,9 @@ impl Scenario {
             steuerbox_outage: None,
             planner: true,
             per_asset_weights: true,
+            // Every reference figure in this workspace is the plain economic
+            // plan; a preference is a comparison to ask for by name.
+            objective: hems_optimizer::model::Objective::cost(),
             prices_ct: summer_prices(),
             risk: hems_optimizer::Risk::default(),
             community: None,
@@ -581,7 +599,7 @@ impl Scenario {
     /// and the number this day prints is what the Solarspitzengesetz costs a
     /// household that has not been given its Steuerbox yet.
     ///
-    /// Set [`HouseholdConfig::para9`]'s relief to [`CapRelief::ImsysWithControl`] to
+    /// Set the roof's [`crate::site::PvConfig::para9`] relief to [`CapRelief::ImsysWithControl`] to
     /// run the same day with the cap lifted, which is the comparison worth
     /// seeing.
     #[must_use]
@@ -623,8 +641,11 @@ impl Scenario {
                 // watt — which is the optimiser working, and the reason the
                 // 9,8 kWp default in this workspace shows a curtailment figure
                 // of zero on every day it runs.
-                battery_kwh: Energy::from_kwh(1.0),
-                battery_power: Power::from_kw(0.5),
+                battery: config.battery.map(|b| crate::site::BatteryConfig {
+                    kwh: Energy::from_kwh(1.0),
+                    power: Power::from_kw(0.5),
+                    ..b
+                }),
                 // Twenty kilowatts peak on a full south roof, with an
                 // inverter sized one to one against the modules. Both halves
                 // matter. The cap is a fraction of the **direct-current** power
@@ -633,8 +654,11 @@ impl Scenario {
                 // is why the 9,8 kWp default in this workspace barely sees it,
                 // and is worth knowing before anybody quotes a curtailment
                 // figure from it.
-                pv_kwp: Power::from_kw(20.0),
-                pv_ac_nominal: Power::from_kw(20.0),
+                pv: config.pv.map(|p| crate::site::PvConfig {
+                    kwp: Power::from_kw(20.0),
+                    ac_nominal: Power::from_kw(20.0),
+                    ..p
+                }),
                 ..config.clone()
             })
         }
@@ -663,8 +687,13 @@ fn winter_prices() -> Vec<i64> {
         .collect()
 }
 
-/// A summer curve with a midday collapse — and four negative quarter hours,
-/// which is what § 51 EEG is about.
+/// A summer curve with a midday collapse — and **twelve** negative quarter
+/// hours, three whole hours of them, which is what § 51 EEG is about.
+///
+/// The count was documented as four until `DayResult::para51_hours` started
+/// reporting it, which is the argument for the KPI in one line: a rule applied
+/// per slot inside the price stack, a figure quoted in two documents, and
+/// nothing that compared the two.
 fn summer_prices() -> Vec<i64> {
     (0..96)
         .map(|i| {
@@ -698,6 +727,32 @@ pub struct DayResult {
     pub imported_kwh: f64,
     /// Energy fed into the grid, kWh.
     pub exported_kwh: f64,
+    /// Quarter hours in which § 51 EEG took the remuneration to zero.
+    ///
+    /// The negative-price hours — 573 of them in 2025 — and the number the
+    /// § 51 rule owes a day it is applied on (R20). The summer reference day is
+    /// *written around* four of them, and until this existed nothing counted
+    /// them: the rule was applied per slot inside the price stack and no day
+    /// reported whether it had ever bound.
+    ///
+    /// It is a property of the **tariff** rather than of the plan — no
+    /// controller can move a negative auction — so it is context for the
+    /// day's decisions rather than a result of them, which is exactly why it
+    /// belongs beside them.
+    pub para51_hours: usize,
+    /// Carbon dioxide behind what this household **imported**, kg.
+    ///
+    /// Accumulated a control period at a time against the grid's own intensity
+    /// in that quarter hour, so it is the emissions of the electricity the
+    /// household actually drew rather than the day's average times its total.
+    /// The two differ by exactly the thing a carbon price is for: moving load
+    /// from a dirty hour to a clean one changes the first and leaves the second
+    /// alone.
+    ///
+    /// It is the KPI the objective's carbon term owes the reference day (R20).
+    /// A term that can be priced and whose effect nothing reports is a term that
+    /// could stop being applied without any day noticing.
+    pub imported_co2_kg: f64,
     /// Production, kWh.
     pub produced_kwh: f64,
     /// What the plan made at midnight expected the day's **bill** to be, euros.
@@ -861,6 +916,23 @@ pub struct DayResult {
     pub grid_event_respected: bool,
     /// The largest overshoot of a § 14a ceiling, watts. Should be zero.
     pub worst_overshoot_w: f64,
+    /// The largest amount by which the **Einspeiseleistung** crossed the § 9
+    /// EEG / LPP ceiling at the connection point, watts.
+    ///
+    /// A statutory limit with nothing asserting it is a statutory limit nobody
+    /// is enforcing. § 14a had `grid_event_respected` from the first day and
+    /// § 9 EEG had only [`DayResult::peak_feed_in_kw`] — a number printed beside
+    /// its ceiling, which a reader has to compare by eye, and which sat *above*
+    /// it for four quarter hours of the `capped` day while the line underneath
+    /// said the limit had been respected throughout.
+    ///
+    /// It is measured against the **instantaneous** ceiling because § 9 Abs. 2
+    /// EEG says Leistung. What it counts is what the connection point did, not
+    /// what the guard commanded: the two differ by the control period, and it is
+    /// the difference this exists to size.
+    pub worst_feed_in_overshoot_w: f64,
+    /// For how long the connection point was above that ceiling, minutes.
+    pub feed_in_over_minutes: i64,
     /// How long the manager held itself at its failsafe value for want of
     /// contact with an Energy Guard, minutes — the `init` and `failsafe` states
     /// of the EEBUS machine together.
@@ -1103,6 +1175,7 @@ impl DayResult {
             }),
             respected_the_grid: self.grid_event_respected,
             worst_overshoot_w: self.worst_overshoot_w,
+            worst_feed_in_overshoot_w: self.worst_feed_in_overshoot_w,
             minutes_without_a_plan: u32::try_from(self.minutes_without_a_plan).unwrap_or(u32::MAX),
             clipped_ticks: u32::try_from(self.clipped_ticks).unwrap_or(u32::MAX),
             clipped_kwh: self.clipped_kwh,
@@ -1137,6 +1210,81 @@ impl DayResult {
     }
 }
 
+/// The reference household's own devices, unwrapped once.
+///
+/// The simulation harness runs the reference household, which has every asset —
+/// its simulators, its baseline and its KPI table are built around that house.
+/// A configuration that dropped one is a different household than the days were
+/// calibrated on, and the harness says so instead of simulating a device that
+/// is not there. (`hemsd run` has no such precondition: the running box builds
+/// exactly the assets its configuration describes.)
+struct Reference {
+    /// The roof — a dark one of no size where the household has none, because
+    /// a simulator can honestly run a roof that never produces, where it cannot
+    /// honestly run a battery that is not there.
+    pv: crate::site::PvConfig,
+    battery: crate::site::BatteryConfig,
+    evse: crate::site::EvseConfig,
+    heat_pump: crate::site::HeatPumpConfig,
+    dhw: crate::site::DhwConfig,
+}
+
+impl Reference {
+    fn of(config: &HouseholdConfig) -> anyhow::Result<Self> {
+        let missing = |what: &'static str| {
+            anyhow::anyhow!(
+                "the simulation harness runs the reference household, which has a {what}; \
+                 a household without one is a `hemsd run` configuration, not a scenario"
+            )
+        };
+        Ok(Self {
+            pv: config.pv.unwrap_or(crate::site::PvConfig {
+                kwp: Power::ZERO,
+                ac_nominal: Power::ZERO,
+                para9: Para9Status::default(),
+            }),
+            battery: config.battery.ok_or_else(|| missing("battery"))?,
+            evse: config.evse.ok_or_else(|| missing("charge point"))?,
+            heat_pump: config.heat_pump.ok_or_else(|| missing("heat pump"))?,
+            dhw: config.dhw.ok_or_else(|| missing("hot-water tank"))?,
+        })
+    }
+}
+
+/// The reference household's asset identifiers, unwrapped once — see
+/// [`Reference`].
+struct ReferenceIds {
+    /// Present even where the site has no roof, for the same reason
+    /// [`Reference::pv`] is: a measurement recorded under an identifier no
+    /// asset carries is ignored by the guard, which is exactly what a dark
+    /// roof of no size amounts to.
+    pv: AssetId,
+    battery: AssetId,
+    evse: AssetId,
+    heat_pump: AssetId,
+    dhw: AssetId,
+}
+
+impl ReferenceIds {
+    fn of(household: &Household) -> anyhow::Result<Self> {
+        let take = |id: &Option<AssetId>, what: &'static str| {
+            id.clone().ok_or_else(|| {
+                anyhow::anyhow!("the reference household names its {what}, and this site has none")
+            })
+        };
+        Ok(Self {
+            pv: match &household.pv {
+                Some(id) => id.clone(),
+                None => AssetId::new("pv")?,
+            },
+            battery: take(&household.battery, "battery")?,
+            evse: take(&household.evse, "charge point")?,
+            heat_pump: take(&household.heat_pump, "heat pump")?,
+            dhw: take(&household.dhw, "hot-water tank")?,
+        })
+    }
+}
+
 /// Run one day and report what happened.
 ///
 /// The control loop runs once a minute and the planner every quarter of an hour,
@@ -1154,28 +1302,25 @@ impl DayResult {
 #[allow(clippy::too_many_lines)]
 pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     let household = Household::build(&scenario.config)?;
+    let house = Reference::of(&scenario.config)?;
+    let ids = ReferenceIds::of(&household)?;
     let site = &household.site;
     let start = scenario.start();
     let day = Horizon::new(start, 96);
 
     // ── The physical house ──────────────────────────────────────────────────
-    let array = ArrayModel::new(
-        scenario.config.pv_kwp,
-        scenario.config.pv_ac_nominal,
-        35.0,
-        180.0,
-    );
+    let array = ArrayModel::new(house.pv.kwp, house.pv.ac_nominal, 35.0, 180.0);
     let mut building = BuildingSim {
-        nominal_electrical: scenario.config.heat_pump_power,
+        nominal_electrical: house.heat_pump.power,
         // The same floor the planner is given, so the plan and the house agree
         // about what "on" is worth for a unit whose slots are scheduled.
-        min_electrical: scenario.config.heat_pump_power * 0.3,
-        thermostat_set_c: scenario.config.comfort_min_c + 0.5,
-        thermostat_max_c: scenario.config.comfort_max_c,
+        min_electrical: house.heat_pump.power * 0.3,
+        thermostat_set_c: house.heat_pump.comfort_min_c + 0.5,
+        thermostat_max_c: house.heat_pump.comfort_max_c,
         // A single-speed compressor where the household has one, so a day can
         // report what the planner's minimum runtime actually bought. Without it
         // the constraint is stated in every plan and observed by nothing.
-        compressor: (!scenario.config.heat_pump_modulating).then(compressor_sim),
+        compressor: (!house.heat_pump.modulating).then(compressor_sim),
         ..BuildingSim::new(21.0)
     };
     let mut inverter = PvSim::default();
@@ -1184,7 +1329,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // to put the tank's heat back.
         battery.stored.kwh() + tank.stored.kwh() / tank.cop.max(f64::EPSILON)
     };
-    let tank_asset = match site.asset(&household.dhw) {
+    let tank_asset = match site.asset(&ids.dhw) {
         Some(Asset::Dhw(t)) => t.clone(),
         _ => unreachable!("the household always has a tank"),
     };
@@ -1198,14 +1343,14 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         .dishwasher
         .clone()
         .map(hems_sim::ApplianceSim::new);
-    let mut battery = BatterySim::new(scenario.config.battery_kwh, scenario.config.battery_power);
+    let mut battery = BatterySim::new(house.battery.kwh, house.battery.power);
     // Thirty per cent, or the backup reserve if the household asked for more: a
     // house that boots below its own promise is a real case, but it is not the
     // one these days are about, and starting there makes every reserve figure
     // look like it was broken by a standing loss.
-    battery.stored = scenario.config.battery_kwh * scenario.config.reserve_soc.fraction().max(0.30);
+    battery.stored = house.battery.kwh * house.battery.reserve_soc.fraction().max(0.30);
     let mut evse = EvseSim::new();
-    if scenario.config.evse_switchable {
+    if house.evse.switchable {
         evse = evse.switchable();
     }
     let mut evse = evse.with_vehicle(VehicleSim {
@@ -1252,6 +1397,11 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         tariff = tariff.in_community(hems_tariff::tariff::SharingTariff::at(c.price_ct));
     }
     let prices = PriceStack::build(&tariff, day);
+    // The § 51 EEG hours this day actually contained. A property of the tariff
+    // rather than of the plan — nobody can move a negative auction — and the
+    // number that says whether the rule bound at all on a day written around
+    // it.
+    let para51_hours = prices.negative_price_slots().len();
 
     // The neighbours' roofs, under the same sky as this one — and the meter that
     // watches them. The *same* meter the unmanaged household is given, so the
@@ -1277,7 +1427,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         site.location,
         start,
         household_load,
-        hot_water_draw,
+        hems_forecast::hotwater::draw,
         scenario
             .ev
             .map(|e| (e.arrival, e.departure, e.energy_target - e.energy_now)),
@@ -1323,7 +1473,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     // than against an instant.
     let mut pv_slot_wh = 0.0_f64;
     let mut load_slot_wh = 0.0_f64;
-    let mut slot_minutes = 0_u32;
+    let mut slot_covered = Duration::ZERO;
     // Energy each asset has moved since the start of the current quarter hour.
     // The arbiter follows the plan's *energy*, so somebody has to count it, and
     // on a real box that somebody is the driver layer.
@@ -1337,6 +1487,19 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     let overrides = BTreeMap::new();
 
     let stores_open = stored_at_start(&battery, &tank);
+    // How long each state lasted, accumulated as **durations**.
+    //
+    // These were five `+= 1` counters over a loop whose step is
+    // [`CONTROL_PERIOD`], so every one of them reported minutes only for as long
+    // as nobody changed that constant — and a constant that cannot be changed is
+    // not a parameter, it is a number written in five places. Summing the step
+    // makes the period a parameter again, which is what lets a day be run at the
+    // cadence a real box actually ticks at (D140).
+    let mut single_phase = Duration::ZERO;
+    let mut without_a_plan = Duration::ZERO;
+    let mut failsafe_for = Duration::ZERO;
+    let mut limited_for = Duration::ZERO;
+    let mut feed_in_over = Duration::ZERO;
     // What the connection point saw last tick. The only thing on this loop that
     // reads it is the offline fallback for a shiftable appliance, which has to
     // decide before the current tick's balance exists.
@@ -1344,6 +1507,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
 
     let mut result = DayResult {
         grid_event_respected: true,
+        para51_hours,
         // Seeded so the first sample sets both ends; a zero start would report a
         // freezing house that never happened.
         indoor_min_c: f64::INFINITY,
@@ -1381,15 +1545,21 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // and the evidence record has to say which of the two happened.
         // § 9 EEG travels with the site rather than with an event: a system in
         // the size class keeps the 60 % cap until an intelligent metering system
-        // with a control device is in operation.
-        let feed_in = hems_grid::para9::site_feed_in_ceiling(site, None, None);
-        result.feed_in_ceiling_kw = feed_in.map(|(p, _)| p.kw());
+        // with a control device is in operation. So it is **not** handed to the
+        // guard here — the guard derives it from the site on every tick, which
+        // is the only way a real box gets it too, and a simulator that fed it in
+        // would be testing a path production does not have.
+        result.feed_in_ceiling_kw =
+            hems_grid::para9::site_feed_in_ceiling(site, None, None).map(|(p, _)| p.kw());
         let limits = GridLimits {
             steuve_ceiling: ceiling,
             steuve_since: ceiling_since,
             in_failsafe: !lpc.state().is_controlled(),
-            feed_in_ceiling: feed_in.map(|(p, _)| p),
-            feed_in_rule: feed_in.map(|(_, r)| r),
+            // What an *operator* has asked for, which in this scenario is
+            // nothing. The statute is the guard's own business.
+            feed_in_ceiling: None,
+            feed_in_rule: None,
+            mgcp_factor: None,
         };
 
         // Re-plan on [`REPLAN_PERIOD`] **or when something the plan assumed
@@ -1409,7 +1579,10 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         {
             let horizon = Horizon::new(now, 96);
             let horizon_prices = PriceStack::build(&tariff, horizon);
-            let horizon_draw: Vec<f64> = horizon.slots().map(|s| hot_water_draw(s).get()).collect();
+            let horizon_draw: Vec<f64> = horizon
+                .slots()
+                .map(|s| hems_forecast::hotwater::draw(s).get())
+                .collect();
             // What the community expects to be able to allocate this member, slot
             // by slot. Zero-length where the household is not in one, which is
             // what leaves the model exactly as it was.
@@ -1434,19 +1607,19 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     efficiency_discharge: battery.efficiency_discharge,
                     soc_min: battery.soc_min,
                     soc_max: battery.soc_max,
-                    reserve_soc: scenario.config.reserve_soc,
-                    degradation_eur_per_kwh: scenario.config.battery_wear_eur_per_kwh,
+                    reserve_soc: house.battery.reserve_soc,
+                    degradation_eur_per_kwh: house.battery.wear_eur_per_kwh,
                     grid_charging_allowed: true,
                 })
                 .with_thermal(
                     ThermalModel {
                         state: building.state,
                         building: building.building,
-                        comfort_min_c: scenario.config.comfort_min_c,
-                        comfort_max_c: scenario.config.comfort_max_c,
+                        comfort_min_c: house.heat_pump.comfort_min_c,
+                        comfort_max_c: house.heat_pump.comfort_max_c,
                         discomfort_eur_per_kelvin_hour: DISCOMFORT_EUR_PER_KELVIN_HOUR,
                         heat_pump: HeatPumpModel {
-                            modulating: scenario.config.heat_pump_modulating,
+                            modulating: house.heat_pump.modulating,
                             cop: building.cop,
                             // What the compressor is actually doing, not what a
                             // fresh model would assume. A receding horizon
@@ -1460,7 +1633,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                                 .as_ref()
                                 .map(hems_sim::CompressorSim::state)
                                 .unwrap_or_default(),
-                            ..HeatPumpModel::modulating(scenario.config.heat_pump_power)
+                            ..HeatPumpModel::modulating(house.heat_pump.power)
                         },
                     },
                     &horizon_outdoor,
@@ -1482,6 +1655,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     site,
                     now,
                 ))
+                .with_objective(scenario.objective)
                 .in_community(&horizon_share);
 
             // The dishwasher, while there is still a decision to make about it.
@@ -1524,7 +1698,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             // make a scenario built to test a car arriving mid-reduction test a
             // planner that had already been told.
             if let Some(ev) = scenario.ev
-                && let Some(Asset::Evse(evse_asset)) = site.asset(&household.evse)
+                && let Some(Asset::Evse(evse_asset)) = site.asset(&ids.evse)
             {
                 let plugged = now >= start + ev.arrival;
                 let predicted =
@@ -1690,10 +1864,10 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         let available = weather.production_at(&array, site.location, now);
         let outdoor_now = weather.outdoor_at(now);
         let ceiling = previous
-            .get(&household.pv)
+            .get(&ids.pv)
             .copied()
             .map_or(available, Power::outflow);
-        let (pv_now, _) = inverter.step(available, ceiling);
+        let (pv_now, _) = inverter.step(available, ceiling, step);
         let load_now = weather.load_at(now, household_load(slot));
 
         // The dishwasher. It is *scheduled*, never modulated: the plan names the
@@ -1749,21 +1923,15 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 .insert(id.clone(), Measurement::power(now, appliance_now));
         }
         for (id, power) in [
-            (&household.pv, pv_now),
+            (&ids.pv, pv_now),
             (&household.load, load_now),
             (
-                &household.battery,
-                previous
-                    .get(&household.battery)
-                    .copied()
-                    .unwrap_or(Power::ZERO),
+                &ids.battery,
+                previous.get(&ids.battery).copied().unwrap_or(Power::ZERO),
             ),
             (
-                &household.evse,
-                previous
-                    .get(&household.evse)
-                    .copied()
-                    .unwrap_or(Power::ZERO),
+                &ids.evse,
+                previous.get(&ids.evse).copied().unwrap_or(Power::ZERO),
             ),
         ] {
             state
@@ -1773,45 +1941,39 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // What the roof *could* do, which is the one thing a curtailed inverter
         // cannot be asked for indirectly: read its output and a controller
         // learns only what it already commanded.
-        if let Some(m) = state.assets.get_mut(&household.pv) {
+        if let Some(m) = state.assets.get_mut(&ids.pv) {
             m.available_power = Some(available);
         }
         // The guard needs the state of charge as well as the power: a full
         // battery must not be told to charge and one at its backup reserve must
         // not be told to discharge, and both happen between re-plans.
-        if let Some(m) = state.assets.get_mut(&household.battery) {
+        if let Some(m) = state.assets.get_mut(&ids.battery) {
             m.soc = Some(battery.soc());
         }
         // And the *car's*, on the charge point, which is where a vehicle's charge
         // reaches a real box. Without it the surplus fallback cannot know the car
         // has had what it was asked for.
-        if let Some(m) = state.assets.get_mut(&household.evse)
+        if let Some(m) = state.assets.get_mut(&ids.evse)
             && let Some(v) = evse.vehicle.as_ref()
             && v.capacity > Energy::ZERO
         {
             m.soc = Soc::new(v.stored.kwh() / v.capacity.kwh()).ok();
         }
         state.assets.insert(
-            household.dhw.clone(),
-            Measurement::power(
-                now,
-                previous.get(&household.dhw).copied().unwrap_or(Power::ZERO),
-            ),
+            ids.dhw.clone(),
+            Measurement::power(now, previous.get(&ids.dhw).copied().unwrap_or(Power::ZERO)),
         );
         state.assets.insert(
-            household.heat_pump.clone(),
+            ids.heat_pump.clone(),
             Measurement::power(
                 now,
-                previous
-                    .get(&household.heat_pump)
-                    .copied()
-                    .unwrap_or(Power::ZERO),
+                previous.get(&ids.heat_pump).copied().unwrap_or(Power::ZERO),
             ),
         );
         // What the charge point's contactor is actually in. The guard bounds a
         // device by what it *is* doing, not by what it was told to do — a
         // single-phase session is a Schieflast and a three-phase one is not.
-        state.phases.insert(household.evse.clone(), evse.mode);
+        state.phases.insert(ids.evse.clone(), evse.mode);
         let grid_now: Power = state.assets.values().filter_map(|m| m.power).sum();
         state.grid = Some(Measurement::power(now, grid_now));
 
@@ -1823,7 +1985,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 &pv_forecast,
                 &load_forecast,
                 delivered_slot,
-                slot_minutes,
+                slot_covered,
                 pv_slot_wh,
                 load_slot_wh,
                 &mut pv_scored,
@@ -1831,13 +1993,13 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             );
             pv_slot_wh = 0.0;
             load_slot_wh = 0.0;
-            slot_minutes = 0;
+            slot_covered = Duration::ZERO;
             delivered.clear();
             delivered_slot = slot;
         }
         pv_slot_wh += available.get() * step.as_seconds_f64() / 3600.0;
         load_slot_wh += load_now.inflow().get() * step.as_seconds_f64() / 3600.0;
-        slot_minutes += 1;
+        slot_covered += step;
 
         let decision = arbiter.tick(Tick {
             now,
@@ -1853,7 +2015,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
 
         // The hardware answers. The contactor first: changing the conductor
         // count while current is flowing is what welds one shut.
-        if let Some(next) = decision.phases.get(&household.evse)
+        if let Some(next) = decision.phases.get(&ids.evse)
             && evse.set_mode(next.mode)
         {
             result.phase_switches += 1;
@@ -1863,7 +2025,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         let battery_actual = battery.step(
             decision
                 .commanded
-                .get(&household.battery)
+                .get(&ids.battery)
                 .copied()
                 .unwrap_or(Power::ZERO),
             step,
@@ -1877,7 +2039,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             if plugged_in {
                 decision
                     .commanded
-                    .get(&household.evse)
+                    .get(&ids.evse)
                     .copied()
                     .unwrap_or(Power::ZERO)
             } else {
@@ -1888,7 +2050,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         let hp_actual = building.step(
             decision
                 .commanded
-                .get(&household.heat_pump)
+                .get(&ids.heat_pump)
                 .copied()
                 .unwrap_or(Power::ZERO),
             outdoor_now,
@@ -1897,16 +2059,16 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         let (dhw_actual, dhw_short) = tank.step(
             decision
                 .commanded
-                .get(&household.dhw)
+                .get(&ids.dhw)
                 .copied()
                 .unwrap_or(Power::ZERO),
-            weather.draw_in(slot, hot_water_draw(slot)) * (step / SLOT),
+            weather.draw_in(slot, hems_forecast::hotwater::draw(slot)) * (step / SLOT),
             step,
         );
-        previous.insert(household.battery.clone(), battery_actual);
-        previous.insert(household.evse.clone(), evse_actual);
-        previous.insert(household.heat_pump.clone(), hp_actual);
-        previous.insert(household.dhw.clone(), dhw_actual);
+        previous.insert(ids.battery.clone(), battery_actual);
+        previous.insert(ids.evse.clone(), evse_actual);
+        previous.insert(ids.heat_pump.clone(), hp_actual);
+        previous.insert(ids.dhw.clone(), dhw_actual);
         result.dhw_kwh += dhw_actual.kw() * step.as_seconds_f64() / 3600.0;
         result.cold_water_kwh += dhw_short.kwh();
         result.cost.unserved_eur += dhw_short.kwh() * HOT_WATER_SHORTFALL_EUR_PER_KWH;
@@ -1930,11 +2092,11 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // other device does.
         let pv_allowed = decision
             .commanded
-            .get(&household.pv)
+            .get(&ids.pv)
             .copied()
             .unwrap_or(-available)
             .outflow();
-        previous.insert(household.pv.clone(), -pv_allowed);
+        previous.insert(ids.pv.clone(), -pv_allowed);
         // Curtailment is production the *controller refused*, measured against
         // what the weather offered this tick. Taking the difference between the
         // weather and the meter instead would count the inverter's own settling
@@ -1947,10 +2109,10 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // real loss whatever feeding it in would have earned.
         result.cost.curtailment_eur += curtailed_now * CURTAILMENT_EUR_PER_KWH;
         for (id, power) in [
-            (&household.battery, battery_actual),
-            (&household.evse, evse_actual),
-            (&household.heat_pump, hp_actual),
-            (&household.dhw, dhw_actual),
+            (&ids.battery, battery_actual),
+            (&ids.evse, evse_actual),
+            (&ids.heat_pump, hp_actual),
+            (&ids.dhw, dhw_actual),
         ] {
             *delivered.entry(id.clone()).or_insert(Energy::ZERO) += power.over(step);
         }
@@ -1992,17 +2154,38 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         result.produced_kwh += pv_now.outflow().kw() * hours;
         result.consumed_kwh += load_now.inflow().kw() * hours;
         result.imported_kwh += grid.inflow().kw() * hours;
+        // The grid's own intensity in *this* quarter hour, so that shifting a
+        // kilowatt-hour from the evening ramp into the middle of the day shows
+        // up. Where the tariff carries no intensity there is nothing honest to
+        // accumulate — a flat annual figure would make this the day's import
+        // times a constant, which is a number that cannot move.
+        if let Some(grams) = prices.at(slot).and_then(|p| p.co2_g_per_kwh) {
+            result.imported_co2_kg += grid.inflow().kw() * hours * grams / 1000.0;
+        }
         result.exported_kwh += grid.outflow().kw() * hours;
+        // § 9 EEG is a limit on a *power*, so it is checked on every tick
+        // against what the connection point actually did — the same discipline
+        // the § 14a evidence record applies to the netzwirksamer
+        // Leistungsbezug. `feed_in_ceiling_kw` is derived from the site above
+        // and is `None` where nothing caps this roof.
+        if let Some(cap) = result.feed_in_ceiling_kw {
+            let over = grid.outflow().kw() - cap;
+            if over > 0.0 {
+                result.worst_feed_in_overshoot_w =
+                    result.worst_feed_in_overshoot_w.max(over * 1000.0);
+                feed_in_over += step;
+            }
+        }
         result.battery_throughput_kwh += battery_actual.abs().kw() * hours;
         if evse.mode == PhaseMode::Single && evse_actual > Power::ZERO {
-            result.single_phase_minutes += 1;
+            single_phase += step;
         }
         if scenario.planner
             && plan
                 .as_ref()
                 .is_none_or(|p| p.is_stale(now, arbiter.config().max_plan_age))
         {
-            result.minutes_without_a_plan += 1;
+            without_a_plan += step;
         }
         // What the hardware would not take. Counted here rather than inferred
         // from the meter afterwards, because the meter cannot tell a device that
@@ -2020,8 +2203,8 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         result.heat_pump_kwh += hp_actual.inflow().kw() * hours;
         result.indoor_min_c = result.indoor_min_c.min(building.indoor_c());
         result.indoor_max_c = result.indoor_max_c.max(building.indoor_c());
-        let outside_band = (scenario.config.comfort_min_c - building.indoor_c())
-            .max(building.indoor_c() - scenario.config.comfort_max_c)
+        let outside_band = (house.heat_pump.comfort_min_c - building.indoor_c())
+            .max(building.indoor_c() - house.heat_pump.comfort_max_c)
             .max(0.0);
         result.discomfort_kelvin_hours += outside_band * hours;
 
@@ -2032,7 +2215,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // Half the wear on each leg, so a full cycle pays it once — the same
         // convention the planner's objective uses.
         result.cost.wear_eur +=
-            battery_actual.abs().kw() * hours * (scenario.config.battery_wear_eur_per_kwh / 2.0);
+            battery_actual.abs().kw() * hours * (house.battery.wear_eur_per_kwh / 2.0);
         result.cost.discomfort_eur += outside_band * hours * DISCOMFORT_EUR_PER_KELVIN_HOUR;
 
         // Two different stories, and they were being told as one. A limit from a
@@ -2042,9 +2225,9 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // reports a reduction on a day when the operator said nothing at all.
         if limits.steuve_ceiling.is_some() {
             if limits.in_failsafe {
-                result.failsafe_minutes += 1;
+                failsafe_for += step;
             } else {
-                result.limited_minutes += 1;
+                limited_for += step;
             }
         }
 
@@ -2065,9 +2248,9 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         // `[A1 2.4.1]` is ordinary load: it spends the surplus like any other
         // and never appears against the ceiling.
         let (steuve_consumption, other_consumption) = [
-            (&household.battery, battery_actual),
-            (&household.evse, evse_actual),
-            (&household.heat_pump, hp_actual),
+            (&ids.battery, battery_actual),
+            (&ids.evse, evse_actual),
+            (&ids.heat_pump, hp_actual),
         ]
         .into_iter()
         .fold(
@@ -2219,6 +2402,13 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     // ── § 42c: what the community actually allocated this member ────────────
     (result.shared_kwh, result.cost.sharing_eur) = community.settle(&prices);
 
+    // The durations the loop accumulated, in the minutes the report speaks.
+    result.single_phase_minutes = single_phase.whole_minutes();
+    result.minutes_without_a_plan = without_a_plan.whole_minutes();
+    result.failsafe_minutes = failsafe_for.whole_minutes();
+    result.limited_minutes = limited_for.whole_minutes();
+    result.feed_in_over_minutes = feed_in_over.whole_minutes();
+
     result.quarter_hours = registers.into_values().collect();
     // The § 9 EEG quantity, at the resolution § 9 EEG measures it: the largest
     // quarter-hour average that left the connection point, straight off the
@@ -2241,7 +2431,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         &pv_forecast,
         &load_forecast,
         delivered_slot,
-        slot_minutes,
+        slot_covered,
         pv_slot_wh,
         load_slot_wh,
         &mut pv_scored,
@@ -2487,7 +2677,8 @@ fn unmanaged_heat_pump(
     now: OffsetDateTime,
     step: Duration,
 ) -> Power {
-    let low = scenario.config.comfort_min_c;
+    let house = Reference::of(&scenario.config).expect("run() has already validated this");
+    let low = house.heat_pump.comfort_min_c;
     if building.indoor_c() < low {
         *thermostat_on = true;
     } else if building.indoor_c() > low + 0.5 {
@@ -2495,7 +2686,7 @@ fn unmanaged_heat_pump(
     }
     building.step(
         if *thermostat_on {
-            bounded(scenario.config.heat_pump_power)
+            bounded(house.heat_pump.power)
         } else {
             Power::ZERO
         },
@@ -2629,6 +2820,7 @@ fn settle_sharing(
     (kwh, credit)
 }
 
+#[allow(clippy::too_many_lines)]
 fn baseline_cost(
     scenario: &Scenario,
     weather: &Weather,
@@ -2637,6 +2829,7 @@ fn baseline_cost(
     site: &Site,
     location: GeoPoint,
 ) -> CostBreakdown {
+    let house = Reference::of(&scenario.config).expect("run() has already validated this");
     let start = scenario.start();
     // The same § 9 EEG ceiling the managed house lives under. It is a property
     // of the installation, not of who is controlling it.
@@ -2658,25 +2851,23 @@ fn baseline_cost(
     // zeroed at the departure so that the shortfall is charged once.
     let mut car_stored = scenario.ev.map_or(Energy::ZERO, |e| e.energy_now);
     let mut building = BuildingSim {
-        nominal_electrical: scenario.config.heat_pump_power,
+        nominal_electrical: house.heat_pump.power,
         // The same floor the planner is given, so the plan and the house agree
         // about what "on" is worth for a unit whose slots are scheduled.
-        min_electrical: scenario.config.heat_pump_power * 0.3,
-        thermostat_set_c: scenario.config.comfort_min_c + 0.5,
-        thermostat_max_c: scenario.config.comfort_max_c,
+        min_electrical: house.heat_pump.power * 0.3,
+        thermostat_set_c: house.heat_pump.comfort_min_c + 0.5,
+        thermostat_max_c: house.heat_pump.comfort_max_c,
         // A single-speed compressor where the household has one, so a day can
         // report what the planner's minimum runtime actually bought. Without it
         // the constraint is stated in every plan and observed by nothing.
-        compressor: (!scenario.config.heat_pump_modulating).then(compressor_sim),
+        compressor: (!house.heat_pump.modulating).then(compressor_sim),
         ..BuildingSim::new(21.0)
     };
     let mut thermostat_on = false;
     let mut cost = CostBreakdown::default();
     let mut tank = TankSim::new(
-        Energy::from_kwh(
-            scenario.config.dhw_litres * hems_core::asset::WATER_KWH_PER_LITRE_KELVIN * 15.0,
-        ),
-        scenario.config.dhw_heater,
+        Energy::from_kwh(house.dhw.litres * hems_core::asset::WATER_KWH_PER_LITRE_KELVIN * 15.0),
+        house.dhw.heater,
     );
     let tank_open = tank.stored;
     // The unmanaged household presses start when it loads the machine, which is
@@ -2743,8 +2934,8 @@ fn baseline_cost(
         // difference being measured — and it is not immune to a cold shower
         // either: it starts each morning where the evening left it.
         let (dhw, dhw_short) = tank.step(
-            scenario.config.dhw_heater,
-            weather.draw_in(slot, hot_water_draw(slot)) * (step / SLOT),
+            house.dhw.heater,
+            weather.draw_in(slot, hems_forecast::hotwater::draw(slot)) * (step / SLOT),
             step,
         );
         cost.unserved_eur += dhw_short.kwh() * HOT_WATER_SHORTFALL_EUR_PER_KWH;
@@ -2768,8 +2959,8 @@ fn baseline_cost(
         // A thermostat is not free of discomfort: it starts reheating only once
         // the house has already fallen through the band. Leaving that out would
         // credit the planner with comfort the baseline also delivered.
-        let outside = (scenario.config.comfort_min_c - building.indoor_c())
-            .max(building.indoor_c() - scenario.config.comfort_max_c)
+        let outside = (house.heat_pump.comfort_min_c - building.indoor_c())
+            .max(building.indoor_c() - house.heat_pump.comfort_max_c)
             .max(0.0);
         cost.discomfort_eur += outside * hours * DISCOMFORT_EUR_PER_KELVIN_HOUR;
         now += step;
@@ -2801,23 +2992,6 @@ fn baseline_cost(
     cost
 }
 
-/// A household base load: low at night, peaks morning and evening.
-/// Heat drawn from the hot-water tank in one quarter hour, watt-hours.
-///
-/// A four-person household uses six to seven kilowatt-hours of hot water a day,
-/// and almost none of it at random: a shower before work, washing-up after
-/// lunch, baths and dishes in the evening. That predictability is the whole
-/// reason a tank is worth planning with — a store whose demand nobody can
-/// forecast is a store nobody can pre-charge.
-fn hot_water_draw(slot: Slot) -> Energy {
-    let hour = f64::from(slot.local_minute_of_day()) / 60.0;
-    let peak = |centre: f64, width: f64, kwh: f64| kwh * (-((hour - centre) / width).powi(2)).exp();
-    // Kilowatt-hours of heat per hour, sampled at the middle of the slot and
-    // taken over a quarter of an hour.
-    let kw = peak(7.0, 0.8, 1.7) + peak(13.0, 0.7, 0.6) + peak(20.0, 1.1, 1.4) + 0.03;
-    Energy::from_kwh(kw * 0.25)
-}
-
 fn household_load(slot: Slot) -> Power {
     let minute = f64::from(slot.local_minute_of_day());
     let hour = minute / 60.0;
@@ -2840,21 +3014,25 @@ fn score_slot(
     pv_forecast: &hems_forecast::Forecast,
     load_forecast: &hems_forecast::Forecast,
     slot: Slot,
-    minutes: u32,
+    covered: Duration,
     pv_wh: f64,
     load_wh: f64,
     pv_scored: &mut Vec<(Band, f64)>,
     load_scored: &mut Vec<(Band, f64)>,
 ) {
-    if minutes == 0 {
+    // Watt-hours over the part of the slot that was actually simulated, back to
+    // an average power. `covered` is a duration rather than a count of ticks
+    // because [`CONTROL_PERIOD`] is a parameter: a count is only a duration
+    // while nobody changes it, and this file used to hold five such counts.
+    let hours = covered.as_seconds_f64() / 3600.0;
+    if hours <= 0.0 {
         return;
     }
-    let minutes = f64::from(minutes);
     if let Some(band) = pv_forecast.at(slot) {
-        pv_scored.push((band, pv_wh / minutes * 60.0));
+        pv_scored.push((band, pv_wh / hours));
     }
     if let Some(band) = load_forecast.at(slot) {
-        load_scored.push((band, load_wh / minutes * 60.0));
+        load_scored.push((band, load_wh / hours));
     }
 }
 

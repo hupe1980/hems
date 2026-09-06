@@ -232,7 +232,11 @@ pub fn price_at(tariff: &Tariff, slot: Slot) -> SlotPrice {
         stufe,
         negative_price_hour: negative,
         price_known,
-        co2_g_per_kwh: None,
+        // The grid's own intensity where the tariff carries one. Where it does
+        // not, the planner falls back to a flat annual figure — see
+        // `Tariff::carbon_g_per_kwh` for why a *constant* makes a carbon price
+        // indistinguishable from an autarky premium.
+        co2_g_per_kwh: tariff.carbon_g_per_kwh.get(&slot).copied(),
         // § 42c changes which energy price applies to the allocated
         // kilowatt-hours and nothing else: the electricity reaches the member
         // over the public grid, so the network charge, the levies and the value
@@ -273,6 +277,7 @@ mod tests {
             feed_in: FeedIn::eeg(Decimal::new(786, 2))
                 .under_para51_from(Some(time::macros::date!(2026 - 01 - 01))),
             sharing: None,
+            carbon_g_per_kwh: BTreeMap::new(),
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

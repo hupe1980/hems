@@ -307,6 +307,29 @@ pub struct Tariff {
     /// one.
     #[cfg_attr(feature = "serde", serde(default))]
     pub sharing: Option<SharingTariff>,
+    /// The grid's carbon intensity in each quarter hour, g CO₂/kWh.
+    ///
+    /// Empty on most tariffs, and then the planner falls back to a flat annual
+    /// average — which makes a carbon price algebraically identical to an
+    /// autarky premium, because every hour is equally dirty. That was the state
+    /// of this workspace until this field existed: `hems-tariff::source` has
+    /// parsed Energy-Charts' intensity series for four versions,
+    /// `SlotPrice::co2_g_per_kwh` was hard-coded `None`, and the objective term
+    /// that reads it could only ever see the constant.
+    ///
+    /// It is worth having because the intensity and the price **disagree**. A
+    /// still winter evening is dear *and* dirty and both signals point the same
+    /// way; a windy night is cheap and only moderately clean, while a sunny
+    /// midday is cheap *and* clean. So a household that prices carbon moves
+    /// flexible load out of the night and into the middle of the day, which no
+    /// price signal on its own would ask for — and where the two agree, the
+    /// dial correctly changes nothing.
+    ///
+    /// Not `rust_decimal`: grams per kilowatt-hour is a physical estimate that
+    /// nobody is billed on, and P3 puts the exact arithmetic where money and a
+    /// Nachweis are.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub carbon_g_per_kwh: BTreeMap<Slot, f64>,
     /// The supplier's annual standing charge, euros.
     #[cfg_attr(feature = "serde", serde(default))]
     #[cfg_attr(feature = "serde", serde(with = "rust_decimal::serde::str"))]
@@ -324,6 +347,7 @@ impl Tariff {
             levies: Levies::default(),
             feed_in: FeedIn::NONE,
             sharing: None,
+            carbon_g_per_kwh: BTreeMap::new(),
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

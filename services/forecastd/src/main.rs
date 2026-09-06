@@ -49,13 +49,21 @@ async fn main() -> anyhow::Result<()> {
 
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
-    tokio::spawn(fetch_loop(
-        poller,
-        Arc::clone(&runs),
-        health.clone(),
-        settings.clone(),
+    // **Vital**: a forecastd whose fetch loop has died serves the same stale run
+    // for ever and looks perfectly healthy doing it. `Health::vital` is what
+    // makes `/livez` able to fail, which is the whole of what a liveness probe
+    // is for (D132).
+    health.vital(
+        "fetch",
         signal.clone(),
-    ));
+        fetch_loop(
+            poller,
+            Arc::clone(&runs),
+            health.clone(),
+            settings.clone(),
+            signal.clone(),
+        ),
+    );
 
     // The two surfaces answer from the same runs, so they cannot disagree.
     let mut app = router(Weather::new(runs.clone()));

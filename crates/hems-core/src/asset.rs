@@ -11,6 +11,7 @@ use time::Date;
 
 use crate::envelope::Envelope;
 use crate::ids::{AssetId, CircuitId};
+use crate::thermal::CopCurve;
 use crate::units::{Current, Energy, NOMINAL_VOLTAGE, PhaseConnection, PhaseMode, Power, Soc};
 
 /// What a driver can do with an asset.
@@ -422,6 +423,22 @@ pub enum HeatPumpControl {
     PowerCeiling,
     /// Discrete modes over a digital interface (EEBUS OMBC-style).
     OperationModes,
+    /// A process the manager starts and stops (EEBUS OHPCF).
+    ///
+    /// The one control mode that can ask a heat pump to consume **more**. The
+    /// other three are bounds, and a bound an appliance is already under changes
+    /// nothing — so a plan that has worked out the house will be cheaper if the
+    /// compressor runs now, while the roof is exporting, cannot express that
+    /// through any of them. Pre-heating into a cheap hour is the whole reason a
+    /// thermal model is in the optimiser, and this is how the decision leaves
+    /// the box.
+    ///
+    /// The unit still runs its own controller underneath: what the manager
+    /// decides is *when the process runs*, not what the flow temperature is. So
+    /// the minimum runtime and minimum rest are the appliance's own, and a
+    /// compressor that announces them is one whose planner does not have to be
+    /// told them in a configuration file.
+    Compressor,
 }
 
 /// A photovoltaic array with its inverter.
@@ -550,6 +567,34 @@ pub struct HeatPump {
     /// Whether the pump modulates or only starts and stops.
     #[cfg_attr(feature = "serde", serde(default))]
     pub modulating: bool,
+    /// The bottom of the temperature band the household will accept, °C.
+    ///
+    /// A property of the *installation* rather than of the unit, and it lives
+    /// here for the same reason a tank's litres do: the planner's whole heating
+    /// trade is how far it may let the house drift to avoid an expensive hour,
+    /// and a box that guessed the band would be guessing how cold somebody is
+    /// willing to be.
+    #[cfg_attr(feature = "serde", serde(default = "default_comfort_min"))]
+    pub comfort_min_c: f64,
+    /// The top of it, °C.
+    #[cfg_attr(feature = "serde", serde(default = "default_comfort_max"))]
+    pub comfort_max_c: f64,
+    /// How the coefficient of performance moves with the weather.
+    ///
+    /// The conversion between what the meter sees and what the house receives,
+    /// so it is needed both to plan the unit and to learn the building from it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cop: CopCurve,
+}
+
+/// 20 °C, the bottom of the band `ThermalModel::house` uses.
+fn default_comfort_min() -> f64 {
+    20.0
+}
+
+/// 23 °C.
+fn default_comfort_max() -> f64 {
+    23.0
 }
 
 impl Evse {
@@ -1068,6 +1113,9 @@ mod tests {
             heating_rod: Some(Power::from_kw(6.0)),
             control: HeatPumpControl::PowerCeiling,
             modulating: true,
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            cop: CopCurve::air_source(),
         };
         // 5 + 6 = 11 kW: exactly the threshold above which the 0,4 scaling of
         // [A1 4.5.1] applies, so getting this sum wrong changes the minimum power.

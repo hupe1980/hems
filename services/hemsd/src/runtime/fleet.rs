@@ -152,6 +152,40 @@ impl Prices {
     }
 }
 
+/// What `tariffd` says the grid's carbon intensity is.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Carbon {
+    /// The quarter hours that have one.
+    pub points: Vec<CarbonPoint>,
+}
+
+/// One quarter hour's intensity.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+pub struct CarbonPoint {
+    /// The quarter hour's start.
+    #[serde(with = "time::serde::rfc3339")]
+    pub slot: time::OffsetDateTime,
+    /// Grams of carbon dioxide per kilowatt-hour drawn from the grid.
+    pub g_per_kwh: f64,
+}
+
+impl Carbon {
+    /// The series, as [`hems_tariff::tariff::Tariff::carbon_g_per_kwh`] wants
+    /// it.
+    ///
+    /// A non-finite or negative figure is dropped rather than carried: it would
+    /// make one term of the planner's objective undefined and the resulting plan
+    /// arbitrary.
+    #[must_use]
+    pub fn series(&self) -> BTreeMap<Slot, f64> {
+        self.points
+            .iter()
+            .filter(|p| p.g_per_kwh.is_finite() && p.g_per_kwh >= 0.0)
+            .map(|p| (Slot::containing(p.slot), p.g_per_kwh))
+            .collect()
+    }
+}
+
 /// The box's client for the two fleet services.
 #[derive(Debug, Clone)]
 pub struct Fleet {
@@ -220,6 +254,28 @@ impl Fleet {
             horizon.len,
         );
         self.get("prices", &url).await.map(Some)
+    }
+
+    /// Ask `tariffd` for the grid's carbon intensity over `horizon`.
+    ///
+    /// Only worth a request where the household actually prices carbon: a
+    /// deployment whose `co2_eur_per_kg` is zero would be fetching a series it
+    /// then multiplies by nothing, and the planner's flat fallback is exactly
+    /// the right answer for a plan that does not care.
+    ///
+    /// # Errors
+    /// [`FleetError`]. `Ok(None)` where no `tariffd` is configured.
+    pub async fn carbon(&self, horizon: Horizon) -> Result<Option<Carbon>, FleetError> {
+        let Some(base) = &self.tariffd else {
+            return Ok(None);
+        };
+        let url = format!(
+            "{}/v1/carbon?from={}&slots={}",
+            base.trim_end_matches('/'),
+            urlencode(&rfc3339(horizon.first.start())),
+            horizon.len,
+        );
+        self.get("carbon", &url).await.map(Some)
     }
 
     /// Ask `forecastd` for this household's sky.

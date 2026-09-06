@@ -124,6 +124,15 @@ impl core::fmt::Debug for StoredIdentity {
     }
 }
 
+/// A failsafe the network operator wrote, as it is stored.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StoredFailsafe {
+    /// The power the household restrains itself to.
+    pub watts: f64,
+    /// How long it holds that for once it starts, seconds.
+    pub minimum_s: i64,
+}
+
 /// What has not reached the fleet yet.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Backlog {
@@ -355,6 +364,53 @@ impl Store {
                 identity.ship_id,
                 identity.key_pem,
                 identity.trusted,
+                now.unix_timestamp()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// What the network operator has said this household falls back to.
+    ///
+    /// `None` where no operator has ever written one, which is the ordinary
+    /// case: the configured value stands until somebody changes it.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the read fails.
+    pub fn eebus_failsafe(&self, direction: &str) -> Result<Option<StoredFailsafe>, StoreError> {
+        self.connection
+            .query_row(
+                "SELECT watts, minimum_s FROM eebus_failsafe WHERE direction = ?1",
+                params![direction],
+                |row| {
+                    Ok(StoredFailsafe {
+                        watts: row.get(0)?,
+                        minimum_s: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    /// Keep it, so the next power cut does not undo the operator's write.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the write fails.
+    pub fn put_eebus_failsafe(
+        &self,
+        direction: &str,
+        failsafe: &StoredFailsafe,
+        now: OffsetDateTime,
+    ) -> Result<(), StoreError> {
+        self.connection.execute(
+            "INSERT INTO eebus_failsafe (direction, watts, minimum_s, written_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(direction) DO UPDATE SET watts = ?2, minimum_s = ?3, written_at = ?4",
+            params![
+                direction,
+                failsafe.watts,
+                failsafe.minimum_s,
                 now.unix_timestamp()
             ],
         )?;

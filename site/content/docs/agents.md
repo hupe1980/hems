@@ -1,6 +1,6 @@
 +++
 title = "Agents"
-description = "Every fleet service answers over the Model Context Protocol, read-only and authorising each caller as itself — and an advisory plane that proposes, and cannot act."
+description = "Every fleet service answers over the Model Context Protocol, read-only and authorising each caller as itself — beside an advisory plane that cannot act."
 weight = 12
 +++
 

@@ -71,7 +71,21 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!("no price sources are configured; this service cannot become ready");
     }
 
+    // The curated Modul 3 catalogue, validated before a socket exists: a fleet
+    // serving windows nobody may sell is a whole Netzgebiet priced against a
+    // tariff nobody may be billed on (D126, at scale).
+    let catalogue = Arc::new(tariffd::Catalogue::curate(&settings.modul3)?);
+    if !catalogue.is_empty() {
+        tracing::info!(
+            calendars = catalogue.len(),
+            "the Modul 3 catalogue is curated"
+        );
+    }
+
     let cache = Arc::new(RwLock::new(PriceCache::new()));
+    // The grid's own carbon intensity, kept beside the prices. One publisher,
+    // so nothing to reconcile — see `hems_tariff::cache::CarbonCache`.
+    let carbon = Arc::new(RwLock::new(hems_tariff::cache::CarbonCache::new()));
     let health = Health::new();
     health.bad("prices", "no fetch has succeeded yet");
 
@@ -89,18 +103,28 @@ async fn main() -> anyhow::Result<()> {
 
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
-    tokio::spawn(fetch_loop(
-        poller,
-        Arc::clone(&cache),
-        health.clone(),
-        settings.ready_slots,
+    // **Vital**: this is the loop every box in the fleet asks for a price curve
+    // every five minutes. A tariffd whose fetch loop has died serves yesterday's
+    // prices and answers `/livez` with a 200, so nothing restarts it and every
+    // household plans against a day that has already happened (D132).
+    health.vital(
+        "fetch",
         signal.clone(),
-    ));
+        fetch_loop(
+            poller,
+            Arc::clone(&cache),
+            Arc::clone(&carbon),
+            health.clone(),
+            settings.ready_slots,
+            signal.clone(),
+        ),
+    );
 
     // The two surfaces answer from the same cache, so they cannot disagree. The
     // MCP one is off unless an operator switched it on: an endpoint that speaks
     // to whatever can reach it is one somebody should have to ask for.
-    let mut app = router(Prices::new(cache.clone()));
+    let mut app = router(Prices::new(cache.clone()).with_carbon(Arc::clone(&carbon)))
+        .merge(tariffd::modul3::router(catalogue));
     if settings.mcp.enabled {
         let auth = hems_service::McpAuth::gated(&settings.mcp)?;
         app = app.merge(tariffd::mcp_server::router(
@@ -131,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
 async fn fetch_loop(
     mut poller: Poller<Http>,
     cache: Arc<RwLock<PriceCache>>,
+    carbon: Arc<RwLock<hems_tariff::cache::CarbonCache>>,
     health: Health,
     ready_slots: usize,
     signal: Shutdown,
@@ -139,7 +164,11 @@ async fn fetch_loop(
         let now = time::OffsetDateTime::now_utc();
         let outcome = {
             let mut guard = cache.write().await;
-            poller.poll(&mut guard, now).await
+            let mut carbon_guard = carbon.write().await;
+            let outcome = poller.poll(&mut guard, &mut carbon_guard, now).await;
+            guard.prune(now);
+            carbon_guard.prune(now);
+            outcome
         };
         for (source, why) in &outcome.failed {
             tracing::warn!(?source, why, "a price source did not answer");

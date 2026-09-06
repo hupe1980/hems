@@ -491,6 +491,15 @@ fn shadow_prices(
                     .collect()
             })
             .collect(),
+        may_charge: declared
+            .iter()
+            .map(|f| {
+                f.may_charge
+                    .iter()
+                    .map(|z| z.map_or(0.0, |v| solution.value(v).round()))
+                    .collect()
+            })
+            .collect(),
     };
 
     // ── The duals are prices, so the objective they come from is a price ─────
@@ -631,6 +640,10 @@ struct Vars<'a> {
     /// where the objective cannot pay for a round trip through the meter and
     /// the direction therefore needs no deciding. See [`balance`].
     exporting: &'a [Option<Variable>],
+    /// `1` where the battery is allowed to charge in this slot — `None` unless
+    /// the household has forbidden charging it from the grid. See
+    /// [`storage`].
+    may_charge: &'a [Option<Variable>],
 }
 
 /// Every decision variable of the model, owned.
@@ -662,6 +675,7 @@ struct Variables {
     sh_short: Vec<Variable>,
     shared: Vec<Variable>,
     exporting: Vec<Option<Variable>>,
+    may_charge: Vec<Option<Variable>>,
 }
 
 impl Variables {
@@ -691,6 +705,7 @@ impl Variables {
             sh_short: &self.sh_short,
             shared: &self.shared,
             exporting: &self.exporting,
+            may_charge: &self.may_charge,
         }
     }
 }
@@ -713,6 +728,10 @@ struct Pins {
     /// afternoon imports where a bright one exports, and tying the two together
     /// would make one of them infeasible.
     exporting: Vec<Vec<f64>>,
+    /// Whether the battery was allowed to charge, `[future][k]`. Per future for
+    /// the same reason: a bright afternoon has a surplus to charge from and a
+    /// dull one does not.
+    may_charge: Vec<Vec<f64>>,
 }
 
 /// Declare the variables and their bounds.
@@ -856,6 +875,7 @@ fn recourse_variables(
         sh_short: Vec::with_capacity(problem.shiftable.len()),
         shared: Vec::with_capacity(n),
         exporting: Vec::with_capacity(n),
+        may_charge: Vec::with_capacity(n),
     };
 
     let import_ceiling = problem
@@ -903,6 +923,8 @@ fn recourse_variables(
             future,
             pins,
         ));
+        v.may_charge
+            .push(charge_source_binary(problem, vars, k, future, pins));
         v.curtail.push(vars.add(variable().min(0.0).max(pv)));
 
         let (charge_max, discharge_max, floor, ceiling) =
@@ -1024,6 +1046,46 @@ fn direction_binary(
         // that missed would be a model the duals do not belong to.
         Some(p) => {
             let pinned = p.exporting[future][k];
+            vars.add(variable().min(pinned).max(pinned))
+        }
+        None => vars.add(variable().binary()),
+    })
+}
+
+/// Whether the battery may charge in this slot — `None` where the question
+/// cannot arise.
+///
+/// A household that has set `grid_charging_allowed = false` has said its
+/// storage is only ever filled from its own roof. That is not a preference: it
+/// is the **Ausschließlichkeitsprinzip** a storage system has to satisfy for its
+/// energy to stay green, and MiSpeL measures it as
+/// [`gleichzeitiger Netzbezug`](hems_grid::mispel) — import and charging in the
+/// same quarter hour. A plan that charges while the meter is running has spent
+/// the household's claim to it.
+///
+/// The constraint is therefore `min(g_in, b_ch) = 0`, which is a disjunction and
+/// no inequality implies it. `b_ch ≤ pv` looks like it says the same thing and
+/// does not: with a roof producing 3 kW, a house drawing 1 kW and a battery
+/// taking all 3, the meter runs and every kilowatt-hour in that battery is grey.
+///
+/// So it is a binary — one per slot per future, and **only** for a household
+/// that asked for it (D142). A battery that may take grid energy gets the model
+/// unchanged, which is every household in the reference set and is what keeps
+/// their figures comparable with the ones measured before this existed.
+fn charge_source_binary(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    k: usize,
+    future: usize,
+    pins: Option<&Pins>,
+) -> Option<Variable> {
+    let b = problem.battery?;
+    if b.grid_charging_allowed || b.max_charge <= Power::ZERO {
+        return None;
+    }
+    Some(match pins {
+        Some(p) => {
+            let pinned = p.may_charge[future][k];
             vars.add(variable().min(pinned).max(pinned))
         }
         None => vars.add(variable().binary()),
@@ -1683,12 +1745,14 @@ fn storage<M: SolverModel>(
             == previous + vars.b_ch[k] * (b.efficiency_charge * DT_HOURS)
                 - vars.b_dis[k] * (DT_HOURS / b.efficiency_discharge)
     )));
-    if !b.grid_charging_allowed {
-        // The battery may only take what the roof is producing — the setting
-        // that keeps a storage system outside MiSpeL's flow bookkeeping
-        // altogether, because none of its energy is ever grey.
-        let (pv, _) = problem.forecasts_in(realisation, k);
-        model = model.with(constraint!(vars.b_ch[k] <= pv));
+    if let Some(may) = vars.may_charge[k] {
+        // Nothing goes into this battery while the meter is running. See
+        // [`charge_source_binary`] for why this is a disjunction rather than
+        // `b_ch ≤ pv`, and what it costs the household's Ausschließlichkeit to
+        // get it wrong.
+        let import_m = import_cap(problem, realisation, k);
+        model = model.with(constraint!(vars.g_in[k] <= import_m * (1.0 - may)));
+        model = model.with(constraint!(vars.b_ch[k] <= b.max_charge.get() * may));
     }
     model
 }
@@ -1719,10 +1783,18 @@ fn charging<M: SolverModel>(
     // at all, and the model has no way to find that out.
     //
     // A charge point that can drop to one conductor has *two* such ranges, and
-    // they are mutually exclusive. Modelling only the wider one makes the plan
-    // pessimistic about hardware the household owns: under a limit that leaves
-    // it 3 kW it refuses to charge, while the arbiter would have switched and
-    // charged.
+    // they are mutually exclusive. Only the wider one is modelled, which makes
+    // the plan pessimistic about hardware the household owns: under a limit that
+    // leaves it 3 kW it refuses to charge, while the arbiter would have switched
+    // and charged.
+    //
+    // That is a decision rather than an omission, and it is
+    // [`EvSession::min_charge`]'s. The two ranges need a second binary per slot,
+    // and the cheap substitute — taking the *lowest* minimum the wiring reaches
+    // — is worse than the pessimism: it lets a plan dribble through hours it did
+    // not need to use. Phase switching is the arbiter's lever, and the arbiter
+    // earns its keep precisely where the guard has cut the charge point below
+    // what three conductors can start on.
     if e.min_charge > Power::ZERO {
         model = model.with(constraint!(
             vars.ev[k] <= vars.ev_on[k] * e.max_charge.get()

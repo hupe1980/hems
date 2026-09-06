@@ -49,6 +49,24 @@ pub struct Settings {
     /// A fleet of boxes retrying a failed public API every fifteen seconds is a
     /// denial of service against somebody who is giving the data away.
     pub max_backoff_s: u64,
+    /// The curated Modul 3 calendars, one per network operator and year.
+    ///
+    /// There is no machine-readable national format for a Zählzeitdefinition —
+    /// a PDF or an Excel sheet per network operator — so somebody transcribes
+    /// each one, once per Netzgebiet rather than once per household, and this
+    /// is where the fleet keeps them. The shape of each calendar is
+    /// [`hems_grid::modul3::Transcription`], the same one a box takes as
+    /// `[tariff.modul3]`, so a transcription is portable between the two.
+    ///
+    /// Every entry is checked against the BDEW Anwendungshilfe at start-up and
+    /// a violation **refuses to start** the daemon: a fleet serving windows
+    /// nobody may sell is a whole Netzgebiet of households priced against a
+    /// tariff nobody may be billed on, which is worse than one box (D126). A
+    /// `source` is required for the same reason it is under `run --check` —
+    /// when a household queries a bill, the first question is which document
+    /// said so.
+    #[serde(default)]
+    pub modul3: Vec<Modul3Entry>,
     /// The Model Context Protocol surface, off by default.
     ///
     /// Open like the REST routes when it is switched on: a day-ahead auction
@@ -72,6 +90,7 @@ impl Default for Settings {
             poll_interval_s: 900,
             request_timeout_s: 20,
             max_backoff_s: 3600,
+            modul3: Vec::new(),
             mcp: hems_service::McpSettings::default(),
             ready_slots: 96,
         }
@@ -82,4 +101,15 @@ impl AsMut<hems_service::Settings> for Settings {
     fn as_mut(&mut self) -> &mut hems_service::Settings {
         &mut self.service
     }
+}
+
+/// One network operator's calendar in the curated catalogue.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Modul3Entry {
+    /// The network operator this calendar belongs to — its BDEW-Codenummer,
+    /// which is what a box's site configuration already names.
+    pub netzbetreiber: String,
+    /// The calendar, as transcribed from the operator's price sheet.
+    pub calendar: hems_grid::modul3::Transcription,
 }

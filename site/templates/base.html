@@ -25,7 +25,7 @@
 <meta name="color-scheme" content="light dark">
 <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0d1116" media="(prefers-color-scheme: dark)">
-<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+{% block robots %}<meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">{% endblock %}
 
 <meta property="og:site_name" content="{{ config.title }}">
 <meta property="og:locale" content="en_GB">
@@ -33,9 +33,14 @@
 <meta property="og:url" content="{{ meta_url }}">
 <meta property="og:title" content="{{ meta_title }}">
 <meta property="og:description" content="{{ meta_desc }}">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="{{ get_url(path='og.png') }}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="hems — home energy management for the German grid">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{{ meta_title }}">
 <meta name="twitter:description" content="{{ meta_desc }}">
+<meta name="twitter:image" content="{{ get_url(path='og.png') }}">
 
 <link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml">
 <link rel="sitemap" type="application/xml" href="{{ get_url(path='sitemap.xml') }}">
@@ -65,22 +70,10 @@
 })();
 </script>
 
-{% block schema %}
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "SoftwareSourceCode",
-  "name": "{{ config.title }}",
-  "description": "{{ config.description }}",
-  "url": "{{ config.base_url }}",
-  "codeRepository": "{{ config.extra.repository }}",
-  "programmingLanguage": "Rust",
-  "license": "https://spdx.org/licenses/MIT.html",
-  "applicationCategory": "Home energy management",
-  "keywords": "{{ config.extra.keywords }}"
-}
-</script>
-{% endblock %}
+{#- The project, on every page. A documentation page adds its own article and
+    breadcrumb by overriding this block — see `page.html` — because a nested
+    search result is earned per page rather than per site. -#}
+{% block schema %}{% include "partials/schema.html" %}{% endblock %}
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>

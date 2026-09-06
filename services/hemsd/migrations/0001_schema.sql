@@ -155,6 +155,26 @@ CREATE TABLE IF NOT EXISTS eebus_identity (
     created_at    INTEGER NOT NULL
 ) STRICT;
 
+-- The values the network operator has written for what this household falls
+-- back to when it stops hearing from them ([LPC-021], [LPP-021]).
+--
+-- Kept here rather than in the configuration file because they are not the
+-- household's to set: §2.15 of the implementation guide makes a Controllable
+-- System accept a change from the Energy Guard, and a box that came back from a
+-- power cut on its own file would have discarded it. That is
+-- `ATC_LPC_COM_PT_CSInit_003`, and it is a household question before it is a
+-- certification one — the failsafe is what restrains the house when nobody is
+-- talking to it.
+--
+-- One row per direction, because consumption (§ 14a) and production (§ 9 EEG)
+-- are separate use cases with separate keys.
+CREATE TABLE IF NOT EXISTS eebus_failsafe (
+    direction   TEXT    NOT NULL PRIMARY KEY,
+    watts       REAL    NOT NULL,
+    minimum_s   INTEGER NOT NULL,
+    written_at  INTEGER NOT NULL
+) STRICT;
+
 -- ── Outbound events ─────────────────────────────────────────────────────────
 --
 -- A CloudEvent the box has produced and the fleet has not yet taken. The day

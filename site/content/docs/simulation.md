@@ -1,6 +1,6 @@
 +++
 title = "Simulation and evaluation"
-description = "Seven reference days, hardware simulators that all know how to say no, a seeded weather the planner never sees, and the multi-day sweeps that can falsify what a single day claims."
+description = "Seven reference days, hardware simulators that all know how to say no, a seeded weather the planner never sees, and multi-day sweeps that can falsify a day."
 weight = 10
 +++
 
@@ -40,13 +40,13 @@ $ just demo-all
 
 | Day | What it shows | Saved |
 |---|---|---|
-| `winter` | a reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back 75 minutes | €2,09 |
-| `summer` | more production than the house can use, and four quarter hours of negative prices | €8,61 |
-| `deadline` | a car that arrives *as the reduction starts* with three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,51 |
-| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,28 |
-| `offline` | **the planner switched off** — what the box does on its own | €7,94 |
-| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,72 |
-| `capped` | a clear May day on a 20 kWp roof, the § 9 EEG cap binding at 12,06 of 12,00 kW | €1,31 |
+| `winter` | a reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back 75 minutes | €2,14 |
+| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,65 |
+| `deadline` | a car that arrives *as the reduction starts* with three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,56 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,33 |
+| `offline` | **the planner switched off** — what the box does on its own | €7,90 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,77 |
+| `capped` | a clear May day on a 20 kWp roof, the § 9 EEG cap binding at 11,78 of 12,00 kW | €1,27 |
 
 `autumn` is also the only one of the seven where the seam between the arbiter and
 the wiring shows: a switching wallbox spends the afternoon being asked for power
@@ -70,7 +70,7 @@ because each costs minutes rather than seconds.
 
 | Flag | What it isolates |
 |---|---|
-| `--perfect-foresight` | the January day with the future known: €5,25 against the €2,09 an honest forecast earns |
+| `--perfect-foresight` | the January day with the future known: €5,28 against the €2,14 an honest forecast earns |
 | `--wear-eur-per-kwh 0` | a cost-only optimiser: 18,7 kWh of battery throughput instead of 15,5 |
 | `--no-phase-switching` | on the autumn day, 0,2 kWh into the car against 13,1 — and a car 4,8 kWh short |
 | `--imsys` | the § 9 EEG cap lifted: one cent to the managed household, twelve to the unmanaged one |
@@ -86,14 +86,21 @@ bugs worth finding. So each one has at least one refusal:
 
 | Simulator | Its refusal |
 |---|---|
-| `EvseSim` | below 6 A per conductor it charges **nothing**, and the contactor costs a session while the vehicle re-negotiates |
+| `EvseSim` | below 6 A per conductor it charges **nothing**, and the contactor costs a session ten seconds while the vehicle re-negotiates |
 | `BatterySim` | reports what it **took**, not what it was told, and has a standing loss — one left alone is not full a week later |
-| `PvSim` | follows a curtailment command in a second or two rather than instantly |
+| `PvSim` | follows a curtailment command with a two-second time constant rather than instantly |
 | `BuildingSim` | a thermostat that refuses to keep heating a house that is already warm |
 | `TankSim` | runs out of hot water |
 | `ApplianceSim` | **ignores a stop** — a programme interrupted halfway is not one that resumes |
 | `CompressorSim` | refuses a stop its minimum runtime has not earned, and counts its starts |
 | `SteuerboxSim` | emits EEBUS limitation events on a script, including going quiet |
+
+**Every one of those lags is a *time*, not a number of calls**, and that is not
+a detail: a dynamic expressed per tick is a dynamic whose speed belongs to
+whoever is calling it. These days tick once a minute and a box ticks once a
+second, so a "two-second" inverter counted in steps would take four minutes to
+obey a feed-in limit. Every simulator here takes the step duration, and a day run
+at any cadence describes the same hardware.
 
 Two of those found real defects. Without the heat pump's own thermostat, a
 manager that stopped planning cooked the reference house to **64 °C** and

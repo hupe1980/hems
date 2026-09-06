@@ -35,4 +35,6 @@ pub use config::{ControlSettings, DriverSettings, Settings, SiteSettings};
 pub use forecasting::{Learned, Weather, WeatherSpec};
 pub use runtime::{Running, Status};
 pub use scenario::{CommunityMembership, DayResult, EvPlan, Scenario, run};
-pub use site::{Household, HouseholdConfig};
+pub use site::{
+    BatteryConfig, DhwConfig, EvseConfig, HeatPumpConfig, Household, HouseholdConfig, PvConfig,
+};

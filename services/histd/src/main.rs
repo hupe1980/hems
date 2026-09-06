@@ -52,17 +52,27 @@ async fn main() -> anyhow::Result<()> {
 
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
-    tokio::spawn(retention_loop(
-        Arc::clone(&store),
-        health.clone(),
-        settings.retention_sweep_s,
+    // **Vital**, and the quietest of the three: a retention loop that has died
+    // sweeps nothing, so the two years of `[A1 7.3]` evidence grow without bound
+    // and the only symptom is a disk filling up months later. `/livez` used to
+    // stay green through all of it (D132).
+    health.vital(
+        "retention",
         signal.clone(),
-    ));
+        retention_loop(
+            Arc::clone(&store),
+            health.clone(),
+            settings.retention_sweep_s,
+            signal.clone(),
+        ),
+    );
 
     // The two surfaces answer from the same store and from the same credentials,
     // and each MCP call is authorised as its own caller — so a token cannot
     // reach a site over `/mcp` that the REST route would refuse it.
-    let mut app = router(History::new(db.clone(), store, credentials.clone()));
+    let mut app = router(
+        History::new(db.clone(), store, credentials.clone()).settling(settings.mispel.clone()),
+    );
     if settings.mcp.enabled {
         let auth = hems_service::McpAuth::per_caller(&settings.mcp, &credentials)?;
         app = app.merge(histd::mcp_server::router(

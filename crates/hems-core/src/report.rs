@@ -16,8 +16,9 @@
 //!
 //! # The three that must be zero
 //!
-//! [`DayKpis::respected_the_grid`], [`DayKpis::minutes_without_a_plan`] and
-//! [`DayKpis::worst_overshoot_w`] are not statistics. A fleet operator asking
+//! [`DayKpis::respected_the_grid`], [`DayKpis::minutes_without_a_plan`],
+//! [`DayKpis::worst_overshoot_w`] and [`DayKpis::worst_feed_in_overshoot_w`]
+//! are not statistics. A fleet operator asking
 //! "how are my ten thousand households" is not asking for an average of those —
 //! **any** breach of a network operator's instruction is a finding, and an
 //! average is how one becomes invisible among nine thousand nine hundred and
@@ -143,6 +144,27 @@ pub struct DayKpis {
     /// ceiling, watts. Zero on a compliant day.
     #[cfg_attr(feature = "serde", serde(default))]
     pub worst_overshoot_w: f64,
+    /// The furthest the Einspeiseleistung ever went over the § 9 EEG ceiling,
+    /// watts. Zero on a compliant day.
+    ///
+    /// § 14a has had a compliance answer since the first day this type existed
+    /// and § 9 EEG had none, which is a strange asymmetry to keep: both are
+    /// statutory limits on the same connection point, both are enforced by the
+    /// same guard on the same tick, and only one of them was ever checked. A
+    /// fleet could not tell that a roof was feeding in over its cap.
+    ///
+    /// Measured against the **instantaneous** ceiling, because § 9 Abs. 2 EEG
+    /// says Leistung. The quarter-hour register a settlement is built from is a
+    /// different and coarser question, and a roof can sit above the statutory
+    /// limit for minutes inside a slot whose average is under it.
+    ///
+    /// There is no companion boolean, deliberately:
+    /// [`DayKpis::respected_the_feed_in_ceiling`] derives from this number, so
+    /// the two cannot disagree. Its § 14a neighbour has one because
+    /// [`DayKpis::respected_the_grid`] is *not* derivable — a `[A1 7.2]` record
+    /// can be non-compliant for reasons an overshoot in watts does not capture.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub worst_feed_in_overshoot_w: f64,
     /// Minutes the arbiter spent with no plan it was willing to follow.
     ///
     /// The seam number that found a defect costing €1,50 a day for the life of
@@ -211,6 +233,7 @@ impl Default for DayKpis {
             economics: None,
             respected_the_grid: true,
             worst_overshoot_w: 0.0,
+            worst_feed_in_overshoot_w: 0.0,
             minutes_without_a_plan: 0,
             control_events: 0,
             below_minimum_commanded: false,
@@ -256,7 +279,20 @@ impl DayKpis {
     /// Whether anything on this day is worth somebody looking at.
     #[must_use]
     pub fn needs_attention(&self) -> bool {
-        !self.respected_the_grid || self.minutes_without_a_plan > 0 || self.below_minimum_commanded
+        !self.respected_the_grid
+            || !self.respected_the_feed_in_ceiling()
+            || self.minutes_without_a_plan > 0
+            || self.below_minimum_commanded
+    }
+
+    /// Whether the Einspeiseleistung stayed inside the § 9 EEG ceiling all day.
+    ///
+    /// `true` where nothing caps this site's feed-in, which is the honest answer
+    /// rather than a missing one: a plant outside § 9 Abs. 2 has no ceiling to
+    /// cross, and neither has one that never crossed it.
+    #[must_use]
+    pub fn respected_the_feed_in_ceiling(&self) -> bool {
+        self.worst_feed_in_overshoot_w <= 0.0
     }
 }
 

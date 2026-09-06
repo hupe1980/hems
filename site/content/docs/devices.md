@@ -1,6 +1,6 @@
 +++
 title = "Devices and drivers"
-description = "What a wanted power becomes on real hardware — amperes, contact states, contactors — and the sans-I/O driver contract that keeps a protocol from becoming a second control plane."
+description = "What a wanted power becomes on real hardware — amperes, contact states, contactors — and the sans-I/O driver contract behind EEBUS, SunSpec and Modbus."
 weight = 9
 +++
 
@@ -177,6 +177,44 @@ holds came off the wire this second or is the last one it saw before the device
 went quiet. No layer above can recover that distinction, because both arrive as
 the same `f64`.
 
+### And so is whether silence means anything
+
+The registry drops a reading older than ten seconds, and asks the household to be
+told which device has gone quiet. That is the right question of a **polled**
+driver: a SunSpec inverter reads every second, so a reading older than a few of
+those means the device stopped answering while its socket stayed open, and only
+the timestamp can say so.
+
+It is the wrong question of a driver whose values are **notified on change**.
+EEBUS MDT, MRT and MOT deliver a value when it moves, and a hot-water tank
+holding 52 °C and a room holding 21 °C move for hours at a time — which is the
+protocol working. Judging them the same way dropped both from the site's state
+ten seconds after every reading, so the tank and the building were in the plan
+only in the moments just after they changed. Which is the opposite of when a plan
+needs them.
+
+Notified-versus-polled is not the distinction, which is worth saying because it
+is the one to reach for. *Every* EEBUS scenario here is subscription-driven — the
+use-case specifications ask an actor to subscribe, and name polling only as the
+fallback for a subscription that was refused. What separates them is whether the
+notification comes on a **clock**, and across all fifty-seven descriptors the
+things on a clock are the heartbeats and nothing else. So the declaration is held
+to the specification: a driver that gains a use case with a heartbeat — and stops
+being one whose silence is meaningless — fails the build rather than a
+household.
+
+So drivers declare `reports_on_change`, and what such a driver owes instead is a
+**link** — which it reports on its own initiative, because a SHIP session that
+goes away takes the driver's link with it. What that gives up is the device that
+keeps its socket open and stops updating; where the peer stamps its readings, the
+driver puts *that* instant on the measurement and the age is meaningful again.
+
+A peer's timestamp is believed within two minutes ahead and an hour behind this
+box's own clock, and not otherwise. A household device sets its clock from NTP or
+from nothing at all, and the second is common — and `Measurement::at` is what the
+guard ages a reading by, so a wrong one is a reading refused for ever or trusted
+for ever.
+
 ### Available power is declared, not assumed
 
 A curtailed inverter asked what it is producing answers with **what the manager
@@ -188,7 +226,7 @@ So drivers declare `reports_available_power`, and a household is entitled to kno
 which of the two its box is running on. Where it is false the fallback is the
 nameplate — optimistic, and self-correcting on the next tick.
 
-## The registry: five mismatches that are loud at startup
+## The registry: what it refuses before a byte moves
 
 Something has to own a *set* of drivers, give each one its bytes, and fold what
 they say into the two things the control planes read — `SiteState`, what the
@@ -197,19 +235,20 @@ house is doing, and `GridLimits`, what the operator is asking for. That is
 the layer where a socket becomes legitimate.
 
 Registration is a **check**, not a formality. A declaration nothing validates is a
-comment with a type, so registration refuses five mismatches that would otherwise
+comment with a type, so registration refuses six mismatches that would otherwise
 be discovered months later:
 
 | Refused | Otherwise presents as |
 |---|---|
 | no drivers at all | a box that keeps the house safe by assuming every controllable device is at its nameplate, for ever |
 | a driver for an asset the site does not have | a device that is simply never commanded |
-| two drivers for one asset | two sources of truth about one meter |
-| a controllable asset whose driver cannot command | a device the arbiter talks to all day and never moves |
+| two drivers that both command one asset | one contactor obeying two managers, and nothing that could say which |
+| two drivers that both measure one asset | two sources of truth about one meter |
+| a controllable asset no driver can command | a device the arbiter talks to all day and never moves |
 | a § 14a site with no driver that reports grid limits | a household that believes it is participating and would never hear a reduction |
 
 Each of those is silent at runtime and loud at startup, which is the right way
-round — and `hemsd run --check` is all five without opening a socket, which is
+round — and `hemsd run --check` is all six without opening a socket, which is
 what an installer runs before leaving.
 
 The first two are different mistakes with the same symptom, and they are reported
@@ -280,6 +319,36 @@ effect, so `W / (1 − ThrotPct)` recovers what the array would deliver
 unthrottled. A device that publishes it earns `reports_available_power`; one that
 does not, says so.
 
+### A write answer is not a confirmation
+
+Curtailment in model 123 is a percentage of `WMax`, and the write response
+echoes the address and the quantity and **never the values**. So "accepted"
+means the frame was well formed and nothing more, and two perfectly ordinary
+inverters answer it identically while disobeying:
+
+- one **clips** `WMaxLimPct` to its own minimum step — the plan asked for 2 kW
+  and the roof will deliver 3;
+- one stores `WMaxLimPct` and leaves `WMaxLim_Ena` at **zero**, which curtails
+  nothing at all. The setpoint is there, the limit is not in force, and every
+  layer above reports a compliant house.
+
+So the driver reads the registers back and answers from what it finds there.
+`confirmed` is what the device actually holds, `accepted` is whether the limit is
+in force, and `detail` names which of the two happened. The difference between
+commanded and confirmed is where a plan and a house quietly stop agreeing, and
+it is now a number rather than a surprise.
+
+A command that is **never answered** — the device went quiet, the link dropped —
+is reported as a failure rather than left in flight. Silence here is the
+dangerous case: nothing contradicts the ceiling, so it reaches the § 14a evidence
+record as one that was issued and obeyed.
+
+The box keeps the last outcome per device and publishes it on `/v1/status` as
+`disobedient`, with its own readiness check beside the driver one. The two are
+deliberately separate: a **silent** device is a network fault, and a
+**disobedient** one is answering perfectly well and not doing what it is told.
+They are different ends of the house.
+
 ### The walk is bounded, because the device decides where it goes
 
 Each step of the chain walk reads two registers the *device* chose — a model
@@ -302,6 +371,47 @@ It is the same argument the **scale factor** makes one layer down: `10^exponent`
 with an exponent read straight off a wire is an infinity waiting to happen, so an
 exponent outside the specification's own −10…10 is treated as no scaling at all.
 Both are refusals to invent a number on behalf of hardware nobody here controls.
+
+### The other half of the market: a map, not a model list
+
+SunSpec works because it is a *standard* — the device publishes a model list and
+the driver walks it, so nothing is typed into a file and nothing can be typed
+wrongly. Most German heat pumps are not that. A Stiebel, Vaillant, Viessmann or
+Bosch unit answers Modbus all day and publishes no model list at all: the
+register numbers are in a PDF, and every unit's are different.
+
+`modbus::registers` is the driver for that, and it was written for **one
+measurement**. The planner models the building, learns which house it is from the
+household's own record, and can start the compressor — and all of it is gated on
+an *indoor temperature*, which no EEBUS use case carried at the time and which a
+heat pump had been publishing in a register the whole time.
+
+EEBUS caught up: `hvac::mrt` carries a room temperature, so a unit that speaks it
+needs no register map. This remains the path for everything that does not, which
+is most of the installed base — and it is the **alternative** rather than a
+companion, because both measure and one asset gets one meter.
+
+A point declares five things and guesses none of them:
+
+| | Why it cannot be inferred |
+|---|---|
+| **space** — holding or input | separately addressed, and most vendors put sensors in the input space SunSpec never touches; reading the wrong one returns a plausible number from elsewhere in the map |
+| **width and word order** | a 32-bit value spans two registers and vendors disagree which comes first. 1,8 kW read the other way round is 117 964 800 W — a household drawing a hundred megawatts, which no bounds check calls impossible the way a negative temperature is impossible |
+| **scale** | a temperature is published in tenths of a kelvin as often as in kelvin, and a *negative* scale is how a vendor reporting generation as positive becomes this workspace's load convention |
+| **field** | which of `power`, `temperature_c` or `soc` it becomes — a short list on purpose, so a map can only say things the rest of the box already knows how to use |
+
+It **reads and never writes**, and that is the design rather than a stage it has
+not reached. A register map that could write is one where a typo in a
+configuration file starts a compressor: the consequence is not a bad reading, it
+is a heat pump doing something nobody asked for. Commanding belongs to a protocol
+that says what a value *means*, and the registry lets both drivers speak for one
+asset precisely so this one never has to.
+
+One point per request, too, rather than one read spanning a block. Coalescing is
+the obvious optimisation and it is wrong here: a vendor map is sparse, a device
+answers a read crossing an unimplemented register with an exception, and the
+reply carries no way to say *which* register was the problem — so one bad number
+in the file would silently cost every point that shares its block.
 
 ## `eebus` — the § 14a side
 
@@ -376,12 +486,162 @@ engines, and a message either side refuses to encode simply does not arrive. And
 at all, which is the only arrangement in which there is exactly one copy of the
 § 14a state machine in the product.
 
+### The car, and an arrival that has no message
+
+What the plan was always missing about a charge point is not power — the arbiter
+has commanded amperes since the first day — but *whether there is a car on the
+end of it, and how full it is*. `EvSession` has been in the optimiser from the
+beginning and was never built on a running box, because nothing reported an
+arrival.
+
+`eebus-ev` reports one, and the way it does is the interesting part. **EVCC
+scenario 1 has no payload at all**: an `EV` entity *appearing* underneath the
+`EVSE` entity is how a car says it is plugged in, and scenario 8 is the entity
+going away again. So the box watches the peer's own entity tree — re-reading
+discovery every half minute, because a cable going in sends nothing — and EVSOC
+then gives the state of charge and the battery's size.
+
+Both of those or neither. A percentage says nothing about how long charging will
+take and a capacity says nothing about how much is needed, so a car that
+publishes one of them is a car the planner leaves out rather than one it charges
+against an invented battery. A car on IEC 61851 has a pilot wire and cannot
+answer at all — it is still plugged in, and the plan still has to know that.
+
+**The departure and the target are the household's.** No EEBUS use case carries
+either, and that is right: a car that published a departure time would be
+publishing a guess about its driver. They come from configuration, and they are
+what turn a state of charge into a deadline the planner can price.
+
+There is one thing this seam cannot do, and it is worth knowing rather than
+discovering. SPINE keeps a peer's discovery as a **merged document** — a re-send
+is allowed to be partial, so every consumer would otherwise reimplement the merge
+— which means a shorter reply cannot remove what an earlier one added. An `EV`
+entity that has gone away is still in the tree. Taking it out needs a datagram
+that says `delete`, which a charge point has to choose to send. So an arrival is
+visible on every peer and a departure only on one that deletes, or when the
+session restarts — and the household's own departure time is what ends the
+session in the meantime.
+
+### The heat pump: the lever, and the state it is aimed at
+
+Three use cases on one session, because SHIP grants one connection per peer pair
+and they are three parts of one decision.
+
+**OHPCF** is the lever, and it is the only one in the whole set that can ask an
+appliance to consume *more*. Everything else on the grid side is a ceiling, and a
+ceiling an appliance is already under changes nothing — so a plan that has worked
+out the house will be cheaper if the compressor runs at eleven, while the roof is
+exporting, had no way to say so. The compressor announces that it *could* run,
+what it would draw, how long it must run once started and how long it must then
+rest; the last two are the planner's minimum-runtime rows, arriving from the
+machine rather than from a configuration file.
+
+It needs a **binding**, and that is the part a manager built on monitoring use
+cases does not expect. A subscription buys the right to be *told*; only a binding
+buys the right to write. Without one the compressor answers every start
+`BindingRequired` before its own state machine ever sees it — an offer the box can
+locate, report, and never take up.
+
+**MRT** is the state the lever is aimed at: the air temperature of each room the
+unit monitors. A device that watches four announces the use case four times, and
+the driver reports the mean — the model has a single air node, because `Rc2`
+describes a *dwelling*, and picking the first room would have the planner heat the
+house to keep one bedroom in band. The mean is over the rooms that have **spoken**,
+not the ones that exist: folding a zero in for a sensor that has not reported is a
+house the planner thinks is freezing.
+
+**MOT** is the weather at this building rather than a forecast for the grid
+square. Planning still needs the forecast — the future cannot be measured — but
+the *fit* is better off with the thermometer, and the difference is several
+degrees on the days it matters. Which the fit would otherwise attribute to the
+fabric, since heat loss is exactly what the two are told apart by.
+
+### The hot-water tank, and the direction hems had never gone
+
+Everything above is a network operator reaching *this* box. A hot-water circuit
+is the other way round: a device on the household's own network, which the box
+dials. `eebus-dhw` is that driver, and it does two things — **MDT**, the
+temperature the tank actually reached, and **CDSF**, asking for a one-time hot
+water loading.
+
+One number, and it is the one that kept a whole feature out of every real plan.
+The optimiser has modelled a hot-water store since it was written: a linear tank
+with a heater, a coefficient of performance, a standing loss and a price on a
+cold shower. It was never *given* one on a running box, because
+`DhwModel::stored_now` — the heat in the tank right now — is read off a
+thermometer and nothing reported one.
+
+So the tank enters the plan **only where a driver measured it**. An unmeasured
+one is absent from the problem and from the asset names, not guessed at: a
+store's state of charge is not a thing to assume, and the guess is wrong in the
+expensive direction — a tank guessed full is one nobody heats overnight, and the
+household finds out in the shower.
+
+And for a long time the number went one way only. A tank is a **controllable**
+asset, so a household whose only tank driver was this one was refused at
+start-up: the box could read a store it had no way to move, and the plan
+scheduled heat nothing could carry the decision to. CDSF scenario 2 is that
+decision — a one-time loading is the button in the bathroom, pressed over the
+wire, and scenario 3 gives it back when a cloud arrives.
+
+It is deliberately **not** a setpoint. `cdt` writes one, and a setpoint is a
+number the circuit's own controller may decline to act on — and one written into
+an operation mode the circuit is not in is applied, acknowledged, and changes
+nothing. The planner decides a *power* per slot from a comfort band it already
+holds as a constraint, and a loading is what that maps onto.
+
+Two refusals are worth naming, because both are silent otherwise:
+
+- A reading the circuit marks `outOfRange` or `error` is **not** a temperature.
+  `[MDT-005]` says an appliance SHALL ignore it, and the dangerous reading is
+  never a wild one — a sensor stuck at 5 °C is perfectly plausible, and it would
+  have the plan heat a full tank all night at the day's worst price.
+- A reconnect drops the descriptions with the peer. An address that comes back
+  may be a different circuit, and MDT Table 7 permits `degC`, `degF` and `K`, so
+  resolving a new circuit's values against an old one's meaning is forty degrees
+  wrong exactly where it matters.
+
+The box does not write a setpoint, and that is deliberate. Asking for a
+temperature is CDT, and CDT has a trap in it: a setpoint written into an
+operation mode the circuit is not in is applied, acknowledged, and changes
+nothing. A box that only wrote setpoints would report success and heat no water.
+Reading is what makes that visible at all, so it comes first — and the plan moves
+the tank by curtailing its heater, which it can already do.
+
 ### The session under it
 
 `hemsd` opens the socket: TCP, TLS 1.2 with mutual authentication, a WebSocket
-upgrade and the SHIP handshake. The household **listens** — the Energy Guard is
-the network operator's box and it is the side that dials — and accepts one
-session at a time, because a Controllable System has exactly one Energy Guard.
+upgrade and the SHIP handshake. For § 14a the household **listens** — the Energy
+Guard is the network operator's box and it is the side that dials — and accepts
+one session at a time, because a Controllable System has exactly one Energy
+Guard. For a device on the household's own network it is the box that dials,
+reconnecting for ever with a bounded backoff, because a heat pump on a switched
+socket is not a request that can fail. The datagram pump above the handshake is
+the same one either way, which is what keeps there being one copy of it.
+
+Both directions share **one identity**. The SKI follows the key, so a box that
+dialled under a second key would be two devices on its own network — one of which
+an installer has never been shown. And the peer's SKI is required rather than
+optional when dialling: TLS proves a SKI rather than taking its word, and a box
+that dialled whatever answered on the address would take a tank temperature from
+anything on the network that offered one.
+
+**And the box announces itself**, because the side that listens is the side that
+has to be findable. `_ship._tcp` with the SHIP TXT record set (SHIP § 6): the
+SHIP ID, the WebSocket path and the SKI. Without it a Steuerbox has to be given
+an address by hand, which is the one thing a network operator's box does not
+have, and a certification lab asks to see the record set anyway.
+
+The announcement is **withdrawn for the length of a session**. SHIP asks a node
+to stop announcing while it cannot accept another connection, and this box
+cannot: one Energy Guard means a second peer that found it and dialled would be
+refused, so announcing through a session is advertising a refusal. Only routable
+addresses go into the record — a `169.254.x.x` from a DHCP that never answered
+tells a peer to dial somewhere it cannot reach, which is worse than saying
+nothing. And a box that *cannot* announce still starts: no multicast on the
+network, or a container without host networking, does not stop a session opened
+to the box's address, and trading a working § 14a installation for a missing
+convenience is the wrong way round.
 
 The box's key lives in its own database, and that is the commissioning story
 rather than a storage detail. **The SKI follows the key**: it is what an
@@ -390,6 +650,20 @@ reports make that exchange the single most common § 14a commissioning failure
 there is. A box that generated a fresh key on every boot would make it fail again
 on every boot. The trust store is kept with it, so a household does not re-pair
 its Steuerbox after a power cut.
+
+**And a SKI can be approved while the box is running.** That is the other half of
+the commissioning story: an unapproved peer is *held pending*, not refused, so an
+installer who reads the SKI off the Steuerbox can `POST` it to `/v1/pairing` and
+the handshake that was already waiting completes. What it replaces is a static
+list in a configuration file, edited and then restarted — on a box whose restart
+costs its § 14a session, its plan and its place in the control period. A mistyped
+SKI is refused at the point somebody can still fix it, rather than stored as a
+peer that will never connect with nothing anywhere to say why.
+
+Revoking one deliberately does not tear the session down. The § 14a session is
+how a reduction arrives, and dropping it the instant somebody revokes a SKI would
+take the household out of contact with its network operator on a keystroke; it
+simply cannot reconnect, which is what revocation means.
 
 An unapproved peer still completes TLS — it has to, so its SKI can be shown to
 somebody — and is held short of the data phase. That is the whole of SHIP's trust

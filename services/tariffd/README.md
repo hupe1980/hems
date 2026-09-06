@@ -26,10 +26,24 @@ against a flat default **knowingly** rather than being told nothing is wrong.
 |---|---|
 | `GET /v1/prices?from=…&slots=96` | the resolved quarter-hourly curve |
 | `GET /v1/prices/coverage` | how much of a window it can price |
+| `GET /v1/modul3` | which operators the curated Modul 3 catalogue covers |
+| `GET /v1/modul3/{netzbetreiber}` | one operator's transcribed calendars |
 | `GET /livez`, `/readyz`, `/version` | as every daemon here |
 
-**Unauthenticated on purpose**: a day-ahead curve is a published auction result.
-That is a decision rather than an oversight, which is why it is written down.
+**Unauthenticated on purpose**: a day-ahead curve and a network operator's
+price sheet are published figures. That is a decision rather than an oversight,
+which is why it is written down.
+
+## The curated Modul 3 catalogue
+
+There is no machine-readable national format for a Zählzeitdefinition — a PDF
+or an Excel sheet per network operator — so somebody transcribes each one,
+**once per Netzgebiet** rather than once per household. `[[modul3]]` entries
+carry the identical `hems_grid::modul3::Transcription` a box takes as
+`[tariff.modul3]`, keyed by the operator's BDEW-Codenummer; every one is
+checked against the BDEW Anwendungshilfe at start-up, and a violation refuses
+the daemon — a fleet serving windows nobody may sell prices a whole Netzgebiet
+against a tariff nobody may be billed on.
 
 ## The fetching is behind a trait
 

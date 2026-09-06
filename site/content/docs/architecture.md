@@ -81,13 +81,35 @@ pins the lender's ceiling at zero in exchange. The battery may go on discharging
 or it may stop; it may not turn into a load while the others spend the headroom
 it created.
 
-The two grid limits are also enforced with deliberately different conservatism.
-A § 14a reduction is a *control instruction* with a five-minute response
-presumption, so the guard may never be over it even for a tick, and a silent
-device is assumed to be drawing its nameplate. The § 9 EEG cap is a *settlement*
-limit read off quarter-hour registers, so only metered consumption counts as
-headroom — a nameplate guess is safe in one direction and would be nonsense in
-the other.
+**The same three tests run the other way for § 9 EEG.** § 9 Abs. 2 bounds the
+Einspeiseleistung *at the connection point*, so the household's own consumption
+is headroom: a house using 3 kW may lawfully produce 3 kW above the cap, and a
+guard that ignored that would curtail every roof by the household's own draw for
+the life of the installation. So it lends that too — and a loan is only as good
+as the ability to call it in, which the guard can do only when it next runs.
+Three kinds of draw fail that test:
+
+- consumption the guard is, this same tick, **commanding away**: already stopped
+  in all but the measurement;
+- consumption that came from a **nameplate rather than a meter**. Assuming a
+  silent device is drawing its rating keeps a § 14a budget small, which is the
+  safe direction; reusing the same guess as headroom for feeding in turns it
+  inside out;
+- consumption a device's **own controller can withdraw** — a heat pump or a tank
+  answering its own thermostat underneath whatever ceiling it was given. How much
+  of that is lent is `lend_window` against the tick period: all of it at the one
+  second a box runs at, a sixth at the one minute a simulated day runs at,
+  because the exposure is one tick either way.
+
+Both limits are enforced on **power**, every tick. Reading the 60 % cap as a
+quarter-hour average — which the register in the day report might suggest — would
+let a roof sit above the statutory ceiling for minutes at a time on the strength
+of a forecast about the rest of the slot. The register is a diagnostic; the
+statute says Leistung. What differs between the two rules is not the resolution
+but *what each measures*: § 14a bounds the netzwirksamer Leistungsbezug of the
+**controllable devices**, so a dishwasher's draw is not headroom for a wallbox;
+§ 9 EEG bounds the Einspeisung at the Verknüpfungspunkt, so everything the house
+is using is headroom, whoever is using it.
 
 And the Schieflast reaches fewer devices than it looks like it should. VDE-AR-N
 4100 Abschnitt 5.5.2 covers only equipment that can feed in or store —
@@ -237,6 +259,29 @@ shadow price of that store's own state equation — which is what the guard's
 allocator weights a reduction by. See [the planner](@/docs/optimizer.md) and
 [forecasting](@/docs/forecasting.md).
 
+### The fourth voice
+
+S2 introduces one more, and where it ranks is a decision rather than an
+inheritance. A Customer Energy Manager driving hems as a *Resource Manager*
+sends instructions about assets it has been described, and the order is:
+
+> **guard > the household's own override > a CEM's instruction > the plan >
+> the fallback.**
+
+The guard first because it always is — a network operator's reduction has no
+exception for a manager somebody else is paying. The **household** above the CEM
+because these are its devices and `pause` means pause; a manager that could
+overrule the button on the wall is one nobody would install. The CEM above the
+**plan** because that is what being managed *means*: a Resource Manager that
+describes its flexibility, accepts an instruction and then does what it had
+planned anyway has made S2's argument and declined the consequence.
+
+hems is a CEM in its ordinary deployment, so this is the case where a household
+has deliberately handed an asset to somebody else's manager — an aggregator, a
+landlord's building manager. The session is built and tested; the wiring is not,
+which is why `hems_flex::session` emits an *event* rather than a setpoint. See
+[flexibility](@/docs/flexibility.md).
+
 ## Why everything is sans-I/O
 
 The guard, the arbiter, the planner, the price stack, the solar model and the
@@ -269,11 +314,11 @@ release.
 Something has to own a *set* of them, and that is `hemsd`'s registry: it gives
 each driver its bytes, folds what they say into what the house is doing and what
 the operator is asking for, and — before a single byte moves — checks that the
-drivers and the site agree about what they are for. Five mismatches are loud at
+drivers and the site agree about what they are for. Six mismatches are loud at
 startup rather than silent for months: a box with no drivers at all, a driver for
-an asset that does not exist, two drivers for one asset, a controllable device
-whose driver cannot command it, and a § 14a household with nothing that could
-hear a reduction. `hemsd run --check` is exactly that, without a socket.
+an asset that does not exist, two drivers that both command or both measure one
+asset, a controllable device no driver can command, and a § 14a household with
+nothing that could hear a reduction. `hemsd run --check` is exactly that, without a socket.
 
 **And around the registry, one task per socket.** It connects, reads until the
 driver's own deadline, writes whatever the driver produced, and reconnects with a
@@ -327,9 +372,17 @@ a reboot does not cost a fortnight of it.
 
 ### The plan models what the drivers can report, and names no more
 
-The planner fills in the stores whose state something actually measures: today
-the battery, off its own meter. The car, the building and the tank wait on
-drivers that report an arrival, an indoor temperature and a tank temperature.
+The planner fills in the stores whose state something actually measures: the
+battery off its own meter, the hot-water tank off EEBUS MDT, and the car off
+EVCC and EVSOC — a cable going in is an `EV` entity appearing under the `EVSE`,
+which is the whole of that message — and the **building**, off the room
+temperature the heat pump has been measuring all along, over EEBUS MRT or a
+vendor's register map.
+
+Each is a **refusal** where nothing measured it, not a default. A store's state
+is not a thing to assume, and every one of these guesses wrong in the expensive
+direction: a battery guessed full is one the box empties, and a tank guessed full
+is one nobody heats overnight.
 
 Leaving a store out is not the same as *naming* it. A plan that named the charge
 point while modelling no car emits a target of zero watts with an envelope

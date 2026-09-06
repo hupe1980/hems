@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 hems-core    = { workspace = true }
 hems-grid    = { workspace = true }
+metering     = { workspace = true }
 hems-service = { workspace = true }
 # The Model Context Protocol surface at `/mcp`, on the socket this daemon
 # already binds. Read-only tools: an agent may read what an operator reads and

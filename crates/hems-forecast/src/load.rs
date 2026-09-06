@@ -15,40 +15,10 @@
 
 use std::collections::BTreeMap;
 
-use hems_core::prelude::{Horizon, Power, Slot};
+use hems_core::prelude::{DayType, Horizon, Power, Slot};
 use metering::holiday::Bundesland;
 
 use crate::quantile::{Band, Forecast};
-
-/// The kind of day a slot falls on.
-///
-/// Three classes, because that is what the data supports: a household's Saturday
-/// differs from its Tuesday, and a public holiday behaves like a Sunday. Using
-/// the metering layer's holiday calendar means hems and the settlement layer
-/// never disagree about which days those are.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum DayType {
-    /// Monday to Friday, excluding public holidays.
-    Workday,
-    /// Saturday.
-    Saturday,
-    /// Sunday and public holidays.
-    Sunday,
-}
-
-impl DayType {
-    /// The day type of `slot` in `land`.
-    #[must_use]
-    pub fn of(slot: Slot, land: Bundesland) -> Self {
-        match metering::holiday::slp_day_type(slot.local_date(), land) {
-            metering::load_profile::SlpDayType::Samstag => DayType::Saturday,
-            metering::load_profile::SlpDayType::SonnFeiertag => DayType::Sunday,
-            metering::load_profile::SlpDayType::Werktag => DayType::Workday,
-        }
-    }
-}
 
 /// One cell of the profile: everything observed at this day type and time.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -75,6 +45,22 @@ impl Cell {
 /// The smallest number of observations a cell needs before its spread is
 /// treated as informative.
 pub const MIN_SAMPLES: usize = 3;
+
+/// How much wider a band gets when it is answered from a **different day type**.
+///
+/// A household's Saturday is like its Monday in shape and not in level — later
+/// mornings, more cooking, somebody at home — so borrowing the quarter hour
+/// across day types is a good guess and a worse one than the cell it replaces.
+/// Half again, which takes the 40 % default to 60 %.
+const CROSS_DAY_WIDENING: f64 = 1.5;
+
+/// And when it is answered from a quarter hour the household has never been
+/// metered through at all.
+///
+/// Twice, which takes the default to 80 % — wide enough that a planner handed
+/// one does not bet a battery on it, which is the whole job of a band nobody has
+/// evidence for.
+const UNSEEN_WIDENING: f64 = 2.0;
 
 /// The cells, as a **sequence** rather than a map.
 ///
@@ -201,7 +187,7 @@ impl LoadProfile {
     pub fn band_at(&self, slot: Slot) -> Band {
         let key = (DayType::of(slot, self.land), slot.index_in_local_day());
         let Some(cell) = self.cells.get(&key) else {
-            return Band::certain(0.0);
+            return self.seasonal_naive_at(slot);
         };
         let n = cell.samples.len();
         if n < MIN_SAMPLES {
@@ -218,6 +204,58 @@ impl LoadProfile {
         .sorted()
     }
 
+    /// The same quarter hour of the day, under whatever day type this household
+    /// has been seen on — the seasonal-naive fallback, for a cell with nothing
+    /// in it.
+    ///
+    /// A cell is empty on the first Saturday of a box's life, on the first public
+    /// holiday, and on any quarter hour the household has not been metered
+    /// through — so this is the ordinary case rather than an edge. Answering
+    /// `p10 = p50 = p90 = 0` would say *the house will use nothing, and I am
+    /// sure*, which is the confident lie `ForecastTooShort` refuses one slot at a
+    /// time; a plan given it defers every flexible kilowatt-hour into hours it
+    /// believes are free and overstates the § 14a surplus by the load it did not
+    /// expect.
+    ///
+    /// The household's own Monday 07:15 is a far better guess at its Saturday
+    /// 07:15, and the profile already holds it. A quarter hour seen on no day at
+    /// all falls back to the household's overall median, widened further. Only a
+    /// profile with **no history whatsoever** returns zero, which its caller is
+    /// supposed to have excluded with [`LoadProfile::is_empty`] (D145).
+    #[must_use]
+    fn seasonal_naive_at(&self, slot: Slot) -> Band {
+        let quarter = slot.index_in_local_day();
+        let across: Vec<f64> = self
+            .cells
+            .iter()
+            .filter(|((_, q), _)| *q == quarter)
+            .map(|(_, cell)| cell.quantile(0.5))
+            .collect();
+        if !across.is_empty() {
+            let median = across.iter().sum::<f64>() / across.len() as f64;
+            return Band::relative(median, self.default_spread * CROSS_DAY_WIDENING);
+        }
+        // Not this quarter hour on any day. The household's own level is still
+        // a better answer than nothing, and the band says how much better.
+        let all: Vec<f64> = self.cells.values().map(|c| c.quantile(0.5)).collect();
+        if all.is_empty() {
+            return Band::certain(0.0);
+        }
+        let median = all.iter().sum::<f64>() / all.len() as f64;
+        Band::relative(median, self.default_spread * UNSEEN_WIDENING)
+    }
+
+    /// Whether this profile has learned anything at all.
+    ///
+    /// The gate a caller needs instead of [`LoadProfile::support`] on one slot:
+    /// with the seasonal-naive fallback above, a profile that has seen *any* of
+    /// this household can answer for every slot, and one that has seen none of
+    /// it can answer for none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.cells.values().all(|c| c.samples.is_empty())
+    }
+
     /// A forecast over a horizon.
     #[must_use]
     pub fn forecast(&self, horizon: Horizon) -> Forecast {
@@ -229,6 +267,88 @@ impl LoadProfile {
 
 #[cfg(test)]
 mod tests {
+
+    /// A quarter hour with no history is never forecast as an **empty house**.
+    ///
+    /// The defect this pins, and it was a whole day wide. A box gates on the
+    /// support of the horizon's *first* slot, so a Friday-evening re-plan over
+    /// a two-day horizon reached a Saturday whose cells were all empty and was
+    /// handed `p10 = p50 = p90 = 0` for every one of them — a household that
+    /// uses nothing all weekend, stated with certainty. A plan given that defers
+    /// every flexible kilowatt-hour into hours it believes are free and
+    /// overstates the § 14a surplus by the whole of the load it did not expect.
+    ///
+    /// It is the same confident lie `hems_optimizer::SolveError::ForecastTooShort`
+    /// refuses one slot at a time, arriving through a forecast that was long
+    /// enough.
+    #[test]
+    fn a_day_type_the_household_has_never_had_is_not_forecast_as_an_empty_house() {
+        let mut profile = LoadProfile::new(Bundesland::Be);
+        // A week of workdays, and nothing else. 2026-06-01 is a Monday.
+        for day in 0..5 {
+            for q in 0..96 {
+                let slot = Slot::containing(
+                    datetime!(2026-06-01 00:00:00 UTC)
+                        + time::Duration::days(day)
+                        + time::Duration::minutes(15 * q),
+                );
+                profile.observe(slot, Power::from_kw(0.6));
+            }
+        }
+        // The Saturday. No cell for it, on any quarter hour.
+        let saturday = slot_at(5, 7);
+        assert_eq!(profile.support(saturday), 0, "no Saturday has been seen");
+        let band = profile.band_at(saturday);
+        assert!(
+            band.p50 > 0.0,
+            "a household that has been metered all week does not use nothing on \
+             Saturday: {band:?}"
+        );
+        assert!(
+            band.p90 > band.p10,
+            "and a band with no evidence behind it has to be wide, not certain: {band:?}"
+        );
+        assert!(
+            band.width() > profile.band_at(slot_at(1, 7)).width(),
+            "wider than the cell it stands in for"
+        );
+    }
+
+    /// …and a quarter hour seen on no day at all still answers from the
+    /// household's own level.
+    #[test]
+    fn an_hour_never_metered_falls_back_to_the_households_own_level() {
+        let mut profile = LoadProfile::new(Bundesland::Be);
+        // Only the mornings, for a week.
+        for day in 0..5 {
+            for q in 28..40 {
+                let slot = Slot::containing(
+                    datetime!(2026-06-01 00:00:00 UTC)
+                        + time::Duration::days(day)
+                        + time::Duration::minutes(15 * q),
+                );
+                profile.observe(slot, Power::from_kw(0.8));
+            }
+        }
+        let midnight = slot_at(1, 0);
+        let band = profile.band_at(midnight);
+        assert!(band.p50 > 0.0, "{band:?}");
+        assert!(band.p90 > band.p50, "{band:?}");
+    }
+
+    /// A profile that has learned nothing says so, rather than answering zero.
+    #[test]
+    fn an_empty_profile_is_empty_rather_than_confidently_nothing() {
+        let profile = LoadProfile::new(Bundesland::Be);
+        assert!(profile.is_empty());
+        // It still answers — the type has no "unknown" — and the caller is the
+        // one that must not ask.
+        assert_eq!(profile.band_at(slot_at(0, 12)), Band::certain(0.0));
+
+        let mut one = LoadProfile::new(Bundesland::Be);
+        one.observe(slot_at(0, 12), Power::from_kw(0.5));
+        assert!(!one.is_empty(), "one reading is history");
+    }
 
     #[cfg(feature = "serde")]
     #[test]

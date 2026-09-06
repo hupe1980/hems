@@ -20,7 +20,8 @@ use core::time::Duration as StdDuration;
 use eebus::model::{DeviceType, EntityType};
 use eebus::spine::{Engine, LocalDevice, LocalEntity};
 use eebus::usecases::limitation::{self, EnergyGuardActor, GuardEvent, LimitWrite};
-use eebus::usecases::lpc;
+use eebus::usecases::monitoring::{Measurand, MonitoredUnit, Naming};
+use eebus::usecases::{lpc, mgcp};
 use hems_core::prelude::{AssetId, Power};
 use hems_drv::eebus::{Lpc, Use};
 use hems_drv::{Driver, DriverEvent, LimitSource, LinkState};
@@ -40,22 +41,65 @@ fn elapsed(seconds: i64) -> StdDuration {
 }
 
 /// The network operator's box: an Energy Guard on a `GridGuard` entity.
-fn steuerbox() -> (Engine, EnergyGuardActor) {
+fn steuerbox() -> (Engine, EnergyGuardActor, ConnectionPoint) {
     let mut device = LocalDevice::new("n:dso", "Steuerbox-1", DeviceType::ElectricitySupplySystem)
         .expect("a valid device address");
+    // The same box is also the **Grid Connection Point** of MGCP, which is how a
+    // real Steuerbox is built: it sits at the connection, so it is both the
+    // thing that reduces the household and the thing that knows what crosses the
+    // meter and what the operator configured there. Scenario 1 is the § 9
+    // limitation factor — a configured value rather than a measurement — and
+    // scenario 2 is the momentary power, which MGCP marks *recommended*.
+    let unit = MonitoredUnit::new(1)
+        .naming(Naming::GridConnectionPoint)
+        .with(Measurand::total_power());
     device
         .add_entity(
             LocalEntity::new([1], EntityType::GridGuard)
                 .with_feature(limitation::client_feature(1))
-                .with_feature(limitation::device_diagnosis_feature(2)),
+                .with_feature(limitation::device_diagnosis_feature(2))
+                .with_feature(mgcp::curtailment_feature(3))
+                .with_feature(unit.electrical_connection_feature(4))
+                .with_feature(unit.measurement_feature(5)),
         )
         .expect("a fresh entity");
     let client = device.address_of(&[1], 1);
     let diagnosis = device.address_of(&[1], 2);
+    let curtailment = device.address_of(&[1], 3);
+    let electrical = device.address_of(&[1], 4);
+    let measurement = device.address_of(&[1], 5);
     let mut engine = Engine::new(device);
     engine.add_use_case([1], 1, &lpc::ENERGY_GUARD);
+    engine.add_use_case_scenarios([1], 3, &mgcp::GRID_CONNECTION_POINT, &[1, 2]);
+    unit.publish(&mut engine, &electrical, &measurement);
+    // The description is published at start-up, as a real connection point
+    // publishes it: it is what says which `keyId` carries the factor, and a
+    // Monitoring Appliance reads it once at commissioning. A fixture that only
+    // set it when the value changed would be testing an ordering no device has.
+    if let Some(feature) = engine.device_mut().resolve_mut(&curtailment) {
+        feature
+            .set_data(mgcp::curtailment_description())
+            .expect("the description MGCP Table 23 fixes");
+    }
     let actor = EnergyGuardActor::new(lpc::DIRECTION, client, diagnosis, StdDuration::ZERO);
-    (engine, actor)
+    (
+        engine,
+        actor,
+        ConnectionPoint {
+            unit,
+            curtailment,
+            electrical,
+            measurement,
+        },
+    )
+}
+
+/// The Steuerbox's MGCP side: what it publishes about the connection.
+struct ConnectionPoint {
+    unit: MonitoredUnit,
+    curtailment: eebus::model::FeatureAddress,
+    electrical: eebus::model::FeatureAddress,
+    measurement: eebus::model::FeatureAddress,
 }
 
 /// The household: hems as a Controllable System.
@@ -79,6 +123,8 @@ fn household() -> Lpc {
 struct Wire {
     guard_engine: Engine,
     guard: EnergyGuardActor,
+    /// What the Steuerbox publishes about the connection point.
+    point: ConnectionPoint,
     box_driver: Lpc,
     /// What the household's driver reported upwards this run.
     reported: Vec<DriverEvent>,
@@ -89,10 +135,11 @@ struct Wire {
 
 impl Wire {
     fn new() -> Self {
-        let (guard_engine, guard) = steuerbox();
+        let (guard_engine, guard, point) = steuerbox();
         Self {
             guard_engine,
             guard,
+            point,
             box_driver: household(),
             reported: Vec::new(),
             answers: Vec::new(),
@@ -180,6 +227,69 @@ impl Wire {
         let answers = self.guard.handle_timeout(&mut self.guard_engine, mono);
         self.answers.extend(answers);
         self.settle(seconds);
+    }
+
+    /// The Steuerbox publishes a § 9 curtailment factor, as a percentage.
+    ///
+    /// Its description goes out first, because that is what a
+    /// `deviceConfigurationKeyValueListData` is read against: a value with no
+    /// description behind it names a `keyId` nobody can interpret.
+    fn publishes_curtailment(&mut self, percent: f64, seconds: i64) {
+        let mono = elapsed(seconds);
+        let feature = self
+            .guard_engine
+            .device_mut()
+            .resolve_mut(&self.point.curtailment)
+            .expect("the Steuerbox's own feature");
+        feature
+            .set_data(mgcp::curtailment_value(percent))
+            .expect("a factor inside 0..=100");
+        let function = eebus::model::Function::DeviceConfigurationKeyValueListData;
+        let address = self.point.curtailment.clone();
+        self.guard_engine.notify(&address, &function, mono);
+    }
+
+    /// The connection point publishes what is crossing the meter, in watts.
+    ///
+    /// Load convention throughout MGCP `[MPC-001]`: consumption positive,
+    /// production negative, so a household exporting reads below zero.
+    fn publishes_power(&mut self, watts: f64, seconds: i64) {
+        let mono = elapsed(seconds);
+        self.point.unit.set(&Measurand::total_power(), watts);
+        let (electrical, measurement) = (
+            self.point.electrical.clone(),
+            self.point.measurement.clone(),
+        );
+        self.point
+            .unit
+            .publish(&mut self.guard_engine, &electrical, &measurement);
+        self.guard_engine.notify(
+            &measurement,
+            &eebus::model::Function::MeasurementListData,
+            mono,
+        );
+    }
+
+    /// The connection-point measurements the driver reported.
+    fn measured(&self) -> Vec<Power> {
+        self.reported
+            .iter()
+            .filter_map(|e| match e {
+                DriverEvent::Measured(m) => m.power,
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The feed-in factors the driver reported to the rest of hems.
+    fn factors(&self) -> Vec<f64> {
+        self.reported
+            .iter()
+            .filter_map(|e| match e {
+                DriverEvent::FeedInFactor(f) => Some(f.percent),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The ceilings the driver reported to the rest of hems.
@@ -327,5 +437,88 @@ fn a_dropped_session_does_not_by_itself_restrain_the_household() {
         Some(LimitSource::Failsafe),
         "and the record says the household restrained itself rather than that \
          the operator asked it to"
+    );
+}
+
+#[test]
+fn the_connection_points_curtailment_factor_reaches_the_box() {
+    // `[MGCP-011]`: the grid connection point publishes the percentage of the
+    // building's cumulated nominal PV peak power that may be fed in. hems is the
+    // Monitoring Appliance and reads it — it never writes one, because the
+    // factor is set by whoever configures the connection.
+    //
+    // The chain this closes had no live end at all: `GridLimits::mgcp_factor`
+    // was a field the guard already folded into § 9 EEG's ceiling, and nothing
+    // in any driver could ever set it. The documented "smaller of the statutory
+    // cap and the EEBUS factor" was a minimum over one arm.
+    let mut wire = Wire::new();
+    wire.open(0);
+    wire.settle(0);
+
+    assert!(
+        wire.factors().is_empty(),
+        "nothing has been published yet, and a factor nobody sent is not zero"
+    );
+
+    wire.publishes_curtailment(70.0, 1);
+    wire.settle(1);
+
+    assert_eq!(
+        wire.factors(),
+        vec![70.0],
+        "seventy per cent, as the percentage that crossed the wire — the watts \
+         it means depend on the roof, which the driver does not know"
+    );
+}
+
+#[test]
+fn an_unchanged_curtailment_factor_is_not_reported_twice() {
+    // The guard is edge-driven and the § 14a evidence record is a document. A
+    // standing configuration re-notified on every subscription refresh would
+    // fill both with a fact that never changed.
+    let mut wire = Wire::new();
+    wire.open(0);
+    wire.settle(0);
+
+    wire.publishes_curtailment(60.0, 1);
+    wire.settle(1);
+    wire.publishes_curtailment(60.0, 2);
+    wire.settle(2);
+    wire.publishes_curtailment(50.0, 3);
+    wire.settle(3);
+
+    assert_eq!(
+        wire.factors(),
+        vec![60.0, 50.0],
+        "twice published, once reported — and the change is reported"
+    );
+}
+
+#[test]
+fn the_connection_points_own_meter_reaches_the_box() {
+    // MGCP scenario 2, and the most useful number in the use case: the
+    // momentary power **at the connection point** is what `[A1 2.3]` is
+    // measured against, so a household whose Steuerbox publishes it has a grid
+    // meter without owning one — and the § 14a driver was already talking to
+    // that box.
+    //
+    // Load convention throughout `[MPC-001]`: consumption positive, production
+    // negative. It is hems's convention too, so a sign that survives this test
+    // is a sign nothing flipped on the way through — which is the failure that
+    // would look like a household exporting hard at midnight.
+    let mut wire = Wire::new();
+    wire.open(0);
+    wire.settle(0);
+
+    wire.publishes_power(3_400.0, 1);
+    wire.settle(1);
+    assert_eq!(wire.measured(), vec![Power::new(3_400.0)], "drawing 3,4 kW");
+
+    wire.publishes_power(-2_100.0, 2);
+    wire.settle(2);
+    assert_eq!(
+        wire.measured().last().copied(),
+        Some(Power::new(-2_100.0)),
+        "and feeding in 2,1 kW, which is negative and stays negative"
     );
 }

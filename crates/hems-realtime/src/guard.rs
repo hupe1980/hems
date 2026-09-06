@@ -95,8 +95,22 @@ pub struct GridLimits {
     #[cfg_attr(feature = "serde", serde(default))]
     pub feed_in_ceiling: Option<Power>,
     /// Which rule produced [`GridLimits::feed_in_ceiling`].
+    ///
+    /// Only meaningful for a *reported* ceiling. The § 9 EEG statutory cap is
+    /// not carried here at all: the guard derives it from the site on every
+    /// tick, because it applies to the plant by force of law and not because a
+    /// session said so.
     #[cfg_attr(feature = "serde", serde(default))]
     pub feed_in_rule: Option<GuardRule>,
+    /// The EEBUS `MGCP` PV feed-in power limitation factor `[MGCP-011]`, where a
+    /// driver has published one.
+    ///
+    /// `None` on every box today, and it is not an oversight to leave the field:
+    /// the guard passes it into the same call that folds in the statutory cap
+    /// and the LPP limit, so the day the `eebus` crate exposes MGCP scenario 1
+    /// there is a place for it to arrive and nothing else to change.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mgcp_factor: Option<f64>,
     /// Whether the § 14a ceiling arrived through the EEBUS failsafe rather than
     /// as a live command — the same number, a different story to tell.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -192,6 +206,33 @@ pub struct GuardConfig {
         serde(default = "default_tick_period", with = "duration_secs")
     )]
     pub tick_period: Duration,
+    /// How long a loan of the household's own consumption may be outstanding.
+    ///
+    /// § 9 Abs. 2 EEG bounds the Einspeiseleistung at the connection point, so a
+    /// house using 3 kW may lawfully produce 3 kW above the cap — and the guard
+    /// lends that headroom to the inverter. But a loan is only as good as the
+    /// ability to call it in, and the guard can only call it in when it next
+    /// runs: every kilowatt that stops between two ticks is a kilowatt over a
+    /// statutory ceiling until the following one.
+    ///
+    /// This is the same discipline [`GuardConfig::tick_period`] already imposes
+    /// on a storage bound — a bound on a state is only a bound on a rate once
+    /// you know how long the rate is held for — pointed at a bound on export.
+    /// The guard lends the fraction `min(1, lend_window / tick_period)` of the
+    /// draw it cannot predict, so a box re-deriving every second lends all of it
+    /// and a control loop running once a minute lends a sixth.
+    ///
+    /// Ten seconds, because a controller that cannot re-derive inside ten
+    /// seconds is not a closed loop, and because that is the order of the
+    /// control interval every Wirkleistungsbegrenzung on the market runs at.
+    /// Setting it to zero refuses the loan altogether, which is what a box with
+    /// no measurement of its own consumption should do. See D141 for the
+    /// alternative — a flat safety margin — and why a derived number beat it.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "default_lend_window", with = "duration_secs")
+    )]
+    pub lend_window: Duration,
 }
 
 fn default_max_age() -> Duration {
@@ -200,6 +241,10 @@ fn default_max_age() -> Duration {
 
 fn default_tick_period() -> Duration {
     Duration::seconds(1)
+}
+
+fn default_lend_window() -> Duration {
+    Duration::seconds(10)
 }
 
 #[cfg(feature = "serde")]
@@ -224,6 +269,7 @@ impl Default for GuardConfig {
             unbalance_limit: UNBALANCE_LIMIT,
             max_measurement_age: default_max_age(),
             tick_period: default_tick_period(),
+            lend_window: default_lend_window(),
         }
     }
 }
@@ -409,6 +455,7 @@ impl Guard {
         site: &Site,
         state: &SiteState,
         steuve_ids: &[&AssetId],
+        wants: &BTreeMap<AssetId, (Power, f64)>,
         now: OffsetDateTime,
     ) -> Flows {
         let mut flows = Flows::default();
@@ -462,6 +509,17 @@ impl Guard {
             } else {
                 flows.other_consumption += p;
             }
+            // …and how much of what it is drawing may not be lent to an
+            // inverter in full. See `Flows::unpredictable_consumption`.
+            if self_regulating(asset) {
+                flows.unpredictable_consumption += p.max(Power::ZERO);
+            } else if is_controllable(asset)
+                && let Some((want, _)) = wants.get(asset.id())
+            {
+                // A draw this tick is about to command away has already
+                // stopped; none of it is lendable at any cadence.
+                flows.unlendable_consumption += (p - want.max(Power::ZERO)).max(Power::ZERO);
+            }
         }
 
         // The grid meter closes the balance. Where it is fresh it is the better
@@ -512,7 +570,7 @@ impl Guard {
 
         // ── What the site is doing ─────────────────────────────────────────
         let steuve_ids: Vec<&AssetId> = steuve.iter().flat_map(|s| s.assets.iter()).collect();
-        let flows = self.flows(site, state, &steuve_ids, now);
+        let flows = self.flows(site, state, &steuve_ids, wants, now);
         // Every local generator, the controllable ones included: this is what
         // the connection point actually saw, and it is what the Nachweis of
         // `[A1 7]` has to be able to reproduce. Whether the guard is willing to
@@ -537,7 +595,7 @@ impl Guard {
             .filter(|a| is_controllable(a))
             .map(|a| a.id().clone())
             .collect();
-        Self::bound_feed_in(site, limits, &flows, &controllable, wants, &mut verdict);
+        self.bound_feed_in(site, limits, &flows, &controllable, wants, &mut verdict);
 
         // ── § 14a: the budget for the controllable devices, then its sharing ─
         //
@@ -728,6 +786,7 @@ impl Guard {
     /// narrows *ceilings*, so [`Guard::lend_generation`] sees a discharge bound
     /// nothing later takes away.
     fn bound_feed_in(
+        &self,
         site: &Site,
         limits: &GridLimits,
         flows: &Flows,
@@ -735,25 +794,61 @@ impl Guard {
         wants: &BTreeMap<AssetId, (Power, f64)>,
         verdict: &mut GuardVerdict,
     ) {
+        // How much of the draw a thermostat could withdraw the guard is willing
+        // to lend the roof: all of it at a one-second cadence, a sixth of it at
+        // one minute. See [`GuardConfig::lend_window`].
+        let lent = {
+            let (window, period) = (
+                self.config.lend_window.as_seconds_f64(),
+                self.config.tick_period.as_seconds_f64(),
+            );
+            if window <= 0.0 || !window.is_finite() {
+                0.0
+            } else if period <= 0.0 || !period.is_finite() {
+                1.0
+            } else {
+                (window / period).clamp(0.0, 1.0)
+            }
+        };
+        let metered = flows.metered_consumption(lent);
         Self::share_export(
             controllable,
             physical_headroom(
                 site.grid.export_ceiling(),
-                flows.uncontrollable_generation - flows.metered_consumption(),
+                flows.uncontrollable_generation - metered,
             ),
             wants,
             GuardRule::ContractLimit,
             verdict,
         );
-        if let Some(ceiling) = limits.feed_in_ceiling {
+        // The statutory cap is derived **here, every tick**, from the site's own
+        // § 9 EEG status rather than waited for on the wire. It has to be: § 9
+        // Abs. 1 applies to the plant by force of law whether or not an operator
+        // ever opens an LPP session, and a box that only enforced what a session
+        // told it would leave an uncontrolled 60 %-regime roof feeding in
+        // without limit — legally exposed, and with nothing on any screen to say
+        // so. `site_feed_in_ceiling` already takes the strictest of the three,
+        // so the LPP limit is folded in rather than replaced.
+        //
+        // Where the site has no generation at all there is no profile and no
+        // statutory cap, and an operator's LPP limit still stands on its own —
+        // a battery exports too.
+        let binding = hems_grid::para9::site_feed_in_ceiling(
+            site,
+            limits.mgcp_factor,
+            limits.feed_in_ceiling,
+        )
+        .or_else(|| {
+            limits
+                .feed_in_ceiling
+                .map(|c| (c, limits.feed_in_rule.unwrap_or(GuardRule::Lpp)))
+        });
+        if let Some((ceiling, rule)) = binding {
             Self::share_export(
                 controllable,
-                physical_headroom(
-                    ceiling,
-                    flows.uncontrollable_generation - flows.metered_consumption(),
-                ),
+                physical_headroom(ceiling, flows.uncontrollable_generation - metered),
                 wants,
-                limits.feed_in_rule.unwrap_or(GuardRule::Lpp),
+                rule,
                 verdict,
             );
         }
@@ -1307,6 +1402,25 @@ pub fn produces(asset: &Asset) -> bool {
     matches!(asset, Asset::Pv(_))
 }
 
+/// Whether this asset runs itself when nothing is limiting it.
+///
+/// A heat pump has a thermostat and a hot-water tank has a temperature sensor,
+/// and an energy manager only ever tells either of them to use *less*. A battery
+/// and a charge point have no opinion of their own and do nothing at all until
+/// somebody asks them to.
+///
+/// Two consumers, and they read it in opposite directions. The arbiter uses it
+/// to decide what an **absent** instruction means — "run your own programme"
+/// rather than "stop", which is the difference between a January house that
+/// stays warm and one that goes cold while the box reports a saving. The guard
+/// uses it to decide what a **present** measurement is worth as feed-in
+/// headroom: a device that runs itself can stop by itself, and a bound built on
+/// a draw that stops is a bound that stops with it.
+#[must_use]
+pub fn self_regulating(asset: &Asset) -> bool {
+    matches!(asset, Asset::HeatPump(_) | Asset::Dhw(_))
+}
+
 /// Whether the arbiter can move this asset at all.
 #[must_use]
 pub fn is_controllable(asset: &Asset) -> bool {
@@ -1344,6 +1458,39 @@ struct Flows {
     /// cap because it is probably using them. So the export side subtracts this
     /// back out and counts only what a meter actually saw.
     assumed_consumption: Power,
+    /// Consumption that has already stopped in all but the measurement.
+    ///
+    /// A draw the guard is, this same tick, commanding away: the one kind it
+    /// knows will not be there. Unlike [`Flows::unpredictable_consumption`] this
+    /// is not a matter of cadence, so none of it is lendable however fast the
+    /// loop runs.
+    unlendable_consumption: Power,
+    /// Consumption a device's own controller can withdraw without being asked.
+    ///
+    /// A household's own consumption *is* headroom under § 9 Abs. 2 EEG — the
+    /// statute bounds the Einspeiseleistung at the Verknüpfungspunkt, so a house
+    /// using 3 kW may produce 3 kW above the cap. But only for as long as it
+    /// lasts, and an inverter cannot be re-commanded until the guard runs again:
+    /// every kilowatt of consumption that stops between two ticks is a kilowatt
+    /// over the statutory ceiling until the next one. This is the same test
+    /// [`Guard::lend_generation`] applies to a battery's discharge before it
+    /// lets the § 14a budget count on it, pointed the other way.
+    ///
+    /// A heat pump and a hot-water tank answer their own thermostat underneath
+    /// whatever ceiling they are given, so a safety cut-out is not something
+    /// anybody commanded: on the `capped` reference day the heat pump sat
+    /// against its 23 °C limit and dropped 1,1 kW without warning, which is
+    /// precisely the 1,1 kW the roof had been allowed to add.
+    ///
+    /// How much of it is lent is [`GuardConfig::lend_window`] against the tick
+    /// period, because this half is a question of *cadence* rather than of
+    /// knowledge: a box that re-derives every second is over a ceiling for a
+    /// second, and a loop that re-derives every minute is over it for a minute.
+    ///
+    /// Uncontrollable load is *not* in here and cannot be: a dishwasher's
+    /// programme ending is not something a guard can see coming, and refusing to
+    /// count the household's base load at all would curtail every roof by it.
+    unpredictable_consumption: Power,
     /// Devices whose consumption had to be assumed rather than measured.
     assumed: Vec<AssetId>,
 }
@@ -1353,11 +1500,14 @@ impl Flows {
     /// headroom for feeding in.
     ///
     /// Where the grid meter closed the balance, the uninstrumented load it
-    /// revealed is measured too and is included; the nameplate guesses are
-    /// subtracted back out. Under-counting is the safe direction here, and this
-    /// under-counts.
-    fn metered_consumption(&self) -> Power {
-        (self.other_consumption + self.steuve_consumption - self.assumed_consumption)
+    /// revealed is measured too and is included; the nameplate guesses and the
+    /// draw this tick is about to end are subtracted back out. Under-counting is
+    /// the safe direction here, and this under-counts.
+    fn metered_consumption(&self, lent: f64) -> Power {
+        (self.other_consumption + self.steuve_consumption
+            - self.assumed_consumption
+            - self.unlendable_consumption
+            - self.unpredictable_consumption * (1.0 - lent))
             .max(Power::ZERO)
     }
 }
@@ -1754,6 +1904,9 @@ mod tests {
                 heating_rod: None,
                 control: hems_core::asset::HeatPumpControl::SgReady,
                 modulating: true,
+                comfort_min_c: 20.0,
+                comfort_max_c: 23.0,
+                cop: CopCurve::air_source(),
             }));
         let guard = Guard::new(GuardConfig::default());
         let limits = GridLimits {
@@ -1772,6 +1925,115 @@ mod tests {
         assert!(
             (wallbox.kw() - 7.0).abs() < 1e-6,
             "the wallbox should get all 7 kW that are left, got {wallbox}"
+        );
+    }
+
+    /// A heat pump's draw is headroom for feeding in only for as long as the
+    /// guard can take it back.
+    ///
+    /// § 9 Abs. 2 EEG bounds the Einspeiseleistung at the connection point, so
+    /// the household's own consumption genuinely *is* headroom — but only for as
+    /// long as it lasts, and an inverter cannot be re-commanded until the guard
+    /// runs again. A heat pump answers its own thermostat underneath whatever
+    /// ceiling it is given: on the `capped` reference day it sat against its
+    /// 23 °C safety limit and dropped 1,1 kW without anybody commanding it,
+    /// which is exactly the 1,1 kW the roof had been allowed to add. The
+    /// household's base load stays lendable, because refusing to count it at all
+    /// would curtail every roof by it and nothing would be bought with the loss.
+    ///
+    /// So the question is not *whether* to lend but *how long the loan is
+    /// outstanding*, and that is [`GuardConfig::lend_window`] against the tick
+    /// period. This is the fast half; the slow half is the test after it.
+    #[test]
+    fn a_fast_loop_may_lend_a_thermostats_draw_to_the_roof() {
+        let mut site = site();
+        site.assets
+            .push(Asset::HeatPump(hems_core::asset::HeatPump {
+                meta: meta("waermepumpe", 3.0),
+                electrical_nominal: Power::from_kw(3.0),
+                heating_rod: None,
+                control: hems_core::asset::HeatPumpControl::PowerCeiling,
+                modulating: true,
+                comfort_min_c: 20.0,
+                comfort_max_c: 23.0,
+                cop: CopCurve::air_source(),
+            }));
+        let guard = Guard::new(GuardConfig::default());
+
+        // 9,8 kWp under § 9 Abs. 2: 5,88 kW may leave the connection point.
+        let cap = Power::from_kw(5.88);
+        let floor_of = |heat_pump_kw: f64| {
+            let v = guard.verdict(
+                &site,
+                &GridLimits::default(),
+                &state(&[
+                    ("pv", -8.0),
+                    ("haushalt", 0.5),
+                    ("waermepumpe", heat_pump_kw),
+                ]),
+                &wants(&[("pv", -9.8), ("waermepumpe", 3.0)]),
+                NOW,
+            );
+            v.envelope(&AssetId::new("pv").unwrap()).floor.outflow()
+        };
+
+        // The base load is lent: the roof may produce the cap plus what the
+        // house is using.
+        let quiet = floor_of(0.0);
+        assert!(
+            (quiet - (cap + Power::from_kw(0.5))).abs() < Power::new(1.0),
+            "the household's own 0,5 kW is headroom under § 9 Abs. 2, got {quiet}"
+        );
+        // At the default one-second cadence the thermostat's draw is lent too:
+        // the guard calls the loan in on its next run, and a second over a
+        // ceiling is inside every window a limiter is measured in. (1 kW, not
+        // more: the inverter's own 8 kW rating is the next bound along and would
+        // otherwise be what is being asserted.)
+        let running = floor_of(1.0);
+        assert!(
+            (running - (quiet + Power::from_kw(1.0))).abs() < Power::new(1.0),
+            "a box re-deriving every second can lend the thermostat's 1 kW, got {running}"
+        );
+    }
+
+    /// …and a control loop that runs once a minute lends almost none of it.
+    ///
+    /// The other half of [`GuardConfig::lend_window`]: the same household, the
+    /// same measurement, a cadence sixty times slower. A loan outstanding for a
+    /// minute is a minute over a statutory ceiling when the thermostat cuts out,
+    /// so the guard makes a sixth of it.
+    #[test]
+    fn a_slow_loop_lends_almost_none_of_a_thermostats_draw() {
+        let mut site = site();
+        site.assets
+            .push(Asset::HeatPump(hems_core::asset::HeatPump {
+                meta: meta("waermepumpe", 3.0),
+                electrical_nominal: Power::from_kw(3.0),
+                heating_rod: None,
+                control: hems_core::asset::HeatPumpControl::PowerCeiling,
+                modulating: true,
+                comfort_min_c: 20.0,
+                comfort_max_c: 23.0,
+                cop: CopCurve::air_source(),
+            }));
+        let guard = Guard::new(GuardConfig {
+            tick_period: Duration::minutes(1),
+            ..GuardConfig::default()
+        });
+        let v = guard.verdict(
+            &site,
+            &GridLimits::default(),
+            &state(&[("pv", -8.0), ("haushalt", 0.5), ("waermepumpe", 2.0)]),
+            &wants(&[("pv", -9.8), ("waermepumpe", 3.0)]),
+            NOW,
+        );
+        let floor = v.envelope(&AssetId::new("pv").unwrap()).floor.outflow();
+        // 5,88 kW of cap, the 0,5 kW base load in full, and a sixth of the
+        // thermostat's 2 kW.
+        let expected = Power::from_kw(5.88 + 0.5 + 2.0 / 6.0);
+        assert!(
+            (floor - expected).abs() < Power::new(5.0),
+            "a one-minute loop lent {floor}, and only {expected} of it can be called back in time"
         );
     }
 
@@ -2090,19 +2352,107 @@ mod tests {
     }
 
     #[test]
+    fn an_operator_asking_for_less_than_the_statute_wins_and_is_named() {
+        // The two arms are not alternatives. § 9 applies to the plant by force
+        // of law, an LPP session is the operator asking on top of it, and the
+        // house lives under whichever is stricter — with the reason chain
+        // saying which, because a household told "§ 9 EEG" for an operator's
+        // intervention has been told the wrong thing about its own bill.
+        let site = site();
+        let guard = Guard::new(GuardConfig::default());
+        let limits = GridLimits {
+            feed_in_ceiling: Some(Power::from_kw(2.0)),
+            feed_in_rule: Some(GuardRule::Lpp),
+            ..GridLimits::default()
+        };
+        let v = guard.verdict(&site, &limits, &state(&[]), &wants(&[]), NOW);
+        let exported: Power = ["pv", "battery"]
+            .iter()
+            .map(|id| v.envelope(&AssetId::new(id).unwrap()).floor.outflow())
+            .sum();
+        assert!(
+            exported <= Power::from_kw(2.0) + Power::new(1e-6),
+            "the operator's 2 kW is what binds, got {exported}"
+        );
+        let pv_id = AssetId::new("pv").unwrap();
+        assert_eq!(
+            v.binding_at(&pv_id, v.envelope(&pv_id).floor),
+            Some(GuardRule::Lpp),
+            "and it is the operator, not the statute, that is named"
+        );
+    }
+
+    #[test]
+    fn the_connection_points_own_factor_is_the_third_arm_and_can_be_the_strictest() {
+        // `[MGCP-011]` is a fraction of the *cumulated nominal AC power* of the
+        // inverters, where § 9's cap is a fraction of installed DC. They differ
+        // on almost every real installation, because inverters are routinely
+        // undersized against the modules — this site is 9,8 kWp of module
+        // behind 8 kW of inverter, so 60 % of one is 5,88 kW and 50 % of the
+        // other is 4 kW. Taking the smaller is the only reading that satisfies
+        // both.
+        let site = site();
+        let guard = Guard::new(GuardConfig::default());
+        let limits = GridLimits {
+            mgcp_factor: Some(0.5),
+            ..GridLimits::default()
+        };
+        let v = guard.verdict(&site, &limits, &state(&[]), &wants(&[]), NOW);
+        let exported: Power = ["pv", "battery"]
+            .iter()
+            .map(|id| v.envelope(&AssetId::new(id).unwrap()).floor.outflow())
+            .sum();
+        assert!(
+            exported <= Power::from_kw(4.0) + Power::new(1e-6),
+            "half of 8 kW of inverter, not 60 % of 9,8 kWp of module: got {exported}"
+        );
+        let pv_id = AssetId::new("pv").unwrap();
+        assert_eq!(
+            v.binding_at(&pv_id, v.envelope(&pv_id).floor),
+            Some(GuardRule::Para9Cap),
+            "the wire announcing the statutory limitation is still § 9 EEG and \
+             not an operator intervening"
+        );
+    }
+
+    #[test]
+    fn a_plant_that_has_passed_its_test_is_not_capped_at_all() {
+        // The other side of deriving the cap from the site: § 9 Abs. 2 lifts it
+        // once an intelligent metering system with a control device is in
+        // operation *and* the first Ansteuerbarkeit test has succeeded. A guard
+        // that applied 60 % to every roof would cost such a household forty per
+        // cent of its export for a rule that stopped applying to it.
+        let mut site = site();
+        for asset in &mut site.assets {
+            if let Asset::Pv(pv) = asset {
+                pv.para9.relief = hems_core::prelude::CapRelief::ImsysWithControl;
+            }
+        }
+        let guard = Guard::new(GuardConfig::default());
+        let v = guard.verdict(&site, &GridLimits::default(), &state(&[]), &wants(&[]), NOW);
+        let pv_id = AssetId::new("pv").unwrap();
+        assert_eq!(
+            v.binding_at(&pv_id, v.envelope(&pv_id).floor),
+            None,
+            "nothing on this site limits feed-in"
+        );
+    }
+
+    #[test]
     fn the_feed_in_cap_is_shared_at_the_connection_point() {
         // § 9 EEG caps the Einspeisung *at the connection point*. Applied to
         // each generator on its own — which is what this did until the fourth
         // audit — a roof allowed 5,88 kW and a battery allowed 5,88 kW put
         // 11,76 kW through a limit of 5,88.
+        // Nothing is put on `GridLimits`: the 9,8 kWp plant in `site()` has not
+        // passed its Ansteuerbarkeit test, so the guard derives 60 % of it from
+        // the site itself on every tick. That is how a real box gets the cap —
+        // § 9 Abs. 1 EEG applies to the plant and is not something an operator
+        // sends — and a test that handed the ceiling in would be exercising a
+        // path production does not have.
         let site = site();
         let guard = Guard::new(GuardConfig::default());
-        let limits = GridLimits {
-            feed_in_ceiling: Some(Power::from_kw(5.88)),
-            feed_in_rule: Some(GuardRule::Para9Cap),
-            ..GridLimits::default()
-        };
-        let v = guard.verdict(&site, &limits, &state(&[]), &wants(&[]), NOW);
+        let v = guard.verdict(&site, &GridLimits::default(), &state(&[]), &wants(&[]), NOW);
         let exported: Power = ["pv", "battery"]
             .iter()
             .map(|id| v.envelope(&AssetId::new(id).unwrap()).floor.outflow())

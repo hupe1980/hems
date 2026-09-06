@@ -119,10 +119,10 @@ $ cargo run -p hemsd -- simulate --day winter --perfect-foresight
 
 | Day | Saved | Saved, knowing the future | The premium |
 |---|---|---|---|
-| January, § 14a reduction, 20 kWh of charging to place | **€2,09** | €5,25 | 60 % |
-| January evening, car arrives *as* the reduction starts | **€2,51** | €4,93 | 49 % |
-| June, more sun than the house can use | **€8,61** | €8,91 | 3 % |
-| May, § 9 EEG cap, no car | **€1,31** | €1,53 | 14 % |
+| January, § 14a reduction, 20 kWh of charging to place | **€2,14** | €5,28 | 59 % |
+| January evening, car arrives *as* the reduction starts | **€2,56** | €4,96 | 48 % |
+| June, more sun than the house can use | **€8,65** | €8,94 | 3 % |
+| May, § 9 EEG cap, no car | **€1,27** | €1,33 | 5 % |
 
 The shape of that table is a result rather than noise. Where the surplus lasts
 all day the plan has slack and being wrong costs nothing. Where a large charging
@@ -148,7 +148,7 @@ of them.
 | `load` | the household's uncontrolled draw | its own quarter hours, by day type |
 | `session` | when the car comes home and how empty | its own charging sessions, by weekday |
 | `building` | which house this is | indoor and outdoor temperature against the heat put in |
-| `naive` | any of them, badly, with nothing | the last day, or the last hour |
+| `naive` | any of them, badly, with almost nothing | one reading, on a box that has no profile yet |
 | `metrics` | nothing — it scores the rest | pinball, coverage, bias, CRPS |
 
 Three of them are asymmetric on purpose:
@@ -173,6 +173,20 @@ identity ratio and a wide prior band. A weekday with fewer than three observed
 charging sessions returns **no** forecast at all, and the planner then reserves
 nothing rather than reserving the evening's cheap hours for a car that may not
 come.
+
+**A cell with no history says so by widening.** The profile keys its cells on
+`(day type, quarter hour)`, and a box's first Saturday has none — nor does its
+first public holiday, nor any quarter hour it has not been metered through. An
+empty cell borrows the same quarter hour from the day types the household *has*
+been seen on, widened by half because a Saturday is not a Monday; a quarter hour
+seen on no day at all falls back to the household's own level, widened twice.
+Answering zero would be the one thing a forecast must never do — say *the house
+will use nothing, and I am sure* — and a plan given that defers every flexible
+kilowatt-hour into hours it believes are free.
+
+Only a profile that has learned nothing at all has nothing to say, and the box
+does not ask one: it uses persistence off its own meter on its first morning, and
+refuses to plan if it cannot read its own connection point.
 
 ## What this measurement is not
 

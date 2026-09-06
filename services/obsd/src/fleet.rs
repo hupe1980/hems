@@ -172,6 +172,16 @@ impl Fleet {
                         ),
                     });
                 }
+                if !day.respected_the_feed_in_ceiling() {
+                    summary.over_feed_in_ceiling.push(Finding {
+                        site: name.clone(),
+                        date: day.date,
+                        detail: format!(
+                            "the Einspeiseleistung went {:.0} W over the § 9 EEG ceiling",
+                            day.worst_feed_in_overshoot_w
+                        ),
+                    });
+                }
                 if day.below_minimum_commanded {
                     summary.below_minimum.push(Finding {
                         site: name.clone(),
@@ -294,6 +304,15 @@ pub struct Summary {
     /// A list and never a rate: one household in ten thousand is a compliance
     /// incident with a name and a date, and "99,99 %" reads as success.
     pub breached: Vec<Finding>,
+    /// **Every** day a roof fed in above its § 9 EEG ceiling.
+    ///
+    /// The other statutory limit on the same connection point, and for a long
+    /// time the fleet had no answer about it at all: § 14a arrives as an
+    /// instruction and leaves a record, § 9 Abs. 2 applies by force of law and
+    /// leaves none, so the one that needed watching hardest was the one nothing
+    /// watched. A list rather than a rate, for the same reason as
+    /// [`Summary::breached`].
+    pub over_feed_in_ceiling: Vec<Finding>,
     /// Every day a commanded ceiling went below the minimum of `[A1 4.5]`.
     ///
     /// Not a fault of the box — hems applies such a command, because refusing a
@@ -338,7 +357,10 @@ impl Summary {
     /// Whether anything here needs a human.
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.breached.is_empty() && self.sites_without_a_plan.is_empty() && self.silent.is_empty()
+        self.breached.is_empty()
+            && self.over_feed_in_ceiling.is_empty()
+            && self.sites_without_a_plan.is_empty()
+            && self.silent.is_empty()
     }
 }
 
@@ -395,6 +417,34 @@ mod tests {
         assert_eq!(summary.breached.len(), 1);
         assert_eq!(summary.breached[0].site, "site-999");
         assert!(summary.breached[0].detail.contains("850"));
+        assert!(!summary.is_clean());
+    }
+
+    /// The other statutory limit on the same connection point, and it is a
+    /// finding of its own.
+    ///
+    /// § 14a arrives as an instruction and leaves a record, so a breach of it
+    /// has something to be read out of. § 9 Abs. 2 EEG applies by force of law,
+    /// leaves no record, and for a long time the fleet had no answer about it at
+    /// all — which is exactly backwards, because the limit nobody sends is the
+    /// one nobody notices.
+    #[test]
+    fn a_roof_over_its_paragraph_nine_ceiling_is_a_finding_of_its_own() {
+        let mut fleet = Fleet::new(60);
+        fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
+        let mut over = day("b", date!(2026 - 02 - 27));
+        over.worst_feed_in_overshoot_w = 1_140.0;
+        assert!(over.needs_attention(), "a fleet has to be told about it");
+        fleet.record(over, NOW);
+
+        let summary = fleet.summarise(NOW, SILENT_AFTER);
+        assert!(
+            summary.breached.is_empty(),
+            "§ 14a was respected and must not be blamed for a § 9 EEG excess"
+        );
+        assert_eq!(summary.over_feed_in_ceiling.len(), 1);
+        assert_eq!(summary.over_feed_in_ceiling[0].site, "b");
+        assert!(summary.over_feed_in_ceiling[0].detail.contains("1140"));
         assert!(!summary.is_clean());
     }
 

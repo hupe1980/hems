@@ -113,7 +113,21 @@ impl<U: Upstream> Poller<U> {
     }
 
     /// Ask every source whose turn it is, and merge what comes back.
-    pub async fn poll(&mut self, cache: &mut PriceCache, now: OffsetDateTime) -> PollOutcome {
+    /// Ask every source that is due, merge what comes back, and say what moved.
+    ///
+    /// `carbon` is a second cache rather than a column on the first: the
+    /// intensity comes from one publisher in grams while the prices come from
+    /// four in euros, and there is nothing to reconcile for a set of one. It is
+    /// here at all because the Energy-Charts fetch used to carry the series into
+    /// a field this loop dropped — so the parser had no consumer, the price
+    /// stack's own `co2_g_per_kwh` was always `None`, and a household could not
+    /// price carbon however much it wanted to.
+    pub async fn poll(
+        &mut self,
+        cache: &mut PriceCache,
+        carbon: &mut hems_tariff::cache::CarbonCache,
+        now: OffsetDateTime,
+    ) -> PollOutcome {
         let mut outcome = PollOutcome::default();
         let due: Vec<Source> = self
             .schedules
@@ -126,7 +140,8 @@ impl<U: Upstream> Poller<U> {
             match self.upstream.fetch(source).await {
                 Ok(fetched) => {
                     let merged = cache.merge(&fetched.series, now);
-                    if merged.is_empty() {
+                    let carbon_moved = carbon.merge(&fetched.co2_g_per_kwh);
+                    if merged.is_empty() && carbon_moved == 0 {
                         outcome.stale.push(source);
                     } else {
                         outcome.learned_from.push(source);
@@ -275,7 +290,8 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
-        let outcome = poller.poll(&mut cache, NOON).await;
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
+        let outcome = poller.poll(&mut cache, &mut carbon, NOON).await;
         assert_eq!(outcome.learned_from, vec![Source::Smard]);
         assert!(is_ready(&cache, NOON, 96));
     }
@@ -300,9 +316,15 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
-        assert!(poller.poll(&mut cache, NOON).await.learned_anything());
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
+        assert!(
+            poller
+                .poll(&mut cache, &mut carbon, NOON)
+                .await
+                .learned_anything()
+        );
         let later = NOON + time::Duration::minutes(15);
-        let outcome = poller.poll(&mut cache, later).await;
+        let outcome = poller.poll(&mut cache, &mut carbon, later).await;
         assert!(!outcome.learned_anything());
         assert_eq!(outcome.stale, vec![Source::Smard]);
     }
@@ -330,14 +352,15 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
-        let first = poller.poll(&mut cache, NOON).await;
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
+        let first = poller.poll(&mut cache, &mut carbon, NOON).await;
         assert_eq!(first.failed.len(), 1);
         assert_eq!(first.learned_from, vec![Source::Smard]);
 
         // A quarter of an hour later SMARD is due again and ENTSO-E, having
         // failed once, is not.
         let later = NOON + time::Duration::minutes(15);
-        let second = poller.poll(&mut cache, later).await;
+        let second = poller.poll(&mut cache, &mut carbon, later).await;
         assert_eq!(second.learned_from, vec![Source::Smard]);
         assert!(second.failed.is_empty(), "ENTSO-E was not asked again yet");
     }
@@ -358,10 +381,11 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
         let mut now = NOON;
         let mut waits = Vec::new();
         for _ in 0..5 {
-            poller.poll(&mut cache, now).await;
+            poller.poll(&mut cache, &mut carbon, now).await;
             let due = poller.next_due().expect("a source is scheduled");
             waits.push(due - now);
             now = due;
@@ -395,12 +419,13 @@ mod tests {
             time::Duration::hours(4),
         );
         let mut cache = PriceCache::new();
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
         let mut now = NOON;
         for _ in 0..2 {
-            poller.poll(&mut cache, now).await;
+            poller.poll(&mut cache, &mut carbon, now).await;
             now = poller.next_due().unwrap();
         }
-        poller.poll(&mut cache, now).await;
+        poller.poll(&mut cache, &mut carbon, now).await;
         assert_eq!(
             poller.next_due().unwrap() - now,
             time::Duration::minutes(15),
@@ -437,7 +462,8 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
-        poller.poll(&mut cache, NOON).await;
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
+        poller.poll(&mut cache, &mut carbon, NOON).await;
         assert!(
             coverage(&cache, NOON, 96) > 0.98,
             "almost everything is there"
@@ -461,7 +487,8 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
-        let outcome = poller.poll(&mut cache, NOON).await;
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
+        let outcome = poller.poll(&mut cache, &mut carbon, NOON).await;
         assert!(!outcome.learned_anything());
         assert!(!is_ready(&cache, NOON, 96));
         assert!(poller.next_due().is_none());
@@ -485,10 +512,11 @@ mod tests {
             time::Duration::hours(1),
         );
         let mut cache = PriceCache::new();
-        poller.poll(&mut cache, NOON).await;
+        let mut carbon = hems_tariff::cache::CarbonCache::new();
+        poller.poll(&mut cache, &mut carbon, NOON).await;
         // One minute later nothing is due, so nothing is asked.
         poller
-            .poll(&mut cache, NOON + time::Duration::minutes(1))
+            .poll(&mut cache, &mut carbon, NOON + time::Duration::minutes(1))
             .await;
         assert_eq!(poller.upstream.asked(), vec![Source::Smard]);
     }

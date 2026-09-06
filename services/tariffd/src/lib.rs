@@ -44,9 +44,11 @@
 pub mod api;
 pub mod config;
 pub mod mcp_server;
+pub mod modul3;
 pub mod poller;
 pub mod upstream;
 
-pub use config::{Endpoint, Settings};
+pub use config::{Endpoint, Modul3Entry, Settings};
+pub use modul3::Catalogue;
 pub use poller::{PollOutcome, Poller};
 pub use upstream::{Fetched, Http, Upstream, UpstreamError};

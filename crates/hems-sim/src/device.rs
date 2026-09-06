@@ -266,24 +266,34 @@ impl ApplianceSim {
 ///
 /// A real inverter follows a new ceiling in a second or two rather than
 /// instantly (the DC/DC stage has to walk off the maximum power point), so this
-/// one does too: `response` is the fraction of the remaining gap it closes per
-/// step. It is the smallest way of saying no that keeps a controller honest.
+/// one does too. It is the smallest way of saying no that keeps a controller
+/// honest.
+///
+/// # The lag is a time constant, not a fraction of a step
+///
+/// [`PvSim::settling`] is a first-order time constant, and the fraction of the
+/// gap closed in a step of `dt` is `1 − exp(−dt/τ)`. A fraction *per call* would
+/// make the inverter's speed a property of the caller's tick length instead: at
+/// the one-minute cadence the reference days run, a constant calibrated as "two
+/// seconds of settling" describes a machine that takes four minutes to obey a
+/// feed-in limit. A day at one cadence only says something about a box at
+/// another if the hardware is the same hardware (D140).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PvSim {
     /// What the inverter is feeding in now, as a non-negative magnitude.
     pub producing: Power,
-    /// The fraction of the gap to a new ceiling closed in one step.
+    /// The time constant of the ramp onto a new ceiling.
     ///
-    /// `1.0` follows instantly. The default of 0,4 is about two seconds of
-    /// settling at a one-second tick, which is what a string inverter does.
-    pub response: f64,
+    /// `Duration::ZERO` follows instantly. The default of two seconds is what a
+    /// string inverter's DC/DC stage takes to walk off the maximum power point.
+    pub settling: Duration,
 }
 
 impl Default for PvSim {
     fn default() -> Self {
         Self {
             producing: Power::ZERO,
-            response: 0.4,
+            settling: Duration::seconds(2),
         }
     }
 }
@@ -300,16 +310,29 @@ impl PvSim {
     /// and reporting the ramp as curtailment would make a controller that never
     /// curtails anything print a curtailment figure every sunrise — a KPI that
     /// moves when nothing was decided is worse than one that is always zero.
-    pub fn step(&mut self, available: Power, ceiling: Power) -> (Power, Power) {
+    pub fn step(&mut self, available: Power, ceiling: Power, dt: Duration) -> (Power, Power) {
         let available = available.max(Power::ZERO);
         let ceiling = ceiling.max(Power::ZERO);
         let target = available.min(ceiling);
         let gap = target - self.producing;
-        self.producing = (self.producing + gap * self.response.clamp(0.0, 1.0)).max(Power::ZERO);
+        self.producing = (self.producing + gap * Self::closed(self.settling, dt)).max(Power::ZERO);
         // Never above what the weather is offering, whatever the ramp says: an
         // inverter cannot overshoot into sunshine that is not there.
         self.producing = self.producing.min(available);
         (-self.producing, (available - ceiling).max(Power::ZERO))
+    }
+
+    /// The fraction of the gap a first-order lag of `tau` closes in `dt`.
+    ///
+    /// `1 − exp(−dt/τ)`, which is 0 for a step of no length and 1 for a machine
+    /// with no lag — and, crucially, is a function of *time* rather than of how
+    /// often somebody happens to call this.
+    fn closed(tau: Duration, dt: Duration) -> f64 {
+        let (tau, dt) = (tau.as_seconds_f64(), dt.as_seconds_f64());
+        if !(tau.is_finite() && dt.is_finite()) || tau <= 0.0 || dt <= 0.0 {
+            return if dt > 0.0 { 1.0 } else { 0.0 };
+        }
+        1.0 - (-dt / tau).exp()
     }
 }
 
@@ -326,13 +349,27 @@ pub struct EvseSim {
     pub switchable: bool,
     /// The car, when one is connected.
     pub vehicle: Option<VehicleSim>,
-    /// Ticks left before a commanded phase change has taken effect.
+    /// How long is left before a commanded phase change has taken effect.
     ///
     /// Real hardware opens a contactor and lets the vehicle re-negotiate, and
     /// IEC 61851 gives that seconds rather than milliseconds. A simulator that
     /// switched instantly would hide every controller bug that chatters.
-    switch_delay_ticks: u8,
+    ///
+    /// A **duration** rather than a count of calls, for the reason
+    /// [`PvSim::settling`] gives: a dead time counted in ticks is a dead time
+    /// whose length is decided by the caller's cadence, so the same charge point
+    /// lost ten seconds of a session on a box and a whole minute on a reference
+    /// day (D140).
+    switch_remaining: Duration,
 }
+
+/// How long a contactor operation costs a session.
+///
+/// IEC 61851 has the vehicle re-negotiate through the control pilot after the
+/// contactor moves; ten seconds is what a wallbox that can switch conductors
+/// actually takes, and it is the cost the phase policy's hysteresis exists to
+/// be worth paying.
+pub const PHASE_SWITCH_DEAD_TIME: Duration = Duration::seconds(10);
 
 /// The car.
 #[derive(Debug, Clone, PartialEq)]
@@ -364,7 +401,7 @@ impl EvseSim {
             mode: PhaseMode::Three,
             switchable: false,
             vehicle: None,
-            switch_delay_ticks: 0,
+            switch_remaining: Duration::ZERO,
         }
     }
 
@@ -384,16 +421,16 @@ impl EvseSim {
 
     /// Command a phase mode, the way a driver would.
     ///
-    /// Returns `true` when the mode changed. The change costs a tick, because a
-    /// real charge point opens its contactor and lets the vehicle re-negotiate:
-    /// during that tick the session delivers nothing, which is the cost a
-    /// controller has to be worth paying.
+    /// Returns `true` when the mode changed. The change costs
+    /// [`PHASE_SWITCH_DEAD_TIME`], because a real charge point opens its
+    /// contactor and lets the vehicle re-negotiate: for that long the session
+    /// delivers nothing, which is the cost a controller has to be worth paying.
     pub fn set_mode(&mut self, mode: PhaseMode) -> bool {
         if !self.switchable || mode == self.mode {
             return false;
         }
         self.mode = mode;
-        self.switch_delay_ticks = 1;
+        self.switch_remaining = PHASE_SWITCH_DEAD_TIME;
         true
     }
 
@@ -419,9 +456,12 @@ impl EvseSim {
     /// not charge. Controllers that forget this spend a whole afternoon
     /// commanding 1 kW into a car that never wakes up.
     pub fn step(&mut self, commanded: Power, dt: Duration) -> Power {
-        if self.switch_delay_ticks > 0 {
-            // The contactor is open and the vehicle is re-negotiating.
-            self.switch_delay_ticks -= 1;
+        if self.switch_remaining > Duration::ZERO {
+            // The contactor is open and the vehicle is re-negotiating. A step
+            // longer than what is left of the dead time spends the rest of it
+            // and still delivers nothing: a charge point does not deliver half a
+            // re-negotiation.
+            self.switch_remaining = (self.switch_remaining - dt).max(Duration::ZERO);
             return Power::ZERO;
         }
         let (minimum, maximum) = (self.minimum_power(), self.maximum_power());
@@ -733,6 +773,81 @@ mod tests {
     use super::*;
 
     const QUARTER: Duration = Duration::minutes(15);
+
+    /// The inverter obeys a ceiling in the same *time* however often it is
+    /// asked.
+    ///
+    /// The defect this pins: the ramp used to close a fixed fraction of the gap
+    /// per call, so the machine's speed was a property of the caller's cadence.
+    /// The reference days run once a minute and a constant calibrated for a
+    /// one-second box therefore simulated an inverter four minutes behind every
+    /// feed-in limit — which put the `capped` day's quarter-hour register at
+    /// 12,06 kW against a 12,00 kW § 9 EEG ceiling.
+    #[test]
+    fn the_inverters_lag_is_a_time_and_not_a_number_of_ticks() {
+        let available = Power::from_kw(10.0);
+        let ceiling = Power::from_kw(4.0);
+
+        // Ten seconds in one call, and the same ten seconds in ten.
+        let mut once = PvSim {
+            producing: available,
+            ..PvSim::default()
+        };
+        let mut split = once;
+        once.step(available, ceiling, Duration::seconds(10));
+        for _ in 0..10 {
+            split.step(available, ceiling, Duration::seconds(1));
+        }
+        assert!(
+            (once.producing - split.producing).abs() < Power::new(1.0),
+            "one ten-second step reached {} and ten one-second steps reached {}",
+            once.producing,
+            split.producing
+        );
+
+        // …and a step far longer than the time constant has settled.
+        let mut slow = PvSim {
+            producing: available,
+            ..PvSim::default()
+        };
+        slow.step(available, ceiling, Duration::minutes(1));
+        assert!(
+            (slow.producing - ceiling).abs() < Power::new(1.0),
+            "a two-second inverter had a whole minute and stopped at {}",
+            slow.producing
+        );
+    }
+
+    /// A contactor operation costs the session the same seconds whatever the
+    /// control loop's period is.
+    #[test]
+    fn a_phase_switch_costs_a_dead_time_and_not_a_tick() {
+        let vehicle = || VehicleSim {
+            capacity: Energy::from_kwh(60.0),
+            stored: Energy::from_kwh(10.0),
+            efficiency: 0.92,
+            efficiency_single_phase: 0.85,
+            max_charge: Power::from_kw(11.0),
+        };
+        let mut evse = EvseSim::new().switchable().with_vehicle(vehicle());
+        assert!(evse.set_mode(PhaseMode::Single));
+
+        // Half the dead time in one step: still nothing.
+        let half = PHASE_SWITCH_DEAD_TIME / 2;
+        assert_eq!(evse.step(Power::from_kw(3.0), half), Power::ZERO);
+        assert_eq!(evse.step(Power::from_kw(3.0), half), Power::ZERO);
+        assert!(evse.step(Power::from_kw(3.0), half) > Power::ZERO);
+
+        // And a single step longer than the dead time spends all of it — a
+        // charge point does not deliver half a re-negotiation.
+        let mut slow = EvseSim::new().switchable().with_vehicle(vehicle());
+        assert!(slow.set_mode(PhaseMode::Single));
+        assert_eq!(
+            slow.step(Power::from_kw(3.0), Duration::minutes(1)),
+            Power::ZERO
+        );
+        assert!(slow.step(Power::from_kw(3.0), Duration::minutes(1)) > Power::ZERO);
+    }
 
     #[test]
     fn a_compressor_will_not_stop_before_its_minimum_has_run() {

@@ -481,6 +481,9 @@ mod tests {
             heating_rod: None,
             control: HeatPumpControl::PowerCeiling,
             modulating: true,
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            cop: CopCurve::air_source(),
         })
     }
 
@@ -689,6 +692,9 @@ mod tests {
             heating_rod: Some(Power::from_kw(9.0)),
             control: HeatPumpControl::SgReady,
             modulating: false,
+            comfort_min_c: 20.0,
+            comfort_max_c: 23.0,
+            cop: CopCurve::air_source(),
         });
         let devices = classify_on(&[hp], TODAY);
         assert_eq!(devices[0].power, Power::from_kw(12.0));

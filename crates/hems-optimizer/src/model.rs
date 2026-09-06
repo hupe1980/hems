@@ -165,9 +165,9 @@ impl EvSession {
     ///
     /// It is the cheap answer to "is this household at risk today", and the
     /// reason it exists is a measurement. Planning against three futures instead
-    /// of one median is worth €0,35 a day on the evening a car arrives *as* a
+    /// of one median is worth €0,16 a day on the evening a car arrives *as* a
     /// § 14a reduction starts — and it removes the charge the median plan leaves
-    /// undelivered — while costing €0,95 a day and seven times the solve on an
+    /// undelivered — while costing €1,03 a day and five to seven times the solve on an
     /// ordinary winter evening where nothing is at stake. Something has to
     /// decide which day it is.
     ///
@@ -678,9 +678,13 @@ impl Objective {
 /// once the event ends, a flat limit has no way to say that another one is
 /// expected at teatime tomorrow.
 ///
-/// The same shape is what § 24.16's grid-stress anticipation needs — the
-/// operator's monthly list of control actions per postcode `[A1 8.4]` is a set
-/// of windows — so the planner learns to read one now rather than later.
+/// The window is also what an *anticipated* reduction needs, and the source for
+/// one is **not** `[A1 8.4]`. That publication — monthly on VNBdigital since
+/// 01.03.2025, in the BDEW's own format — is a per-Netzbereich **aggregate**:
+/// `Eingriffsdauer [h im Kalendermonat]` and `Eingriffsintensität [%]`, with no
+/// timestamps in it at all. It says how exposed an area is, not when. The only
+/// window-shaped record of when a household was actually reduced is its own
+/// `[A1 7.2]` evidence, which the box keeps for two years anyway.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TimedLimit {
@@ -978,9 +982,9 @@ pub struct Problem<'a> {
     ///
     /// [`Risk::deterministic`] by default — one future, the median of both
     /// forecasts. Not because it is the best plan: `hemsd risk` measures three
-    /// futures as worth about €0,35 a day where a service is at risk and as
-    /// costing about €0,95 a day where none is, and three futures cost seven
-    /// times the solve. That is a trade a household's box should make
+    /// futures as worth about €0,16 a day where a service is at risk and as
+    /// costing about €1,03 a day where none is, and five to seven times the
+    /// solve. That is a trade a household's box should make
     /// deliberately rather than inherit. See [`Risk`].
     pub risk: Risk,
     /// What a kilowatt-hour still in the battery at the end of the horizon is
@@ -1259,7 +1263,7 @@ impl Default for Risk {
     /// how much — but because it is the plan a caller who has said nothing about
     /// uncertainty is entitled to: the cheapest to solve, and the one every
     /// figure in this workspace is calibrated against. Three futures cost
-    /// **seven times the solve** on the reference winter day, which is a
+    /// **five to seven times the solve** on the reference winter day, which is a
     /// decision a household's box should make deliberately rather than inherit.
     fn default() -> Self {
         Self::deterministic()
@@ -1276,6 +1280,25 @@ impl Risk {
             scenarios: ScenarioSet::Median,
             cvar_alpha: 0.7,
             cvar_weight: 0.0,
+        }
+    }
+
+    /// Three futures, priced at their **expected** cost — no weight on the tail.
+    ///
+    /// The middle policy, and it is not the same thing as a single median:
+    /// three futures are *priced*, so a plan can say "and if the afternoon is
+    /// dull I do this instead" and the recourse is worth what it is worth. What
+    /// it does not do is pay anything extra to avoid the bad one, which is
+    /// [`Risk::hedged`]'s job.
+    ///
+    /// It exists as a constructor because two callers had written the same
+    /// `Risk { cvar_weight: 0.0, ..hedged() }` literal in two files, and two
+    /// spellings of one policy are two things that can disagree about it.
+    #[must_use]
+    pub const fn expected() -> Self {
+        Self {
+            cvar_weight: 0.0,
+            ..Self::hedged()
         }
     }
 
@@ -1569,6 +1592,20 @@ impl<'a> Problem<'a> {
     #[must_use]
     pub fn with_shiftable(mut self, run: ShiftableRun) -> Self {
         self.shiftable.push(run);
+        self
+    }
+
+    /// Price what the household is willing to pay to avoid something other
+    /// than money.
+    ///
+    /// Without this every plan minimises the plain economic objective, which is
+    /// the right default and was for a long time the *only* reachable one: the
+    /// carbon price and the autarky premium were read by the solver and settable
+    /// by nothing a daemon configured, so a household that had bought a battery
+    /// for independence could not say so. See [`Objective`].
+    #[must_use]
+    pub fn with_objective(mut self, objective: Objective) -> Self {
+        self.objective = objective;
         self
     }
 

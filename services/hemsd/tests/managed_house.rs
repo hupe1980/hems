@@ -24,7 +24,7 @@ use std::sync::Arc;
 use hems_core::prelude::{AssetId, Power};
 use hems_drv::modbus::{Cadence, SunSpec};
 use hems_service::Shutdown;
-use hemsd::drivers::Registry;
+use hemsd::drivers::{Attached, DriverId, Registry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -146,12 +146,20 @@ async fn serve(listener: TcpListener, watts: u16, hangup_after: usize) {
 }
 
 /// A registry holding one SunSpec driver for `pv`.
-fn registry() -> (Arc<Mutex<Registry>>, AssetId, hems_core::prelude::Site) {
+fn registry() -> (
+    Arc<Mutex<Registry>>,
+    DriverId,
+    AssetId,
+    hems_core::prelude::Site,
+) {
     let household = hemsd::Household::build(&hemsd::HouseholdConfig::default())
         .expect("the reference household");
-    let asset = household.pv.clone();
+    let asset = household
+        .pv
+        .clone()
+        .expect("the reference household has a roof");
     let mut registry = Registry::new();
-    registry
+    let driver = registry
         .register(
             Box::new(SunSpec::new(
                 asset.clone(),
@@ -164,7 +172,12 @@ fn registry() -> (Arc<Mutex<Registry>>, AssetId, hems_core::prelude::Site) {
             &household.site,
         )
         .expect("the site has a roof");
-    (Arc::new(Mutex::new(registry)), asset, household.site)
+    (
+        Arc::new(Mutex::new(registry)),
+        driver,
+        asset,
+        household.site,
+    )
 }
 
 /// Wait until `check` holds, or give up after `attempts` short sleeps.
@@ -195,11 +208,14 @@ async fn a_reading_travels_from_a_socket_to_the_guard() {
     let address = listener.local_addr().expect("its address").to_string();
     tokio::spawn(serve(listener, 2_310, usize::MAX));
 
-    let (registry, asset, _site) = registry();
+    let (registry, driver, asset, _site) = registry();
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(hemsd::runtime::transport::tcp(
         Arc::clone(&registry),
-        asset.clone(),
+        Attached {
+            driver,
+            asset: asset.clone(),
+        },
         address,
         signal,
     ));
@@ -265,11 +281,14 @@ async fn a_reconnect_does_not_leave_half_a_frame_behind() {
     // goes — which is a Wi-Fi bridge, not a broken device.
     tokio::spawn(serve(listener, 2_310, 12));
 
-    let (registry, asset, _site) = registry();
+    let (registry, driver, asset, _site) = registry();
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(hemsd::runtime::transport::tcp(
         Arc::clone(&registry),
-        asset.clone(),
+        Attached {
+            driver,
+            asset: asset.clone(),
+        },
         address,
         signal,
     ));
@@ -301,11 +320,14 @@ async fn a_device_that_stops_answering_stops_being_believed() {
     let address = listener.local_addr().expect("its address").to_string();
     tokio::spawn(serve(listener, 2_310, usize::MAX));
 
-    let (registry, asset, _site) = registry();
+    let (registry, driver, asset, _site) = registry();
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(hemsd::runtime::transport::tcp(
         Arc::clone(&registry),
-        asset.clone(),
+        Attached {
+            driver,
+            asset: asset.clone(),
+        },
         address,
         signal.clone(),
     ));
@@ -358,7 +380,7 @@ async fn a_grid_driver_with_no_transport_still_runs_its_clock() {
         .expect("the reference household");
     let start = time::OffsetDateTime::now_utc();
     let mut registry = Registry::new();
-    registry
+    let _driver = registry
         .register(
             Box::new(hems_drv::eebus::Lpc::new(
                 AssetId::new("netzanschluss").expect("a valid identifier"),
@@ -436,7 +458,7 @@ async fn a_reduction_a_running_box_lived_through_reaches_its_two_year_record() {
     );
 
     let mut registry = Registry::new();
-    registry
+    let _driver = registry
         .register(Box::new(lpc), &household.site)
         .expect("a grid driver speaks for the connection point");
     let now = start + time::Duration::seconds(130);
@@ -602,7 +624,10 @@ async fn a_boost_reaches_the_arbiter_and_still_loses_to_the_grid() {
     let overrides = Overrides::new();
     overrides
         .set(
-            household.evse.clone(),
+            household
+                .evse
+                .clone()
+                .expect("the reference household has a charge point"),
             hems_core::setpoint::UserOverride::Boost,
             None,
             now,
@@ -641,7 +666,12 @@ async fn a_boost_reaches_the_arbiter_and_still_loses_to_the_grid() {
         .expect("a reduction is in force, so there is a budget");
     let car = decision
         .commanded
-        .get(&household.evse)
+        .get(
+            household
+                .evse
+                .as_ref()
+                .expect("the reference household has a charge point"),
+        )
         .copied()
         .unwrap_or(Power::ZERO);
     assert!(
@@ -655,7 +685,12 @@ async fn a_boost_reaches_the_arbiter_and_still_loses_to_the_grid() {
     // would be a button that does nothing.
     let heat_pump = decision
         .commanded
-        .get(&household.heat_pump)
+        .get(
+            household
+                .heat_pump
+                .as_ref()
+                .expect("the reference household has a heat pump"),
+        )
         .copied()
         .unwrap_or(Power::ZERO);
     assert!(

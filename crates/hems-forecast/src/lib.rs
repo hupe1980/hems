@@ -43,6 +43,7 @@
 )]
 
 pub mod building;
+pub mod hotwater;
 pub mod load;
 pub mod metrics;
 pub mod naive;
@@ -53,7 +54,7 @@ pub mod solar;
 pub mod weather;
 
 pub use building::{Identified, ThermalSample, identify};
-pub use load::{DayType, LoadProfile};
+pub use load::LoadProfile;
 pub use metrics::{CALIBRATION_DAYS, Calibration, is_informative};
 pub use naive::{persistence, seasonal_naive};
 pub use quantile::{Band, Forecast, PowerBand};

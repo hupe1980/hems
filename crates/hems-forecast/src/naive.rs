@@ -19,6 +19,13 @@
 //!
 //! Both come back with a wide band, and that is the point rather than a defect:
 //! a plan made against a naive forecast should be a plan that does not bet much.
+//!
+//! **Which of the two a box uses.** [`persistence`], on its first morning, from
+//! the one reading it has. [`seasonal_naive`] wants a *series* and a box with a
+//! series has a [`LoadProfile`](crate::load::LoadProfile) instead — which
+//! answers an empty cell from the same quarter hour on the day types it has
+//! seen, so the seasonal-naive idea runs there rather than here (D145). This one
+//! is published for an embedder holding a raw series and nothing else.
 
 use std::collections::BTreeMap;
 

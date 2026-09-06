@@ -13,6 +13,15 @@
 //! record of what the *network operator* itself commanded and what the
 //! connection point drew, and it is theirs to check.
 //!
+//! **Nor is the MiSpeL settlement**, and for the same reason rather than a
+//! second one. `/v1/sites/{site}/mispel` is the household's own levy privilege
+//! and the flows behind it — how full the store was, when it was charged from
+//! the grid, what the roof earned — which the Festlegung has the
+//! *Anlagenbetreiber* produce and submit. It sits behind
+//! `Authority::may_read_everything` beside the Data Act export, so the same
+//! credential that cannot reach one cannot reach the other, and leaving it out
+//! here is that decision honoured rather than an unbuilt tool.
+//!
 //! That split is `hems_service::Authority`'s, not this module's; what this
 //! module does is refuse to route around it.
 

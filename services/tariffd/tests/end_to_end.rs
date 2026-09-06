@@ -95,6 +95,7 @@ fn a_captured_awattar_body_becomes_priced_quarter_hours() {
 #[tokio::test]
 async fn a_day_of_fetching_ends_with_a_cache_the_planner_can_use() {
     let mut cache = PriceCache::new();
+    let mut carbon = hems_tariff::cache::CarbonCache::new();
     let mut poller = Poller::new(
         captured(vec![(Source::Awattar, vec![Ok(awattar_body())])]),
         [Source::Awattar],
@@ -102,7 +103,7 @@ async fn a_day_of_fetching_ends_with_a_cache_the_planner_can_use() {
         time::Duration::minutes(15),
         time::Duration::hours(1),
     );
-    let outcome = poller.poll(&mut cache, NOON).await;
+    let outcome = poller.poll(&mut cache, &mut carbon, NOON).await;
     assert_eq!(outcome.learned_from, vec![Source::Awattar]);
     assert!(is_ready(&cache, NOON, 16), "the four hours are contiguous");
     assert!(!is_ready(&cache, NOON, 17), "and no further");
@@ -115,6 +116,7 @@ async fn the_more_trusted_source_decides_where_two_disagree() {
     // the auction — so what stands afterwards is SMARD's, whatever order they
     // arrived in.
     let mut cache = PriceCache::new();
+    let mut carbon = hems_tariff::cache::CarbonCache::new();
     let mut poller = Poller::new(
         captured(vec![
             (Source::Awattar, vec![Ok(awattar_body())]),
@@ -125,7 +127,7 @@ async fn the_more_trusted_source_decides_where_two_disagree() {
         time::Duration::minutes(15),
         time::Duration::hours(1),
     );
-    poller.poll(&mut cache, NOON).await;
+    poller.poll(&mut cache, &mut carbon, NOON).await;
     assert_eq!(
         cache.at(Slot::containing(NOON)).unwrap().source,
         Source::Smard
@@ -138,6 +140,7 @@ async fn an_outage_leaves_the_box_able_to_plan_from_what_it_already_has() {
     // goes away, and the household still has prices. A design that answered from
     // the last request rather than from a store would have nothing.
     let mut cache = PriceCache::new();
+    let mut carbon = hems_tariff::cache::CarbonCache::new();
     let mut poller = Poller::new(
         captured(vec![(
             Source::Awattar,
@@ -148,12 +151,12 @@ async fn an_outage_leaves_the_box_able_to_plan_from_what_it_already_has() {
         time::Duration::minutes(15),
         time::Duration::hours(1),
     );
-    poller.poll(&mut cache, NOON).await;
+    poller.poll(&mut cache, &mut carbon, NOON).await;
 
     let mut now = NOON;
     for _ in 0..3 {
         now = poller.next_due().expect("still scheduled");
-        let outcome = poller.poll(&mut cache, now).await;
+        let outcome = poller.poll(&mut cache, &mut carbon, now).await;
         assert_eq!(outcome.failed.len(), 1);
     }
     // An hour of failures later, the prices are still there and still usable.
@@ -166,6 +169,7 @@ async fn prices_more_than_two_days_old_are_dropped() {
     // A gateway box's flash is not a time-series database. Everything the cache
     // holds is within two days of now, in both directions.
     let mut cache = PriceCache::new();
+    let mut carbon = hems_tariff::cache::CarbonCache::new();
     let mut poller = Poller::new(
         captured(vec![(Source::Awattar, vec![Ok(awattar_body())])]),
         [Source::Awattar],
@@ -173,12 +177,83 @@ async fn prices_more_than_two_days_old_are_dropped() {
         time::Duration::minutes(15),
         time::Duration::hours(1),
     );
-    poller.poll(&mut cache, NOON).await;
+    poller.poll(&mut cache, &mut carbon, NOON).await;
     assert_eq!(cache.len(), 16);
 
     // Three days later nothing in it is worth keeping, and one more poll — which
     // fails, because the capture is spent — prunes it.
     let much_later = NOON + time::Duration::days(3);
-    poller.poll(&mut cache, much_later).await;
+    poller.poll(&mut cache, &mut carbon, much_later).await;
     assert!(cache.is_empty(), "the old curve went");
+}
+
+/// A captured Energy-Charts answer: two hours of German carbon intensity.
+fn energy_charts_body() -> String {
+    let t = NOON.unix_timestamp();
+    format!(
+        r#"{{"unix_seconds":[{t},{}],"co2eq":[186.4,512.9]}}"#,
+        t + 3600
+    )
+}
+
+#[tokio::test]
+async fn the_grids_carbon_intensity_survives_the_whole_chain() {
+    // The chain this closes was dead in **four** consecutive links: the
+    // Energy-Charts parser had no consumer, the fetch carried the series into a
+    // struct field this loop dropped, `SlotPrice::co2_g_per_kwh` was hard-coded
+    // `None`, and the objective's carbon term was settable from no
+    // configuration. Even switched on it could only ever have seen the flat
+    // annual fallback — which makes a carbon price algebraically identical to an
+    // autarky premium, because every hour is equally dirty.
+    //
+    // So this asserts the whole path: a captured body, the poller, the cache,
+    // and a tariff a planner would actually be given.
+    let upstream = captured(vec![(Source::EnergyCharts, vec![Ok(energy_charts_body())])]);
+    let mut poller = Poller::new(
+        upstream,
+        [Source::EnergyCharts],
+        NOON,
+        time::Duration::minutes(15),
+        time::Duration::hours(1),
+    );
+    let mut cache = PriceCache::new();
+    let mut carbon = hems_tariff::cache::CarbonCache::new();
+    poller.poll(&mut cache, &mut carbon, NOON).await;
+
+    // Two published hours become eight quarter hours — a published figure is an
+    // average over its own interval, so it is *expanded* and never interpolated.
+    assert_eq!(carbon.len(), 8, "two hours are eight quarter hours");
+    let noon = Slot::containing(NOON);
+    assert!(
+        carbon.at(noon).is_some_and(|g| (g - 186.4).abs() < 1e-9),
+        "the clean midday figure survives: {:?}",
+        carbon.at(noon)
+    );
+
+    // And the price cache is untouched: grams are not euros, and a CO₂ source
+    // that merged into the price cache would be a bug of an entirely different
+    // size.
+    assert!(
+        cache.is_empty(),
+        "an intensity series is not a price series"
+    );
+
+    // The other end of the chain: a tariff carrying the series prices each slot
+    // with the grid's *own* intensity rather than a constant — which is the
+    // whole difference between a carbon signal and a second autarky dial.
+    let tariff = hems_tariff::tariff::Tariff {
+        carbon_g_per_kwh: carbon.series(),
+        ..hems_tariff::tariff::Tariff::fixed(
+            rust_decimal::Decimal::new(30, 0),
+            rust_decimal::Decimal::new(10, 0),
+        )
+    };
+    let stack = hems_tariff::PriceStack::build(&tariff, hems_core::prelude::Horizon::new(NOON, 8));
+    let intensities: Vec<f64> = stack.slots.iter().filter_map(|p| p.co2_g_per_kwh).collect();
+    assert_eq!(intensities.len(), 8, "every slot carries one");
+    assert!(
+        intensities.iter().any(|g| (*g - 186.4).abs() < 1e-9)
+            && intensities.iter().any(|g| (*g - 512.9).abs() < 1e-9),
+        "and the clean hour and the dirty one are different numbers: {intensities:?}"
+    );
 }

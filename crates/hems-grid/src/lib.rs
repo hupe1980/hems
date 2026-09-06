@@ -67,6 +67,7 @@ pub mod modul3;
 pub mod para14a;
 pub mod para9;
 pub mod sharing;
+pub mod stress;
 
 pub use evidence::{Action, ComplianceSample, ControlEvent, EvidenceRecorder, Observation};
 pub use lpc::{Direction, LimitWrite, LpcConfig, LpcEvent, LpcMachine, LpcState, Nack, Outcome};

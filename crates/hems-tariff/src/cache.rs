@@ -446,3 +446,147 @@ mod tests {
         assert_eq!(cache.contiguous_until(first.offset(9)), None);
     }
 }
+
+/// The grid's carbon intensity, kept the way the prices are.
+///
+/// # Why it is a cache of its own and not a column on the price one
+///
+/// It arrives from a different source on a different cadence and means a
+/// different thing. Energy-Charts publishes g CO₂/kWh for the German bidding
+/// zone; the four price sources publish €/MWh. Putting grams in the price cache
+/// would need `Observed` to carry an optional quantity in another unit, and the
+/// reconciliation rules that cache exists for — a more trusted source wins, then
+/// a finer publication — are about a curve that arrives twice from *competing*
+/// publishers. There is one intensity publisher, so there is nothing to
+/// reconcile, and inventing a trust order for a set of one would be machinery
+/// that decides nothing.
+///
+/// # What it closes
+///
+/// `hems-tariff::source::energy_charts_co2` has parsed this series for four
+/// versions and **nothing consumed it**: the fetch carried it into a struct
+/// field the poller dropped, [`crate::SlotPrice::co2_g_per_kwh`] was hard-coded
+/// `None`, and the objective term that reads it could therefore only ever see a
+/// flat annual constant — which makes a carbon price algebraically identical to
+/// an autarky premium, because every hour is equally dirty. This is the missing
+/// link, and [`crate::tariff::Tariff::carbon_g_per_kwh`] is the other end of it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CarbonCache {
+    points: BTreeMap<Slot, f64>,
+}
+
+impl CarbonCache {
+    /// An empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take in what the publisher published, and say how many quarter hours it
+    /// moved.
+    ///
+    /// A **later** observation wins outright, which is the whole of the trust
+    /// order for a single publisher restating its own series: Energy-Charts
+    /// revises the recent past as metering settles, and a revision is a
+    /// correction rather than a competing opinion.
+    ///
+    /// A non-finite or negative figure is dropped rather than stored. Grams per
+    /// kilowatt-hour is a non-negative physical quantity, and a `NaN` reaching
+    /// the objective would make one term of it undefined and the plan arbitrary.
+    pub fn merge(&mut self, points: &BTreeMap<Slot, f64>) -> usize {
+        let mut moved = 0;
+        for (slot, grams) in points {
+            if !grams.is_finite() || *grams < 0.0 {
+                continue;
+            }
+            if self.points.insert(*slot, *grams) != Some(*grams) {
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// Drop everything more than [`RETENTION`] away from `now`, in either
+    /// direction — the same rule the prices are kept under and for the same
+    /// reason.
+    pub fn prune(&mut self, now: OffsetDateTime) {
+        self.points
+            .retain(|slot, _| (slot.start() - now).abs() <= RETENTION);
+    }
+
+    /// The intensity in one quarter hour.
+    #[must_use]
+    pub fn at(&self, slot: Slot) -> Option<f64> {
+        self.points.get(&slot).copied()
+    }
+
+    /// The whole series, as [`crate::tariff::Tariff::carbon_g_per_kwh`] wants
+    /// it.
+    #[must_use]
+    pub fn series(&self) -> BTreeMap<Slot, f64> {
+        self.points.clone()
+    }
+
+    /// How many quarter hours it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Whether it holds none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod carbon_tests {
+    use super::*;
+    use time::Duration;
+    use time::macros::datetime;
+
+    const NOON: OffsetDateTime = datetime!(2026-06-21 12:00:00 UTC);
+
+    fn series(values: &[(i64, f64)]) -> BTreeMap<Slot, f64> {
+        values
+            .iter()
+            .map(|(i, g)| (Slot::containing(NOON + Duration::minutes(15 * i)), *g))
+            .collect()
+    }
+
+    #[test]
+    fn a_revision_wins_because_one_publisher_correcting_itself_is_not_a_dispute() {
+        let mut cache = CarbonCache::new();
+        assert_eq!(cache.merge(&series(&[(0, 380.0)])), 1);
+        // Restating the same figure is confirmation and moves nothing, which is
+        // what lets a caller notice a source that has stopped updating.
+        assert_eq!(cache.merge(&series(&[(0, 380.0)])), 0);
+        // A corrected figure is taken.
+        assert_eq!(cache.merge(&series(&[(0, 402.0)])), 1);
+        assert_eq!(cache.at(Slot::containing(NOON)), Some(402.0));
+    }
+
+    #[test]
+    fn nonsense_never_reaches_the_objective() {
+        // A `NaN` here would make one term of the planner's objective undefined
+        // and the resulting plan arbitrary, and a negative intensity is not a
+        // grid anybody has.
+        let mut cache = CarbonCache::new();
+        let bad = series(&[(0, f64::NAN), (1, -12.0), (2, 300.0)]);
+        assert_eq!(cache.merge(&bad), 1, "only the real one");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(
+            cache.at(Slot::containing(NOON + Duration::minutes(30))),
+            Some(300.0)
+        );
+    }
+
+    #[test]
+    fn it_is_pruned_in_both_directions_like_the_prices() {
+        let mut cache = CarbonCache::new();
+        cache.merge(&series(&[(0, 300.0)]));
+        cache.prune(NOON + Duration::days(30));
+        assert!(cache.is_empty(), "a month later it is not worth keeping");
+    }
+}

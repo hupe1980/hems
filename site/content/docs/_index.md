@@ -1,6 +1,6 @@
 +++
 title = "Documentation"
-description = "How hems is put together: the domain model, the German grid rules as executable code, the three control planes, the planner, the forecasts, the drivers, the fleet around the box, and the agents that read it."
+description = "How hems is put together: the domain model, the German grid rules as code, three control planes, the planner, the forecasts, the drivers and the fleet."
 sort_by = "weight"
 template = "section.html"
 +++

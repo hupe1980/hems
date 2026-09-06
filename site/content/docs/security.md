@@ -1,6 +1,6 @@
 +++
 title = "Security and supply chain"
-description = "The box trusts a key it was built with, not a server. Secrets are references, authorisation is per site, and every release ships with an SBOM and a provenance attestation."
+description = "The box trusts a key it was built with, not a server. Secrets are references, authorisation is per site, and every release ships an SBOM and provenance."
 weight = 13
 +++
 

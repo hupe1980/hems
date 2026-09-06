@@ -202,6 +202,48 @@ impl Clipping {
     }
 }
 
+/// The furthest the connection point went over its § 9 EEG ceiling today.
+///
+/// § 14a is recorded as *events* — a network operator's instruction has a
+/// beginning and an end and `[A1 7.2]` asks for a record of it — so the day's
+/// § 14a compliance can be read back out of the store. § 9 Abs. 2 is not an
+/// event: it applies to the plant by force of law all day, every day, and there
+/// is nothing to open a record against. It is therefore accumulated as the loop
+/// runs, exactly like [`Clipping`], and for the same reason: a statute nobody
+/// measures against is a statute nobody is keeping.
+///
+/// Measured on the **instantaneous** Einspeiseleistung, because § 9 Abs. 2 says
+/// Leistung. The quarter-hour registers in the store answer a different and
+/// coarser question, and a roof can sit above the statutory limit for minutes
+/// inside a slot whose average is under it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FeedIn {
+    worst_overshoot_w: f64,
+}
+
+impl FeedIn {
+    /// Add one control period, given what left the connection point and the
+    /// ceiling in force.
+    pub fn tick(
+        &mut self,
+        exported: hems_core::units::Power,
+        ceiling: Option<hems_core::units::Power>,
+    ) {
+        let Some(ceiling) = ceiling else {
+            return;
+        };
+        let over = (exported - ceiling).get();
+        if over > 0.0 {
+            self.worst_overshoot_w = self.worst_overshoot_w.max(over);
+        }
+    }
+
+    /// Begin a new day.
+    pub fn roll(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Build the KPIs for the Berlin calendar day `date`, from what the box wrote
 /// down.
 ///
@@ -224,6 +266,7 @@ pub fn kpis(
     date: Date,
     unplanned: Unplanned,
     clipping: Clipping,
+    feed_in: FeedIn,
     scored: &Scored,
 ) -> Result<Option<DayKpis>, StoreError> {
     let from = metering::calendar::day_start_utc(date);
@@ -281,6 +324,10 @@ pub fn kpis(
         // reduction rather than the absence of evidence.
         respected_the_grid: worst_overshoot_w <= 0.0,
         worst_overshoot_w,
+        // …and the other statute on the same connection point. There is no
+        // companion boolean: `DayKpis::respected_the_feed_in_ceiling` derives
+        // from this number, so the two cannot come apart.
+        worst_feed_in_overshoot_w: feed_in.worst_overshoot_w,
         // Zero where the box was not watching for the whole day. A restart is
         // not a day without a plan, and a fleet that added them would count a
         // reboot as a fault.
@@ -340,6 +387,7 @@ mod tests {
             date!(2026 - 01 - 15),
             Unplanned::watching(),
             Clipping::default(),
+            FeedIn::default(),
             &Scored::default(),
         )
         .unwrap();
@@ -362,6 +410,7 @@ mod tests {
             date!(2026 - 01 - 15),
             Unplanned::watching(),
             Clipping::default(),
+            FeedIn::default(),
             &Scored::default(),
         )
         .unwrap()
@@ -401,6 +450,7 @@ mod tests {
             date!(2026 - 01 - 15),
             Unplanned::watching(),
             Clipping::default(),
+            FeedIn::default(),
             &Scored::default(),
         )
         .unwrap()

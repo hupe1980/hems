@@ -18,16 +18,48 @@ use core::fmt;
 
 /// The function codes this driver uses.
 ///
-/// SunSpec lives in holding registers, so `0x03` reads and `0x10` writes. A
-/// device that only implements input registers (`0x04`) is out of scope and
-/// says so rather than being guessed at: reading the wrong space returns
-/// plausible numbers from somewhere else in the map, which is worse than an
-/// error.
+/// SunSpec lives in holding registers, so `0x03` reads and `0x10` writes.
+/// `0x04` reads the **input** register space, which is where most vendors put
+/// their sensors — a heat pump's room and flow temperatures among them — and
+/// which nothing in SunSpec ever touches.
+///
+/// Which space a value lives in is declared and never guessed: the two are
+/// separately addressed, so reading the wrong one returns plausible numbers
+/// from somewhere else in the map, which is worse than an error.
 pub mod function {
     /// Read holding registers.
     pub const READ_HOLDING: u8 = 0x03;
+    /// Read input registers.
+    pub const READ_INPUT: u8 = 0x04;
     /// Write multiple holding registers.
     pub const WRITE_MULTIPLE: u8 = 0x10;
+}
+
+/// Which register space a read addresses.
+///
+/// Declared rather than discovered. A device that implements both keeps
+/// different values at the same number in each, and a driver that tried one and
+/// fell back to the other would report whichever answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum Space {
+    /// Read/write registers — where SunSpec lives.
+    #[default]
+    Holding,
+    /// Read-only registers — where most vendors put their sensors.
+    Input,
+}
+
+impl Space {
+    /// The function code that reads it.
+    #[must_use]
+    pub const fn function(self) -> u8 {
+        match self {
+            Self::Holding => function::READ_HOLDING,
+            Self::Input => function::READ_INPUT,
+        }
+    }
 }
 
 /// The most registers a single read may ask for.
@@ -109,8 +141,10 @@ pub struct Request {
 /// What a request asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RequestBody {
-    /// Read `count` holding registers from `address`.
+    /// Read `count` registers from `address` in `space`.
     Read {
+        /// Which register space.
+        space: Space,
         /// The first register.
         address: u16,
         /// How many, at most [`MAX_REGISTERS_PER_READ`].
@@ -131,8 +165,12 @@ impl Request {
     pub fn encode(&self) -> Vec<u8> {
         let mut pdu = Vec::with_capacity(16);
         match &self.body {
-            RequestBody::Read { address, count } => {
-                pdu.push(function::READ_HOLDING);
+            RequestBody::Read {
+                space,
+                address,
+                count,
+            } => {
+                pdu.push(space.function());
                 pdu.extend_from_slice(&address.to_be_bytes());
                 pdu.extend_from_slice(&count.min(&MAX_REGISTERS_PER_READ).to_be_bytes());
             }
@@ -219,7 +257,10 @@ fn decode_pdu(pdu: &[u8]) -> Result<ResponseBody, FrameError> {
     }
 
     match code {
-        function::READ_HOLDING => {
+        // The two reads answer identically — a byte count and that many bytes —
+        // and which space they came from is the caller's own question, since it
+        // is the caller that asked.
+        function::READ_HOLDING | function::READ_INPUT => {
             let Some((&byte_count, values)) = rest.split_first() else {
                 return Err(FrameError::Malformed("a read with no byte count"));
             };
@@ -242,18 +283,23 @@ fn decode_pdu(pdu: &[u8]) -> Result<ResponseBody, FrameError> {
                 count: u16::from_be_bytes([rest[2], rest[3]]),
             })
         }
-        other => Err(FrameError::Malformed(match other {
-            0x04 => "an input-register response, which SunSpec does not live in",
-            _ => "an unexpected function code",
-        })),
+        _ => Err(FrameError::Malformed("an unexpected function code")),
     }
 }
 
 impl fmt::Display for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.body {
-            RequestBody::Read { address, count } => {
-                write!(f, "read {count} registers from {address}")
+            RequestBody::Read {
+                space,
+                address,
+                count,
+            } => {
+                let space = match space {
+                    Space::Holding => "holding",
+                    Space::Input => "input",
+                };
+                write!(f, "read {count} {space} registers from {address}")
             }
             RequestBody::Write { address, values } => {
                 write!(f, "write {} registers at {address}", values.len())
@@ -272,6 +318,7 @@ mod tests {
             transaction: 7,
             unit: 1,
             body: RequestBody::Read {
+                space: Space::Holding,
                 address: 40_000,
                 count: 2,
             },

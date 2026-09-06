@@ -46,9 +46,11 @@
 //! four publish the **net wholesale** price. They are not interchangeable, and
 //! adding a markup, network charges, levies and VAT to a Tibber figure prices a
 //! kilowatt-hour at roughly twice what it costs. So a series carries the
-//! [`PriceBasis`] it was published on, and [`PriceSeries::into_spot`] — the only
-//! way into [`crate::tariff::EnergyPrice::Dynamic`], which expects a wholesale
-//! price — **refuses** a gross one.
+//! [`PriceBasis`] it was published on, and [`crate::cache::PriceCache::merge`] —
+//! the only way a series reaches a [`crate::tariff::EnergyPrice::Dynamic`],
+//! which expects a wholesale price — **refuses** a gross one. The refusal lives
+//! at the cache rather than on the series because the cache is where the mistake
+//! would become permanent.
 
 use std::collections::BTreeMap;
 
@@ -138,19 +140,6 @@ pub struct PriceSeries {
 }
 
 impl PriceSeries {
-    /// The spot map for [`crate::tariff::EnergyPrice::Dynamic`].
-    ///
-    /// # Errors
-    /// [`SourceError::WrongBasis`] for a gross consumer series: adding a markup
-    /// and the whole levy stack to a price that already contains them prices a
-    /// kilowatt-hour at about twice what it costs.
-    pub fn into_spot(self) -> Result<BTreeMap<Slot, Decimal>, SourceError> {
-        match self.basis {
-            PriceBasis::Wholesale => Ok(self.points),
-            PriceBasis::GrossConsumer => Err(SourceError::WrongBasis),
-        }
-    }
-
     /// How many quarter hours the series covers.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -161,17 +150,6 @@ impl PriceSeries {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.points.is_empty()
-    }
-
-    /// The quarter hours where the wholesale price is negative — the § 51 EEG
-    /// hours, and the ones worth planning around.
-    #[must_use]
-    pub fn negative_slots(&self) -> Vec<Slot> {
-        self.points
-            .iter()
-            .filter(|(_, p)| **p < Decimal::ZERO)
-            .map(|(s, _)| *s)
-            .collect()
     }
 }
 
@@ -355,7 +333,8 @@ pub fn smard(json: &str) -> Result<PriceSeries, SourceError> {
 /// ```
 ///
 /// `total` is the **gross consumer** price in €/kWh, so the series comes back
-/// with [`PriceBasis::GrossConsumer`] and [`PriceSeries::into_spot`] refuses it.
+/// with [`PriceBasis::GrossConsumer`], and [`crate::cache::PriceCache::merge`]
+/// refuses to take it in.
 /// Tibber's own `energy` field is closer to a wholesale price but still carries
 /// the supplier's markup, so it is not one either.
 ///
@@ -736,7 +715,15 @@ mod tests {
         let series = awattar(json).expect("a valid response");
         assert_eq!(series.published_minutes, 15);
         assert_eq!(series.len(), 2, "quarter hours are never expanded");
-        assert_eq!(series.negative_slots().len(), 1);
+        assert_eq!(
+            series
+                .points
+                .values()
+                .filter(|p| **p < Decimal::ZERO)
+                .count(),
+            1,
+            "a negative quarter hour is parsed as one"
+        );
     }
 
     #[test]
@@ -768,7 +755,18 @@ mod tests {
         assert_eq!(series.len(), 8);
         let first = Slot::containing(datetime!(2026-01-01 00:00:00 +01:00));
         assert_eq!(series.points.get(&first), Some(&dec!(32.40)));
-        assert_eq!(series.into_spot(), Err(SourceError::WrongBasis));
+        // Tibber publishes what the household actually pays, and adding a
+        // markup, the network charge, the levies and the value added tax to it
+        // prices a kilowatt-hour at about twice what it costs. The series says
+        // so, and the refusal is enforced where such a series would otherwise
+        // become permanent — `PriceCache::merge`, which is the only route into
+        // a stack — rather than by a second guard nothing called.
+        let mut cache = crate::cache::PriceCache::new();
+        let merged = cache.merge(&series, datetime!(2026-01-01 00:00:00 UTC));
+        assert!(
+            merged.is_empty() && cache.is_empty(),
+            "a gross consumer series never reaches a price stack"
+        );
     }
 
     #[test]
@@ -807,7 +805,14 @@ mod tests {
         // The publisher skipped position 3, which means "as before".
         assert_eq!(at(30), dec!(-5.0));
         assert_eq!(at(45), dec!(1.0));
-        assert_eq!(series.negative_slots().len(), 2);
+        assert_eq!(
+            series
+                .points
+                .values()
+                .filter(|p| **p < Decimal::ZERO)
+                .count(),
+            2
+        );
     }
 
     #[test]

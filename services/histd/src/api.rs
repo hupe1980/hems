@@ -32,6 +32,7 @@ pub struct History {
     db: Db,
     writer: Arc<std::sync::Mutex<Store>>,
     credentials: Arc<Credentials>,
+    mispel: Arc<std::collections::BTreeMap<String, crate::config::MispelSettings>>,
 }
 
 impl History {
@@ -47,7 +48,29 @@ impl History {
             db,
             writer,
             credentials: Arc::new(credentials),
+            mispel: Arc::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Which MiSpeL option each site has declared, `[MiSpeL Tenor]`.
+    ///
+    /// Separate from [`History::new`] because it is the operator's *intent*
+    /// rather than a connection or a credential: a deployment that settles
+    /// nobody is a deployment that keeps the registers and does not compute a
+    /// Nachweis from them, which is exactly what every deployment did before
+    /// this existed.
+    #[must_use]
+    pub fn settling(
+        mut self,
+        declarations: std::collections::BTreeMap<String, crate::config::MispelSettings>,
+    ) -> Self {
+        self.mispel = Arc::new(declarations);
+        self
+    }
+
+    /// What `site` has declared, if anything.
+    fn declaration(&self, site: &str) -> Option<crate::config::MispelSettings> {
+        self.mispel.get(site).copied()
     }
 
     /// What the request's bearer token is allowed to do.
@@ -121,6 +144,7 @@ pub fn router(history: History) -> Router {
         .route("/v1/sites/{site}/events", post(put_event))
         .route("/v1/sites/{site}/nachweis", get(get_nachweis))
         .route("/v1/sites/{site}/export", get(get_export))
+        .route("/v1/sites/{site}/mispel", get(get_mispel))
         .with_state(history)
 }
 
@@ -207,6 +231,74 @@ async fn get_export(
         .read(move |store| crate::export::data_act(store, &site))
         .await
         .map(axum::Json)
+}
+
+/// `?year=2026&month=10` — the calendar period to settle.
+#[derive(Debug, serde::Deserialize)]
+pub struct Period {
+    /// The calendar year. Required.
+    pub year: i32,
+    /// The calendar month, `1`–`12`. Required for the Abgrenzungsoption, which
+    /// settles per month; refused for the Pauschaloption, which settles per
+    /// year.
+    #[serde(default)]
+    pub month: Option<u8>,
+}
+
+async fn get_mispel(
+    State(state): State<History>,
+    Path(site): Path<String>,
+    headers: HeaderMap,
+    Query(period): Query<Period>,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    // The **household's** document, on the same footing as the Data Act export
+    // rather than the § 14a Nachweis — and the difference is who the reader is.
+    // `[A1 7.2]` is the record of what a *network operator* commanded, so an
+    // operator may read it. A MiSpeL settlement is the household's own levy
+    // privilege and the flows behind it: how full their store was, when it was
+    // charged from the grid, what their roof earned. The Festlegung has the
+    // *Anlagenbetreiber* produce and submit it, so it is theirs to hand over —
+    // and a § 14a operator credential that could read every household's
+    // storage economics is a reach nothing granted it.
+    deny_unless(state.authority(&headers)?.may_read_everything(&site))?;
+    let Some(declared) = state.declaration(&site) else {
+        // Refused rather than defaulted: every option produces a different
+        // Nachweis from the same registers.
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let outcome = state
+        .read(move |store| {
+            Ok(crate::export::mispel(
+                store,
+                &site,
+                Some(declared),
+                period.year,
+                period.month,
+            ))
+        })
+        .await?;
+    match outcome {
+        Ok(value) => Ok(axum::Json(value)),
+        // The caller asked wrongly — a window the declared option does not
+        // settle over, or a month that is not one.
+        Err(
+            crate::export::MispelExportError::WrongWindow(_)
+            | crate::export::MispelExportError::NotACalendarMonth { .. },
+        ) => Err(StatusCode::BAD_REQUEST),
+        Err(crate::export::MispelExportError::Undeclared { .. }) => Err(StatusCode::NOT_FOUND),
+        // The request was well formed and the **registers** cannot support a
+        // settlement — a negative quantity, case A4 without its storage meter,
+        // a share whose denominator is zero. That is a fact about the record
+        // rather than about the question, which is what `422` is for.
+        Err(crate::export::MispelExportError::Arithmetic(e)) => {
+            tracing::warn!(error = %e, "a MiSpeL settlement was refused");
+            Err(StatusCode::UNPROCESSABLE_ENTITY)
+        }
+        Err(crate::export::MispelExportError::Store(e)) => {
+            tracing::error!(error = %e, "a query failed");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
 }
 
 /// `403` where a credential is real and does not reach this site.

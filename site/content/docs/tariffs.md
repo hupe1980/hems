@@ -1,6 +1,6 @@
 +++
 title = "Tariffs and prices"
-description = "A German bill is a stack, and every layer moves for its own reasons — the five published day-ahead sources, § 51 EEG, and the Modul advisor that answers a question no supplier will."
+description = "A German electricity bill is a stack, and every layer moves for its own reasons: five day-ahead sources, § 51 EEG, and an advisor for the § 14a Module."
 weight = 5
 +++
 
@@ -46,7 +46,7 @@ flowchart LR
   L --> S
   S --> IMP["import_ct, gross<br/>what the household pays"]
   S --> EXP["export_ct<br/>what it earns — zero when<br/>the spot price was negative"]
-  S --> SH["shared_ct<br/>a § 42c allocation"]
+  S --> SH["shared_import_ct<br/>a § 42c allocation"]
   IMP --> P["the planner"]
   EXP --> P
   SH --> P
@@ -123,6 +123,14 @@ calendar breaks the [Anwendungshilfe](@/docs/grid-rules.md#modul-3-time-variable
 Window membership is decided on **local wall-clock time**, because that is how
 the price sheet is written.
 
+At fleet scale the same transcription happens once per Netzgebiet instead of
+once per household: `tariffd` keeps a curated catalogue — one entry per network
+operator and year, in the identical shape a box uses, validated against the
+same Anwendungshilfe when the daemon starts — and serves it openly at
+`/v1/modul3/{netzbetreiber}`. A calendar that breaks a rule refuses the whole
+daemon rather than warning, because a fleet serving windows nobody may sell
+prices a whole Netzgebiet against a tariff nobody may be billed on.
+
 It is worth planning against for a reason the wholesale curve cannot match: the
 windows are fixed **a year in advance**. A household learns tomorrow's spot price
 each afternoon and learns its Hochtarif in the preliminary price sheet of the
@@ -155,8 +163,8 @@ household already knows which side of it they are on.
 
 A household in an energy-sharing community pays the community's **energy
 component** for the kilowatt-hours the Aufteilungsschlüssel allocated, and its
-supplier's for the rest. `SlotPrice::shared_ct` is the same stack with the
-community's energy price substituted, so the two are directly comparable.
+supplier's for the rest. `SlotPrice::shared_import_ct` is the same stack with
+the community's energy price substituted, so the two are directly comparable.
 
 The result is less dramatic than the phrase “free solar from the neighbours”
 suggests, and the arithmetic is the point: a community selling at **12 ct/kWh
@@ -165,7 +173,7 @@ net** still delivers a **32,5 ct** kilowatt-hour against the supplier's
 and 19 % VAT do not care where the electron came from, because it crossed the
 public grid to get here.
 
-`SlotPrice::shared_saving_f64` floors at **zero**, and never goes negative. That
+`SlotPrice::sharing_discount_f64` floors at **zero**, and never goes negative. That
 keeps the planner's sharing term convex; the reasoning is in
 [the planner](@/docs/optimizer.md#ss-42c-the-neighbours-roof-as-a-cheap-block-of-import).
 

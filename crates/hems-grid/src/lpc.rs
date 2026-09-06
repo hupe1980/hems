@@ -48,6 +48,17 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::seconds(60);
 /// `[LPC-906]`, `[LPC-914/2]`.
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::seconds(120);
 
+/// How fresh a heartbeat must be for a limit write to count as arriving from an
+/// Energy Guard that is in contact (implementation guide §§ 2.11, 2.14).
+///
+/// The same sixty seconds the sibling `eebus` crate's certifiable machine uses
+/// (`WRITE_WINDOW` there): outside the controlled states a write is evaluated
+/// only when a heartbeat arrived within this window. A staler heartbeat is
+/// evidence the Energy Guard *was* alive, not that it is in control — and the
+/// exhaustive exploration found that without the window, one heartbeat in
+/// `unlimited/autonomous` opened the write gate for ever.
+pub const WRITE_WINDOW: Duration = Duration::seconds(60);
+
 /// The shortest Failsafe Duration Minimum the standard allows, `[LPC-022/1]`.
 pub const FAILSAFE_DURATION_MIN: Duration = Duration::hours(2);
 
@@ -87,7 +98,7 @@ impl fmt::Display for Direction {
 }
 
 /// The five states of the Controllable System, § 2.3.2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum LpcState {
@@ -169,8 +180,9 @@ pub enum Nack {
     #[error("limit is not a finite value")]
     NotFinite,
     /// In `init`, `failsafe` and `unlimited/autonomous` a write is only accepted
-    /// after a heartbeat has re-established contact.
-    #[error("no heartbeat has been received in this state yet")]
+    /// after a heartbeat has re-established contact — a *fresh* one, within
+    /// [`WRITE_WINDOW`]. A stale heartbeat is not contact.
+    #[error("no heartbeat has re-established contact in this state")]
     NoHeartbeatYet,
     /// The Failsafe Duration Minimum must lie between 2 and 24 hours,
     /// `[LPC-022/3]`.
@@ -486,13 +498,27 @@ impl LpcMachine {
     }
 
     fn handle_limit(&mut self, write: LimitWrite, now: OffsetDateTime) -> Outcome {
-        // § 2.2: in these states a write is only accepted once a heartbeat has
-        // re-established contact.
+        // § 2.2 and implementation guide §§ 2.11, 2.14: in these states a write
+        // is evaluated only when a heartbeat arrived within [`WRITE_WINDOW`] —
+        // a heartbeat has to have re-established contact, and a stale one has
+        // not. In `init` and `failsafe` the distinction is nearly invisible,
+        // because a timer moves the machine on within 120 s of a heartbeat that
+        // no write follows. `unlimited/autonomous` has no such timer, so
+        // without the freshness check a single heartbeat there opened the write
+        // gate **for ever**: an Energy Guard that heartbeated once and died
+        // could limit the household days later with one delayed write — found
+        // by the exhaustive exploration in `tests/lpc_exhaustive.rs`, which is
+        // what it exists for. The sibling `eebus` crate's certifiable machine
+        // has the same window, so the two cannot disagree about a write on the
+        // edge of it.
         let needs_contact = matches!(
             self.state,
             LpcState::Init | LpcState::Failsafe | LpcState::UnlimitedAutonomous
         );
-        if needs_contact && self.heartbeat_in_state.is_none() {
+        let in_contact = self
+            .last_heartbeat
+            .is_some_and(|hb| now - hb < WRITE_WINDOW);
+        if needs_contact && !in_contact {
             return Outcome::nack(Nack::NoHeartbeatYet);
         }
 
@@ -654,6 +680,45 @@ mod tests {
             assert!(m.tick(t).is_none(), "no transition at minute {i}");
             assert_eq!(m.state(), LpcState::Limited);
         }
+    }
+
+    #[test]
+    fn a_stale_heartbeat_does_not_reopen_the_write_gate() {
+        // Found by `tests/lpc_exhaustive.rs`: `unlimited/autonomous` has no
+        // timer, so a single heartbeat there used to open the write gate for
+        // ever — an Energy Guard that heartbeated once and died could limit
+        // the household days later with one delayed write. Implementation
+        // guide §§ 2.11, 2.14: a write outside the controlled states counts
+        // only within `WRITE_WINDOW` of a heartbeat.
+        let mut m = machine();
+        // Settle into `unlimited/autonomous` — no contact within 120 s.
+        assert!(m.tick(T0 + Duration::seconds(121)).is_some());
+        assert_eq!(m.state(), LpcState::UnlimitedAutonomous);
+        // One heartbeat, then silence.
+        let hb = T0 + Duration::minutes(3);
+        let _ = m.handle(LpcEvent::Heartbeat, hb);
+        // A write inside the window is contact re-established…
+        let mut fresh = m.clone();
+        let inside = fresh.handle(
+            LpcEvent::Limit(LimitWrite::Activated {
+                value: Power::from_kw(4.2),
+                duration: None,
+            }),
+            hb + Duration::seconds(59),
+        );
+        assert!(inside.is_accepted());
+        assert_eq!(fresh.state(), LpcState::Limited);
+        // …and one outside it is not: the heartbeat is evidence the Energy
+        // Guard was alive, not that it is in control.
+        let outside = m.handle(
+            LpcEvent::Limit(LimitWrite::Activated {
+                value: Power::from_kw(4.2),
+                duration: None,
+            }),
+            hb + Duration::minutes(30),
+        );
+        assert_eq!(outside.ack, Err(Nack::NoHeartbeatYet));
+        assert_eq!(m.state(), LpcState::UnlimitedAutonomous);
     }
 
     #[test]

@@ -62,6 +62,22 @@ pub struct Measurement {
     pub soc: Option<Soc>,
     /// Temperature in degrees Celsius — battery cells, DHW tank, flow.
     pub temperature_c: Option<f64>,
+    /// Outdoor air temperature in degrees Celsius, where the device measures it.
+    ///
+    /// Kept apart from [`Measurement::temperature_c`], which is the *asset's*
+    /// own — a tank's water, a battery's cells, a room's air. This one is the
+    /// weather, and a heat pump is the household device most likely to report
+    /// it: its defrost logic and its heating curve run on nothing else.
+    ///
+    /// Worth taking from the appliance rather than from a forecast, and not
+    /// merely for convenience. A building's thermal model is identified from
+    /// three signals — indoor temperature, outdoor temperature, and the heat
+    /// delivered — and a forecast is for a grid square while the sensor is on
+    /// the wall of *this* building, in its own shade and its own wind. Planning
+    /// still needs the forecast, because the future cannot be measured; the
+    /// **fit** is better off with the thermometer.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub outdoor_c: Option<f64>,
     /// Grid frequency in hertz, where the device measures it.
     pub frequency_hz: Option<f64>,
     /// What a generator *could* produce right now if nothing limited it, as a
@@ -94,6 +110,7 @@ impl Measurement {
             energy_out: None,
             soc: None,
             temperature_c: None,
+            outdoor_c: None,
             frequency_hz: None,
             available_power: None,
         }
@@ -156,18 +173,6 @@ impl Measurement {
             .is_fresh()
             .then_some(self.power)
             .flatten()
-    }
-
-    /// Per-phase power, derived from the total and a phase connection when the
-    /// device does not report it.
-    #[must_use]
-    pub fn power_per_phase_or_split(
-        &self,
-        connection: crate::units::PhaseConnection,
-        mode: crate::units::PhaseMode,
-    ) -> Option<PerPhase<Power>> {
-        self.power_per_phase
-            .or_else(|| self.power.map(|p| connection.distribute(p, mode)))
     }
 }
 

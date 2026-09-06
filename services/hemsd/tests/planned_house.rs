@@ -124,7 +124,12 @@ fn registry_with_a_battery_at(soc: f64) -> (Arc<Mutex<Registry>>, hemsd::Househo
     let household = hemsd::Household::build(&hemsd::HouseholdConfig::default())
         .expect("the reference household");
     let mut registry = Registry::new();
-    let mut battery = Reporting::new(household.battery.clone());
+    let mut battery = Reporting::new(
+        household
+            .battery
+            .clone()
+            .expect("the reference household has a battery"),
+    );
     let mut m = Measurement::at(time::OffsetDateTime::now_utc());
     m.power = Some(Power::ZERO);
     m.soc = Soc::new(soc).ok();
@@ -251,6 +256,7 @@ async fn a_box_with_a_fleet_plans_against_real_prices_and_a_real_sky() {
             ),
             tariff: settings.tariff.clone(),
             control: settings.control.clone(),
+            charging: None,
             wear_eur_per_kwh: 0.08,
         },
         Arc::clone(&registry),
@@ -262,6 +268,7 @@ async fn a_box_with_a_fleet_plans_against_real_prices_and_a_real_sky() {
         hemsd::runtime::planner::Published {
             modelled_pv: Arc::clone(&modelled),
             bands: Arc::new(RwLock::new(BTreeMap::new())),
+            outdoor: Arc::new(RwLock::new(BTreeMap::new())),
         },
         Arc::clone(&learned),
         // No store: what is being tested is the planning loop, and a box that
@@ -290,10 +297,11 @@ async fn a_box_with_a_fleet_plans_against_real_prices_and_a_real_sky() {
     assert_eq!(plan.slots.len(), 96);
 
     // The battery is named and commanded, because the problem modelled it.
-    let commands_battery = plan
-        .slots
-        .iter()
-        .any(|s| s.targets.iter().any(|t| t.asset == household.battery));
+    let commands_battery = plan.slots.iter().any(|s| {
+        s.targets
+            .iter()
+            .any(|t| Some(&t.asset) == household.battery.as_ref())
+    });
     assert!(
         commands_battery,
         "the battery reported a state of charge, so the plan may move it"
@@ -303,10 +311,11 @@ async fn a_box_with_a_fleet_plans_against_real_prices_and_a_real_sky() {
     // plan that named it would emit a target of zero with an envelope pinned at
     // zero, which the arbiter obeys — an instruction not to charge, all day,
     // from a planner that had simply not been told about the car.
-    let commands_evse = plan
-        .slots
-        .iter()
-        .any(|s| s.targets.iter().any(|t| t.asset == household.evse));
+    let commands_evse = plan.slots.iter().any(|s| {
+        s.targets
+            .iter()
+            .any(|t| Some(&t.asset) == household.evse.as_ref())
+    });
     assert!(
         !commands_evse,
         "an asset the problem does not model must not be named: an envelope \
@@ -387,6 +396,7 @@ async fn a_battery_whose_charge_nobody_reports_is_left_out_of_the_plan() {
             ),
             tariff: settings.tariff.clone(),
             control: settings.control.clone(),
+            charging: None,
             wear_eur_per_kwh: 0.08,
         },
         registry,
@@ -396,6 +406,7 @@ async fn a_battery_whose_charge_nobody_reports_is_left_out_of_the_plan() {
         hemsd::runtime::planner::Published {
             modelled_pv: modelled,
             bands: Arc::new(RwLock::new(BTreeMap::new())),
+            outdoor: Arc::new(RwLock::new(BTreeMap::new())),
         },
         learned,
         None,
@@ -415,10 +426,10 @@ async fn a_battery_whose_charge_nobody_reports_is_left_out_of_the_plan() {
 
     let plan = published.expect("the box still plans without a battery it can read");
     assert!(
-        !plan
-            .slots
+        !plan.slots.iter().any(|s| s
+            .targets
             .iter()
-            .any(|s| s.targets.iter().any(|t| t.asset == household.battery)),
+            .any(|t| Some(&t.asset) == household.battery.as_ref())),
         "a store nobody can read the fill of is one no plan may move"
     );
 }
@@ -468,6 +479,7 @@ async fn a_box_installed_this_morning_plans_from_persistence() {
             ),
             tariff: settings.tariff.clone(),
             control: settings.control.clone(),
+            charging: None,
             wear_eur_per_kwh: 0.08,
         },
         registry,
@@ -477,6 +489,7 @@ async fn a_box_installed_this_morning_plans_from_persistence() {
         hemsd::runtime::planner::Published {
             modelled_pv: Arc::new(RwLock::new(BTreeMap::new())),
             bands: Arc::new(RwLock::new(BTreeMap::new())),
+            outdoor: Arc::new(RwLock::new(BTreeMap::new())),
         },
         // A box that has learned nothing at all — switched on this morning.
         Arc::new(Mutex::new(Learned::new(metering::Bundesland::Be))),
@@ -503,5 +516,183 @@ async fn a_box_installed_this_morning_plans_from_persistence() {
     assert!(
         plan.expected_cost.is_some(),
         "and it is a real plan, priced like any other"
+    );
+}
+
+#[test]
+fn every_risk_policy_a_household_can_configure_reaches_the_planner() {
+    // Until the box could be told, it always planned against one median: the
+    // scenario set, its Rockafellar–Uryasev tail and the quantile knob were
+    // selectable from `hemsd simulate` and from **nothing on a wall**, so a
+    // household could not act on the trade-off `hemsd risk` had measured for it.
+    //
+    // Each setting has to map to a *distinct* policy, because four names for the
+    // same plan would be a configuration surface that decides nothing — which is
+    // the failure this workspace keeps finding in itself.
+    use hemsd::config::RiskSettings;
+
+    let median = RiskSettings::Median.model();
+    let expected = RiskSettings::Expected.model();
+    let hedged = RiskSettings::Hedged.model();
+    let pessimistic = RiskSettings::Pessimistic.model();
+
+    // One future against three: the deterministic policy declares no scenario
+    // variables or rows at all, which is what makes it a comparison against the
+    // old planner rather than a differently-conditioned one.
+    assert_eq!(median.realisations().len(), 1);
+    assert_eq!(expected.realisations().len(), 3);
+    assert_eq!(hedged.realisations().len(), 3);
+    assert_eq!(
+        pessimistic.realisations().len(),
+        1,
+        "a quantile plan is one future, which is the whole of what is wrong with it"
+    );
+
+    // `expected` and `hedged` differ only in the tail weight, and that is the
+    // distinction: pricing three futures at all, against pricing the worst of
+    // them more.
+    assert_eq!(expected.tail_weight(), 0.0);
+    assert!(hedged.tail_weight() > 0.0);
+
+    // And the default is the median, because every figure in this workspace is
+    // calibrated against it.
+    assert_eq!(RiskSettings::default(), RiskSettings::Median);
+    assert_eq!(
+        hemsd::config::ControlSettings::default().risk,
+        RiskSettings::Median
+    );
+}
+
+/// One planning round with whatever registry is handed in, and the plan it made.
+async fn plan_with(
+    registry: Arc<Mutex<Registry>>,
+    household: &hemsd::Household,
+) -> Option<hems_core::prelude::Plan> {
+    let (fleet_url, _keep) = fleet_on_loopback().await;
+    let settings = hemsd::Settings {
+        fleet: hemsd::config::FleetSettings {
+            tariffd_url: Some(fleet_url.clone()),
+            forecastd_url: Some(fleet_url),
+            location: Some("berlin".into()),
+            request_timeout_s: 5,
+        },
+        control: hemsd::ControlSettings {
+            horizon_slots: 96,
+            solve_budget_s: 20.0,
+            ..hemsd::ControlSettings::default()
+        },
+        ..hemsd::Settings::default()
+    };
+    let plan = Arc::new(RwLock::new(None));
+    let (signal, trigger) = Shutdown::channel();
+    tokio::spawn(hemsd::runtime::planner::run(
+        Planner {
+            household: household.clone(),
+            array: hems_forecast::ArrayModel::new(
+                Power::from_kw(9.8),
+                Power::from_kw(8.0),
+                35.0,
+                180.0,
+            ),
+            tariff: settings.tariff.clone(),
+            control: settings.control.clone(),
+            charging: None,
+            wear_eur_per_kwh: 0.08,
+        },
+        registry,
+        hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
+        Arc::clone(&plan),
+        Arc::new(RwLock::new(None)),
+        hemsd::runtime::planner::Published {
+            modelled_pv: Arc::new(RwLock::new(BTreeMap::new())),
+            bands: Arc::new(RwLock::new(BTreeMap::new())),
+            outdoor: Arc::new(RwLock::new(BTreeMap::new())),
+        },
+        Arc::new(Mutex::new(learned_household(metering::Bundesland::Be))),
+        None,
+        hems_service::Health::new(),
+        signal,
+    ));
+    let mut published = None;
+    for _ in 0..300 {
+        if let Some(p) = plan.read().await.clone() {
+            published = Some(p);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    trigger.trigger();
+    published
+}
+
+/// A meter, a battery and — optionally — a heat pump reporting how warm the
+/// house is.
+fn registry_with_a_house_at(indoor_c: Option<f64>) -> (Arc<Mutex<Registry>>, hemsd::Household) {
+    let (registry, household) = registry_with_a_battery_at(0.5);
+    if let Some(indoor_c) = indoor_c {
+        let id = household
+            .heat_pump
+            .clone()
+            .expect("the reference household has a heat pump");
+        let mut pump = Reporting::new(id);
+        let mut m = Measurement::at(time::OffsetDateTime::now_utc());
+        m.power = Some(Power::ZERO);
+        m.temperature_c = Some(indoor_c);
+        pump.say(m);
+        registry
+            .try_lock()
+            .expect("nothing else holds the registry yet")
+            .register(Box::new(pump), &household.site)
+            .expect("the site has a heat pump");
+    }
+    (registry, household)
+}
+
+#[tokio::test]
+async fn a_house_nobody_measures_the_temperature_of_is_not_pre_heated() {
+    // The same refusal the battery makes, for the same reason. A thermal plan
+    // built on a guessed indoor temperature decides when to heat from a number
+    // nobody read, and it is wrong in the expensive direction on exactly the
+    // cold mornings it matters. The box still plans everything else.
+    let (registry, household) = registry_with_a_house_at(None);
+    let plan = plan_with(registry, &household)
+        .await
+        .expect("a box with no room sensor still plans its roof and its battery");
+    assert!(
+        !plan.slots.iter().any(|s| s
+            .targets
+            .iter()
+            .any(|t| Some(&t.asset) == household.heat_pump.as_ref())),
+        "a house nobody measured is one no plan may pre-heat"
+    );
+}
+
+#[tokio::test]
+async fn a_measured_house_is_planned_rather_than_left_to_its_own_thermostat() {
+    // The lever a thermal model exists for. Until this was wired the planner
+    // passed `heat_pump: None` unconditionally — every household's heating was
+    // its own thermostat's business, and the RC model, the COP curve, the
+    // comfort band and the minimum-runtime rows were exercised only by the
+    // simulator.
+    let (registry, household) = registry_with_a_house_at(Some(21.0));
+    let plan = plan_with(registry, &household)
+        .await
+        .expect("a box that can read its house plans it");
+    let commanded: Vec<_> = plan
+        .slots
+        .iter()
+        .flat_map(|s| s.targets.iter())
+        .filter(|t| Some(&t.asset) == household.heat_pump.as_ref())
+        .collect();
+    assert!(
+        !commanded.is_empty(),
+        "the heat pump is named in the plan because the problem models it"
+    );
+    // A January day at 3 °C: the house loses heat, so the plan has to put some
+    // back. A model that named the asset and asked it for nothing all day would
+    // be a target of zero the arbiter obeys as an instruction (D96).
+    assert!(
+        commanded.iter().any(|t| t.power.inflow().get() > 0.0),
+        "and it is asked to run, because a house at 3 °C outside cools"
     );
 }

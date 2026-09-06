@@ -35,6 +35,7 @@ use crate::describe::{
     describe_heat_pump, describe_programme, describe_pv, resource_manager_details,
 };
 use crate::map::{ControlType, control_type_for};
+use crate::session::{Offer, Ratings, Session};
 
 /// What the descriptions need to know that the site itself does not say.
 #[derive(Debug, Clone)]
@@ -82,6 +83,12 @@ impl<'a> DescribeContext<'a> {
     pub fn with_ev_session(mut self, session: EvStorage) -> Self {
         self.ev_session = Some(session);
         self
+    }
+
+    /// The mode of the asset with this identifier, or its wiring's default.
+    fn mode_of_id(&self, site: &Site, id: &AssetId) -> PhaseMode {
+        site.asset(id)
+            .map_or(PhaseMode::Three, |asset| self.mode_of(asset))
     }
 
     fn mode_of(&self, asset: &Asset) -> PhaseMode {
@@ -209,6 +216,104 @@ pub fn describe_site(site: &Site, ctx: &DescribeContext<'_>) -> SiteDescription 
     out
 }
 
+/// Every session a household would open, one per resource.
+///
+/// S2 puts one Resource Manager on one connection, so a house is several
+/// sessions rather than one multiplexed one — see [`crate::session`]. This is
+/// the bridge: it takes the descriptions [`describe_site`] built and pairs each
+/// with the ratings a status needs, so a caller cannot open a session whose
+/// description and whose ratings came from different sites.
+///
+/// The sessions come back **unopened**: [`Session::open`] is a decision about a
+/// socket and this crate has none.
+#[must_use]
+pub fn sessions_for(site: &Site, ctx: &DescribeContext<'_>) -> Vec<Session> {
+    let described = describe_site(site, ctx);
+    let details: BTreeMap<&AssetId, &ResourceManagerDetails> =
+        described.resources.iter().map(|(id, d)| (id, d)).collect();
+    let mut out = Vec::new();
+    let mut push = |id: &AssetId, offer: Offer, ratings: Ratings| {
+        if let Some(d) = details.get(id) {
+            out.push(Session::new(id.clone(), (*d).clone(), offer, ratings));
+        }
+    };
+
+    for (id, description) in &described.batteries {
+        let Some(Asset::Battery(b)) = site.asset(id) else {
+            continue;
+        };
+        push(
+            id,
+            Offer::Battery(Box::new(description.clone())),
+            Ratings::both(b.max_charge, b.max_discharge),
+        );
+    }
+    for (id, description) in &described.sessions {
+        let Some(Asset::Evse(e)) = site.asset(id) else {
+            continue;
+        };
+        let mode = ctx.mode_of_id(site, id);
+        push(
+            id,
+            Offer::Ev(Box::new(description.clone())),
+            // A one-way charge point has no discharge rating, and `Ratings`
+            // says so with a zero rather than with the same number twice: a
+            // factor against a rating it cannot reach is a status nobody can
+            // reconcile with the meter beside it.
+            if e.bidirectional {
+                Ratings::both(e.max_power(mode), e.max_power(mode))
+            } else {
+                Ratings::draws(e.max_power(mode))
+            },
+        );
+    }
+    for (id, description) in &described.tanks {
+        let Some(Asset::Dhw(t)) = site.asset(id) else {
+            continue;
+        };
+        push(
+            id,
+            Offer::Dhw(Box::new(description.clone())),
+            Ratings::draws(t.heater),
+        );
+    }
+    for (id, constraints) in &described.envelopes {
+        let ceiling = site
+            .asset(id)
+            .map_or(Power::ZERO, |a| a.meta().connection_power.abs());
+        push(
+            id,
+            Offer::Envelope(Box::new(constraints.clone())),
+            Ratings::draws(ceiling),
+        );
+    }
+    for (id, description) in &described.modes {
+        let Some(Asset::HeatPump(hp)) = site.asset(id) else {
+            continue;
+        };
+        push(
+            id,
+            Offer::HeatPump(Box::new(description.clone())),
+            Ratings::draws(hp.electrical_nominal),
+        );
+    }
+    for (id, description) in &described.programmes {
+        let peak = site
+            .asset(id)
+            .and_then(|a| match a {
+                Asset::Load(l) => l.programme().map(hems_core::asset::Programme::peak),
+                _ => None,
+            })
+            .unwrap_or(Power::ZERO);
+        push(
+            id,
+            Offer::Programme(Box::new(description.clone())),
+            Ratings::draws(peak),
+        );
+    }
+    out
+}
+
 /// A heat pump that takes a power ceiling, as a `PEBC` envelope.
 ///
 /// Its consequence is [`Defer`]: a heat pump held down catches up later out of
@@ -322,6 +427,9 @@ mod tests {
                     heating_rod: Some(Power::from_kw(3.0)),
                     control: HeatPumpControl::PowerCeiling,
                     modulating: true,
+                    comfort_min_c: 20.0,
+                    comfort_max_c: 23.0,
+                    cop: CopCurve::air_source(),
                 }),
                 Asset::Dhw(DhwTank {
                     meta: meta("warmwasser", 0.5),
@@ -402,31 +510,72 @@ mod tests {
         assert!(element.power_ranges[0].start_of_range > 4_000.0);
     }
 
+    /// Every description survives the standard's own wire format **exactly**.
+    ///
+    /// A description that cannot be serialised is a description that cannot be
+    /// sent; `s2energy` is generated from the official schema, so parsing one
+    /// back is the whole crate checked against the standard for the price of one
+    /// assertion.
+    ///
+    /// # It used to compare `message_type` and not the value
+    ///
+    /// Because it could not pass otherwise: a battery's S2 fill rate is
+    /// 1,319 4 × 10⁻³ kWh/s and came back differing in the last unit in the last
+    /// place, and the comment here blamed `serde_json`'s float *printer* and
+    /// weakened the assertion to the message type. The diagnosis was wrong and
+    /// the weakening was the real cost — a test that no longer checked the
+    /// numbers in a description was passing on a crate whose entire output is
+    /// numbers.
+    ///
+    /// It is the *parser*: `float_roundtrip` is not one of `serde_json`'s
+    /// default features, and without it reading a float back is a fast
+    /// approximation. The workspace turns it on, and this asserts the value.
     #[test]
     fn every_description_survives_the_standards_own_wire_format() {
-        // A description that cannot be serialised is a description that cannot
-        // be sent. `s2energy` is generated from the official schema, so parsing
-        // one back is the whole crate checked against the standard.
-        //
-        // Compared by `message_type` and not by value: an S2 fill rate is a
-        // double, and a battery's is 1,319 4 × 10⁻⁶ kWh/s — a number whose
-        // shortest decimal form does not survive a round trip in its last unit
-        // in the last place. Asserting bitwise equality would be asserting
-        // something about `serde_json`'s float printer rather than about this
-        // crate.
         let messages = described().messages();
         assert!(!messages.is_empty(), "a household with nothing to say");
         for message in messages {
             let json = serde_json::to_string(&message).expect("serialises");
             let back: Message = serde_json::from_str(&json).expect("round-trips");
-            assert_eq!(
-                std::mem::discriminant(&back),
-                std::mem::discriminant(&message),
-                "{json}"
-            );
+            assert_eq!(back, message, "{json}");
             assert!(
                 json.contains("message_type"),
                 "the wire form names itself: {json}"
+            );
+        }
+    }
+
+    /// A household produces one session per resource, each carrying its own
+    /// ratings.
+    ///
+    /// The pairing is the point: a session built from one site's description and
+    /// another's ratings would report a factor that does not match the power
+    /// measurement beside it, and nothing downstream could tell.
+    #[test]
+    fn a_household_opens_one_session_per_resource() {
+        let site = site();
+        let modes = BTreeMap::new();
+        let ctx = DescribeContext::new(T0, T0 + time::Duration::hours(12), &modes);
+        let described = describe_site(&site, &ctx);
+        let sessions = sessions_for(&site, &ctx);
+
+        assert_eq!(
+            sessions.len(),
+            described.described(),
+            "one session per described resource, and no session for a resource \
+             this crate could not describe"
+        );
+        for session in &sessions {
+            assert_eq!(
+                *session.state(),
+                crate::session::SessionState::Idle,
+                "opening one is a decision about a socket, and this crate has none"
+            );
+            let asset = site.asset(session.asset()).expect("a real asset");
+            assert_eq!(
+                session.control_type(),
+                control_type_for(asset, ctx.ev_session.is_some()).into(),
+                "a session offers what the mapping says the asset is"
             );
         }
     }

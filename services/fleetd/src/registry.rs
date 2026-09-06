@@ -206,6 +206,17 @@ impl Registry {
 
     /// Which site a token belongs to.
     ///
+    /// A map lookup, **not** the constant-time comparison
+    /// [`Registry::may_enrol`] uses on the enrolment secret, and the difference
+    /// is the entropy rather than an inconsistency. An enrolment secret is
+    /// chosen by whoever provisions the fleet and written on a job sheet, so it
+    /// can be short, guessable and worth attacking a byte at a time. A token is
+    /// [`mint_token`]'s 256 bits from the operating system's own entropy: there
+    /// is no prefix to walk towards, and a linear constant-time scan would make
+    /// every authenticated request on the fleet O(boxes).
+    ///
+    /// [`mint_token`]: crate::api
+    ///
     /// # Errors
     /// [`EnrolmentError::UnknownToken`].
     pub fn site_for(&self, token: &str) -> Result<&str, EnrolmentError> {

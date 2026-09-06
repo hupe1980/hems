@@ -51,7 +51,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::drivers::Registry;
+use crate::drivers::{Attached, DriverId, Registry};
 
 /// The shared driver set.
 pub type Shared = Arc<Mutex<Registry>>;
@@ -78,7 +78,8 @@ const READ_BUFFER: usize = 8 * 1024;
 /// Returns when `shutdown` is triggered, and not before — there is no error
 /// path, and that is the design rather than an omission: see the module note on
 /// why a household gateway box is not a request that can fail.
-pub async fn tcp(registry: Shared, asset: AssetId, address: String, shutdown: Shutdown) {
+pub async fn tcp(registry: Shared, on: Attached, address: String, shutdown: Shutdown) {
+    let Attached { driver, asset } = on;
     let mut backoff = BACKOFF_MIN;
     loop {
         if shutdown.is_triggered() {
@@ -111,11 +112,11 @@ pub async fn tcp(registry: Shared, asset: AssetId, address: String, shutdown: Sh
             }
         };
 
-        session(&registry, &asset, stream, &shutdown).await;
+        session(&registry, driver, &asset, stream, &shutdown).await;
         registry
             .lock()
             .await
-            .on_link(&asset, LinkState::Down, now());
+            .on_link(driver, LinkState::Down, now());
         if shutdown.is_triggered() {
             return;
         }
@@ -148,9 +149,9 @@ pub async fn tcp(registry: Shared, asset: AssetId, address: String, shutdown: Sh
 /// It is not a substitute for the transport, and nothing here pretends it is:
 /// the readiness probe says the box cannot hear a reduction. What it buys is
 /// that the state the box reports is the state the machine is actually in.
-pub async fn clock_only(registry: Shared, asset: AssetId, shutdown: Shutdown) {
+pub async fn clock_only(registry: Shared, driver: DriverId, shutdown: Shutdown) {
     loop {
-        let deadline = registry.lock().await.deadline_of(&asset);
+        let deadline = registry.lock().await.deadline_of(driver);
         let wait = deadline.map_or(
             // No deadline at all: nothing to wake for, so wait for the shutdown.
             // A driver in this state is inert by its own account.
@@ -161,15 +162,21 @@ pub async fn clock_only(registry: Shared, asset: AssetId, shutdown: Shutdown) {
             biased;
             () = shutdown.clone().wait() => return,
             () = tokio::time::sleep(wait) => {
-                registry.lock().await.on_timeout_of(&asset, now());
+                registry.lock().await.on_timeout_of(driver, now());
             }
         }
     }
 }
 
 /// One connection, from the handshake to whatever ends it.
-async fn session(registry: &Shared, asset: &AssetId, mut stream: TcpStream, shutdown: &Shutdown) {
-    registry.lock().await.on_link(asset, LinkState::Up, now());
+async fn session(
+    registry: &Shared,
+    driver: DriverId,
+    asset: &AssetId,
+    mut stream: TcpStream,
+    shutdown: &Shutdown,
+) {
+    registry.lock().await.on_link(driver, LinkState::Up, now());
     let mut buffer = vec![0_u8; READ_BUFFER];
 
     loop {
@@ -179,7 +186,7 @@ async fn session(registry: &Shared, asset: &AssetId, mut stream: TcpStream, shut
         // bytes the driver produced are lost, which the reconnect will notice
         // because the driver is told the link dropped.
         loop {
-            let outgoing = registry.lock().await.poll_transmit_of(asset);
+            let outgoing = registry.lock().await.poll_transmit_of(driver);
             let Some(bytes) = outgoing else { break };
             if let Err(error) = stream.write_all(&bytes).await {
                 tracing::warn!(%asset, %error, "the write failed");
@@ -187,7 +194,7 @@ async fn session(registry: &Shared, asset: &AssetId, mut stream: TcpStream, shut
             }
         }
 
-        let deadline = registry.lock().await.deadline_of(asset);
+        let deadline = registry.lock().await.deadline_of(driver);
         let wait = deadline.map(|at| {
             // Saturating: a deadline already in the past means "wake now", and
             // an unsigned conversion of a negative duration is a seventy-year
@@ -205,7 +212,7 @@ async fn session(registry: &Shared, asset: &AssetId, mut stream: TcpStream, shut
                 }
                 Ok(n) => {
                     let mut guard = registry.lock().await;
-                    if let Err(error) = guard.on_bytes(asset, &buffer[..n], now()) {
+                    if let Err(error) = guard.on_bytes(driver, &buffer[..n], now()) {
                         // A malformed frame is a device, not an outage: the
                         // driver has already resynchronised as best it can, and
                         // dropping the connection for one would turn a noisy
@@ -219,7 +226,7 @@ async fn session(registry: &Shared, asset: &AssetId, mut stream: TcpStream, shut
                 }
             },
             () = sleep_for(wait) => {
-                registry.lock().await.on_timeout_of(asset, now());
+                registry.lock().await.on_timeout_of(driver, now());
             }
         }
     }

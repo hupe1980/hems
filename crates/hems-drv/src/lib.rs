@@ -78,11 +78,23 @@ mod link;
 
 #[cfg(feature = "eebus")]
 pub mod eebus;
+
+#[cfg(feature = "eebus")]
+pub mod eebus_dhw;
+
+#[cfg(feature = "eebus")]
+pub mod eebus_ev;
+
+#[cfg(feature = "eebus")]
+pub mod eebus_heat_pump;
 #[cfg(feature = "modbus")]
 pub mod modbus;
 
 pub use capability::DriverCapabilities;
-pub use event::{CommandOutcome, DriverEvent, GridLimit, LimitDirection, LimitSource};
+pub use event::{
+    CommandOutcome, DriverEvent, Failsafe, FeedInFactor, Flexibility, GridLimit, LimitDirection,
+    LimitSource, VehiclePresence,
+};
 pub use link::LinkState;
 
 use hems_core::prelude::AssetId;

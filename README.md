@@ -18,8 +18,8 @@
 > 🚧 **Pre-alpha.** The control stack is real, tested and simulated end to end.
 > `hemsd run` opens real sockets to real devices, accepts a network operator's
 > Steuerbox over TLS, and plans against fetched prices and a fetched sky. The
-> plan is a battery — the car, the building and the tank wait on drivers. See
-> [Status](#-status).
+> plan reaches the battery, the hot-water tank, the car and the building. What
+> is missing is the market side and certification. See [Status](#-status).
 
 A household with a roof, a battery, a car, a heat pump and a hot-water tank is
 now a small power station with legal obligations. Since 2024 the network operator
@@ -46,7 +46,7 @@ This file is the front door.
 | [Architecture](https://hupe1980.github.io/hems/docs/architecture/) | three control planes, three cadences, one order of authority |
 | [The domain model](https://hupe1980.github.io/hems/docs/domain-model/) | one sign convention, the quarter-hour grid, the electrical tree, commands that name a reason |
 | [The grid rules](https://hupe1980.github.io/hems/docs/grid-rules/) | § 14a, § 9 EEG, Modul 3, MiSpeL, § 42c — as code, with the citation for every number |
-| [Tariffs and prices](https://hupe1980.github.io/hems/docs/tariffs/) | the bill as a stack, the five day-ahead sources, § 51 EEG, the Modul advisor |
+| [Tariffs and prices](https://hupe1980.github.io/hems/docs/tariffs/) | the bill as a stack, the five day-ahead sources, § 51 EEG, the grid's carbon intensity, the Modul advisor |
 | [The planner](https://hupe1980.github.io/hems/docs/optimizer/) | the receding-horizon MILP, and what a kilowatt-hour is worth per device |
 | [Forecasting](https://hupe1980.github.io/hems/docs/forecasting/) | what the box believes about tomorrow, and what being wrong costs |
 | [Flexibility](https://hupe1980.github.io/hems/docs/flexibility/) | S2 / EN 50491-12-2 as the internal model |
@@ -76,8 +76,8 @@ $ cargo run -p hemsd -- run --config /etc/hems/hemsd.toml
 
 `--check` builds the site and the drivers and stops before opening a socket — the
 command an installer runs before leaving the cellar. It refuses a driver for an
-asset the site does not have, two drivers for one asset, a controllable device
-whose driver cannot command it, a § 14a household with nothing that could hear a
+asset the site does not have, two drivers that both command or both measure one
+asset, a controllable device no driver can command, a § 14a household with nothing that could hear a
 reduction, and a **Modul 3 calendar the household may not be billed on** — the
 one thing in the file that is transcribed by hand from a PDF, checked against
 the seven rules of the BDEW Anwendungshilfe. Each of those is silent at runtime
@@ -137,16 +137,17 @@ households.
 ```console
 $ cargo run -p hemsd -- simulate --day winter
 
+
   2026-01-15 — with a § 14a reduction
 
-  produced                                  8.4 kWh
+  produced                                  8.5 kWh
   household consumption                    11.0 kWh
   charged into the car                     21.7 kWh
   heat pump                                26.1 kWh
   hot water                                 3.1 kWh
   dishwasher                         1.1 kWh, 75 min later
   battery throughput                       15.5 kWh
-  imported                                 55.7 kWh
+  imported                                 55.6 kWh
   exported                                  0.3 kWh
   curtailed                                 0.0 kWh
   peak feed-in, per quarter hour     0.12 of 5.88 kW
@@ -161,14 +162,14 @@ $ cargo run -p hemsd -- simulate --day winter
   production forecast, CRPS          192 W (81 % of 32 lit)
   load forecast, CRPS                18 W (85 % covered)
 
-  electricity bill                          21.08 €
+  electricity bill                          21.03 €
   battery life spent                         0.62 €
   comfort given up                           0.19 €
   borrowed from the stores                   0.14 €
-  cost of the day                           22.02 €
+  cost of the day                           21.97 €
   without optimisation                      24.12 €
-  saved                                      2.09 €
-  …of it on the bill                         3.39 €
+  saved                                      2.14 €
+  …of it on the bill                         3.44 €
 
   § 14a limit in force                       90 min
   …against a minimum of                     10.5 kW
@@ -178,9 +179,12 @@ $ cargo run -p hemsd -- simulate --day winter
   slowest reaction                   0 s, commanded
   minutes without a plan                          0
   commands the hardware clipped      0 ticks (0.00 kWh)
-  the opening plan expected          20.05 €, off by +1.03
+  quarter hours § 51 EEG zeroed                   0
+  carbon behind the imports          18.2 kg (327 g/kWh)
+  the opening plan expected          20.05 €, off by +0.98
   without an Energy Guard                     3 min
-  limit respected throughout                    yes
+  § 14a limit respected                         yes
+  § 9 EEG ceiling respected                     yes
 
   described in S2                       6 resources
   dearest asset vs cheapest                      2×
@@ -189,27 +193,30 @@ $ cargo run -p hemsd -- simulate --day winter
   …on this day it would have         -3.97 € on the energy
 ```
 
-Four lines there are not in anybody else's table, and the
+Five lines there are not in anybody else's table, and the
 [planner page](https://hupe1980.github.io/hems/docs/optimizer/) argues each:
 
 - **without optimisation** — the same day delivering the **same service** with no
   battery, a wallbox that starts on plug-in and ordinary thermostats, against the
   **same weather** and under the **same grid rules**. A saving computed any other
   way flatters itself.
-- **saved / …of it on the bill** — €2,09 against €3,39. The saving counts the
+- **saved / …of it on the bill** — €2,14 against €3,44. The saving counts the
   battery life, the comfort and the service the plan spent; the bill is the
   flattering number every other system quotes.
 - **…covered by the store** — `[A1 2.3]` in one number: kilowatt-hours the
   battery lent the controllable devices during the reduction, which never crossed
   the connection point.
 - **relief from § 14a was worth** — the shadow price of the network operator's own
-  ceiling. Zero here, because the store lends the headroom; €3,93/kWh on the same
+  ceiling. Zero here, because the store lends the headroom; €1,20/kWh on the same
   evening in a house without one.
+- **§ 14a limit respected / § 9 EEG ceiling respected** — two statutes on one
+  connection point, two answers. A limit printed beside its bound is not a limit
+  anybody is checking.
 
 The three forecast lines are the evidence for the money lines: the planner is
 given only what six weeks of the box's own metering could have taught it, and
-`--perfect-foresight` shows what a saving quoted without that measures — **€5,25
-against €2,09** on this day.
+`--perfect-foresight` shows what a saving quoted without that measures — **€5,28
+against €2,14** on this day.
 
 ## 💡 What makes it different
 
@@ -252,9 +259,11 @@ Seven claims, each argued on the site rather than here.
 
 Every regulatory number carries the document and clause it comes from —
 `[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
-all 378 of them against an index of primary sources, **failing the build** if one
+all 450 of them against an index of primary sources, **failing the build** if one
 names a document the index does not carry. `cargo xtask check-wire` does the same
-for the 121 quantities and instants, each of which has to say how it travels.
+for the 124 quantities and instants, each of which has to say how it travels, and
+`cargo xtask check-vital` for a daemon's background loops: one spawned outside
+`Health::vital` has a liveness probe that cannot fail, which is worse than none.
 
 The documents are third-party copyrighted publications and are not redistributed;
 the index records the retrieval URL of each.
@@ -270,8 +279,8 @@ the index records the retrieval URL of each.
 | [`hems-optimizer`](crates/hems-optimizer) | Receding-horizon MILP: cost, wear, comfort, hot water, shiftable appliances placed rather than smeared, grid limits per slot as hard constraints | none |
 | [`hems-realtime`](crates/hems-realtime) | The guard plane, fair allocation of a limited budget, the one-second arbiter | none |
 | [`hems-device`](crates/hems-device) | What a wanted power becomes on real hardware: amperes, phase counts, SG Ready contacts — and `realisable`, what a semi-continuous device will *actually* take | none |
-| [`hems-drv`](crates/hems-drv) | The driver contract — bytes and a clock in, events and bytes out — with SunSpec over Modbus TCP and the EEBUS LPC Controllable System behind features | none |
-| [`hems-flex`](crates/hems-flex) | The household's flexibility in S2 (EN 50491-12-2): which control type each asset is, every description a whole site would send — the same wallbox is a store with a car on it and an envelope without one — and what an instruction means | none |
+| [`hems-drv`](crates/hems-drv) | The driver contract — bytes and a clock in, events and bytes out — with SunSpec over Modbus TCP, the EEBUS LPC/LPP Controllable System, and the MGCP and MDT Monitoring Appliances behind features | none |
+| [`hems-flex`](crates/hems-flex) | The household's flexibility in S2 (EN 50491-12-2): which control type each asset is, every description a whole site would send — the same wallbox is a store with a car on it and an envelope without one — what an instruction means, and the sans-I/O **Resource Manager session** that has the conversation | none |
 | [`hems-sim`](crates/hems-sim) | Battery, charge point, inverter, building, hot-water tank, a dishwasher that will not be paused, and Steuerbox simulators on virtual time — each with at least one way of saying no — and a seeded weather realisation, so the day that happens is not the day that was forecast | none |
 | [`hems-events`](crates/hems-events) | The CloudEvents catalogue, enforced by a workspace guard | none |
 | [`hems-service`](crates/hems-service) | The shell every daemon shares: configuration from a file then the environment, a **`Secret`** whose configured value may be an `env:` or `file:` reference rather than the credential itself, **live and ready as separate questions**, a bounded shutdown, and Ed25519 verification of a release *and of the box's own configuration* — whose trust anchor is a key the box was built with, not the server that offered it | tokio, axum |
@@ -335,11 +344,14 @@ crosses that seam is a SPINE datagram, so a limit an Energy Guard writes becomes
 the ceiling the guard enforces, the control loop writes the `[A1 7.2]` record as
 the reduction runs, and `histd` gets what it will take.
 
-What it does **not** do is plan the whole house. The plan is a **battery**: the
-car, the building and the hot-water tank are left out, because nothing reports an
-arrival, an indoor temperature or a tank temperature — each is a driver rather
-than a planner change, and an asset the plan named but did not model would be an
-instruction not to use it. `hems-sim` still stands in for those.
+The plan reaches every store the box can **read**: the battery off its own
+meter, the hot-water tank (EEBUS MDT), the car (EEBUS EVCC and EVSOC) and the
+building (EEBUS MRT, or a vendor's Modbus register map). Each is a refusal
+rather than a default where nothing measured it — a store's state is not a thing
+to assume, and every one of these guesses wrong in the expensive direction. An
+unmeasured store is left out of the *names* the plan may command too: an asset a
+plan names but does not model gets an envelope pinned at zero, and the arbiter
+obeys that as an instruction not to use it.
 
 | Works today | |
 |---|---|
@@ -348,11 +360,17 @@ instruction not to use it. `hems-sim` still stands in for those.
 | The receding-horizon MILP | wear, comfort, hot water, placed appliances, per-slot grid limits, a shadow price per asset, and planning against three futures |
 | Forecasting, and being scored on it | solar geometry, a residual corrector that learns *this* roof, CRPS and calibration beside the money |
 | Seven reference days end to end | plus multi-day back-test and risk sweeps |
-| S2 / EN 50491-12-2 as the internal flexibility model | every message a whole site would send, and a count of what it cannot express |
+| S2 / EN 50491-12-2 as the internal flexibility model **and as a Resource Manager** | every message a whole site would send, a count of what it cannot express, and the handshake-to-instruction session a Customer Energy Manager drives — sans-I/O, so a whole negotiation is a unit test |
 | The driver contract, SunSpec over Modbus TCP, and the EEBUS LPC Controllable System | sans-I/O; a whole § 14a day in virtual time, and an Energy Guard writing a limit over SPINE datagrams |
-| **The SHIP session** — TLS 1.2 with mutual authentication, the WebSocket upgrade, the handshake, a trust store and a SKI that survive a reboot | a Steuerbox reduces a running household to 4,2 kW over a real socket, and an unapproved one completes TLS and gets no further |
+| **The hot-water tank over EEBUS MDT** — the one number that kept the optimiser's hot-water store out of every real plan | a circuit reports 52,5 °C over SPINE and the planner gets a store; a flagged sensor reaches it as an absent tank rather than a number to heat against |
+| **The heat pump over EEBUS** — the lever an energy manager never had | OHPCF starts and stops the compressor's process, which is the one use case that can ask an appliance to consume *more*; MRT reports the air temperature of each room it watches and MOT the weather at this building, which are two of the three signals a thermal model is identified from. Three use cases on one session, because SHIP grants one per peer |
+| **The hot-water loading over EEBUS CDSF** | the button in the bathroom, pressed over the wire: the shortest path there is from "the roof is exporting" to "the tank is absorbing it", and given back when a cloud arrives. Not a setpoint — a setpoint hands the decision back to the circuit's own controller, which is what an MPC exists to replace |
+| **A vendor's own register map over Modbus TCP** | for everything that answers Modbus and publishes no SunSpec model list, which is most of the installed heat-pump base. Space, width, word order, scale and field are declared and none is guessed; it reads and never writes, because a map that could write is one where a typo starts a compressor |
+| **The car over EEBUS EVCC and EVSOC** — an arrival, which has no message: an `EV` entity appearing under the `EVSE` *is* the message | a cable goes in and the plan gets a charging deadline; a car that cannot say how full it is is still a car, and is not charged against an invented battery |
+| **Pairing a Steuerbox without a restart** | it dials a box that does not know it, is held pending, is approved mid-handshake, and gets through |
+| **The SHIP session** — TLS 1.2 with mutual authentication, the WebSocket upgrade, the handshake, a trust store and a SKI that survive a reboot, and a `_ship._tcp` announcement so a Steuerbox can find the box at all | a Steuerbox reduces a running household to 4,2 kW over a real socket, and an unapproved one completes TLS and gets no further |
 | The driver registry | `hemsd` checks the drivers against the site *before* a byte moves |
-| **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided and what it could not hear |
+| **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided, what it could not hear, and what answered a setpoint without acting on it |
 | **A receding-horizon plan on a real box** | prices from `tariffd`, the sky from `forecastd`, this roof modelled locally and corrected by what it has actually delivered, the battery read off its own meter, the solve off the runtime — and what it learns kept in its own store, so a reboot does not cost a fortnight |
 | **The § 14a record and the quarter-hour registers, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
 | **A box reports what it metered** | `hemsd run` closes each Berlin calendar day from the rows it already wrote — so a restart at 23:50 still reports the whole day — and carries the energies, the § 14a record, the seam numbers and the scores of its own forecast bands. No cost and no baseline: a baseline is a counterfactual only a simulator can re-run, and five of the six cost terms are modelled. The fleet counts those days apart rather than averaging them in as days that saved nothing |
@@ -366,25 +384,28 @@ instruction not to use it. `hems-sim` still stands in for those.
 | Not yet | |
 |---|---|
 | A transport that carries an event to `agentd` | the subscription table says which event type wakes which specialist and a test proves every pattern matches something the workspace emits; the hop from `obsd`'s collector is what is missing |
-| The car, the building and the tank in the plan | each waits on a driver that reports the state it is planned from — an arrival, an indoor temperature, a tank temperature — **next** |
-| EEBUS certification | mDNS/DNS-SD with the SHIP TXT record set, a pairing flow a person can drive, and a conformance harness against the lab's own test list |
+| EEBUS certification | a conformance harness against the lab's own test list, and interop against another implementation. mDNS/DNS-SD and a pairing flow a person can drive are done |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-869 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 019 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (378 citations across five document
-families, each resolving to a document the index carries; 121 quantities,
+clock, the whole suite, the workspace guards (459 citations across five document
+families, each resolving to a document the index carries; 126 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
-Four of those tests are worth naming because of what they guard against. One
+Five of those tests are worth naming because of what they guard against. One
 asserts the reference day's forecasts were **wrong**, since a day the planner
 cannot be surprised by measures a planner that was shown the answer. One runs the
 day's own quarter-hour registers through the § 42c allocation. One checks that
-every asset the arbiter commands can be described in S2. And one hangs a socket
+every asset the arbiter commands can be described in S2. One hangs a socket
 up in the middle of a device discovery and insists the reading that comes back
-afterwards is still the right number. A rule module can be implemented, cited,
+afterwards is still the right number. And one explores **every reachable state**
+of the § 14a limitation machine — breadth-first, deduplicated on the timing
+differences the machine actually compares — and checks four invariants in each;
+its first run found a write-window defect two thousand random steps had sampled
+past for the life of the project. A rule module can be implemented, cited,
 tested and reached by nothing at all, and no property test catches that — a
 property is a statement about code that runs.
 

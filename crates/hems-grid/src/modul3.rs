@@ -218,6 +218,95 @@ impl Modul3Eligibility {
     }
 }
 
+/// The network operator's Modul 3 calendar, as a person transcribes it.
+///
+/// There is no machine-readable national format for a Modul 3 calendar — a PDF
+/// or an Excel sheet per network operator — so whoever commissions a box, or
+/// curates a fleet's catalogue, copies the windows, the billed quarters, the
+/// three working prices and the **source document** into this shape. What makes
+/// transcribing safe rather than a second way to be wrong is that both
+/// consumers refuse a transcription that breaks the Anwendungshilfe
+/// ([`Modul3Calendar::assess`]) before anything is priced on it (D126).
+///
+/// One shape, two writers: `hemsd` takes it as `[tariff.modul3]` for one
+/// household, and `tariffd` takes a list of them — one per Netzbetreiber — for
+/// the fleet's curated catalogue. Sharing the type is what makes an installer's
+/// transcription portable between the two.
+#[cfg(feature = "serde")]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Transcription {
+    /// The operator's own identifier for the Zählzeitdefinition.
+    pub id: String,
+    /// The calendar year the windows are fixed for. § 2 of the Anwendungshilfe
+    /// fixes them per year, and a definition that spans two is refused.
+    pub year: i32,
+    /// The Hochtarif band, `[from, to]` in minutes of the local day.
+    ///
+    /// At least two hours on every day class the definition distinguishes, or
+    /// the calendar breaks the Anwendungshilfe and the consumer says so.
+    pub hochtarif_minutes: [u16; 2],
+    /// The Niedertarif band, the same way. It may wrap past midnight.
+    pub niedertarif_minutes: [u16; 2],
+    /// The calendar quarters the three levels are billed in — the operator's
+    /// Wahlrecht, published on the price sheet and **not** derivable from the
+    /// windows. At least two of `"Q1"`, `"Q2"`, `"Q3"`, `"Q4"`.
+    pub billed_quarters: Vec<String>,
+    /// The Hochtarif working price, ct/kWh.
+    ///
+    /// Three absolute prices rather than a surcharge and a discount, because
+    /// three absolute prices are what a price sheet publishes — and a delta
+    /// against another number would make the household's bill depend on one
+    /// that has nothing to do with its module.
+    pub ht_ct_per_kwh: f64,
+    /// The Standardtarif working price, ct/kWh.
+    pub st_ct_per_kwh: f64,
+    /// The Niedertarif working price, ct/kWh.
+    pub nt_ct_per_kwh: f64,
+    /// Where the calendar was transcribed from — a price-sheet URL, a document
+    /// hash. Optional to parse and required by both consumers' start-up checks:
+    /// a calendar nobody can trace back to a document is one nobody can defend
+    /// when the bill is queried.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[cfg(feature = "serde")]
+impl Transcription {
+    /// The calendar these settings describe, or `None` where a quarter is not
+    /// one of the four.
+    ///
+    /// A bad quarter is a *parse* failure rather than an empty list, because an
+    /// empty `billed_quarters` is itself a conformance finding
+    /// (`BilledQuartersUnknown`) and reporting a typo as "the operator did not
+    /// say" would name the wrong problem.
+    #[must_use]
+    pub fn calendar(&self) -> Option<Modul3Calendar> {
+        let quarters = self
+            .billed_quarters
+            .iter()
+            .map(|q| match q.trim().to_ascii_uppercase().as_str() {
+                "Q1" => Some(Quarter::Q1),
+                "Q2" => Some(Quarter::Q2),
+                "Q3" => Some(Quarter::Q3),
+                "Q4" => Some(Quarter::Q4),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let calendar = Modul3Calendar::new(
+            self.id.clone(),
+            self.year,
+            (self.hochtarif_minutes[0], self.hochtarif_minutes[1]),
+            (self.niedertarif_minutes[0], self.niedertarif_minutes[1]),
+            quarters,
+        );
+        Some(match &self.source {
+            Some(source) => calendar.from_source(source.clone()),
+            None => calendar,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

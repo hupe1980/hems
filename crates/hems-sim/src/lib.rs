@@ -28,7 +28,8 @@ pub mod steuerbox;
 pub mod weather;
 
 pub use device::{
-    ApplianceSim, BatterySim, BuildingSim, CompressorSim, EvseSim, PvSim, TankSim, VehicleSim,
+    ApplianceSim, BatterySim, BuildingSim, CompressorSim, EvseSim, PHASE_SWITCH_DEAD_TIME, PvSim,
+    TankSim, VehicleSim,
 };
 pub use steuerbox::{Instruction, SteuerboxSim};
 pub use weather::Realisation;

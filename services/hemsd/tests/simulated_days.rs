@@ -87,16 +87,19 @@ fn pricing_battery_wear_moves_less_energy_through_the_battery() {
     // The finding of `specs/arxiv/arxiv-2606.16051.pdf` reproduced end to end:
     // a cost-only optimiser cycles a battery for spreads that do not pay for the
     // damage. The saving looks better and the battery is worse off.
-    let cost_only = HouseholdConfig {
-        battery_wear_eur_per_kwh: 0.0,
-        ..HouseholdConfig::default()
+    let with_wear = |wear: f64| {
+        let base = HouseholdConfig::default();
+        HouseholdConfig {
+            battery: base.battery.map(|b| hemsd::BatteryConfig {
+                wear_eur_per_kwh: wear,
+                ..b
+            }),
+            ..base
+        }
     };
+    let cost_only = with_wear(0.0);
     let realistic = HouseholdConfig::default();
-
-    let steep = HouseholdConfig {
-        battery_wear_eur_per_kwh: 1.0,
-        ..HouseholdConfig::default()
-    };
+    let steep = with_wear(1.0);
 
     let a = run(&Scenario::winter_with_grid_event(cost_only)).unwrap();
     let b = run(&Scenario::winter_with_grid_event(realistic)).unwrap();
@@ -121,10 +124,14 @@ fn pricing_battery_wear_moves_less_energy_through_the_battery() {
 
 #[test]
 fn a_backup_reserve_survives_a_whole_day_of_optimisation() {
+    let base = HouseholdConfig::default();
     let config = HouseholdConfig {
-        reserve_soc: Soc::new(0.4).unwrap(),
-        battery_kwh: Energy::from_kwh(10.0),
-        ..HouseholdConfig::default()
+        battery: base.battery.map(|b| hemsd::BatteryConfig {
+            reserve_soc: Soc::new(0.4).unwrap(),
+            kwh: Energy::from_kwh(10.0),
+            ..b
+        }),
+        ..base
     };
     let r = run(&Scenario::winter_with_grid_event(config)).unwrap();
     // The house still runs, and the reserve was not spent on a cheap hour.
@@ -143,8 +150,7 @@ fn a_backup_reserve_survives_a_whole_day_of_optimisation() {
 #[test]
 fn a_house_with_no_photovoltaics_still_plans_and_still_complies() {
     let config = HouseholdConfig {
-        pv_kwp: Power::from_kw(0.0),
-        pv_ac_nominal: Power::from_kw(0.0),
+        pv: None,
         ..HouseholdConfig::default()
     };
     let r = run(&Scenario::winter_with_grid_event(config)).unwrap();
@@ -320,24 +326,56 @@ fn the_sixty_percent_cap_costs_a_roof_what_an_intelligent_meter_would_have_saved
         // which is the only thing § 9 Abs. 2 waits for. The intelligent
         // metering system itself is unchanged, so § 51's negative quarter
         // hours are identical on both sides and what moves is the cap.
-        para9: HouseholdConfig::default()
-            .para9
-            .with_relief(CapRelief::ImsysWithControl),
+        pv: HouseholdConfig::default().pv.map(|pv| hemsd::PvConfig {
+            para9: pv.para9.with_relief(CapRelief::ImsysWithControl),
+            ..pv
+        }),
         ..HouseholdConfig::default()
     }))
     .unwrap();
 
-    // The cap **binds**: the roof is held at the ceiling for the hours around
-    // solar noon, within the minute the simulated inverter takes to obey a new
-    // one. That is the property; the *cost* is the next assertion, and it is
-    // deliberately small.
+    // The cap **binds**, and the quarter-hour register the settlement is built
+    // from stays **under** it. It did not always: the register read 12,06 of
+    // 12,00 kW for four quarter hours and this assertion allowed five per cent,
+    // so a statutory limit was being exceeded with a green test and a report
+    // that said "limit respected throughout" underneath the number that showed
+    // it. Two defects were behind it and both are fixed — `PvSim` closed a
+    // fixed *fraction of a tick* rather than obeying a time constant, so at a
+    // one-minute control period it simulated an inverter that needed four
+    // minutes to answer a limit; and the guard lent the roof consumption that a
+    // thermostat could take away without warning
+    // (`Flows::unlendable_consumption`).
+    //
+    // The tolerance is gone. What is left is measured instead, below.
     let ceiling = capped
         .feed_in_ceiling_kw
         .expect("a 20 kWp roof commissioned after 25.02.2025 without an iMSys is capped");
     assert!(
-        capped.peak_feed_in_kw <= ceiling * 1.05,
-        "the cap was exceeded by more than the inverter's settling time: {:.2} against {ceiling:.2} kW",
+        capped.peak_feed_in_kw <= ceiling,
+        "the quarter-hour feed-in register crossed the § 9 EEG ceiling: {:.2} against {ceiling:.2} kW",
         capped.peak_feed_in_kw
+    );
+
+    // …and what is left of the *instantaneous* limit, which is the one the
+    // statute writes and which no reactive controller can hold across a load
+    // step it did not command. What is left is bounded by the largest such step
+    // on this site — the household's base load, a dishwasher finishing, and the
+    // part of the heat pump's draw a one-minute loop does lend
+    // (`GuardConfig::lend_window`). A real box re-derives every second and holds
+    // each excursion to a second; this day re-derives every minute, so the
+    // duration below is sixty times a box's. The bound is asserted rather than
+    // tolerated because a bound that grows silently is a bound nobody is
+    // keeping.
+    assert!(
+        capped.worst_feed_in_overshoot_w < 1000.0,
+        "the connection point was {:.0} W over the § 9 EEG ceiling for {} min — \
+         more than the household's own uncommanded load steps can account for",
+        capped.worst_feed_in_overshoot_w,
+        capped.feed_in_over_minutes
+    );
+    assert_eq!(
+        relieved.worst_feed_in_overshoot_w, 0.0,
+        "with the cap lifted there is no ceiling to cross"
     );
     assert!(
         relieved.peak_feed_in_kw > ceiling,
@@ -412,19 +450,20 @@ fn an_older_meter_brings_paragraph_51_with_it_and_it_is_a_different_clock() {
     // This is the § 51 clock on its own: the cap is on in both runs, and the
     // only difference is whether the meter went in this year or last.
     let base = HouseholdConfig::default();
-    let this_year = run(&Scenario::summer_capped(&HouseholdConfig {
-        para9: base
-            .para9
-            .with_imsys_since(time::macros::date!(2026 - 03 - 01)),
+    let meter_in = |date: time::Date| HouseholdConfig {
+        pv: base.pv.map(|pv| hemsd::PvConfig {
+            para9: pv.para9.with_imsys_since(date),
+            ..pv
+        }),
         ..base.clone()
-    }))
+    };
+    let this_year = run(&Scenario::summer_capped(&meter_in(time::macros::date!(
+        2026 - 03 - 01
+    ))))
     .unwrap();
-    let last_year = run(&Scenario::summer_capped(&HouseholdConfig {
-        para9: base
-            .para9
-            .with_imsys_since(time::macros::date!(2025 - 03 - 01)),
-        ..base.clone()
-    }))
+    let last_year = run(&Scenario::summer_capped(&meter_in(time::macros::date!(
+        2025 - 03 - 01
+    ))))
     .unwrap();
 
     assert_eq!(
@@ -526,12 +565,18 @@ fn midsummer_is_the_wrong_day_to_measure_a_contactor_on() {
     // *no* difference, and why the shoulder season is where the capability is
     // measured (`a_switchable_charge_point_is_the_whole_session_in_the_shoulder_season`).
     let switchable = run(&Scenario::summer_without_a_planner(HouseholdConfig {
-        evse_switchable: true,
+        evse: HouseholdConfig::default().evse.map(|e| hemsd::EvseConfig {
+            switchable: true,
+            ..e
+        }),
         ..HouseholdConfig::default()
     }))
     .unwrap();
     let fixed = run(&Scenario::summer_without_a_planner(HouseholdConfig {
-        evse_switchable: false,
+        evse: HouseholdConfig::default().evse.map(|e| hemsd::EvseConfig {
+            switchable: false,
+            ..e
+        }),
         ..HouseholdConfig::default()
     }))
     .unwrap();
@@ -564,12 +609,18 @@ fn a_switchable_charge_point_never_costs_more_than_a_fixed_one_under_a_plan() {
         Scenario::summer_surplus,
     ] {
         let switchable = run(&make(HouseholdConfig {
-            evse_switchable: true,
+            evse: HouseholdConfig::default().evse.map(|e| hemsd::EvseConfig {
+                switchable: true,
+                ..e
+            }),
             ..HouseholdConfig::default()
         }))
         .unwrap();
         let fixed = run(&make(HouseholdConfig {
-            evse_switchable: false,
+            evse: HouseholdConfig::default().evse.map(|e| hemsd::EvseConfig {
+                switchable: false,
+                ..e
+            }),
             ..HouseholdConfig::default()
         }))
         .unwrap();
@@ -1058,7 +1109,10 @@ fn a_switchable_charge_point_is_the_whole_session_in_the_shoulder_season() {
     ))
     .unwrap();
     let fixed = run(&Scenario::autumn_without_a_planner(HouseholdConfig {
-        evse_switchable: false,
+        evse: HouseholdConfig::default().evse.map(|e| hemsd::EvseConfig {
+            switchable: false,
+            ..e
+        }),
         ..HouseholdConfig::default()
     }))
     .unwrap();
@@ -1125,7 +1179,10 @@ fn the_fallback_stops_at_the_charge_limit_the_household_set() {
     ))
     .unwrap();
     let unlimited = run(&Scenario::summer_without_a_planner(HouseholdConfig {
-        ev_charge_limit: None,
+        evse: HouseholdConfig::default().evse.map(|e| hemsd::EvseConfig {
+            charge_limit: None,
+            ..e
+        }),
         ..HouseholdConfig::default()
     }))
     .unwrap();
@@ -1255,7 +1312,7 @@ fn a_box_with_no_planner_still_washes_up() {
 
 #[test]
 fn the_tight_evening_plans_against_three_futures_and_the_slack_night_does_not() {
-    // Planning against three futures costs seven times the solve, so something
+    // Planning against three futures costs five to seven times the solve, so something
     // has to decide which days are worth it. The trigger is a property of the
     // charging session rather than of the plan — a plan that has looked only at
     // the median cannot know it is at risk, which is measured in
@@ -1329,7 +1386,7 @@ fn a_forty_two_c_community_moves_the_day_and_the_baseline_is_in_it_too() {
     let plain = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
     let mut with_community = Scenario::winter_with_grid_event(HouseholdConfig::default());
     with_community.community = Some(hemsd::CommunityMembership::mehrfamilienhaus(
-        with_community.config.pv_kwp * 3.0,
+        with_community.config.pv.map_or(Power::ZERO, |pv| pv.kwp) * 3.0,
     ));
     let shared = run(&with_community).unwrap();
 
@@ -1600,6 +1657,7 @@ fn a_box_closes_its_day_from_what_it_wrote_down() {
         day,
         hemsd::runtime::day::Unplanned::watching(),
         hemsd::runtime::day::Clipping::default(),
+        hemsd::runtime::day::FeedIn::default(),
         &hemsd::runtime::day::Scored::default(),
     )
     .unwrap()
@@ -1647,4 +1705,121 @@ fn a_box_closes_its_day_from_what_it_wrote_down() {
     assert_eq!(back.data, kpis, "through the type both sides share");
 
     let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn a_carbon_price_moves_load_towards_the_clean_hours() {
+    // Two objective terms the solver has read since the beginning and **nothing
+    // could switch on**: `Objective` appeared nowhere under `services/`, so a
+    // household that wanted its load in the hours the grid is clean had no way
+    // to ask. And even switched on, the carbon term could not have worked: the
+    // Energy-Charts intensity parser had no consumer, the poller dropped what it
+    // fetched, and `SlotPrice::co2_g_per_kwh` was hard-coded `None` — so the
+    // objective saw a flat annual constant, which makes a carbon price
+    // algebraically identical to an autarky premium.
+    //
+    // With a real intensity curve it is a different signal, and this is the
+    // claim: it moves the household's imports towards the clean hours.
+    let plain = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+
+    let mut priced = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    // Far above any real carbon price, because what is being tested is the
+    // *mechanism*: at 55 €/t the term is worth about two ct/kWh and competes
+    // with wear and comfort, and a test that asserted on that margin would be
+    // measuring the tie-break rather than the signal.
+    priced.objective = priced.objective.with_carbon_price(2.0);
+    let priced = run(&priced).unwrap();
+
+    // The intensity behind what each household imported. Not the day's average
+    // — that is a property of the grid and no plan can move it — but the
+    // emissions of the electricity this household actually drew.
+    let intensity = |r: &hemsd::DayResult| r.imported_co2_kg / r.imported_kwh.max(1e-9) * 1000.0;
+    assert!(
+        intensity(&priced) < intensity(&plain) - 1.0,
+        "pricing carbon should buy cleaner kilowatt-hours: {:.0} g/kWh against {:.0}",
+        intensity(&priced),
+        intensity(&plain)
+    );
+
+    // And the KPI is not structurally zero, which is the failure this workspace
+    // keeps finding in itself: a term that is priced and whose effect nothing
+    // reports could stop being applied with no day noticing.
+    assert!(
+        plain.imported_co2_kg > 1.0,
+        "a winter day importing 50 kWh emits something: {:.2} kg",
+        plain.imported_co2_kg
+    );
+
+    // The guard is outside the objective, so no weight a household chooses can
+    // buy its way past a network operator's reduction.
+    assert!(priced.grid_event_respected);
+}
+
+#[test]
+fn an_autarky_premium_imports_less_and_one_day_cannot_price_it() {
+    // The self-sufficiency dial, and the honest limit of what a reference day
+    // can say about it.
+    //
+    // The **mechanism** is testable on one day: paying to avoid the grid
+    // imports less.
+    let plain = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    let mut autarky = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    autarky.objective = autarky.objective.with_autarky_premium(0.30);
+    let autarky = run(&autarky).unwrap();
+
+    assert!(
+        autarky.imported_kwh < plain.imported_kwh - 0.05,
+        "an autarky premium should import less: {:.2} kWh against {:.2}",
+        autarky.imported_kwh,
+        plain.imported_kwh
+    );
+    assert!(autarky.grid_event_respected);
+
+    // What this day deliberately does **not** assert is what the premium cost,
+    // and the reason is D59's: the plan is optimised against a forecast and
+    // measured against a realisation, so a different plan meets a different day.
+    // Measured here the premium comes out **€1,71 better** on the ledger —
+    // because it discharged the store harder and let the house run cooler, and
+    // on this one weather that happened to pay. Both of those are charged
+    // (`stored_eur`, `discomfort_eur`) and the bill still fell further.
+    //
+    // That is not a saving, it is a single draw: the same trap the hedge fell
+    // into, where one realisation pays a premium every time and makes its claim
+    // never. What a preference is *worth* needs the multi-weather sweep, which
+    // is `hemsd risk`, and asserting a sign here would be pinning noise.
+    let _ = autarky.saving_eur();
+}
+
+#[test]
+fn the_day_counts_the_hours_ss_51_eeg_took_the_remuneration_in() {
+    // § 51 EEG is applied per slot inside the price stack — the anzulegender
+    // Wert goes to zero in a negative quarter hour — and until this KPI existed
+    // **no day reported whether it had ever bound**. The rule could have stopped
+    // being applied and every reference figure would have moved without anything
+    // naming the cause.
+    //
+    // It also caught a documented number being wrong: the summer curve was
+    // described in two places as having four negative quarter hours, and it has
+    // twelve — three whole hours from eleven to two.
+    let summer = run(&Scenario::summer_surplus(HouseholdConfig::default())).unwrap();
+    assert_eq!(
+        summer.para51_hours, 12,
+        "three hours of negative prices is twelve quarter hours"
+    );
+
+    // And the winter day has none, which is what makes the pair a check rather
+    // than a constant: a figure that is the same on every day is not measuring
+    // the day.
+    let winter = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+    assert_eq!(winter.para51_hours, 0);
+
+    // The other half of the same argument: the carbon KPI is a property of what
+    // the household *drew*, so a winter day that imports fifty kilowatt-hours
+    // emits far more than a summer day that runs off its own roof.
+    assert!(
+        winter.imported_co2_kg > summer.imported_co2_kg * 5.0,
+        "a winter import bill is a winter carbon bill: {:.2} kg against {:.2}",
+        winter.imported_co2_kg,
+        summer.imported_co2_kg
+    );
 }

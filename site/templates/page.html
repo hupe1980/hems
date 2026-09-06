@@ -1,18 +1,28 @@
 {% extends "base.html" %}
 
 {% block schema %}
-<script type="application/ld+json">
-{
-  "@context": "https://schema.org",
-  "@type": "TechArticle",
-  "headline": {{ page.title | json_encode | safe }},
-  "description": {{ page.description | default(value=config.description) | json_encode | safe }},
-  "url": "{{ page.permalink }}",
-  "inLanguage": "en",
-  "isPartOf": { "@type": "WebSite", "name": "{{ config.title }}", "url": "{{ config.base_url }}" },
-  "license": "https://spdx.org/licenses/MIT.html"
-}
-</script>
+{%- set_global extra %},
+    {
+      "@type": "TechArticle",
+      "@id": "{{ page.permalink }}#article",
+      "headline": {{ page.title | json_encode | safe }},
+      "description": {{ page.description | default(value=config.description) | json_encode | safe }},
+      "url": "{{ page.permalink }}",
+      "isPartOf": { "@id": "{{ config.base_url }}/#website" },
+      "about": { "@id": "{{ config.base_url }}/#project" },
+      "license": "https://spdx.org/licenses/MIT.html",
+      "inLanguage": "en"
+    },
+    {
+      "@type": "BreadcrumbList",
+      "@id": "{{ page.permalink }}#breadcrumb",
+      "itemListElement": [
+        { "@type": "ListItem", "position": 1, "name": "hems", "item": "{{ config.base_url }}" },
+        { "@type": "ListItem", "position": 2, "name": "Documentation", "item": "{{ get_url(path='@/docs/_index.md') }}" },
+        { "@type": "ListItem", "position": 3, "name": {{ page.title | json_encode | safe }} }
+      ]
+    }{% endset %}
+{%- include "partials/schema.html" %}
 {% endblock %}
 
 {% block content %}

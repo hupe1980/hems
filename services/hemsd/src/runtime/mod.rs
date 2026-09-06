@@ -50,7 +50,7 @@ use hems_service::{Health, Shutdown};
 use tokio::sync::Mutex;
 
 use crate::config::{DriverSettings, Settings};
-use crate::drivers::Registry;
+use crate::drivers::{Attached, Registry};
 use crate::site::Household;
 
 pub use control::{Live, Managed, Status};
@@ -84,6 +84,14 @@ pub enum StartError {
     /// would look exactly like a box that was working.
     #[error("the Modul 3 calendar is not one this household may be billed on: {0}")]
     Modul3(String),
+    /// The building the planner would be given is not one it can integrate.
+    ///
+    /// A refusal, and the only one here that is about physics rather than
+    /// paperwork: D17's whole argument is that the exact discretisation is a
+    /// contraction at any step size, and a set of parameters for which it is not
+    /// is a set for which the planner's own temperature predictions diverge.
+    #[error("the building model is not one the planner can integrate: {0}")]
+    Physics(String),
 }
 
 /// Everything a running box holds.
@@ -103,6 +111,20 @@ pub struct Running {
     pub status: Arc<Mutex<Status>>,
     /// What the household itself has asked for, shared with the HTTP surface.
     pub overrides: overrides::Overrides,
+    /// Each configured driver's registry identity, in the order `[[drivers]]`
+    /// lists them.
+    ///
+    /// Kept rather than recomputed from the index: an asset may have two
+    /// drivers now — one that commands it and one that measures it — so a
+    /// transport that looked its driver up by asset would have run one of them
+    /// and starved the other, and one that assumed registration order matched
+    /// configuration order would depend on an ordering nothing declares.
+    pub drivers: Vec<crate::drivers::DriverId>,
+    /// Approving a Steuerbox on a running box, shared with the HTTP surface.
+    ///
+    /// `None` where this household has no EEBUS identity — a box with no § 14a
+    /// driver has nothing to pair with.
+    pub trust: Option<ship::Trust>,
 }
 
 /// Build the site, the drivers and the registry, and check that they agree.
@@ -115,21 +137,29 @@ pub struct Running {
 ///
 /// # Errors
 /// [`StartError`] for any of them.
-pub fn assemble(settings: &Settings, now: time::OffsetDateTime) -> Result<Running, StartError> {
+pub fn assemble(
+    settings: &Settings,
+    kept: Option<&crate::store::Store>,
+    now: time::OffsetDateTime,
+) -> Result<Running, StartError> {
     let config = settings.site.household()?;
     let household = Household::build(&config).map_err(|e| StartError::Build(e.to_string()))?;
 
     let mut registry = Registry::new();
+    let mut drivers = Vec::with_capacity(settings.drivers.len());
     for driver in &settings.drivers {
-        let built = build_driver(driver, &household.site, now)?;
-        registry.register(built, &household.site)?;
+        let built = build_driver(driver, &household.site, kept, now)?;
+        drivers.push(registry.register(built, &household.site)?);
     }
     registry.validate(&household.site, now)?;
     check_modul3(settings, now)?;
+    check_the_physics(&settings.site, &household)?;
 
     Ok(Running {
+        drivers,
         ski: None,
         overrides: overrides::Overrides::new(),
+        trust: None,
         household,
         registry: Arc::new(Mutex::new(registry)),
         status: Arc::new(Mutex::new(Status::default())),
@@ -193,7 +223,9 @@ fn check_modul3(settings: &Settings, now: time::OffsetDateTime) -> Result<(), St
     let household = settings.site.household()?;
     let eligibility = Modul3Eligibility {
         has_modul_1: true,
-        has_imsys: household.para9.imsys_since.is_some(),
+        has_imsys: household
+            .pv
+            .is_some_and(|pv| pv.para9.imsys_since.is_some()),
         has_rlm: false,
     };
     if !eligibility.is_eligible_on(metering::calendar::local_day(now)) {
@@ -219,10 +251,204 @@ fn check_modul3(settings: &Settings, now: time::OffsetDateTime) -> Result<(), St
     }
 }
 
+/// Whether the house the planner is about to be given is a house it can plan.
+///
+/// Two checks, both on mechanisms that existed and were exercised by nothing but
+/// their own unit tests, and both about the *building* rather than the wiring —
+/// which is why they belong here beside the driver mismatches rather than in the
+/// planner, where the answer would arrive once every five minutes for ever.
+///
+/// # The discretisation has to be a contraction
+///
+/// D17 rests on it: the exact zero-order hold is a contraction at **any** step
+/// size, where explicit Euler at a quarter-hour step gives the air node's
+/// eigenvalue the wrong sign and rings — and is only conditionally stable, with
+/// nothing checking the condition. [`Rc2Discrete::is_contraction`] is that
+/// property, and until now it was asserted in a unit test against
+/// `Rc2::house()` and never against the building a box was actually given. It
+/// cannot fail for physically valid parameters, which is exactly why checking
+/// it is cheap and why a failure means the parameters are not physical.
+///
+/// # And the heat pump has to be able to heat the house
+///
+/// [`Rc2::steady_state_heat_kw`] is, in its own words, "the number that says
+/// whether a heat pump is big enough for the house at all", and nothing asked
+/// it. An undersized unit is **not** a refusal: it is a comfort problem the
+/// planner already prices through the discomfort band, a bivalent system with a
+/// Heizstab is an ordinary German fitting, and a box that would not start
+/// because a cold snap might be uncomfortable would be refusing to manage the
+/// household that needs managing most. So it is said once, loudly, at start-up —
+/// where an installer is standing in front of it — with the heating rod counted
+/// in, because that is what the unit can actually deliver.
+fn check_the_physics(
+    site: &crate::config::SiteSettings,
+    household: &Household,
+) -> Result<(), StartError> {
+    use hems_core::prelude::{Asset, Rc2};
+
+    let building = Rc2::house();
+    // The planner's own step, which is the quarter hour every price, every
+    // register and every plan in this workspace is written in.
+    let step = hems_core::prelude::SLOT;
+    if !building.discretise(step).is_contraction() {
+        return Err(StartError::Physics(format!(
+            "the building model does not contract over a {} minute step, so the \
+             planner's own temperature predictions would diverge — check the \
+             thermal parameters",
+            step.whole_minutes()
+        )));
+    }
+
+    // What it takes to hold the bottom of the comfort band at the design
+    // outdoor temperature. `NORM_AUSSENTEMPERATUR_C` is the conservative end of
+    // DIN EN 12831-1's German range; the exact figure is per location and an
+    // installer who has it can read this warning against their own.
+    let Some(heat_pump) = household
+        .heat_pump
+        .as_ref()
+        .and_then(|id| household.site.asset(id))
+    else {
+        return Ok(());
+    };
+    let Asset::HeatPump(unit) = heat_pump else {
+        return Ok(());
+    };
+    let needed = building.steady_state_heat_kw(site.comfort_min_c, NORM_AUSSENTEMPERATUR_C);
+    // Electrical, through the coefficient of performance the unit would have at
+    // that temperature — a 5 kW unit at a COP of 2,4 delivers 12 kW of heat.
+    let cop = hems_core::prelude::CopCurve::air_source().at(NORM_AUSSENTEMPERATUR_C);
+    let deliverable = unit.group_power().kw() * cop;
+    if deliverable < needed {
+        tracing::warn!(
+            needed_kw = format!("{needed:.1}"),
+            deliverable_kw = format!("{deliverable:.1}"),
+            outdoor_c = NORM_AUSSENTEMPERATUR_C,
+            "this heat pump cannot hold the comfort band at the design outdoor \
+             temperature, heating rod included — the plan will be honest about it \
+             and price the shortfall as discomfort, but the house will be cold on \
+             the coldest days"
+        );
+    }
+    Ok(())
+}
+
+/// The design outdoor temperature the heating check is made at, °C.
+///
+/// −12 °C is the conservative end of the German range in DIN EN 12831-1: the
+/// per-location Norm-Außentemperatur runs from about −10 on the coast to −16 in
+/// the Alps. A single figure is right for a *warning* — an installer with the
+/// table for their postcode can read the two numbers against their own — and
+/// wrong for anything that refused to start.
+const NORM_AUSSENTEMPERATUR_C: f64 = -12.0;
+
+/// The `direction` column a § 14a failsafe is stored under.
+///
+/// A literal in one place rather than at the two call sites: a box that wrote
+/// its failsafe under one spelling and looked for it under another would look,
+/// from every screen, exactly like a box no operator had ever written to.
+pub(crate) const FAILSAFE_CONSUMPTION: &str = "consumption";
+
+/// [`assemble`], with the box's own record behind a lock.
+///
+/// # Errors
+/// [`StartError`], as [`assemble`].
+async fn assembled(
+    settings: &Settings,
+    store: Option<&Arc<Mutex<crate::store::Store>>>,
+    now: time::OffsetDateTime,
+) -> Result<Running, StartError> {
+    let kept = match store {
+        Some(store) => Some(store.lock().await),
+        None => None,
+    };
+    assemble(settings, kept.as_deref(), now)
+}
+
+/// A device read through the vendor's own register map.
+///
+/// Split out because it is the one driver whose whole configuration is a *list*
+/// — every other kind takes an address and a handful of scalars — and the list
+/// is what an installer transcribes from a PDF.
+fn register_map(
+    settings: &crate::config::RegisterSettings,
+    asset: AssetId,
+) -> Result<Box<dyn hems_drv::Driver + Send>, StartError> {
+    let millis = |ms: u64, fallback: i64| {
+        time::Duration::milliseconds(i64::try_from(ms).unwrap_or(fallback))
+    };
+    let driver = hems_drv::modbus::registers::Registers::new(
+        asset,
+        settings.unit,
+        hems_drv::modbus::Cadence {
+            poll: millis(settings.poll_ms, 1_000),
+            timeout: millis(settings.timeout_ms, 5_000),
+        },
+        settings.points.clone(),
+    )
+    .map_err(|e| StartError::Driver {
+        asset: settings.asset.clone(),
+        detail: e.to_string(),
+    })?;
+    Ok(Box::new(driver))
+}
+
+/// The failsafe a Controllable System comes up holding.
+///
+/// What the operator wrote wins over what the file says, because `[LPC-021]`
+/// makes this theirs to change and §2.15 of the implementation guide makes
+/// accepting the change mandatory. A box that came back from a power cut on its
+/// own configuration would have quietly undone it —
+/// `ATC_LPC_COM_PT_CSInit_003`, and a household restrained to the wrong number
+/// with nobody talking to it.
+fn failsafe_in_force(
+    kept: Option<&crate::store::Store>,
+    configured: Power,
+    configured_for: std::time::Duration,
+) -> (Power, std::time::Duration) {
+    let written = kept.and_then(|store| match store.eebus_failsafe(FAILSAFE_CONSUMPTION) {
+        Ok(found) => found,
+        Err(error) => {
+            tracing::warn!(%error, "the operator's failsafe could not be read");
+            None
+        }
+    });
+    let Some(written) = written else {
+        return (configured, configured_for);
+    };
+    tracing::info!(
+        watts = written.watts,
+        seconds = written.minimum_s,
+        "the failsafe the network operator wrote is back in force"
+    );
+    (
+        Power::new(written.watts),
+        std::time::Duration::from_secs(written.minimum_s.unsigned_abs()),
+    )
+}
+
+/// How this box names itself to an EEBUS peer.
+///
+/// One SPINE device address for every dialled device, because the SKI follows
+/// the key: a box that named itself differently per driver would be several
+/// devices on its own network, all but one of which an installer has never been
+/// shown (D136).
+fn spine_identity(vendor: Option<&str>, unique: Option<&str>) -> hems_drv::eebus::SpineIdentity {
+    let default = hems_drv::eebus::SpineIdentity::default();
+    hems_drv::eebus::SpineIdentity {
+        vendor: vendor.map_or(default.vendor, str::to_owned),
+        unique: unique.map_or(default.unique, str::to_owned),
+    }
+}
+
 /// One configured driver, built.
+///
+/// `kept` is what a network operator has already written to this box and the
+/// box wrote down — today only the § 14a failsafe, which is the one value in
+/// the exchange that has to survive a power cut.
 fn build_driver(
     settings: &DriverSettings,
     site: &Site,
+    kept: Option<&crate::store::Store>,
     now: time::OffsetDateTime,
 ) -> Result<Box<dyn hems_drv::Driver + Send>, StartError> {
     let asset = |name: &str| {
@@ -254,7 +480,7 @@ fn build_driver(
             // `[A1 4.5.2]`'s minimum grows with the number of controllable
             // devices, so a vendor's flat 4,2 kW on a household owed 10,5 kW
             // gives away six kilowatts nobody asked it to.
-            let failsafe = s.failsafe_kw.map_or_else(
+            let configured = s.failsafe_kw.map_or_else(
                 || {
                     hems_grid::para14a::minimum_power(
                         &hems_grid::classify_at(&site.assets, now),
@@ -264,21 +490,17 @@ fn build_driver(
                 },
                 Power::from_kw,
             );
-            let identity = hems_drv::eebus::SpineIdentity {
-                vendor: s
-                    .spine_vendor
-                    .clone()
-                    .unwrap_or_else(|| hems_drv::eebus::SpineIdentity::default().vendor),
-                unique: s
-                    .spine_unique
-                    .clone()
-                    .unwrap_or_else(|| hems_drv::eebus::SpineIdentity::default().unique),
-            };
+            let (failsafe, failsafe_for) = failsafe_in_force(
+                kept,
+                configured,
+                std::time::Duration::from_secs(s.failsafe_hours.saturating_mul(3600)),
+            );
+            let identity = spine_identity(s.spine_vendor.as_deref(), s.spine_unique.as_deref());
             let driver = hems_drv::eebus::Lpc::with_identity(
                 asset(&s.asset)?,
                 hems_drv::eebus::Use::Lpc,
                 failsafe,
-                std::time::Duration::from_secs(s.failsafe_hours.saturating_mul(3600)),
+                failsafe_for,
                 now,
                 &identity,
             )
@@ -286,6 +508,34 @@ fn build_driver(
                 asset: s.asset.clone(),
                 detail: e.to_string(),
             })?;
+            Ok(Box::new(driver))
+        }
+        DriverSettings::EebusEv(s) => {
+            let identity = spine_identity(s.spine_vendor.as_deref(), s.spine_unique.as_deref());
+            let driver = hems_drv::eebus_ev::EvCharger::new(asset(&s.asset)?, now, &identity)
+                .map_err(|e| StartError::Driver {
+                    asset: s.asset.clone(),
+                    detail: e.to_string(),
+                })?;
+            Ok(Box::new(driver))
+        }
+        DriverSettings::EebusDhw(s) => {
+            let identity = spine_identity(s.spine_vendor.as_deref(), s.spine_unique.as_deref());
+            let driver = hems_drv::eebus_dhw::DhwTank::new(asset(&s.asset)?, now, &identity)
+                .map_err(|e| StartError::Driver {
+                    asset: s.asset.clone(),
+                    detail: e.to_string(),
+                })?;
+            Ok(Box::new(driver))
+        }
+        DriverSettings::Registers(s) => register_map(s, asset(&s.asset)?),
+        DriverSettings::EebusHeatPump(s) => {
+            let identity = spine_identity(s.spine_vendor.as_deref(), s.spine_unique.as_deref());
+            let driver = hems_drv::eebus_heat_pump::HeatPump::new(asset(&s.asset)?, now, &identity)
+                .map_err(|e| StartError::Driver {
+                    asset: s.asset.clone(),
+                    detail: e.to_string(),
+                })?;
             Ok(Box::new(driver))
         }
     }
@@ -299,7 +549,15 @@ fn build_driver(
 fn transport_address(settings: &DriverSettings) -> Option<String> {
     match settings {
         DriverSettings::Sunspec(s) => Some(s.address.clone()),
-        DriverSettings::EebusLpc(_) => None,
+        DriverSettings::Registers(s) => Some(s.address.clone()),
+        // Both EEBUS kinds, and for the same reason in opposite directions: the
+        // session is TLS with mutual authentication under a WebSocket under a
+        // SHIP handshake, and it is `runtime::ship`'s rather than the
+        // byte-pump's — whether this box accepts it or opens it.
+        DriverSettings::EebusLpc(_)
+        | DriverSettings::EebusDhw(_)
+        | DriverSettings::EebusEv(_)
+        | DriverSettings::EebusHeatPump(_) => None,
     }
 }
 
@@ -316,7 +574,20 @@ pub async fn run(
     shutdown: &Shutdown,
 ) -> anyhow::Result<Running> {
     let now = time::OffsetDateTime::now_utc();
-    let mut running = assemble(settings, now)?;
+
+    // The box's own store, where its two years and its learning live. Opening it
+    // is allowed to fail loudly: a household configured for a record it cannot
+    // keep is one whose Nachweis will be missing on the day it is asked for.
+    //
+    // Before the drivers, because one of them needs it: the § 14a failsafe the
+    // network operator wrote is kept here, and a Controllable System built from
+    // the configuration file alone would come back from a power cut having
+    // undone it.
+    let store = match &settings.store_path {
+        Some(path) => Some(Arc::new(Mutex::new(crate::store::Store::open(path)?))),
+        None => None,
+    };
+    let mut running = assembled(settings, store.as_ref(), now).await?;
 
     if settings.drivers.is_empty() {
         // Not an error and not a silence. A box with no drivers keeps the house
@@ -329,7 +600,7 @@ pub async fn run(
         );
     }
 
-    let eebus_asset = start_drivers(settings, &running, health, shutdown)?;
+    let sessions = start_drivers(settings, &running, health, shutdown)?;
 
     // Named once, here, rather than warned about on every tick. A controllable
     // device with no driver is one the arbiter will decide a setpoint for all
@@ -348,16 +619,24 @@ pub async fn run(
         );
     }
 
-    // The box's own store, where its two years and its learning live. Opening it
-    // is allowed to fail loudly: a household configured for a record it cannot
-    // keep is one whose Nachweis will be missing on the day it is asked for.
-    let store = match &settings.store_path {
-        Some(path) => Some(Arc::new(Mutex::new(crate::store::Store::open(path)?))),
-        None => None,
-    };
-    if let Some(asset) = eebus_asset {
-        running.ski =
-            Some(start_ship(settings, &running, store.as_ref(), asset, health, shutdown).await?);
+    // One identity for both directions. The SKI follows the key, and a box that
+    // dialled a heat pump under a second key would be two devices on its own
+    // network — one of which an installer has never been shown.
+    if sessions.listening.is_some() || !sessions.dialled.is_empty() {
+        let now = time::OffsetDateTime::now_utc();
+        let (node, ski, key_pem) = ship::identity(&settings.ship, store.as_ref(), now).await?;
+        let node = Arc::new(node);
+        if let Some(on) = sessions.listening.clone() {
+            start_ship(settings, &running, &node, ski, on, health, shutdown).await?;
+        }
+        start_dialled(settings, &running, &node, &sessions.dialled, shutdown)?;
+        running.ski = Some(ski.to_display_string());
+        running.trust = Some(ship::Trust::new(
+            Arc::clone(&node),
+            store.clone(),
+            settings.ship.ship_id.clone(),
+            key_pem,
+        ));
     }
 
     let overrides = overrides::Overrides::new();
@@ -392,35 +671,45 @@ pub async fn run(
         }
     }
 
-    tokio::spawn(control::run(
-        control::Managed {
-            site: running.household.site.clone(),
-            grid_meter: Some(running.household.grid_meter.clone()),
-            undriven,
-            // `[A1 4.4.b]`: hems is an energy management system, so the operator
-            // addresses everything behind it with one number rather than each
-            // device on its own. The evidence record has to state which, because
-            // the minimum a reduction may not go below depends on it.
-            control_mode: hems_grid::para14a::ControlMode::Ems,
-            pv: running.household.pv.clone(),
-            battery: running.household.battery.clone(),
-            evse: running.household.evse.clone(),
-            modelled_pv: published.modelled_pv.clone(),
-            bands: published.bands.clone(),
-        },
-        control::Live {
-            registry: Arc::clone(&running.registry),
-            status: Arc::clone(&running.status),
-            plan,
-            prices,
-            learned,
-            store,
-            overrides: overrides.clone(),
-        },
-        settings.control.clone(),
-        health.clone(),
+    // The one task this box cannot do its job without. A control loop that has
+    // panicked leaves a process answering every request and managing nothing —
+    // no guard, no arbiter, no evidence record — and `/livez` is what an
+    // orchestrator restarts on.
+    health.vital(
+        "control",
         shutdown.clone(),
-    ));
+        control::run(
+            control::Managed {
+                site: running.household.site.clone(),
+                grid_meter: Some(running.household.grid_meter.clone()),
+                undriven,
+                // `[A1 4.4.b]`: hems is an energy management system, so the operator
+                // addresses everything behind it with one number rather than each
+                // device on its own. The evidence record has to state which, because
+                // the minimum a reduction may not go below depends on it.
+                control_mode: hems_grid::para14a::ControlMode::Ems,
+                pv: running.household.pv.clone(),
+                battery: running.household.battery.clone(),
+                evse: running.household.evse.clone(),
+                heat_pump: running.household.heat_pump.clone(),
+                modelled_pv: published.modelled_pv.clone(),
+                outdoor: published.outdoor.clone(),
+                bands: published.bands.clone(),
+            },
+            control::Live {
+                registry: Arc::clone(&running.registry),
+                status: Arc::clone(&running.status),
+                plan,
+                prices,
+                learned,
+                store,
+                overrides: overrides.clone(),
+            },
+            settings.control.clone(),
+            health.clone(),
+            shutdown.clone(),
+        ),
+    );
 
     Ok(running)
 }
@@ -436,10 +725,11 @@ fn start_drivers(
     running: &Running,
     health: &Health,
     shutdown: &Shutdown,
-) -> Result<Option<AssetId>, StartError> {
+) -> Result<Sessions, StartError> {
     let mut unreachable = Vec::new();
+    let mut dialled = Vec::new();
     let mut eebus_asset = None;
-    for driver in &settings.drivers {
+    for (driver, id) in settings.drivers.iter().zip(running.drivers.iter().copied()) {
         let asset = AssetId::new(driver.asset()).map_err(|e| StartError::Driver {
             asset: driver.asset().to_string(),
             detail: e.to_string(),
@@ -447,14 +737,24 @@ fn start_drivers(
         if let Some(address) = transport_address(driver) {
             tokio::spawn(transport::tcp(
                 Arc::clone(&running.registry),
-                asset,
+                Attached { driver: id, asset },
                 address,
                 shutdown.clone(),
             ));
         } else if matches!(driver, DriverSettings::EebusLpc(_)) && settings.ship.listen.is_some() {
             // The § 14a session. Started once, below, because the identity has
             // to be created before anything can accept on it.
-            eebus_asset = Some(asset);
+            eebus_asset = Some(Attached { driver: id, asset });
+        } else if matches!(
+            driver,
+            DriverSettings::EebusDhw(_)
+                | DriverSettings::EebusEv(_)
+                | DriverSettings::EebusHeatPump(_)
+        ) {
+            // Dialled rather than accepted, and started with the § 14a session
+            // for the same reason: it needs the box's own identity, which is
+            // created once.
+            dialled.push(Attached { driver: id, asset });
         } else {
             // Still given its clock. Every transition out of the LPC machine's
             // first state is a timer, so a Controllable System nobody ticks sits
@@ -463,7 +763,7 @@ fn start_drivers(
             // it is not really in. See `transport::clock_only`.
             tokio::spawn(transport::clock_only(
                 Arc::clone(&running.registry),
-                asset.clone(),
+                id,
                 shutdown.clone(),
             ));
             unreachable.push(asset);
@@ -488,7 +788,22 @@ fn start_drivers(
              reduction could not arrive",
         );
     }
-    Ok(eebus_asset)
+    Ok(Sessions {
+        listening: eebus_asset,
+        dialled,
+    })
+}
+
+/// The EEBUS sessions that could not be started with the other transports.
+///
+/// Both need the box's own identity, which is created once and after the
+/// drivers are registered: a key that a driver had already used would be a
+/// second identity on the same box.
+struct Sessions {
+    /// The § 14a Controllable System, where one is configured with a listener.
+    listening: Option<Attached>,
+    /// Devices on the household's own network this box dials.
+    dialled: Vec<Attached>,
 }
 
 /// Start the § 14a session: the box's own identity, a listener, and the task
@@ -500,13 +815,12 @@ fn start_drivers(
 async fn start_ship(
     settings: &Settings,
     running: &Running,
-    store: Option<&Arc<Mutex<crate::store::Store>>>,
-    asset: AssetId,
+    node: &Arc<eebus::runtime::Node>,
+    ski: eebus::ship::Ski,
+    on: Attached,
     health: &Health,
     shutdown: &Shutdown,
-) -> anyhow::Result<String> {
-    let now = time::OffsetDateTime::now_utc();
-    let (node, ski) = ship::identity(&settings.ship, store, now).await?;
+) -> anyhow::Result<()> {
     let address = settings.ship.listen.clone().unwrap_or_default();
     let listener = node
         .listen(&address)
@@ -524,13 +838,63 @@ async fn start_ship(
     );
     health.bad("grid", "no Steuerbox has connected yet");
     tokio::spawn(ship::run(
-        node,
+        Arc::clone(node),
         listener,
         Arc::clone(&running.registry),
-        asset,
+        on,
+        settings.ship.clone(),
+        ski,
         shutdown.clone(),
     ));
-    Ok(ski.to_display_string())
+    Ok(())
+}
+
+/// Start one dialling task per EEBUS device on the household's own network.
+///
+/// The § 14a session is the one this box *accepts*; these are the ones it opens.
+/// They share the box's identity, because the SKI follows the key and a box that
+/// dialled under a second one would be two devices on its own network — one of
+/// which an installer has never been shown.
+fn start_dialled(
+    settings: &Settings,
+    running: &Running,
+    node: &Arc<eebus::runtime::Node>,
+    assets: &[Attached],
+    shutdown: &Shutdown,
+) -> anyhow::Result<()> {
+    for driver in &settings.drivers {
+        let (name, address, ski) = match driver {
+            DriverSettings::EebusDhw(s) => (&s.asset, &s.address, &s.ski),
+            DriverSettings::EebusEv(s) => (&s.asset, &s.address, &s.ski),
+            DriverSettings::EebusHeatPump(s) => (&s.asset, &s.address, &s.ski),
+            _ => continue,
+        };
+        let asset = AssetId::new(name).map_err(|e| StartError::Driver {
+            asset: name.clone(),
+            detail: e.to_string(),
+        })?;
+        let Some(on) = assets.iter().find(|a| a.asset == asset) else {
+            continue;
+        };
+        let peer: eebus::ship::Ski = ski
+            .parse()
+            .map_err(|_| ship::ShipError::NotASki(ski.clone()))?;
+        tracing::info!(
+            %address,
+            peer = %peer.to_display_string(),
+            %asset,
+            "dialling an EEBUS device"
+        );
+        tokio::spawn(ship::dial(
+            Arc::clone(node),
+            address.clone(),
+            peer,
+            Arc::clone(&running.registry),
+            on.clone(),
+            shutdown.clone(),
+        ));
+    }
+    Ok(())
 }
 
 /// Start the planning loop, where the box has anything to plan against.
@@ -563,6 +927,10 @@ async fn start_planner(
         // What the box forecast, kept so it can score itself once each slot has
         // happened (D117).
         bands: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
+        // The outdoor temperature the plan was made against, so the control
+        // loop teaches the building from the same series (D117 again, for the
+        // house rather than the roof).
+        outdoor: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
     };
     // What the box remembered from before it was restarted. A fortnight of
     // observations is what makes a forecast worth having, and relearning it
@@ -598,6 +966,13 @@ async fn start_planner(
             tariff: settings.tariff.clone(),
             control: settings.control.clone(),
             wear_eur_per_kwh: settings.site.battery_wear_eur_per_kwh,
+            // The one charge point that can say whether a car is on it. A
+            // second would be two departure times for one household, and a
+            // household has one car park rather than one per driver.
+            charging: settings.drivers.iter().find_map(|d| match d {
+                DriverSettings::EebusEv(s) => Some(s.clone()),
+                _ => None,
+            }),
         },
         Arc::clone(&running.registry),
         fleet,
@@ -744,5 +1119,56 @@ mod tests {
         let mut settings = on_modul_3(Some(calendar()));
         settings.site.imsys_since = None;
         assert!(check_modul3(&settings, NOW).is_err());
+    }
+}
+
+#[cfg(test)]
+mod physics_tests {
+    use super::*;
+    use crate::config::SiteSettings;
+
+    #[test]
+    fn the_reference_household_passes_its_own_physics_check() {
+        // A gate that refuses everything is not a gate, and a gate that accepts
+        // everything is not one either — so the pair is the test.
+        let settings = SiteSettings::default();
+        let household = Household::build(&settings.household().unwrap()).unwrap();
+        assert!(check_the_physics(&settings, &household).is_ok());
+    }
+
+    #[test]
+    fn the_discretisation_the_planner_would_use_is_a_contraction() {
+        // D17's property, checked against the building a box is actually given
+        // rather than only against `Rc2::house()` in a unit test. It is what
+        // makes the exact zero-order hold safe at a quarter-hour step where
+        // explicit Euler gives the air node's eigenvalue the wrong sign, rings
+        // after every change of heat input, and diverges outright at a flat's
+        // air capacity.
+        let step = hems_core::prelude::SLOT;
+        assert!(
+            hems_core::prelude::Rc2::house()
+                .discretise(step)
+                .is_contraction()
+        );
+        // …and at every other step size, which is the half explicit Euler does
+        // not have. A contraction at one step and not another would be a
+        // conditional stability nothing checks.
+        for minutes in [1_i64, 5, 15, 60, 240] {
+            let d = hems_core::prelude::Rc2::house().discretise(time::Duration::minutes(minutes));
+            assert!(d.is_contraction(), "not a contraction at {minutes} minutes");
+        }
+    }
+
+    #[test]
+    fn a_household_with_no_heat_pump_has_no_heating_to_check() {
+        // The check reads the *asset*, so a household that declared none has
+        // nothing to warn about rather than a zero-kilowatt unit that fails.
+        let settings = SiteSettings {
+            heat_pump_kw: 0.0,
+            ..SiteSettings::default()
+        };
+        let household = Household::build(&settings.household().unwrap()).unwrap();
+        assert!(household.heat_pump.is_none());
+        assert!(check_the_physics(&settings, &household).is_ok());
     }
 }

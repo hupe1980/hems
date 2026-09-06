@@ -38,6 +38,7 @@
 
 mod decode;
 pub mod frame;
+pub mod registers;
 mod scan;
 
 pub use scan::{Discovery, ModelMap};
@@ -140,7 +141,16 @@ pub(crate) enum Purpose {
     /// Reading the models that carry a measurement.
     Poll { id: u16, address: u16 },
     /// Writing a curtailment setpoint.
-    Curtail,
+    Curtail { address: u16, wanted: u16 },
+    /// Reading back a curtailment setpoint the device has just accepted.
+    ///
+    /// A Modbus write response echoes the address and the quantity and **not
+    /// the values**, so "accepted" means the frame was well formed and nothing
+    /// more. A device that clipped the percentage to its own range, or that
+    /// took `WMaxLimPct` and left `WMaxLim_Ena` at zero, answers a write
+    /// exactly as one that obeyed. The only way to know which happened is to
+    /// read the registers back.
+    Readback { address: u16, wanted: u16 },
 }
 
 impl SunSpec {
@@ -220,7 +230,11 @@ impl SunSpec {
         self.outbox.push(Request {
             transaction,
             unit: self.unit,
-            body: RequestBody::Read { address, count },
+            body: RequestBody::Read {
+                space: frame::Space::Holding,
+                address,
+                count,
+            },
         });
         self.pending = Some(Pending {
             transaction,
@@ -328,6 +342,9 @@ impl Driver for SunSpec {
     /// replaced inverter, a Modbus gateway that renumbered its units, a DHCP
     /// lease that moved. Walking the chain again costs three reads.
     fn on_link(&mut self, state: LinkState, now: OffsetDateTime) {
+        if let Some(p) = self.pending.clone() {
+            self.abandon_command(p.purpose, "the link went before it was answered", now);
+        }
         self.inbox.clear();
         self.outbox.clear();
         self.pending = None;
@@ -354,6 +371,7 @@ impl Driver for SunSpec {
         if let Some(p) = self.pending.clone()
             && now - p.at >= self.cadence.timeout
         {
+            self.abandon_command(p.purpose, "the device did not answer", now);
             self.pending = None;
             self.partial = None;
             if self.link != LinkState::Stale {
@@ -384,18 +402,20 @@ impl Driver for SunSpec {
             ));
         };
         let transaction = self.transaction();
+        let address = write.address;
+        let wanted = write.values[0];
         self.outbox.push(Request {
             transaction,
             unit: self.unit,
             body: RequestBody::Write {
-                address: write.address,
+                address,
                 values: write.values,
             },
         });
         self.pending = Some(Pending {
             transaction,
             at: now,
-            purpose: Purpose::Curtail,
+            purpose: Purpose::Curtail { address, wanted },
         });
         Ok(())
     }
@@ -443,6 +463,21 @@ impl SunSpec {
         self.pending = None;
 
         match (&pending.purpose, &response.body) {
+            // A device that refuses the write, or refuses to be read back, has
+            // not been curtailed. It is a *command* answer and not a discovery
+            // one: routing it through `refused` would end the model walk on the
+            // strength of an inverter that simply does not accept a setpoint.
+            (
+                Purpose::Curtail { .. } | Purpose::Readback { .. },
+                ResponseBody::Exception { code, .. },
+            ) => {
+                self.events.push(DriverEvent::Command(CommandOutcome {
+                    accepted: false,
+                    confirmed: None,
+                    at: now,
+                    detail: Some(format!("the device refused it, exception {code}")),
+                }));
+            }
             // An exception while walking is how a device says "no model there".
             (_, ResponseBody::Exception { .. }) => {
                 self.discovery.refused(pending.purpose, &mut self.models);
@@ -459,18 +494,100 @@ impl SunSpec {
                 }
                 self.models.advance_poll();
             }
-            (Purpose::Curtail, ResponseBody::WriteAccepted { .. }) => {
-                self.events.push(DriverEvent::Command(CommandOutcome {
-                    accepted: true,
-                    confirmed: None,
-                    at: now,
-                    detail: None,
-                }));
+            (Purpose::Curtail { address, wanted }, ResponseBody::WriteAccepted { .. }) => {
+                // Nothing is reported yet. The write went out well formed,
+                // which is all this answer says; the outcome is what comes back
+                // off the registers.
+                let (address, wanted) = (*address, *wanted);
+                self.read(
+                    address,
+                    CURTAIL_REGISTERS,
+                    Purpose::Readback { address, wanted },
+                    now,
+                );
+            }
+            (Purpose::Readback { wanted, .. }, ResponseBody::Registers(regs)) => {
+                let outcome = self.readback(*wanted, regs, now);
+                self.events.push(DriverEvent::Command(outcome));
             }
             _ => {}
         }
     }
+
+    /// Report a curtailment that will never be answered, and nothing otherwise.
+    ///
+    /// A command whose answer never arrives is not a command that succeeded,
+    /// and it is not one that is still in flight either — the request has been
+    /// dropped. Saying so is what keeps `[A1 7.2]` a record of what was
+    /// commanded *and confirmed*: silence at this seam reaches the evidence as
+    /// a ceiling that was issued and never contradicted, which reads as
+    /// compliance. A discovery read that goes unanswered is a different thing
+    /// and stays where it is, in the link state.
+    fn abandon_command(&mut self, purpose: Purpose, why: &str, now: OffsetDateTime) {
+        if matches!(purpose, Purpose::Curtail { .. } | Purpose::Readback { .. }) {
+            self.events.push(DriverEvent::Command(CommandOutcome {
+                accepted: false,
+                confirmed: None,
+                at: now,
+                detail: Some(why.to_owned()),
+            }));
+        }
+    }
+
+    /// What the device says it will actually do, read off its own registers.
+    ///
+    /// Two things can have gone wrong and neither shows in the write answer.
+    /// The device may have **clipped** the percentage — an inverter with a
+    /// minimum curtailment step, or one that refuses to go below some floor —
+    /// which is a smaller reduction than the guard commanded and a number the
+    /// plan needs. Or it may have taken `WMaxLimPct` and left `WMaxLim_Ena` at
+    /// zero, which is the classic way to curtail nothing at all and believe
+    /// otherwise: the setpoint is stored, the limit is not in force, and every
+    /// layer above reports a compliant house until the meter disagrees.
+    ///
+    /// A short answer is not read optimistically. A device that returned fewer
+    /// registers than the model has is one whose enable flag was not in the
+    /// reply, and assuming it is set would be inventing the confirmation this
+    /// whole exchange exists to obtain.
+    fn readback(&self, wanted: u16, regs: &[u16], now: OffsetDateTime) -> CommandOutcome {
+        let Some((&percent, &enabled)) = regs.first().zip(regs.get(ENABLE_OFFSET)) else {
+            return CommandOutcome {
+                accepted: false,
+                confirmed: None,
+                at: now,
+                detail: Some(format!(
+                    "the read-back returned {} registers, too few to see WMaxLim_Ena",
+                    regs.len()
+                )),
+            };
+        };
+        let in_force = enabled == 1;
+        let confirmed = self
+            .models
+            .rating()
+            .map(|rating| Power::new(rating.get() * f64::from(percent) / 100.0));
+        let detail = if !in_force {
+            Some("WMaxLimPct was stored but WMaxLim_Ena reads 0: the limit is not in force".into())
+        } else if percent != wanted {
+            Some(format!("the device clipped {wanted} % to {percent} %"))
+        } else {
+            None
+        };
+        CommandOutcome {
+            accepted: in_force,
+            confirmed,
+            at: now,
+            detail,
+        }
+    }
 }
+
+/// How many registers a curtailment occupies: `WMaxLimPct` through
+/// `WMaxLim_Ena`.
+const CURTAIL_REGISTERS: u16 = 5;
+
+/// Where `WMaxLim_Ena` sits in them.
+const ENABLE_OFFSET: usize = 4;
 
 /// A curtailment write, resolved to registers.
 #[derive(Debug, Clone, PartialEq, Eq)]

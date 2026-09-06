@@ -79,6 +79,7 @@ fn prices(h: Horizon, ct: &[i64]) -> PriceStack {
         feed_in: FeedIn::eeg(Decimal::new(4, 0))
             .under_para51_from(Some(time::macros::date!(2020 - 01 - 01))),
         sharing: None,
+        carbon_g_per_kwh: BTreeMap::new(),
         standing_charge_eur_per_year: Decimal::ZERO,
     };
     PriceStack::build(&tariff, h)
@@ -368,12 +369,21 @@ fn a_backup_reserve_is_never_planned_away() {
     }
 }
 
+/// A household that has forbidden grid charging never has the meter running
+/// while the battery fills.
+///
+/// The house draws 600 W under a 1 kW roof, so there is 400 W of surplus and
+/// electricity is cheap enough that a battery allowed to would fill from the
+/// grid. The old formulation was `b_ch ≤ pv`, which this passes with 1 kW into
+/// the battery and 600 W bought from the supplier — every watt-hour of it grey,
+/// and the household's Ausschließlichkeit spent. What the setting means is
+/// `min(import, charge) = 0`, and that is what is asserted.
 #[test]
-fn a_battery_barred_from_the_grid_only_takes_what_the_roof_makes() {
+fn a_battery_barred_from_the_grid_never_charges_while_the_meter_runs() {
     let h = horizon(4);
     let p = prices(h, &[5]);
     let pv = flat(h, 1000.0);
-    let load = flat(h, 0.0);
+    let load = flat(h, 600.0);
     let mut b = battery(20.0, 0.1, 0.0);
     b.grid_charging_allowed = false;
     let solved = solve(
@@ -382,13 +392,50 @@ fn a_battery_barred_from_the_grid_only_takes_what_the_roof_makes() {
         T0,
     )
     .unwrap();
+    let mut charged = Power::ZERO;
     for (i, f) in solved.flows.iter().enumerate() {
+        let both = f.battery_charge.min(f.grid_import);
         assert!(
-            f.battery_charge <= Power::new(1000.0) + Power::new(1e-6),
-            "slot {i} charged {} from a 1 kW roof",
+            both <= Power::new(1e-6),
+            "slot {i} imported {} while charging {}",
+            f.grid_import,
             f.battery_charge
         );
+        charged += f.battery_charge;
     }
+    // …and it still uses the surplus it has, or the constraint would be
+    // satisfied by a plan that simply never charges.
+    assert!(
+        charged > Power::new(100.0),
+        "the surplus was there and none of it reached the battery"
+    );
+}
+
+/// The same household with the setting off charges from wherever is cheapest.
+///
+/// The other half of the pair: without it, a constraint that forbade grid
+/// charging for *everybody* would pass the test above and nothing would say so.
+#[test]
+fn a_battery_allowed_the_grid_fills_from_it_when_it_is_cheap() {
+    let h = horizon(4);
+    // Two cheap quarter hours and two dear ones, so filling the store from the
+    // supplier pays for the round trip and the wear.
+    let p = prices(h, &[2, 2, 60, 60]);
+    let pv = flat(h, 1000.0);
+    let load = flat(h, 600.0);
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load).with_battery(battery(20.0, 0.1, 0.0)),
+        &names(),
+        T0,
+    )
+    .unwrap();
+    assert!(
+        solved
+            .flows
+            .iter()
+            .any(|f| f.battery_charge.min(f.grid_import) > Power::new(1.0)),
+        "nothing ever charged while importing, so the setting decides nothing"
+    );
 }
 
 #[test]
@@ -2186,6 +2233,7 @@ fn prices_in_community(h: Horizon, ct: &[i64], community_ct: i64) -> PriceStack 
             community_ct,
             0,
         ))),
+        carbon_g_per_kwh: BTreeMap::new(),
         standing_charge_eur_per_year: Decimal::ZERO,
     };
     PriceStack::build(&tariff, h)
@@ -2361,6 +2409,7 @@ fn legacy_prices(h: Horizon, spot_ct: i64, feed_in_ct: i64) -> PriceStack {
         // exactly the household this test is about.
         feed_in: FeedIn::eeg(Decimal::new(feed_in_ct, 0)),
         sharing: None,
+        carbon_g_per_kwh: BTreeMap::new(),
         standing_charge_eur_per_year: Decimal::ZERO,
     };
     PriceStack::build(&tariff, h)

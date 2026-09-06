@@ -122,6 +122,16 @@ do is turn into a load while the others spend the headroom it created.
 On the reference January evening that is 5,4 kWh of headroom, and the difference
 between a car that leaves full and one that does not.
 
+The same three tests run the other way for § 9 EEG, whose ceiling is on what
+*leaves* rather than on what is drawn. The household's own consumption is
+headroom there — § 9 Abs. 2 measures at the Verknüpfungspunkt — and the guard
+lends it to the inverter, minus the part it could not call back before its next
+tick: a draw it is commanding away this second, a draw it only guessed from a
+nameplate, and the share of a thermostat's draw that `lend_window` says is longer
+than one control period away. A heat pump answering its own safety limit drops a
+kilowatt nobody asked it to, and until this rule existed that kilowatt was
+already spent on the roof.
+
 Two further readings go the conservative way, and both are places where the
 tempting default is the unsafe one:
 
@@ -247,6 +257,18 @@ it has a test named after it. The machine itself lives in the
 it rather than tracking one alongside — see [devices and
 drivers](@/docs/devices.md#eebus-the-ss-14a-side).
 
+The machine is also **explored exhaustively**, not only sampled: a
+breadth-first search over a finite event alphabet visits every reachable state
+of the production machine (deduplicated on the timing differences the machine
+actually compares), checks four invariants in each, and quantifies the
+release-on-silence bound over all of them. Its first run found what two
+thousand random steps never had: one heartbeat in `unlimited/autonomous` used
+to open the write gate for ever, so a control box that heartbeated once and
+died could limit the household days later with a single delayed write. A write
+now counts only within sixty seconds of a heartbeat — the implementation
+guide's own window, and the same gate the `eebus` crate's certifiable machine
+runs.
+
 `init` and `failsafe` are also not § 14a events. The limit in force there is the
 device's own preconfigured value, applied because nothing is talking to it — the
 manager restraining itself, not an operator reducing the house. The evidence
@@ -264,8 +286,31 @@ Two limits apply to feed-in and they are fractions of different things:
   nominal AC power* of the inverters: `P_feed-in ≤ factor × Σ P_PV,AC,nom`.
 
 Those differ on almost every real installation, because inverters are routinely
-undersized against the modules. Taking the smaller of the two results is the only
-reading that satisfies both.
+undersized against the modules — the reference household is 9,8 kWp of module
+behind 8 kW of inverter, so 60 % of one is 5,88 kW and 50 % of the other is
+4 kW. Taking the smaller of the two results is the only reading that satisfies
+both, and there is a third arm beside them: an operator's live LPP session.
+
+The factor arrives over EEBUS **MGCP scenario 1**, where hems is the *Monitoring
+Appliance* — it binds and subscribes to the grid connection point's
+`DeviceConfiguration` and reads the factor; it never writes one, because the
+factor is set by whoever configures the connection. What crosses the wire is a
+**percentage**, and the sum it applies to is a property of the building that no
+EEBUS message carries: only the two together are a number of watts. So the
+driver reports the percentage and the site turns it into a ceiling, because the
+driver does not know the roof.
+
+**The cap comes from the site, not from a wire.** § 9 Abs. 1 applies to the
+plant by force of law: no operator sends it, no session announces it, and a box
+that waited to be told would leave an uncontrolled roof feeding in without
+limit. So the guard derives it from the household's own `Para9Status` on every
+tick, and the planner derives the same ceiling from the same call — a plan made
+without it runs the roof at its rating and then watches the guard curtail it
+every sunny midday. An operator asking for *less* through an LPP session still
+wins, and the reason chain says which of the two it was, because a household
+told "§ 9 EEG" for an operator's intervention has been told the wrong thing
+about its own bill. A plant that has passed its Ansteuerbarkeit test is not
+capped at all.
 
 Both are measured at the **connection point**, which is where the statute
 measures them, so what the house is using is headroom: a household drawing 4 kW
@@ -273,22 +318,32 @@ may produce 4 kW above the cap and still feed in exactly the cap. Applied per in
 house consuming 3 kW would have its roof curtailed as though it consumed nothing
 and throw away exactly those 3 kW every sunny hour.
 
-The two grid limits are also enforced with deliberately different conservatism,
-because they are enforced by different machinery. A § 14a reduction is a *control
-instruction* with a five-minute response presumption `[A1 4.2]`, so the guard may
-never be over it even for a tick. The 60 % cap is a *settlement* limit read off
-quarter-hour meter registers, so the quantity to control is the average over the
-quarter hour — and curtailing a roof as though the car were not charging throws
-away real kilowatt-hours to avoid a one-second transient nobody meters.
+Both limits are enforced on **power**, on every tick. § 14a is a control
+instruction with a five-minute response presumption `[A1 4.2]`, so the guard may
+never be over it even for a tick; § 9 Abs. 2 says *Leistung*, so the same is true
+of the 60 % cap. Reading that one as a quarter-hour average — which the register
+in the day report might suggest — would let a
+roof sit above a statutory line for minutes at a time on the strength of a
+forecast about the rest of the slot. The register is a diagnostic; the statute
+says Leistung.
+
+What differs between them is not the resolution but **what each measures**.
+§ 14a bounds the netzwirksamer Leistungsbezug of the *controllable devices*, so a
+dishwasher's draw is not headroom for a wallbox. § 9 EEG bounds the Einspeisung
+at the *Verknüpfungspunkt*, so everything the house is using is headroom, whoever
+is using it — and curtailing a roof as though the car were not charging throws
+away real kilowatt-hours for nothing.
 
 `just demo capped` runs a clear **May** day on a 20 kWp roof with a small store —
 May, not June, because the cap is a fraction of *direct-current* power and how
 close a roof gets to that fraction is decided by cell temperature — and prints
-the quarter-hour feed-in peak against the ceiling. The cap binds, at 12,06 of
-12,00 kW for four quarter hours around solar noon — the 60 W over is the
-simulated inverter's own settling time at a one-minute control period, not a
-decision — and the household loses
-**0,2 kWh** of export.
+the quarter-hour feed-in peak against the ceiling. The cap binds, at 11,78 of
+12,00 kW around solar noon, and the household loses **2,4 kWh** of export — of
+which 2,3 kWh is the price of the one-minute control period the simulated day
+runs at rather than the one second a box runs at. The guard lends the roof the
+household's own consumption as feed-in headroom, which § 9 Abs. 2 EEG says it
+may, but only the part it could call back before the next tick; the same day at a
+five-second period curtails 0,1 kWh and reaches 11,99 kW.
 
 That is far less than "60 %" sounds, and the arithmetic is worth stating: a
 German roof's clear-day peak is only about two thirds of its direct-current
@@ -299,7 +354,9 @@ throwing it away.
 
 What it *costs* needs a baseline that is capped too, because § 9 EEG does not ask
 whether there is an energy manager behind the meter: lifting the cap moves the
-managed household's own cost by a cent and the unmanaged one's by twelve.
+managed household's own cost by seven cents and the unmanaged one's by twelve —
+and most of those seven are the simulated day's one-minute control loop rather
+than the cap.
 
 The three things that decide the figure are worth naming, because getting any of
 them wrong inflates it several-fold: the month (a 50 °C cell in June keeps a roof
@@ -414,6 +471,54 @@ is a limit nobody should be compensated for. It is `[A1 2.3]` measured in money,
 a § 41e Aggregatorvertrag offer or an OpenADR bid should be priced from —
 aggregators currently price both households at "30 % of nominal".
 
+## How exposed is *this* connection?
+
+`[A1 8.4]` makes the network operator publish how much it has been reducing —
+per Netzbereich, per month, as an Eingriffsdauer in hours and an
+Eingriffsintensität in percent. hems models that document (`hems-grid::stress`),
+including the two things about it that are easy to get wrong. The publication has
+**no timestamps in it**: it is a monthly aggregate over a postcode area, so it
+cannot tell a household when it will be reduced. And the Eingriffsdauer is a
+**maximum over the devices in that area**, not a total — the format's own worked
+example is an 11 kW device held at 4,2 kW for two hours a day, which is 5,2 %
+intensity, and hems reproduces that number in a test so a misread formula fails
+in the build rather than in a filing.
+
+The question a household actually wants answered — *how often does my operator
+reduce me, in which quarter hour, and to what?* — can therefore only come from
+its own `[A1 7.2]` record, which the box is keeping anyway. Ninety days of it,
+bucketed by day type, is `/v1/status`:
+
+```json
+"exposure": {
+  "days_of_record": 90,
+  "hours_reduced": 11.5,
+  "busiest_quarter_hour": "17:45",
+  "busiest_frequency": 0.8,
+  "typical_ceiling_kw": 4.2
+}
+```
+
+*Your operator reduces you at teatime, four times in five, to 4,2 kW.* The days
+of record are on the page next to the figures they are drawn from, because a
+share whose denominator is invisible cannot be checked — and a household that
+has never been reduced gets `null` rather than a tidy sheet of zeroes, since
+nought hours out of nought days is not the same claim as nought out of ninety.
+
+Only operator reductions count. A box holding *itself* below its own fuse is not
+the grid reducing it, and counting those would report every household with a
+small connection as heavily controlled.
+
+**It is reported and not planned against**, and that is a measurement rather than
+a reservation. Feeding anticipated windows into the planner was built and then
+removed: on a dynamic tariff a § 14a reduction lands in the evening peak, which
+is exactly where the price has already told the plan not to be — both signals
+track residual load — so anticipating it moved the reference days by between
+€0,000 and €0,011. On a *flat* tariff, where the price cannot stand in for it, it
+was worth **−€0,018**, because a charging deadline priced at €5/kWh already
+front-loads the session. Four measurements, none of them positive, so the wiring
+went and the number stayed.
+
 ## Modul 3 — time-variable network charges
 
 Available only together with Modul 1, only at a location without registrierende
@@ -491,6 +596,40 @@ installed is supportable, an indifference band above it is neither, and anything
 above *that* — in quarter hours where the spot price was not negative — is
 settleable. The band widens as the store shrinks against the roof, because a
 small store leaves less room for the arbitrage the band exists to keep out.
+
+**What grid charging is actually worth, and why the planner still does not price
+it.** Differentiate that chain at one more kilowatt-hour of `(1)¼`, with `η` the
+round-trip efficiency. The plant-charged quantity falls by one, the renewable
+storage output by `η` — so the *grey* share of what the store fed back rises by
+`η`, the levy-reducing quantity rises by `η`, and the levied grid draw therefore
+rises by only **`1 − η`**. Grid charging costs the levies on the **round-trip
+loss**, about 0,8 ct/kWh, not the levies on the whole kilowatt-hour: the
+Saldierung is exactly what stops a battery being levied twice on one electron.
+The support side is the larger half — the anzulegender Wert is lost on `η` of it,
+about 6,7 ct/kWh — so together roughly **7,5 ct/kWh**, which is the size of the
+whole day-ahead spread an arbitrage is chasing.
+
+It applies only to the share of the store's output that **leaves the house**, and
+that share is a decision the planner makes, which makes the exact term bilinear.
+So the optimiser prices it at zero and says so, rather than at a plausible
+constant: a plan that spends real money on an invented number is worse than one
+that admits it cannot see this.
+
+The third option, **Ausschließlichkeit**, is for a store that is never charged
+from the grid, and it has nothing to settle. It does have something to *plan*, and
+that is where this got interesting: the optimiser expressed "no grid charging" as
+`b_ch ≤ pv`, which reads like the same sentence and is not. With a roof making
+3 kW, a house drawing 1 kW and a battery taking all 3, that constraint is
+satisfied, the meter is running, and every kilowatt-hour in the battery is grey —
+the household's whole claim spent by a plan that thought it was honouring it. What
+the option means is the same `MIN` as above set to zero, `min(import, charge) = 0`,
+which is a disjunction that no inequality implies. It is a binary now, declared
+only for the households that chose the option.
+
+And the Nachweis is **checked** rather than declared: `histd` sums `(1)¼` over
+the period, says whether the claim held, and names the quarter hours that broke
+it. A household should hear that from its own box rather than from its network
+operator.
 
 The Festlegung is an Arbeitsstand of 05.08.2026, so every result carries the
 `RuleSet` that produced it and the day that rule set starts to apply. A Nachweis

@@ -34,7 +34,9 @@ use hems_core::prelude::*;
 use time::{Duration, OffsetDateTime};
 
 use crate::allocate::{Claim, allocate_indivisible};
-use crate::guard::{GridLimits, Guard, GuardConfig, GuardVerdict, SiteState, minimum_useful_power};
+use crate::guard::{
+    GridLimits, Guard, GuardConfig, GuardVerdict, SiteState, minimum_useful_power, self_regulating,
+};
 use crate::phases::{PhaseState, PhaseSwitchConfig};
 
 /// How the arbiter behaves between plans.
@@ -56,10 +58,18 @@ pub struct ArbiterConfig {
         serde(default = "default_plan_age", with = "crate::guard::duration_secs")
     )]
     pub max_plan_age: Duration,
-    /// The largest change to a setpoint in one tick, if the operator wants
-    /// ramping. `None` lets values move freely.
+    /// How fast a setpoint may move, in **watts per second**, if the
+    /// installation wants ramping. `None` lets values move freely.
+    ///
+    /// Per second rather than per tick, and the difference is the one
+    /// [`PvSim`](https://docs.rs/hems-sim)'s settling constant taught this
+    /// workspace: a rate expressed per tick is a rate whose speed belongs to
+    /// whoever is calling, so the same configuration ramped a wallbox sixty
+    /// times more slowly on a box asked to tick once a minute. The arbiter
+    /// multiplies by [`GuardConfig::tick_period`], which it already has for the
+    /// storage bounds.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub ramp_per_tick: Option<Power>,
+    pub ramp_per_second: Option<Power>,
     /// Changes smaller than this are not sent at all — a device that is asked to
     /// chase 20 W of measurement noise wears out its relays for nothing.
     #[cfg_attr(feature = "serde", serde(default = "default_deadband"))]
@@ -93,7 +103,7 @@ impl Default for ArbiterConfig {
             guard: GuardConfig::default(),
             phase_switch: PhaseSwitchConfig::default(),
             max_plan_age: default_plan_age(),
-            ramp_per_tick: None,
+            ramp_per_second: None,
             deadband: default_deadband(),
             residual_power: Power::ZERO,
         }
@@ -779,12 +789,15 @@ impl Arbiter {
         previous: Option<Power>,
         envelope: Envelope,
     ) -> (Power, Option<RealtimeCause>) {
-        let Some(ramp) = self.config.ramp_per_tick else {
+        let Some(rate) = self.config.ramp_per_second else {
             return (wanted, None);
         };
         let Some(previous) = previous else {
             return (wanted, None);
         };
+        // Watts per second into watts this tick. A tick of no length ramps
+        // nothing, which is the honest answer rather than an unbounded step.
+        let ramp = rate * self.config.guard.tick_period.as_seconds_f64().max(0.0);
         let gap = (wanted - previous).abs();
         let step = gap.min(ramp);
         let ramped = if wanted >= previous {
@@ -810,22 +823,6 @@ impl Arbiter {
             .sum();
         Some(Site::balance_residual(grid, [assets]))
     }
-}
-
-/// Whether this asset runs itself when nothing is limiting it.
-///
-/// A heat pump has a thermostat and a hot-water tank has a temperature sensor,
-/// and an energy manager only ever tells either of them to use *less*. A battery
-/// and a charge point have no opinion of their own and do nothing at all until
-/// somebody asks them to.
-///
-/// So an absent instruction means two different things, and reading it as "zero"
-/// for both is how a box whose planner had stopped let a January house go cold
-/// and handed out cold showers in June — while reporting a saving for both,
-/// because energy nobody used is energy nobody bought. It is the same mistake
-/// the inverter made, in the vocabulary of a different device.
-fn self_regulating(asset: &Asset) -> bool {
-    matches!(asset, Asset::HeatPump(_) | Asset::Dhw(_))
 }
 
 /// Which minimum a claim is measured against.
@@ -985,6 +982,24 @@ mod tests {
             }
         }
 
+        /// Lift the § 9 EEG cap, so "no limits" means no limits.
+        ///
+        /// The guard derives the 60 % cap from the *site* on every tick, which
+        /// is the whole point of it — it applies by force of law and not
+        /// because a session said so. A fixture that means "nothing is
+        /// constraining this roof" therefore has to say so about the plant
+        /// rather than about `GridLimits`, and the household this describes is
+        /// an ordinary one: an intelligent metering system in operation whose
+        /// Ansteuerbarkeit test has passed.
+        fn with_the_cap_lifted(mut self) -> Self {
+            for asset in &mut self.site.assets {
+                if let hems_core::prelude::Asset::Pv(pv) = asset {
+                    pv.para9.relief = hems_core::prelude::CapRelief::ImsysWithControl;
+                }
+            }
+            self
+        }
+
         fn measure(mut self, id: &str, kw: f64) -> Self {
             self.state.assets.insert(
                 AssetId::new(id).unwrap(),
@@ -1025,7 +1040,10 @@ mod tests {
         // than buy the evening peak with a full battery sitting behind the
         // meter. Before this the fallback absorbed surplus and nothing else, so
         // an offline box imported at the retail price all evening.
-        let f = Fixture::new().grid(0.5).measure("haushalt", 0.5);
+        let f = Fixture::new()
+            .with_the_cap_lifted()
+            .grid(0.5)
+            .measure("haushalt", 0.5);
         let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
         assert_eq!(commanded(&d, "battery"), Power::from_kw(-0.5));
         // A one-way charge point is not a source and is not asked to be one.
@@ -1039,7 +1057,7 @@ mod tests {
 
     #[test]
     fn with_no_plan_and_a_balanced_connection_nothing_is_asked_to_run() {
-        let f = Fixture::new().grid(0.0);
+        let f = Fixture::new().with_the_cap_lifted().grid(0.0);
         let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
         assert_eq!(commanded(&d, "wallbox"), Power::ZERO);
         assert_eq!(commanded(&d, "battery"), Power::ZERO);
@@ -1058,7 +1076,11 @@ mod tests {
         // and zero is the one value that means "stop" — so reading its silence
         // the same way tells the roof to produce nothing on every tick of every
         // day the plan does not curtail.
-        let f = Fixture::new().grid(0.0);
+        //
+        // The cap is lifted because "unconstrained" has to be true of the
+        // *plant*: § 9 EEG is not something an operator sends, and a roof under
+        // it is never at its maximum power point.
+        let f = Fixture::new().with_the_cap_lifted().grid(0.0);
         let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
         assert_eq!(
             commanded(&d, "pv"),
@@ -1078,9 +1100,12 @@ mod tests {
 
     #[test]
     fn a_feed_in_cap_is_what_narrows_the_inverter_and_it_says_so() {
-        let mut f = Fixture::new().grid(0.0);
-        f.limits.feed_in_ceiling = Some(Power::from_kw(5.88));
-        f.limits.feed_in_rule = Some(GuardRule::Para9Cap);
+        // Nothing is configured on `GridLimits` and nothing arrives on a wire.
+        // § 9 Abs. 1 EEG applies to a 9,8 kWp plant that has not passed its
+        // Ansteuerbarkeit test whether or not an operator ever opens an LPP
+        // session, so the guard derives 60 % of 9,8 kWp from the site itself
+        // and the inverter is held at 5,88 kW.
+        let f = Fixture::new().grid(0.0);
         let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
         assert!(
             commanded(&d, "pv") > Power::from_kw(-8.0),
@@ -1374,7 +1399,7 @@ mod tests {
             ..GridLimits::default()
         };
         let arbiter = Arbiter::new(ArbiterConfig {
-            ramp_per_tick: Some(Power::from_kw(0.5)),
+            ramp_per_second: Some(Power::from_kw(0.5)),
             ..ArbiterConfig::default()
         });
         let d = f.tick(&arbiter, None);
@@ -1392,7 +1417,7 @@ mod tests {
         f.previous
             .insert(AssetId::new("battery").unwrap(), Power::from_kw(3.0));
         let arbiter = Arbiter::new(ArbiterConfig {
-            ramp_per_tick: Some(Power::from_kw(0.5)),
+            ramp_per_second: Some(Power::from_kw(0.5)),
             ..ArbiterConfig::default()
         });
         let d = f.tick(&arbiter, None);

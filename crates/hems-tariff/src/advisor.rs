@@ -61,6 +61,21 @@ pub struct Comparison {
 /// Modul 3 it is deliberately conservative: it shows what the household would
 /// pay *without* shifting anything, so the number is a floor and any load
 /// shifting only improves it.
+///
+/// # `consumption` has to be a **year**, or only the energy halves mean anything
+///
+/// [`Comparison::fixed_eur`] is a Modul 1 lump sum and a Modul 2 metering
+/// charge, and both are annual by nature — there is no such thing as a
+/// quarter-hour's share of a measuring point. So [`Comparison::total_eur`] and
+/// the [`Comparison::delta_eur`] derived from it add a whole year of fixed
+/// charges to however much energy was passed in, and on a series shorter than a
+/// year the fixed halves dominate a number that reads like a saving.
+///
+/// A caller with less than a year has two honest options and this crate offers
+/// both: compare [`Comparison::energy_cost_eur`] alone, which is what the day
+/// report does, or use [`modul2_break_even_kwh`], which is a threshold in
+/// kilowatt-hours a year and is a statement a household can check against its
+/// own bill rather than a projection from one Thursday.
 #[must_use]
 pub fn compare_moduls(
     consumption: &BTreeMap<Slot, Energy>,
@@ -143,6 +158,7 @@ mod tests {
             levies: Levies::household_2026(),
             feed_in: FeedIn::NONE,
             sharing: None,
+            carbon_g_per_kwh: BTreeMap::new(),
             standing_charge_eur_per_year: Decimal::ZERO,
         }
     }

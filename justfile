@@ -67,7 +67,8 @@ test:
 test-crate crate:
     cargo test -p {{ crate }} --all-features
 
-# 🛡️ Workspace guards: citations, the event catalogue, publishable manifests
+# 🛡️ Workspace guards: citations, the event catalogue, publishable manifests,
+# the wire forms, and that a daemon's background loops can fail its liveness
 guards:
     cargo xtask check-all
 
@@ -243,3 +244,13 @@ site:
 # 🌐 Build the documentation site
 site-build:
     cd site && zola build
+
+# 🖼️  Re-render the social preview card from its source
+#
+# `og.png` is what a link to hems looks like in a chat window or a search
+# result, and it is a **build artefact**: the text on it is in `og-card.svg`, so
+# a claim that changes there changes in one place rather than in an image
+# nobody can grep.
+site-card:
+    rsvg-convert -w 1200 -h 630 site/og-card.svg -o site/static/og.png
+    @echo "✅ site/static/og.png"
