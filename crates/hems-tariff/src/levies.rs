@@ -6,7 +6,6 @@
 //! are ever authoritative.
 
 use rust_decimal::Decimal;
-use rust_decimal::prelude::ToPrimitive;
 
 /// The levies and taxes on a kilowatt-hour drawn from the grid, ct/kWh.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,12 +59,6 @@ impl Levies {
             konzessionsabgabe: Decimal::new(166, 2),
             vat_rate: Decimal::new(19, 2),
         }
-    }
-
-    /// The levy total as a float, for the optimiser.
-    #[must_use]
-    pub fn sum_net_f64(&self) -> f64 {
-        self.sum_net().to_f64().unwrap_or(0.0)
     }
 }
 

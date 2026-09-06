@@ -7,8 +7,6 @@ use clap::Parser;
 use hems_service::{Health, Server, Shutdown, shutdown};
 use obsd::Settings;
 use obsd::api::{Observed, router};
-use obsd::fleet::Fleet;
-use tokio::sync::RwLock;
 
 #[derive(Parser)]
 #[command(name = "obsd", version, about = "The hems observability service")]
@@ -28,13 +26,12 @@ async fn main() -> anyhow::Result<()> {
         settings.service.log_json,
     );
 
-    let fleet = Arc::new(RwLock::new(Fleet::new(settings.keep_days)));
+    // Eagerly, so a database this service cannot reach stops it here rather than
+    // letting it accept days it silently drops.
+    let db = hems_service::db::connect(&settings.database, hems_service::identity!().name).await?;
+    hems_service::db::migrate(&db, obsd::store::MIGRATIONS).await?;
+    let store = obsd::store::Store::new(db);
     let health = Health::new();
-    // An observability service has no upstream: it is ready the moment it can
-    // accept a report. A fleet with nothing in it yet is a fleet with nothing in
-    // it, not a broken service — and marking it unready would take the *only*
-    // thing that can accept the first report out of rotation.
-    health.good("collector", time::OffsetDateTime::now_utc());
     // Not a refusal to start: a fleet view that cannot yet accept a report can
     // still answer every question about the days it already holds, and a service
     // that exits on a missing environment variable is one an operator restarts
@@ -89,12 +86,47 @@ async fn main() -> anyhow::Result<()> {
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
 
+    // A fleet with nothing in it yet is a fleet with nothing in it, not a broken
+    // service — so readiness is about the *database* rather than about the
+    // number of sites. What must never happen is a replica reporting itself
+    // ready while it cannot store a day: a box that was told its report was
+    // accepted keeps no second copy.
+    health.vital(
+        "collector",
+        signal.clone(),
+        hems_service::db::watch(
+            store.db().clone(),
+            health.clone(),
+            "collector",
+            signal.clone(),
+        ),
+    );
+    // The series a probe cannot answer: a saturated pool serves `503`s while
+    // `/livez` and `/readyz` both stay green, because the process is alive and
+    // the database is reachable and there is simply no connection to be had.
+    hems_service::metrics::publish_pool(store.db(), hems_service::identity!().name);
+
+    // **Vital**: a retention sweep that has died lets the fleet's days grow
+    // without bound, and the only symptom is a disk filling up months later
+    // (D132).
+    health.vital(
+        "retention",
+        signal.clone(),
+        retention_loop(
+            store.clone(),
+            settings.keep_days,
+            health.clone(),
+            signal.clone(),
+        ),
+    );
+
     let silent_after = time::Duration::seconds(settings.silent_after_s.cast_signed());
     // The two surfaces answer from the same fleet view and under the same
     // credentials, and each MCP call is authorised as its own caller — so a
     // token cannot reach over `/mcp` what the REST route would refuse it.
     let mut app = router(Observed::new(
-        Arc::clone(&fleet),
+        store.clone(),
+        settings.keep_days,
         silent_after,
         secrets,
         time::Duration::seconds(settings.webhook_tolerance_s.cast_signed()),
@@ -104,7 +136,8 @@ async fn main() -> anyhow::Result<()> {
         let auth = hems_service::McpAuth::per_caller(&settings.mcp, &readers)?;
         app = app.merge(obsd::mcp_server::router(
             Arc::new(obsd::mcp_server::State {
-                fleet,
+                store: store.clone(),
+                keep_days: settings.keep_days,
                 silent_after,
                 auth: auth.clone(),
             }),
@@ -123,4 +156,38 @@ async fn main() -> anyhow::Result<()> {
     .run_until(signal)
     .await?;
     Ok(())
+}
+
+/// Delete what has fallen out of the retention window, once a day.
+///
+/// A failure here takes the service **out of rotation** rather than down: a
+/// fleet view that cannot prune is still one that can answer, and what has gone
+/// wrong is a disk rather than the record.
+async fn retention_loop(
+    store: obsd::store::Store,
+    keep_days: usize,
+    health: Health,
+    signal: Shutdown,
+) {
+    loop {
+        let before = obsd::store::window_start(keep_days, time::OffsetDateTime::now_utc().date());
+        match store.prune(before).await {
+            Ok(0) => {}
+            Ok(gone) => {
+                tracing::info!(days = gone, before = %before, "days past the window deleted")
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "retention sweep failed");
+                health.bad("collector", e.to_string());
+            }
+        }
+        let sleep = tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60));
+        tokio::select! {
+            () = sleep => {}
+            () = signal.clone().wait() => {
+                tracing::info!("retention loop stopping");
+                return;
+            }
+        }
+    }
 }

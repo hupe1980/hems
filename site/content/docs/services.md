@@ -167,14 +167,20 @@ request returned.
 | **Evidence** | the network operator's question | `[A1 7.2]` says what a control event is documented with; `[A1 7.3]` says two years |
 | **Settlement** | the household's invoice | the quarter-hour registers MiSpeL's Abgrenzung and § 42c's allocation are computed from |
 
-Keeping them apart is most of the design, and three things fall out of it:
+Keeping them apart is most of the design, and four things fall out of it:
 
 - **Retention is a column**, so “what will you still have in eighteen months” is a
   query rather than an argument.
-- **Quantities are exact decimal strings**, never floats. A settlement that went
-  through a `double` is one nobody can reproduce.
-- **Reads open their own connection.** A household's export is 370 ms of SQLite,
-  and behind one lock a box's evidence write waits 2,7 s for it.
+- **Quantities are exact `NUMERIC`**, never floats. A settlement that went
+  through a `double` is one nobody can reproduce — and because the column type is
+  exact, `SUM(grid_draw_kwh)` over a settlement year is a query.
+- **A correction is a version, not an overwrite.** A register is restated weeks
+  after the month was settled and the Nachweis sent — a substitute value replaced
+  by a real reading. The registers are therefore append-only and keyed by the
+  instant they were learned, so `?as_of=` reproduces the document that was handed
+  over, and the difference from today's answer is what the correction changed.
+- **A fleet's writes do not queue behind one lock**, so a box forwarding evidence
+  does not wait on a household's export.
 
 | | |
 |---|---|
@@ -227,11 +233,93 @@ the Data Act export and off the agent surface: the Festlegung has the
 Anlagenbetreiber produce and submit it, and a § 14a operator credential that
 could read every household's storage economics is a reach nothing granted it.
 
-SQLite (bundled) is what is here now, because it needs no server and no system
-library: every query is exercised against a *real* database in `cargo test`
-rather than against a mock, and `just ci` stays clone-and-run. The schema is
-written in `mako`'s layout, so the move to a Postgres-plus-Iceberg tier is a
-second migration directory rather than a rewrite.
+### What an operator can see
+
+Every daemon serves three things on the port it binds, before any of its own
+routes:
+
+| | |
+|---|---|
+| `/livez` | is this process wedged? — the orchestrator restarts on it |
+| `/readyz` | can it serve traffic? — the orchestrator routes on it, and the body names every dependency and when it was last good |
+| `/metrics` | Prometheus: request counts and latencies, and the **connection pool** |
+
+The pool is the one that matters after the move to PostgreSQL, because it is the
+one no probe can answer. A saturated pool serves `503`s while `/livez` and
+`/readyz` both stay green — the process is alive and the database is reachable,
+and there is simply no connection to be had. `hems_db_pool_available` sitting at
+zero is that, and nothing else says it.
+
+The request label is the **matched route** — `/v1/sites/{site}/export`, whoever
+the site is — rather than a normalised path. A hems site is called something like
+`reference-household`, which no heuristic recognises as an identifier, so a
+path-based label would put every household into the metrics: a cardinality
+explosion proportional to the fleet, and a household identifier in an endpoint
+that is scraped, stored for months and read by everybody. A request that matched
+no route is labelled `unmatched`, because an unrouted URI is attacker-controlled
+and is the one string that must never become a label.
+
+### Reaching the database
+
+Every daemon ships an annotated `<name>.example.toml` beside its source, and each
+is parsed by a test so it cannot drift from the struct it documents —
+`cargo xtask check-examples` fails the build on a daemon that ships neither. The
+shell's own settings are a `[service]` table in all seven, so an operator who has
+configured one has configured all of them.
+
+The three stateful daemons additionally take the same `[database]` block, because
+they need the same thirty lines and three copies of thirty lines diverge in the
+direction that costs most — the copy that is wrong is the one whose readiness
+probe lies:
+
+```toml
+[database]
+# A reference to the credential, never the credential. A PostgreSQL URL carries a
+# password, and one in a configuration file is one in an image, in a backup, and
+# eventually in a repository.
+url = "env:HEMS_HISTD_DATABASE_URL"
+# Per replica. `daemons × replicas × pool_size` has to fit inside the server's own
+# `max_connections`, because PostgreSQL costs a backend process per connection.
+pool_size = 10
+# Fail a request rather than queue it for ever, so a saturated pool surfaces as
+# this daemon's 503 and not as a caller's timeout with nothing in the logs.
+acquire_timeout_s = 5
+# Set on **every** connection. It is the only bound that survives a client that
+# has already gone away: a two-year export whose reader hung up holds a backend
+# and its locks until PostgreSQL is told otherwise.
+statement_timeout_s = 30
+# On by default. What crosses this socket is which households did not respect a
+# network operator's reduction; turning it off is for a unix socket or a test
+# container, and the daemon says so in the log when it happens.
+tls = true
+```
+
+The migrations run at start-up under an **advisory lock**, so several replicas
+coming up together is safe: one applies and the others find nothing to do. A
+migration whose file has *changed* since it was applied is refused rather than
+skipped — the database and the binary then disagree about what the schema is, and
+two years of § 14a evidence is the last record here that should be repaired by
+guesswork.
+
+### Tested against PostgreSQL
+
+The queries are tested against the engine they run on. `NUMERIC` against `TEXT`,
+`TIMESTAMPTZ` against an integer, `UNNEST` against a statement in a loop, an
+advisory lock against nothing at all — every one is a place two engines answer
+differently, and every one is in this schema, so a service checked on a different
+one is a service whose SQL is checked by nothing.
+
+So a container runtime is a prerequisite. The suite starts **one** PostgreSQL for
+the whole workspace and gives each test a database of its own; `just db-stop` is
+the teardown, and `HEMS_TEST_POSTGRES` points it at a server that is already
+running instead, which is how CI runs it. There is deliberately no way to *skip*:
+a test that passed quietly when it could not reach a database would report green
+for a query nobody ran.
+
+The **query plans** are asserted too. A query that stops using an index does not
+fail or log — it returns the right answer and reads a thousand times more rows to
+get it, and the first symptom is a settlement export timing out on the one
+household with two years of history.
 
 ## `fleetd` — enrolment, configuration, releases
 
@@ -241,8 +329,11 @@ and leaves holding a long-lived credential of its own. The secret is
 enrolment secret that still works after the box is in the field is a credential
 sitting in an installer's notes.
 
-Both facts are in an embedded store rather than in memory, and each is written
-**before** it is acted on. A credential exists in exactly two places — the box
+Both facts are in PostgreSQL rather than in memory, and each is written
+**before** it is acted on. The single-use property is a **primary key**, which is
+also why the database is shared rather than a file per replica: a primary key is
+only single-use across the whole service, and two replicas with a file each would
+each accept the same installer secret once. A credential exists in exactly two places — the box
 and the fleet — so a `fleetd` that forgot one on restart would leave a household
 presenting a token nothing recognises, unable to enrol again because its secret
 is spent. What is *not* stored is which sites exist and what they should run:
@@ -287,9 +378,14 @@ not hold a command the arbiter gave it, are **named days** rather than fleet
 percentages. A wallbox refusing a third of its commands is one household with one
 installation problem, and an average puts it at half a per cent.
 
-`obsd` holds a **window, not a history**. The record is `histd`'s; what lives here
-is derived, bounded and rebuildable, and losing it costs a dashboard rather than
-a Nachweis.
+`obsd` holds a **window, not a history**: the record is `histd`'s, and what lives
+here is derived and bounded. It is not, however, rebuildable — a box sends a day
+once and keeps no second copy — so the window is a table, one row per site per
+day, and the retention bound is a `DELETE` an operator can ask questions of.
+
+The aggregation over it is a **pure function** of the days it is handed, with
+`now` a parameter, which is what makes "one household in ten thousand breached a
+limit and the summary says so" a unit test.
 
 There are **two** statutory limits on a household's connection point, and the
 fleet lists them apart. § 14a arrives as an instruction and leaves a record, so a

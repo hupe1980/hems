@@ -47,6 +47,26 @@ jobs:
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # The fleet daemons deploy on PostgreSQL and their queries are tested against
+    # PostgreSQL (D159). A **service container** rather than testcontainers here:
+    # the runner has Docker either way, but a service is started once for the job
+    # instead of once per test binary, and `HEMS_TEST_POSTGRES` is the documented
+    # way to point the suite at one. Pinned to the same major the fixture starts
+    # locally, so a green CI and a green laptop mean the same thing.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      HEMS_TEST_POSTGRES: postgres://postgres:postgres@127.0.0.1:5432
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

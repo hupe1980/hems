@@ -347,8 +347,17 @@ control plane:
   whole payload of a SHIP data frame, so a network operator's Energy Guard
   discovering the box, binding to its load-control feature and writing 4,2 kW is
   a test with no socket in it. What `hemsd` adds underneath is TLS, a WebSocket
-  and a handshake — and no protocol logic at all, which is the only arrangement
-  in which there is exactly one copy of the § 14a state machine in the product.
+  and a handshake — and no protocol logic at all, so the daemon holds no copy of
+  the machine.
+
+  The **simulator** does hold one, and saying otherwise would be the comfortable
+  version: the reference days need to drive a whole § 14a day in virtual time, so
+  hems keeps its own sans-I/O limitation machine for them. Two implementations is
+  a liability whoever holds them, so the two are driven through one event
+  alphabet in lockstep, breadth-first over every reachable state, and the
+  effective limit, the controlled flag and the state name are asserted after
+  every edge. Collapsing to one is on the backlog; what is not optional is
+  something that fails the moment they disagree.
 
 ## The box's two outbound questions
 

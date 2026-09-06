@@ -38,13 +38,17 @@
 use std::collections::BTreeMap;
 
 use hems_core::asset::Programme;
-use hems_core::prelude::{Current, Energy, GeoPoint, Para9Status, Power, Site, Slot, Soc};
+use hems_core::asset::{LegacyStatus, SteuVeExemption};
+use hems_core::prelude::{
+    BuildingClass, Current, Energy, GeoPoint, MaloId, MeloId, Para9Status, Power, Rc2, Site, Slot,
+    Soc,
+};
 use hems_tariff::levies::Levies;
 use hems_tariff::tariff::{EnergyPrice, FeedIn, NetworkCharge, Tariff};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::site::HouseholdConfig;
+use crate::site::{ConnectionConfig, Declared, HouseholdConfig, REFERENCE_ASSETS};
 
 /// The whole of a box's configuration.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -273,12 +277,6 @@ impl ControlSettings {
     #[must_use]
     pub const fn tick_period(&self) -> time::Duration {
         time::Duration::seconds(self.tick_period_s.cast_signed())
-    }
-
-    /// How long between re-plans.
-    #[must_use]
-    pub const fn replan_every(&self) -> time::Duration {
-        time::Duration::seconds(self.replan_every_s.cast_signed())
     }
 }
 
@@ -525,6 +523,54 @@ pub struct SiteSettings {
     pub pv_kwp: f64,
     /// The inverter's alternating-current limit, kW.
     pub pv_ac_kw: f64,
+    /// How far the modules are tilted from horizontal, degrees — 0 flat, 90 a
+    /// wall. Roughly the pitch of the roof they are on.
+    pub pv_tilt_deg: f64,
+    /// Which way they face, degrees clockwise from north: 180 south, 90 east,
+    /// 270 west.
+    ///
+    /// The single most consequential number in this section after the peak
+    /// power, and the one nobody thinks to change. It decides *when* the roof
+    /// produces, and an east–west array left on the default produces two
+    /// shoulders where the plan expects one midday peak. The residual corrector
+    /// learns a *level*; it takes it seasons to learn a shape, and it is bounded
+    /// while it does.
+    pub pv_azimuth_deg: f64,
+    /// The § 9 EEG facts declared about the roof.
+    #[serde(default)]
+    pub para9: Para9Settings,
+    /// The contractually agreed connection power, kW, where one is agreed.
+    ///
+    /// It narrows the guard's headroom, the planner's import ceiling and the
+    /// `ContractualConsumptionNominalMax` an EEBUS Energy Guard is told
+    /// `[LPC-042]`. Omit it and the only limit any of the three sees is the
+    /// fuse.
+    #[serde(default)]
+    pub contract_power_kw: Option<f64>,
+    /// The market location, eleven digits with a valid check digit.
+    #[serde(default)]
+    pub malo: Option<String>,
+    /// The metering location, thirty-three characters.
+    #[serde(default)]
+    pub melo: Option<String>,
+    /// The network operator's BDEW code number, from the § 14a agreement.
+    #[serde(default)]
+    pub dso_code: Option<String>,
+    /// The Netzbereich the operator assigned this connection to `[A1 8.2.b]` —
+    /// what lets a household find its own row in the monthly publication.
+    #[serde(default)]
+    pub netzbereich: Option<String>,
+    /// Which house this is, thermally, until the box has identified its own.
+    #[serde(default)]
+    pub building: BuildingSettings,
+    /// The § 14a and § 9 EEG facts declared per asset, keyed by identifier.
+    ///
+    /// `[site.declared.waermepumpe]`, `[site.declared.pv]`, and so on. A key
+    /// that names no asset this household has is refused at start-up, the same
+    /// way a `[[drivers]]` entry for one is: a declaration nothing reads looks
+    /// exactly like a declaration that worked.
+    #[serde(default)]
+    pub declared: BTreeMap<String, DeclaredSettings>,
     /// Battery capacity, kWh. Zero means the household has no battery — see
     /// [`SiteSettings::pv_kwp`].
     pub battery_kwh: f64,
@@ -584,20 +630,6 @@ pub struct SiteSettings {
     pub evse_switchable: bool,
     /// The state of charge the household asks its car to stop at, 0…1.
     pub ev_charge_limit: Option<f64>,
-    /// Whether an intelligent metering system with a control device is in
-    /// operation, which is what lifts the § 9 Abs. 2 EEG 60 % feed-in cap.
-    ///
-    /// **Off by default, and that is the realistic answer rather than the tidy
-    /// one.** § 9 Abs. 2 lifts the cap only after the network operator's first
-    /// successful Ansteuerbarkeit test, which is a different event on a
-    /// different clock from the meter being fitted. A box that assumed the cap
-    /// was gone would plan a roof it is not allowed to have.
-    pub imsys_control_device: bool,
-    /// The date an intelligent metering system was put into operation, if one
-    /// was — which is what starts § 51 EEG taking the negative quarter hours.
-    ///
-    /// RFC 3339 date, `2024-06-01`.
-    pub imsys_since: Option<String>,
     /// The programme a shiftable appliance is loaded with, as the average power
     /// in kW of each consecutive quarter hour.
     ///
@@ -630,6 +662,20 @@ impl Default for SiteSettings {
         Self {
             pv_kwp: pv.kwp.kw(),
             pv_ac_kw: pv.ac_nominal.kw(),
+            pv_tilt_deg: pv.tilt_deg,
+            pv_azimuth_deg: pv.azimuth_deg,
+            para9: Para9Settings::from(pv.para9),
+            contract_power_kw: reference.connection.contract_power.map(Power::kw),
+            malo: reference.connection.malo.map(|m| m.to_string()),
+            melo: reference.connection.melo.map(|m| m.to_string()),
+            dso_code: reference.connection.dso_code.clone(),
+            netzbereich: reference.connection.netzbereich.clone(),
+            building: BuildingSettings::default(),
+            declared: reference
+                .declared
+                .iter()
+                .map(|(id, d)| (id.clone(), DeclaredSettings::from(*d)))
+                .collect(),
             battery_kwh: battery.kwh.kwh(),
             battery_kw: battery.power.kw(),
             reserve_soc: battery.reserve_soc.fraction(),
@@ -649,14 +695,232 @@ impl Default for SiteSettings {
             evse_max_a: evse.max_current.get(),
             evse_switchable: evse.switchable,
             ev_charge_limit: evse.charge_limit.map(Soc::fraction),
-            imsys_control_device: false,
-            imsys_since: Some("2024-06-01".into()),
             dishwasher_kw_steps: reference
                 .dishwasher
                 .as_ref()
                 .map(|p| p.steps.iter().map(|s| s.kw()).collect())
                 .unwrap_or_default(),
         }
+    }
+}
+
+/// Which house this is, thermally.
+///
+/// Either an archetype — what an installer can answer from the front door — or
+/// the four parameters of the two-mass model, for somebody who has them from a
+/// building simulation. An explicit parameter wins over the archetype, so a
+/// household can pick the closest class and correct the one number it knows.
+///
+/// It is a **prior**, not a fact: the box identifies its own building from the
+/// household's own thermometer once it has watched a few excited days
+/// (`hems_forecast::building`). What the prior buys is the weeks before that,
+/// and the difference is not cosmetic — the fabric capacity decides whether
+/// pre-heating into a cheap hour pays at all, and it spans a factor of five
+/// across the classes.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BuildingSettings {
+    /// The archetype, from [`BuildingClass`]: `average` (the default),
+    /// `new-build`, `solid-wall` or `apartment`.
+    pub class: BuildingClass,
+    /// Heat capacity of the indoor air and the furniture that follows it,
+    /// kWh/K. Overrides the archetype's.
+    pub air_capacity_kwh_per_k: Option<f64>,
+    /// Heat capacity of the building fabric, kWh/K — the large, slow one, and
+    /// the parameter a heating plan turns on.
+    pub mass_capacity_kwh_per_k: Option<f64>,
+    /// Thermal resistance from the indoor air to outdoors, K/kW.
+    ///
+    /// `ΔT / Q` at the design pair: a house losing 6,8 kW at 21 °C indoors and
+    /// −20 °C outdoors is `41 / 6,8` = 6 K/kW.
+    pub r_air_out_k_per_kw: Option<f64>,
+    /// Thermal resistance from the indoor air to the fabric, K/kW.
+    pub r_air_mass_k_per_kw: Option<f64>,
+}
+
+impl BuildingSettings {
+    /// The model this describes.
+    ///
+    /// # Errors
+    /// [`SettingsError::NotABuilding`] where the result is not physical — a
+    /// non-positive capacity or resistance, which makes the planner's own
+    /// temperature predictions diverge rather than merely be wrong.
+    pub fn rc2(&self) -> Result<Rc2, SettingsError> {
+        let base = self.class.rc2();
+        let built = Rc2 {
+            air_capacity_kwh_per_k: self
+                .air_capacity_kwh_per_k
+                .unwrap_or(base.air_capacity_kwh_per_k),
+            mass_capacity_kwh_per_k: self
+                .mass_capacity_kwh_per_k
+                .unwrap_or(base.mass_capacity_kwh_per_k),
+            r_air_out_k_per_kw: self.r_air_out_k_per_kw.unwrap_or(base.r_air_out_k_per_kw),
+            r_air_mass_k_per_kw: self.r_air_mass_k_per_kw.unwrap_or(base.r_air_mass_k_per_kw),
+        };
+        if built.is_valid() {
+            Ok(built)
+        } else {
+            Err(SettingsError::NotABuilding {
+                found: format!("{built:?}"),
+            })
+        }
+    }
+}
+
+/// The § 14a and § 9 EEG facts declared about one asset.
+///
+/// Every one of them is a fact off a contract or a Netzanschlussportal record
+/// rather than off a datasheet, which is why the box has to be told and cannot
+/// work it out. See [`crate::site::Declared`] for what each decides and which
+/// way silence errs.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DeclaredSettings {
+    /// The date of technical commissioning, `2019-04-01`.
+    ///
+    /// It decides the § 9 EEG feed-in limitation for a roof and the § 14a
+    /// regime for a controllable device, and the two read silence in opposite
+    /// directions — see [`crate::site::Declared::commissioned_at`].
+    pub commissioned: Option<String>,
+    /// What the device brings with it from before 2024 `[A1 10]`: `none` (the
+    /// default), `reduced_network_fee` or `nachtspeicher`.
+    pub legacy_status: LegacyStatus,
+    /// Whether the operator moved it into the netzorientierte Steuerung
+    /// voluntarily `[A1 10.4]`. Irreversible, and the operator may not refuse.
+    pub switched_voluntarily: bool,
+    /// Why it is not a steuerbare Verbrauchseinrichtung at all `[A1 3.1.b]`:
+    /// `public_charge_point`, `emergency_services` or
+    /// `non_residential_heating_or_cooling`.
+    pub exemption: Option<SteuVeExemption>,
+}
+
+impl From<Declared> for DeclaredSettings {
+    /// The round trip, so `SiteSettings::default()` can be written from the
+    /// household it describes rather than from a second copy of the same dates.
+    fn from(d: Declared) -> Self {
+        Self {
+            commissioned: d.commissioned_at.map(iso_date),
+            legacy_status: d.legacy_status,
+            switched_voluntarily: d.switched_voluntarily,
+            exemption: d.exemption,
+        }
+    }
+}
+
+/// The § 9 EEG facts declared about the roof.
+///
+/// All four in one table because they are one question — *what limits this
+/// roof's feed-in* — and the answer is a decision tree over them rather than
+/// four independent switches. Flat on `[site]` they read like four unrelated
+/// booleans; here the order they are consulted in is visible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Para9Settings {
+    /// Whether an intelligent metering system **with a control device** is in
+    /// operation, which is what lifts the § 9 Abs. 2 60 % cap.
+    ///
+    /// **Off by default, and that is the realistic answer rather than the tidy
+    /// one.** § 9 Abs. 2 lifts the cap only after the network operator's first
+    /// successful Ansteuerbarkeit test, which is a different event on a
+    /// different clock from the meter being fitted. A box that assumed the cap
+    /// was gone would plan a roof it is not allowed to have.
+    pub imsys_control_device: bool,
+    /// The date an intelligent metering system was put into operation, if one
+    /// was — which is what starts § 51 EEG taking the negative quarter hours.
+    ///
+    /// ISO date, `2024-06-01`.
+    pub imsys_since: Option<String>,
+    /// A Steckersolargerät within **both** size tests of § 9 Abs. 2 S. 4 EEG —
+    /// 2 kW DC and 800 W AC — which is outside Nr. 3 altogether.
+    pub steckersolargeraet: bool,
+    /// The § 100 Abs. 3 S. 2 Nr. 2 EEG 70 % limitation: a system commissioned
+    /// before 2023 that met its obligation that way rather than by accepting a
+    /// Rundsteuerempfänger. Leave it false for anything newer.
+    pub legacy_70_percent: bool,
+}
+
+impl Default for Para9Settings {
+    /// The reference household's roof: an intelligent metering system fitted in
+    /// 2024, so § 51 EEG has been taking the negative quarter hours since the
+    /// start of 2025 — and the § 9 Abs. 2 cap **still on**, because that one
+    /// runs until the operator's first successful Ansteuerbarkeit test and
+    /// nobody has run it.
+    fn default() -> Self {
+        Self::from(Para9Status::default().with_imsys_since(crate::site::REFERENCE_IMSYS_SINCE))
+    }
+}
+
+impl From<Para9Status> for Para9Settings {
+    fn from(p: Para9Status) -> Self {
+        Self {
+            imsys_control_device: matches!(p.relief, hems_core::asset::CapRelief::ImsysWithControl),
+            imsys_since: p.imsys_since.map(iso_date),
+            steckersolargeraet: p.steckersolargeraet,
+            legacy_70_percent: p.legacy_70_percent,
+        }
+    }
+}
+
+impl Para9Settings {
+    /// The § 9 EEG facts this declares.
+    ///
+    /// # Errors
+    /// [`SettingsError::NotADate`] on a meter date that is not one.
+    pub fn status(&self) -> Result<Para9Status, SettingsError> {
+        let imsys_since = self
+            .imsys_since
+            .as_deref()
+            .map(|date| iso("imsys_since", date))
+            .transpose()?;
+        Ok(Para9Status {
+            relief: if self.imsys_control_device {
+                hems_core::asset::CapRelief::ImsysWithControl
+            } else {
+                hems_core::asset::CapRelief::None
+            },
+            imsys_since,
+            steckersolargeraet: self.steckersolargeraet,
+            legacy_70_percent: self.legacy_70_percent,
+        })
+    }
+}
+
+/// An ISO date, or which field was not one.
+fn iso(field: &'static str, date: &str) -> Result<time::Date, SettingsError> {
+    time::Date::parse(date, &time::format_description::well_known::Iso8601::DATE).map_err(|_| {
+        SettingsError::NotADate {
+            field,
+            value: date.to_owned(),
+        }
+    })
+}
+
+/// A date as a configuration file spells it.
+fn iso_date(date: time::Date) -> String {
+    date.format(&time::format_description::well_known::Iso8601::DATE)
+        .unwrap_or_default()
+}
+
+impl DeclaredSettings {
+    /// What this declares, with the date parsed.
+    ///
+    /// # Errors
+    /// [`SettingsError::NotADate`] on a commissioning date that is not one. A
+    /// typo here is not a small thing: it is the input to both statutory
+    /// regimes, and a silent fallback would present as a household planned
+    /// strangely for a year.
+    pub fn declared(&self) -> Result<Declared, SettingsError> {
+        let commissioned_at = self
+            .commissioned
+            .as_deref()
+            .map(|date| iso("commissioned", date))
+            .transpose()?;
+        Ok(Declared {
+            commissioned_at,
+            legacy_status: self.legacy_status,
+            switched_voluntarily: self.switched_voluntarily,
+            exemption: self.exemption,
+        })
     }
 }
 
@@ -687,6 +951,100 @@ pub enum SettingsError {
         /// The top.
         max: f64,
     },
+    /// A thermal model was given that no house could have.
+    #[error(
+        "the building parameters are not physical ({found}); every capacity and \
+         resistance has to be finite and greater than zero, or the planner's own \
+         temperature predictions diverge"
+    )]
+    NotABuilding {
+        /// What was built from the archetype and the overrides.
+        found: String,
+    },
+    /// An identifier was given that the market would not accept.
+    #[error("{field} is {value:?}, which is not a valid {field}: {why}")]
+    NotAnIdentifier {
+        /// Which field.
+        field: &'static str,
+        /// What was given.
+        value: String,
+        /// What the parser said.
+        why: String,
+    },
+    /// Something was declared about an asset this household does not have.
+    #[error(
+        "[site.declared.{asset}] names an asset this household has none of; \
+         the ones it can name are {known}"
+    )]
+    UndeclarableAsset {
+        /// The key that named nothing.
+        asset: String,
+        /// What it could have named.
+        known: String,
+    },
+}
+
+/// Parse a market identifier, or say which one was wrong and why.
+///
+/// A MaLo-ID carries a check digit and a MeLo-ID a Vergabestelle prefix, so a
+/// transposed pair of digits is *detectable* — and swallowing that with an
+/// `.ok()` would put an identifier on a Marktkommunikation message that names
+/// somebody else's connection point. Refuse rather than guess (P5).
+fn market_id<T: std::str::FromStr<Err = metering::ParseError>>(
+    field: &'static str,
+    value: Option<&str>,
+) -> Result<Option<T>, SettingsError> {
+    value
+        .map(|v| {
+            v.parse::<T>()
+                .map_err(|why| SettingsError::NotAnIdentifier {
+                    field,
+                    value: v.to_owned(),
+                    why: why.to_string(),
+                })
+        })
+        .transpose()
+}
+
+impl SiteSettings {
+    /// The § 14a facts declared per asset, with every key checked.
+    ///
+    /// # Errors
+    /// [`SettingsError::UndeclarableAsset`] for a key that names no asset this
+    /// household has — the same rule a `[[drivers]]` entry lives under, and for
+    /// the same reason: a § 14a regime declared for a device that does not exist
+    /// looks, from every screen, exactly like one that took effect.
+    /// [`SettingsError::NotADate`] for a commissioning date that is not one.
+    fn declarations(&self) -> Result<BTreeMap<String, Declared>, SettingsError> {
+        self.declared
+            .iter()
+            .map(|(asset, d)| {
+                if REFERENCE_ASSETS.contains(&asset.as_str()) {
+                    Ok((asset.clone(), d.declared()?))
+                } else {
+                    Err(SettingsError::UndeclarableAsset {
+                        asset: asset.clone(),
+                        known: REFERENCE_ASSETS.join(", "),
+                    })
+                }
+            })
+            .collect()
+    }
+
+    /// What the connection agreement adds to the fuse.
+    ///
+    /// # Errors
+    /// [`SettingsError::NotAnIdentifier`] where a market identifier fails its
+    /// own check digit or prefix.
+    fn connection(&self) -> Result<ConnectionConfig, SettingsError> {
+        Ok(ConnectionConfig {
+            contract_power: self.contract_power_kw.map(Power::from_kw),
+            malo: market_id::<MaloId>("malo", self.malo.as_deref())?,
+            melo: market_id::<MeloId>("melo", self.melo.as_deref())?,
+            dso_code: self.dso_code.clone(),
+            netzbereich: self.netzbereich.clone(),
+        })
+    }
 }
 
 impl SiteSettings {
@@ -709,23 +1067,9 @@ impl SiteSettings {
                 max: self.comfort_max_c,
             });
         }
-        let para9 = match &self.imsys_since {
-            Some(date) => {
-                let parsed =
-                    time::Date::parse(date, &time::format_description::well_known::Iso8601::DATE)
-                        .map_err(|_| SettingsError::NotADate {
-                        field: "imsys_since",
-                        value: date.clone(),
-                    })?;
-                Para9Status::default().with_imsys_since(parsed)
-            }
-            None => Para9Status::default(),
-        };
-        let para9 = if self.imsys_control_device {
-            para9.with_relief(hems_core::asset::CapRelief::ImsysWithControl)
-        } else {
-            para9
-        };
+        let para9 = self.para9.status()?;
+        let declared = self.declarations()?;
+        let connection = self.connection()?;
 
         // A size of zero is the configuration saying the household has no such
         // device, and the site then says so too: the asset is simply not built
@@ -735,6 +1079,8 @@ impl SiteSettings {
             pv: (self.pv_kwp > 0.0).then(|| crate::site::PvConfig {
                 kwp: Power::from_kw(self.pv_kwp),
                 ac_nominal: Power::from_kw(self.pv_ac_kw),
+                tilt_deg: self.pv_tilt_deg,
+                azimuth_deg: self.pv_azimuth_deg,
                 para9,
             }),
             battery: (self.battery_kwh > 0.0 && self.battery_kw > 0.0)
@@ -773,6 +1119,9 @@ impl SiteSettings {
                 }
             }),
             fuse: Current::new(self.fuse_a),
+            connection,
+            building: self.building.rc2()?,
+            declared,
             location: GeoPoint {
                 latitude: self.latitude,
                 longitude: self.longitude,
@@ -1186,6 +1535,199 @@ mod tests {
         let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
         crate::runtime::assemble(&settings, None, time::OffsetDateTime::now_utc())
             .expect("the shipped example describes a box that starts");
+    }
+
+    #[test]
+    fn the_roof_the_installer_described_is_the_roof_the_box_models() {
+        // The chain that was broken: `PvArray` has carried a tilt and an azimuth
+        // since the site model existed, the forecast reads both, and the daemon
+        // wrote 35°/180° into every household in the country. An east-west array
+        // was modelled as due south and left the correction to absorb a *shape*
+        // error it can only take a level out of.
+        let settings = SiteSettings {
+            pv_tilt_deg: 12.0,
+            pv_azimuth_deg: 95.0,
+            ..SiteSettings::default()
+        };
+        let household = crate::site::Household::build(&settings.household().expect("a household"))
+            .expect("a site");
+        let roof = household
+            .site
+            .assets
+            .iter()
+            .find_map(|a| match a {
+                hems_core::prelude::Asset::Pv(pv) => Some(pv),
+                _ => None,
+            })
+            .expect("a roof");
+        assert!((roof.tilt_deg - 12.0).abs() < 1e-9);
+        assert!((roof.azimuth_deg - 95.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_roof_from_the_exempt_window_is_not_capped_at_sixty_per_cent() {
+        // § 100 Abs. 3b EEG disapplies § 9 Abs. 2 entirely to a system
+        // commissioned between 01.01.2023 and 24.02.2025. The daemon used to
+        // stamp 2025-03-01 on every asset, so such a roof was curtailed at 60 %
+        // every sunny midday for the life of the installation — for a limitation
+        // the statute never reached it with.
+        let capped = SiteSettings::default();
+        let exempt = SiteSettings {
+            declared: [(
+                "pv".to_owned(),
+                DeclaredSettings {
+                    commissioned: Some("2024-06-01".to_owned()),
+                    ..DeclaredSettings::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..SiteSettings::default()
+        };
+        let limit = |s: &SiteSettings| {
+            let household = crate::site::Household::build(&s.household().expect("a household"))
+                .expect("a site");
+            hems_grid::para9::GenerationProfile::of_site(&household.site)
+                .expect("a roof")
+                .statutory_limit()
+        };
+        assert!(limit(&capped).is_some(), "March 2025 is capped at 60 %");
+        assert_eq!(limit(&exempt), None, "and June 2024 is capped at nothing");
+    }
+
+    #[test]
+    fn a_legacy_heat_pump_is_not_a_new_steuve() {
+        // `[A1 10.1]`: a device commissioned before 2024 on the old reduced
+        // network fee stays on it until 31.12.2028. Counting it as a new SteuVE
+        // hands the operator a share of its power it may not reduce and counts
+        // its consumption as netzwirksamer Leistungsbezug when it is ordinary
+        // load — and there was no way to say so.
+        let settings = SiteSettings {
+            declared: [(
+                "waermepumpe".to_owned(),
+                DeclaredSettings {
+                    commissioned: Some("2019-04-01".to_owned()),
+                    legacy_status: LegacyStatus::ReducedNetworkFee,
+                    ..DeclaredSettings::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..SiteSettings::default()
+        };
+        let household = crate::site::Household::build(&settings.household().expect("a household"))
+            .expect("a site");
+        let unit = household
+            .heat_pump
+            .as_ref()
+            .and_then(|id| household.site.asset(id))
+            .expect("a heat pump");
+        assert!(matches!(
+            hems_grid::para14a::participation(
+                unit.meta().commissioned_at,
+                unit.meta().steuve_exemption,
+                unit.meta().legacy_status,
+                unit.meta().switched_voluntarily,
+            ),
+            hems_grid::para14a::Participation::Legacy { .. }
+        ));
+    }
+
+    #[test]
+    fn a_declaration_for_an_asset_nobody_has_is_refused() {
+        // The same rule a `[[drivers]]` entry lives under, and for the same
+        // reason: a § 14a regime declared for a device that does not exist looks,
+        // from every screen, exactly like one that took effect.
+        let settings = SiteSettings {
+            declared: [("waermepump".to_owned(), DeclaredSettings::default())]
+                .into_iter()
+                .collect(),
+            ..SiteSettings::default()
+        };
+        assert!(matches!(
+            settings.household(),
+            Err(SettingsError::UndeclarableAsset { .. })
+        ));
+    }
+
+    #[test]
+    fn the_connection_agreement_narrows_what_the_fuse_allows() {
+        // `contract_power` binds the guard's headroom, the planner's import
+        // ceiling and the ContractualConsumptionNominalMax an Energy Guard is
+        // told `[LPC-042]` — and until it could be configured, a box told a
+        // network operator its only limit was a 35 A fuse.
+        let settings = SiteSettings {
+            contract_power_kw: Some(14.0),
+            ..SiteSettings::default()
+        };
+        let household = crate::site::Household::build(&settings.household().expect("a household"))
+            .expect("a site");
+        assert_eq!(
+            household.site.grid.import_ceiling(),
+            hems_core::prelude::Power::from_kw(14.0)
+        );
+        // …and it is deliberately *not* applied to export: an agreement about
+        // how much a household may draw is not a feed-in limitation.
+        assert!(household.site.grid.export_ceiling() > hems_core::prelude::Power::from_kw(20.0));
+    }
+
+    #[test]
+    fn a_market_identifier_that_fails_its_own_check_digit_is_refused() {
+        // A MaLo-ID carries a check digit precisely so a transposition is
+        // detectable, and swallowing that would put an identifier on a market
+        // message that names somebody else's connection point.
+        let settings = SiteSettings {
+            malo: Some("41373559214".to_owned()),
+            ..SiteSettings::default()
+        };
+        assert!(matches!(
+            settings.household(),
+            Err(SettingsError::NotAnIdentifier { field: "malo", .. })
+        ));
+    }
+
+    #[test]
+    fn a_building_the_installer_named_reaches_the_planner() {
+        let settings = SiteSettings {
+            building: BuildingSettings {
+                class: BuildingClass::SolidWall,
+                ..BuildingSettings::default()
+            },
+            ..SiteSettings::default()
+        };
+        let config = settings.household().expect("a household");
+        assert_eq!(config.building, BuildingClass::SolidWall.rc2());
+
+        // …and one parameter may be corrected without giving up the class.
+        let corrected = SiteSettings {
+            building: BuildingSettings {
+                class: BuildingClass::SolidWall,
+                mass_capacity_kwh_per_k: Some(9.0),
+                ..BuildingSettings::default()
+            },
+            ..SiteSettings::default()
+        };
+        let built = corrected.household().expect("a household").building;
+        assert!((built.mass_capacity_kwh_per_k - 9.0).abs() < 1e-9);
+        assert!(
+            (built.r_air_out_k_per_kw - BuildingClass::SolidWall.rc2().r_air_out_k_per_kw).abs()
+                < 1e-9
+        );
+    }
+
+    #[test]
+    fn a_building_that_could_not_exist_is_refused_rather_than_planned_against() {
+        let settings = SiteSettings {
+            building: BuildingSettings {
+                mass_capacity_kwh_per_k: Some(0.0),
+                ..BuildingSettings::default()
+            },
+            ..SiteSettings::default()
+        };
+        assert!(matches!(
+            settings.household(),
+            Err(SettingsError::NotABuilding { .. })
+        ));
     }
 
     #[test]

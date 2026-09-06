@@ -30,7 +30,13 @@ serde        = { version = "1", features = ["derive"] }
 # a few hundred numbers.
 serde_json   = { version = "1", features = ["float_roundtrip"] }
 time         = { version = "0.3", features = ["std", "macros", "parsing", "formatting", "serde-well-known"] }
-rust_decimal = { version = "1", features = ["macros"] }
+# `db-tokio-postgres` gives `Decimal` its `ToSql`/`FromSql` for PostgreSQL's
+# `NUMERIC`, which is what lets a settlement quantity be a number in the database
+# rather than a decimal written into a `TEXT` column. Additive and inert for
+# every crate that does not touch a database — unlike a `serde` feature, it
+# changes no existing impl (D144's lesson, applied to the other kind of global
+# feature).
+rust_decimal = { version = "1", features = ["macros", "db-tokio-postgres"] }
 uuid         = { version = "1", features = ["v4", "v7", "serde"] }
 tracing      = "0.1"
 # The advisory runtime `agentd` is built on: durable, replayable, and the
@@ -53,7 +59,7 @@ quick-xml    = { version = "0.42", default-features = false }
 # quality flags, §14a Modul 3 Zählzeit registers, virtual meters (§42b), §42c
 # eligibility. hems computes *control*; `metering` owns *quantities*, and the
 # two must never disagree about what a quarter-hour is.
-metering     = { version = "0.22", features = ["serde"] }
+metering     = { version = "0.23", features = ["serde"] }
 
 # EEBUS: SHIP + SPINE + the certifiable use cases. Taken with `default-features
 # = false` so the domain side gets the sans-I/O cores and nothing else — no
@@ -105,7 +111,11 @@ tokio        = { version = "1", default-features = false }
 # because the three shared endpoints are the whole of what this workspace needs
 # from one and `Router::merge` is how a daemon adds its own without being able to
 # shadow them.
-axum         = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+# `matched-path` is what lets a metrics label be the *route* rather than the
+# path: a hems site is called `reference-household`, which no heuristic
+# normaliser recognises as an identifier, so without it every household would get
+# a Prometheus label of its own (D163).
+axum         = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "matched-path"] }
 # The client half, on rustls rather than OpenSSL: a gateway box image with no
 # system OpenSSL is the point of a distroless build.
 #
@@ -127,12 +137,59 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["e
 rmcp         = { version = "3", default-features = false, features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
 schemars     = { version = "1", default-features = false, features = ["derive"] }
 tokio-util   = { version = "0.7", default-features = false }
-# The box's own store. SQLite `bundled`, so a gateway image needs no system
-# library and a `cargo test` needs no server — and because `meterstore`, which is
-# the *fleet's* history, is PostgreSQL and Iceberg and is not something a
-# household box runs. The two tiers answer different questions and it is right
-# that they are different stores.
+# ── The two stores, and why there are two ───────────────────────────────────
+#
+# **The box's own**, `rusqlite`, SQLite `bundled` so a gateway image needs no
+# system library. One process, one writer, no network, and a file an installer
+# can copy off a failed box — every property a household gateway wants and a
+# fleet service does not.
 rusqlite     = { version = "0.40", features = ["bundled", "time"] }
+# **The fleet's**, PostgreSQL. The daemons behind it hold the § 14a evidence of
+# every household, and each of the things that made SQLite right on the box is
+# wrong here: one writer serialises a fleet's worth of forwards behind a mutex,
+# a file on one node cannot be replicated, and a daemon that cannot run two
+# replicas cannot be deployed without downtime (D156).
+#
+# Two consequences worth naming, because both are correctness rather than scale.
+# A settlement quantity is a **`NUMERIC`** rather than a decimal written into a
+# `TEXT` column — `rust_decimal` round-trips through PostgreSQL's own exact type,
+# so `SUM(grid_draw_kwh)` is arithmetic the database does rather than 35 040
+# strings this workspace parses (P3, in the store as well as in the code). And an
+# instant is a **`TIMESTAMPTZ`** rather than Unix seconds, so a range query is a
+# range query.
+#
+# `tokio-postgres` rather than `sqlx`, and the reason is cargo rather than taste.
+# `sqlx` declares `sqlx-sqlite` as an optional dependency; cargo enforces the
+# `links = "sqlite3"` uniqueness rule during **resolution**, over optional
+# dependencies it may never enable. Measured at `sqlx =0.8.6` beside this
+# workspace's `rusqlite` `bundled`: `default-features = false` with `["postgres"]`
+# resolves, and adding any one of `macros`, `migrate`, `json` or `any` — so also
+# `sqlx`'s defaults — does not. What survives the exclusions is a driver with no
+# compile-time queries, no migration runner and no JSON. Of the three ways out —
+# move the box to `sqlx/sqlite` too, keep the fleet on SQLite, or use a
+# PostgreSQL driver that links no native library — only the last leaves the
+# safety-critical edge daemon alone. `tokio-postgres` is pure Rust, is what
+# `sqlx-postgres` is built on, and pairs with `deadpool` for the pool and
+# `rustls` for the TLS a managed instance requires.
+tokio-postgres        = { version = "0.7", features = ["with-time-0_3", "with-serde_json-1"] }
+tokio-postgres-rustls = { version = "0.14" }
+deadpool-postgres     = { version = "0.14", default-features = false, features = ["rt_tokio_1"] }
+# The same **aws-lc-rs** provider `reqwest` is on, not `ring`: `deny.toml` bans
+# `ring` precisely so this is a build failure rather than a resolution to
+# notice, and two providers in one binary is a runtime panic.
+rustls                = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+webpki-roots          = { version = "1" }
+# A real PostgreSQL for the tests, in a container the test starts. It is the
+# price of the paragraph above: SQLite was what made `just ci` a clone-and-run,
+# and a fleet service tested against a database it does not deploy on is a
+# service whose queries are checked by nothing (D156).
+# There is deliberately **no** container library here. `hems_service::testdb`
+# runs `docker run --rm` itself: one command and a readiness poll, which is less
+# code than the library call it replaced, one fewer dependency (and with it the
+# `ring` provider that `deny.toml` bans), and it fails in ways that name their
+# own fix. What decided it was a container left in Docker's `dead` state — the
+# library's reuse-by-name attached to the corpse and the whole suite failed with
+# `PortNotExposed`.
 # Signed updates. The CRA (Regulation (EU) 2024/2847, Annex I Part I § 2(c))
 # requires a product to ship security updates and to protect their integrity;
 # an unsigned firmware image on a device that controls a grid connection is the

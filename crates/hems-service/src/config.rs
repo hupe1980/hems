@@ -116,13 +116,7 @@ impl Default for Settings {
     }
 }
 
-impl Settings {
-    /// The shutdown grace period.
-    #[must_use]
-    pub const fn shutdown_grace(&self) -> time::Duration {
-        time::Duration::seconds(self.shutdown_grace_s.cast_signed())
-    }
-}
+impl Settings {}
 
 /// A credential, and where to get it from.
 ///

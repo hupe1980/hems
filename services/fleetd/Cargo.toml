@@ -10,8 +10,9 @@ repository.workspace   = true
 rust-version.workspace = true
 
 [dependencies]
-rusqlite     = { workspace = true }
-hems-service = { workspace = true }
+tokio-postgres    = { workspace = true }
+deadpool-postgres = { workspace = true }
+hems-service = { workspace = true, features = ["postgres"] }
 # The Model Context Protocol surface at `/mcp`, on the socket this daemon
 # already binds. Read-only tools: an agent may read what an operator reads and
 # may move nothing.
@@ -36,4 +37,5 @@ toml          = { workspace = true }
 tracing       = { workspace = true }
 
 [dev-dependencies]
+hems-service = { workspace = true, features = ["testkit"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync", "io-util"] }

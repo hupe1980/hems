@@ -87,16 +87,6 @@ impl Band {
         }
         .sorted()
     }
-
-    /// The band as powers, load convention.
-    #[must_use]
-    pub fn as_power(self) -> PowerBand {
-        PowerBand {
-            p10: Power::new(self.p10),
-            p50: Power::new(self.p50),
-            p90: Power::new(self.p90),
-        }
-    }
 }
 
 impl fmt::Display for Band {
@@ -156,13 +146,6 @@ impl Forecast {
     pub fn medians(&self) -> impl Iterator<Item = f64> + '_ {
         self.slots.iter().map(|(_, b)| b.p50)
     }
-
-    /// The total energy under the median, in watt-hours.
-    #[must_use]
-    pub fn total_median_wh(&self) -> f64 {
-        self.medians().sum::<f64>() * 0.25
-    }
-
     /// Whether every band is well formed.
     #[must_use]
     pub fn is_ordered(&self) -> bool {

@@ -6,10 +6,18 @@ weight = 1
 
 ## Requirements
 
-Rust **1.94** (pinned in `rust-toolchain.toml`) and [`just`](https://just.systems).
+Rust **1.94** (pinned in `rust-toolchain.toml`) and [`just`](https://just.systems)
+to build and run. The default solver is pure Rust, so there is no C++ toolchain
+and no system library to install, and no test reaches the internet.
 
-Nothing else. The default solver is pure Rust, so there is no C++ toolchain and
-no system library to install, and every test runs on a machine with no network.
+`just test` also needs a **container runtime** — Docker, Podman or Colima. The
+fleet daemons deploy on PostgreSQL, so their queries are tested against
+PostgreSQL: a service checked on a different engine is a service whose SQL is
+checked by nothing. The suite starts one container per test binary and gives each
+test a database of its own; `just db` starts one to develop against, and
+`HEMS_TEST_POSTGRES` points the suite at a server that is already running
+instead. There is deliberately no way to *skip* — a test that passed quietly when
+it could not reach a database would report green for a query nobody ran.
 
 ```console
 $ git clone https://github.com/hupe1980/hems && cd hems
@@ -146,22 +154,58 @@ household with **no** battery, not a battery of no size — the asset is simply
 not built, so nothing decides for it, the S2 description never names it, and a
 driver configured for it is refused at start-up.
 
+### Three fields worth ten seconds each
+
+**The roof's geometry.** `pv_tilt_deg` and `pv_azimuth_deg` — 180 is due south,
+90 east, 270 west. The azimuth decides *when* the roof produces, and it is the
+field nobody thinks to change: an east–west array left on due south produces two
+shoulders where the plan expects one midday peak, so the box charges the battery
+from a sun that is not there. What the box learns from its own meter is a
+multiplicative *level* per hour, so it absorbs soiling in a fortnight and a wrong
+compass bearing never.
+
+**Which house it is, thermally.** `[site.building]` takes an archetype —
+`average`, `new-build`, `solid-wall`, `apartment` — or the four parameters
+directly. It is a *prior*: the box fits the real building from the household's
+own thermometer once it has watched a few excited days, and the fit wins. The
+prior matters for the weeks before that, because the fabric capacity decides
+whether pre-heating into a cheap hour pays at all and spans a factor of five
+across the classes.
+
+**What the paperwork says.** `[site.declared.<asset>]` carries the commissioning
+date, the § 14a legacy regime and any exemption; `[site.para9]` the § 9 EEG facts
+about the roof. The commissioning date feeds *both* statutes, and they read
+silence in opposite directions: § 100 Abs. 3b EEG disapplies the § 9 feed-in cap
+entirely to a system commissioned between 01.01.2023 and 24.02.2025, while
+`[A1 10.1]` leaves a 2019 heat pump on the old reduced network fee until
+31.12.2028. Wrong either way costs money — a roof curtailed every sunny midday
+for the life of the installation, or a network operator handed a share of a heat
+pump's power it may not reduce. Neither is derivable from a nameplate, so the box
+asks, and says what each answer produced where somebody can correct it:
+
+```console
+INFO § 14a asset=waermepumpe commissioned=Some(2019-04-01) participation=Legacy { until: 2028-12-31 } controlled=false
+INFO § 9 EEG: no statutory feed-in cap applies to this roof commissioned=Some(2024-06-01)
+```
+
 `--check` builds the site and the drivers and stops before opening a socket. It
 is what an installer runs before leaving, and it refuses the mistakes that are
-otherwise silent for months. It also checks the **physics**: that the building
-model the planner is about to integrate contracts at the quarter-hour step, and
-that the heat pump can hold the comfort band at the design outdoor temperature
-with its heating rod counted in. The first is a refusal — parameters it fails
-for are parameters whose predicted temperatures diverge — though it cannot fail
-while the building is still a fixed prior, and it is in place for when the
-fabric becomes a fitted quantity. The second is a warning, because an undersized
-heat pump is a comfort problem the plan already prices rather than a reason to
-refuse to manage a house.
+otherwise silent for months. It also checks the **physics** of the building it
+was given: that the model the planner integrates contracts at the quarter-hour
+step, and that the heat pump can hold the comfort band at the design outdoor
+temperature with its heating rod counted in *at a coefficient of one*, because a
+resistive element is not a heat pump. The first is a refusal — parameters it
+fails for are parameters whose predicted temperatures diverge. The second is a
+warning, because
+an undersized heat pump is a comfort problem the plan already prices rather than
+a reason to refuse to manage a house.
 
 The refusals are the mistakes that are otherwise silent for months — a driver
 for an asset the site does not have, two drivers that both command or both
 measure one asset, a controllable device no driver can command, a § 14a household with nothing that could
-hear a reduction, and a **Modul 3 calendar that breaks the Anwendungshilfe**:
+hear a reduction, a market identifier that fails its own check digit, a thermal
+model no house could have, a § 14a regime declared for a device this household
+does not own, and a **Modul 3 calendar that breaks the Anwendungshilfe**:
 
 ```console
 📅 Modul 3 `NB-14A-3-2026` for 2026 conforms — HT 17:00–20:00, NT 22:00–06:00, billed in Q1, Q4

@@ -26,7 +26,11 @@ pub struct Endpoint {
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     /// The shared daemon settings.
-    #[serde(flatten)]
+    /// A **table** rather than a flattened set of top-level keys, so every
+    /// daemon in this workspace is configured the same way (D160). The
+    /// environment override is unaffected — it goes through `AsMut<Settings>`
+    /// rather than through the file's shape.
+    #[serde(default)]
     pub service: hems_service::Settings,
     /// Which sources to ask, and where.
     ///
@@ -112,4 +116,29 @@ pub struct Modul3Entry {
     pub netzbetreiber: String,
     /// The calendar, as transcribed from the operator's price sheet.
     pub calendar: hems_grid::modul3::Transcription,
+}
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// The example file that ships with the daemon.
+    ///
+    /// Parsed by a test rather than trusted: a commented example that has
+    /// drifted from the struct it documents is worse than none, because it is
+    /// read by whoever is deploying this and every line of it looks
+    /// authoritative. `include_str!` makes it a build input, and
+    /// `cargo xtask check-examples` fails the build on a daemon that ships
+    /// neither.
+    const EXAMPLE: &str = include_str!("../tariffd.example.toml");
+
+    #[test]
+    fn the_example_configuration_parses_and_describes_a_service() {
+        let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
+        assert!(
+            !settings.sources.is_empty(),
+            "a `tariffd` with no source never becomes ready, so an example with \
+             none would document a service that cannot start usefully"
+        );
+    }
 }

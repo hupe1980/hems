@@ -10,27 +10,16 @@ use hems_grid::mispel::QuarterHour;
 use hems_service::auth::{Authority, Credentials, bearer};
 use time::OffsetDateTime;
 
-use crate::{Db, Store, StoreError};
+use crate::{Store, StoreError};
 
 /// What the API writes to and reads from.
 ///
-/// # Every query runs off the runtime, and reads do not queue behind writes
-///
-/// `rusqlite` is synchronous, so a call inside an `async` handler occupies a
-/// runtime worker for as long as it takes. A household's Data Act export is the
-/// two years of `[A1 7.3]` — about 11 MB of JSON and 370 ms — and there are only
-/// as many workers as cores, so a few concurrent exports stall *every* request
-/// including `/livez` and `/readyz`. Everything therefore goes through
-/// [`tokio::task::spawn_blocking`].
-///
-/// Off the runtime, a single connection still serialises them: eight exports put
-/// a box's evidence write 2,7 s behind. SQLite in WAL mode allows many readers
-/// and one writer, so a read opens its own connection through [`Db`] and only
-/// writes share one.
+/// One pool and no writer: the driver is async, so a Data Act export — 11 MB of
+/// JSON and 370 ms — yields rather than occupying a runtime worker, and there is
+/// no write lock for a fleet's forwarded evidence to queue behind (D156).
 #[derive(Clone)]
 pub struct History {
-    db: Db,
-    writer: Arc<std::sync::Mutex<Store>>,
+    store: Store,
     credentials: Arc<Credentials>,
     mispel: Arc<std::collections::BTreeMap<String, crate::config::MispelSettings>>,
 }
@@ -43,10 +32,9 @@ impl History {
     /// evidence a network operator settles on, so "nobody configured it" has to
     /// read as "nobody may".
     #[must_use]
-    pub fn new(db: Db, writer: Arc<std::sync::Mutex<Store>>, credentials: Credentials) -> Self {
+    pub fn new(store: Store, credentials: Credentials) -> Self {
         Self {
-            db,
-            writer,
+            store,
             credentials: Arc::new(credentials),
             mispel: Arc::new(std::collections::BTreeMap::new()),
         }
@@ -87,53 +75,18 @@ impl History {
         .and_then(|token| self.credentials.authority_of(token))
         .ok_or(StatusCode::UNAUTHORIZED)
     }
+}
 
-    /// Run one **read** off the runtime, on a connection of its own.
-    async fn read<T, F>(&self, work: F) -> Result<T, StatusCode>
-    where
-        T: Send + 'static,
-        F: FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
-    {
-        let db = self.db.clone();
-        Self::off_the_runtime(move || work(&db.connect()?)).await
-    }
-
-    /// Run one **write** off the runtime, on the connection that owns the write
-    /// lock.
-    ///
-    /// A poisoned mutex is a previous write that panicked while holding it.
-    /// `into_inner` takes the store anyway: the panic was in *this* code rather
-    /// than in SQLite, a transaction is either committed or not, and refusing
-    /// every write afterwards would turn one bad query into an outage of the
-    /// § 14a record.
-    async fn write<T, F>(&self, work: F) -> Result<T, StatusCode>
-    where
-        T: Send + 'static,
-        F: FnOnce(&mut Store) -> Result<T, StoreError> + Send + 'static,
-    {
-        let writer = Arc::clone(&self.writer);
-        Self::off_the_runtime(move || {
-            let mut guard = writer
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            work(&mut guard)
-        })
-        .await
-    }
-
-    async fn off_the_runtime<T, F>(work: F) -> Result<T, StatusCode>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
-    {
-        tokio::task::spawn_blocking(work)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-            .map_err(|e| {
-                tracing::error!(error = %e, "a query failed");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })
-    }
+/// A query that failed is a `500`, and it says so once.
+///
+/// The one place a [`StoreError`] becomes a status, so a route cannot invent a
+/// different answer for the same fault — and the one place it is logged, so a
+/// failing database is one line per request rather than none or three.
+fn failed<T>(outcome: Result<T, StoreError>) -> Result<T, StatusCode> {
+    outcome.map_err(|e| {
+        tracing::error!(error = %e, "a query failed");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
 }
 
 /// The routes.
@@ -170,9 +123,7 @@ async fn put_quarter_hours(
     // One transaction for the whole batch: a day's registers are one fact, and a
     // settlement that can observe half of them is one that can be run on half a
     // day.
-    state
-        .write(move |store| store.put_quarter_hours(&site, &quarters, now))
-        .await?;
+    failed(state.store.put_quarter_hours(&site, &quarters, now).await)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -183,10 +134,13 @@ async fn get_quarter_hours(
     Query(window): Query<Window>,
 ) -> Result<axum::Json<Vec<QuarterHour>>, StatusCode> {
     deny_unless(state.authority(&headers)?.may_read(&site))?;
-    state
-        .read(move |store| store.quarter_hours(&site, window.from, window.to))
-        .await
-        .map(axum::Json)
+    failed(
+        state
+            .store
+            .quarter_hours(&site, window.from, window.to)
+            .await,
+    )
+    .map(axum::Json)
 }
 
 async fn put_event(
@@ -196,10 +150,7 @@ async fn put_event(
     axum::Json(event): axum::Json<hems_grid::evidence::ControlEvent>,
 ) -> Result<StatusCode, StatusCode> {
     deny_unless(state.authority(&headers)?.may_write(&site))?;
-    state
-        .write(move |store| store.put_control_event(&site, &event))
-        .await
-        .map(|_| StatusCode::CREATED)
+    failed(state.store.put_control_event(&site, &event).await).map(|_| StatusCode::CREATED)
 }
 
 async fn get_nachweis(
@@ -211,9 +162,7 @@ async fn get_nachweis(
     // A network operator may read this: it is the record of what *they*
     // commanded and what the connection point drew, `[A1 7.2]`.
     deny_unless(state.authority(&headers)?.may_read(&site))?;
-    state
-        .read(move |store| crate::export::nachweis(store, &site, window.from, window.to))
-        .await
+    failed(crate::export::nachweis(&state.store, &site, window.from, window.to).await)
         .map(axum::Json)
 }
 
@@ -227,10 +176,7 @@ async fn get_export(
     // generated — when the shower ran, which fortnight nobody was in — and a
     // fleet operator holding a token is not a household.
     deny_unless(state.authority(&headers)?.may_read_everything(&site))?;
-    state
-        .read(move |store| crate::export::data_act(store, &site))
-        .await
-        .map(axum::Json)
+    failed(crate::export::data_act(&state.store, &site).await).map(axum::Json)
 }
 
 /// `?year=2026&month=10` — the calendar period to settle.
@@ -243,6 +189,16 @@ pub struct Period {
     /// year.
     #[serde(default)]
     pub month: Option<u8>,
+    /// Which **version** of the registers to settle from, RFC 3339.
+    ///
+    /// Omitted, the settlement reads the registers as they stand, which is what
+    /// a first settlement of a period wants. Given, it reads them as they stood
+    /// at that instant — which is how a Nachweis already handed over is
+    /// reproduced after a register has been restated, and how the delta a
+    /// correction produces is computed. The registers are versioned precisely so
+    /// this question has an answer.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub as_of: Option<time::OffsetDateTime>,
 }
 
 async fn get_mispel(
@@ -266,24 +222,26 @@ async fn get_mispel(
         // Nachweis from the same registers.
         return Err(StatusCode::NOT_FOUND);
     };
-    let outcome = state
-        .read(move |store| {
-            Ok(crate::export::mispel(
-                store,
-                &site,
-                Some(declared),
-                period.year,
-                period.month,
-            ))
-        })
-        .await?;
+    let outcome = crate::export::mispel(
+        &state.store,
+        &site,
+        Some(declared),
+        period.year,
+        period.month,
+        period.as_of,
+    )
+    .await;
     match outcome {
         Ok(value) => Ok(axum::Json(value)),
         // The caller asked wrongly — a window the declared option does not
-        // settle over, or a month that is not one.
+        // settle over, a month that is not one, or a period earlier than the
+        // Festlegung that would settle it. The last is a `400` rather than a
+        // `404` on purpose: the site exists and its option is declared, and what
+        // is wrong is the *period* the caller named.
         Err(
             crate::export::MispelExportError::WrongWindow(_)
-            | crate::export::MispelExportError::NotACalendarMonth { .. },
+            | crate::export::MispelExportError::NotACalendarMonth { .. }
+            | crate::export::MispelExportError::BeforeTheRules { .. },
         ) => Err(StatusCode::BAD_REQUEST),
         Err(crate::export::MispelExportError::Undeclared { .. }) => Err(StatusCode::NOT_FOUND),
         // The request was well formed and the **registers** cannot support a

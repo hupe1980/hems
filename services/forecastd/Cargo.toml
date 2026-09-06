@@ -33,4 +33,5 @@ tokio      = { workspace = true, features = ["rt-multi-thread", "macros", "signa
 tracing    = { workspace = true }
 
 [dev-dependencies]
+toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "sync"] }

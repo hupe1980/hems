@@ -161,12 +161,111 @@ impl CompressorState {
     }
 }
 
-impl Rc2 {
-    /// A well-insulated German single-family house of roughly 150 m².
+/// A building archetype, for a box that has not identified its own house yet.
+///
+/// # Why the default is not good enough
+///
+/// The fabric capacity is what decides whether pre-heating into a cheap hour
+/// pays at all, and between a 1970s solid-wall house and a new timber frame it
+/// differs by a factor of five. The envelope loss differs by four. A box that
+/// planned every household against one set of numbers would over-heat most of
+/// them and pay the comfort slack for the overshoot — so the archetype an
+/// installer picks in the cellar is the **prior**, and the box replaces it with
+/// a building identified from the household's own thermometer
+/// (`hems_forecast::building`) once it has watched a few excited days.
+///
+/// # Where the numbers come from
+///
+/// Each is a 150 m² dwelling, and the two capacities are the effective thermal
+/// capacity classes of DIN EN ISO 13790 (light 80 kJ/m²K ≈ 22 Wh/m²K, heavy
+/// 260, very heavy 370) times that floor area. `R_air_out` is `ΔT / Q` at the
+/// archetype's specific heat load, taken at the German design pair of 21 °C
+/// indoors and −20 °C outdoors — so a class quoted at *q* W/m² has
+/// `R = 41 K / (q · 150 W)`.
+///
+/// `R_air_mass = 0,4 K/kW` is shared: with an air capacity near 0,6 kWh/K it is
+/// an air–fabric time constant of about a quarter of an hour, which is the
+/// number the exact discretisation exists for (see the module header) and is a
+/// property of how a room exchanges heat with its own walls rather than of how
+/// well the outside wall is insulated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum BuildingClass {
+    /// The average German single-family house of roughly 150 m² — 1990s
+    /// masonry, or an older one partly retrofitted. About 45 W/m², which is
+    /// 6,8 kW of design heat load.
     ///
-    /// `R_air_out = 6 K/kW` is a heat loss of about 3,5 kW at −20 °C outdoors
-    /// and 21 °C indoors; the fabric holds about 12 kWh/K, which is what makes
-    /// pre-heating worth planning at all.
+    /// The default, and the house every reference day in this workspace is
+    /// measured on.
+    #[default]
+    Average,
+    /// GEG-era new build or a deep retrofit: about 27 W/m², 4,1 kW.
+    NewBuild,
+    /// Unretrofitted pre-1979 solid-wall masonry: about 110 W/m², 16,5 kW, and
+    /// a very heavy fabric that takes a day to move.
+    SolidWall,
+    /// A flat inside a heated block: roughly 80 m², losing heat on two sides
+    /// rather than six.
+    ///
+    /// Light on **envelope** and not on **mass**, which is the distinction that
+    /// decides whether pre-heating pays. Its outside walls are somebody else's
+    /// problem, so `R_air_out` is the highest of the four; but the concrete slabs
+    /// above and below it are its own thermal capacity — ISO 13790 counts an
+    /// internal element to half its depth — so 5,0 kWh/K over 80 m² is about
+    /// 63 Wh/m²K, which is medium rather than light. A flat is a small store
+    /// behind a good coat, not a tent.
+    Apartment,
+}
+
+impl BuildingClass {
+    /// The two-mass model this archetype stands for.
+    #[must_use]
+    pub const fn rc2(self) -> Rc2 {
+        match self {
+            Self::Average => Rc2::house(),
+            Self::NewBuild => Rc2 {
+                air_capacity_kwh_per_k: 0.6,
+                // Timber frame or a screed floor over insulation: light to
+                // medium, about 40 Wh/m²K.
+                mass_capacity_kwh_per_k: 6.0,
+                // 41 K / 4,1 kW.
+                r_air_out_k_per_kw: 10.0,
+                r_air_mass_k_per_kw: 0.4,
+            },
+            Self::SolidWall => Rc2 {
+                air_capacity_kwh_per_k: 0.6,
+                // Very heavy, ≈ 100 Wh/m²K over 150 m².
+                mass_capacity_kwh_per_k: 15.0,
+                // 41 K / 16,5 kW.
+                r_air_out_k_per_kw: 2.5,
+                r_air_mass_k_per_kw: 0.4,
+            },
+            Self::Apartment => Rc2 {
+                // 80 m² rather than 150.
+                air_capacity_kwh_per_k: 0.35,
+                mass_capacity_kwh_per_k: 5.0,
+                // 41 K / 2,7 kW: a flat with heated neighbours above, below and
+                // to one side loses heat through far less envelope than its
+                // floor area suggests.
+                r_air_out_k_per_kw: 15.0,
+                r_air_mass_k_per_kw: 0.4,
+            },
+        }
+    }
+}
+
+impl Rc2 {
+    /// The average German single-family house of roughly 150 m².
+    ///
+    /// `R_air_out = 6 K/kW` is a design heat load of 6,8 kW at −20 °C outdoors
+    /// and 21 °C indoors — 45 W/m², which is 1990s masonry or an older house
+    /// partly retrofitted rather than a new build. The fabric holds about
+    /// 12 kWh/K, which is what makes pre-heating worth planning at all.
+    ///
+    /// It is [`BuildingClass::Average`], and it is the prior a box starts from
+    /// when nobody has said which house this is. See [`BuildingClass`] for the
+    /// span the others cover and why the choice matters.
     #[must_use]
     pub const fn house() -> Self {
         Self {

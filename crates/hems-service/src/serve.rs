@@ -67,7 +67,13 @@ impl Server {
             identity,
             settings,
             health: health.clone(),
-            router: router.merge(shared_routes(identity, health)),
+            router: router
+                .merge(shared_routes(identity, health))
+                .merge(crate::metrics::routes())
+                // Applied last so it wraps every route, including the probes
+                // and `/metrics` itself — a health endpoint that has stopped
+                // being answered promptly is exactly the thing worth seeing.
+                .layer(axum::middleware::from_fn(crate::metrics::record)),
         }
     }
 
@@ -227,6 +233,54 @@ mod tests {
 
     /// The smallest HTTP/1.1 client that can ask one question, so the crate
     /// needs no HTTP client dependency to test its own server.
+    #[tokio::test]
+    async fn a_request_is_counted_against_the_route_it_matched_and_not_its_path() {
+        // The label a site identifier must never reach. `mako-service` decides
+        // this with a heuristic — a segment is variable if it is a UUID, is more
+        // than four digits, or is very long — and a hems site is called
+        // `reference-household`, which is none of those. Every household would
+        // get a Prometheus label of its own: a cardinality explosion
+        // proportional to the fleet, and a household identifier in an endpoint
+        // that is scraped and kept for months (D163).
+        let app = Router::new().route(
+            "/v1/sites/{site}/export",
+            get(|| async { "everything, machine-readable, free" }),
+        );
+        let (address, trigger) = start(Health::new(), app).await;
+
+        assert_eq!(
+            http_get(address, "/v1/sites/reference-household/export")
+                .await
+                .0,
+            200
+        );
+        let (_, body) = http_get(address, "/metrics").await;
+
+        assert!(
+            body.contains(r#"route="/v1/sites/{site}/export""#),
+            "the label is the matched route:\n{body}"
+        );
+        assert!(
+            !body.contains("reference-household"),
+            "and it never carries the household:\n{body}"
+        );
+        trigger.trigger();
+    }
+
+    #[tokio::test]
+    async fn a_route_that_matched_nothing_does_not_become_a_label() {
+        // An unrouted URI is attacker-controlled, so it is the one string that
+        // must never reach a label — a monitoring system can be filled from
+        // outside by asking for a million different 404s.
+        let (address, trigger) = start(Health::new(), Router::new()).await;
+        assert_eq!(http_get(address, "/../nonsense-9f3c").await.0, 404);
+        let (_, body) = http_get(address, "/metrics").await;
+
+        assert!(body.contains(r#"route="unmatched""#), "{body}");
+        assert!(!body.contains("nonsense-9f3c"), "{body}");
+        trigger.trigger();
+    }
+
     async fn http_get(address: SocketAddr, path: &str) -> (u16, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();

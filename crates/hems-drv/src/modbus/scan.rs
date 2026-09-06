@@ -201,13 +201,6 @@ impl Discovery {
             state: State::Probing(0),
         }
     }
-
-    /// Whether the model list is known.
-    #[must_use]
-    pub fn is_done(&self) -> bool {
-        self.state == State::Done
-    }
-
     /// Begin again — a device that went quiet may come back as something else.
     pub fn restart(&mut self) {
         self.state = State::Probing(0);

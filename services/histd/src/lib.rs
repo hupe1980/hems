@@ -71,4 +71,4 @@ pub mod mcp_server;
 pub mod store;
 
 pub use config::Settings;
-pub use store::{Db, Store, StoreError};
+pub use store::{Store, StoreError};

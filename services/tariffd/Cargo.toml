@@ -32,4 +32,5 @@ tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "sig
 tracing      = { workspace = true }
 
 [dev-dependencies]
+toml = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync"] }

@@ -4,6 +4,9 @@
 //! every domain crate of this workspace. What that buys is that "one household
 //! in ten thousand breached a limit and the summary says so" is a unit test
 //! rather than a thing somebody hopes.
+//!
+//! The days come from [`crate::store`]; this is the arithmetic over whatever it
+//! is handed (D157).
 
 use std::collections::BTreeMap;
 
@@ -15,6 +18,15 @@ use time::{Date, OffsetDateTime};
 pub struct SiteHistory {
     days: BTreeMap<Date, DayKpis>,
     last_report: Option<OffsetDateTime>,
+}
+
+impl From<crate::store::SiteDays> for SiteHistory {
+    fn from(read: crate::store::SiteDays) -> Self {
+        Self {
+            days: read.days,
+            last_report: read.last_report,
+        }
+    }
 }
 
 impl SiteHistory {
@@ -34,37 +46,26 @@ impl SiteHistory {
 #[derive(Debug, Clone, Default)]
 pub struct Fleet {
     sites: BTreeMap<String, SiteHistory>,
-    keep_days: usize,
 }
 
 impl Fleet {
-    /// A fleet keeping `keep_days` per site.
+    /// A fleet over a window the store has already read.
     #[must_use]
-    pub fn new(keep_days: usize) -> Self {
-        Self {
-            sites: BTreeMap::new(),
-            keep_days: keep_days.max(1),
-        }
+    pub fn of(sites: BTreeMap<String, SiteHistory>) -> Self {
+        Self { sites }
     }
 
-    /// Take in one day.
+    /// Take in one day, for a test that is about the arithmetic.
     ///
     /// A day that is already on record is **replaced**, not appended: a box that
     /// re-sends yesterday after a reconnect is correcting itself, and a fleet
     /// that counted it twice would double one household's saving inside an
-    /// average.
+    /// average. The rule that matters is the store's primary key — this is the
+    /// same rule, so a unit test can build a fleet without a database.
     pub fn record(&mut self, day: DayKpis, at: OffsetDateTime) {
         let history = self.sites.entry(day.site.clone()).or_default();
         history.last_report = Some(at);
         history.days.insert(day.date, day);
-        // The window is bounded, oldest first. `keep_days` is at least one and a
-        // day was just inserted, so the map is never empty inside this loop.
-        while history.days.len() > self.keep_days {
-            let Some(oldest) = history.days.keys().next().copied() else {
-                break;
-            };
-            history.days.remove(&oldest);
-        }
     }
 
     /// How many sites have ever reported.
@@ -403,7 +404,7 @@ mod tests {
     fn one_breach_in_a_thousand_is_a_finding_with_a_name_and_not_a_rate() {
         // The whole reason `breached` is a list. "99,9 % compliance" reads as
         // success and is how a compliance incident disappears.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         for i in 0..999 {
             fleet.record(day(&format!("site-{i}"), date!(2026 - 02 - 27)), NOW);
         }
@@ -430,7 +431,7 @@ mod tests {
     /// one nobody notices.
     #[test]
     fn a_roof_over_its_paragraph_nine_ceiling_is_a_finding_of_its_own() {
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
         let mut over = day("b", date!(2026 - 02 - 27));
         over.worst_feed_in_overshoot_w = 1_140.0;
@@ -450,7 +451,7 @@ mod tests {
 
     #[test]
     fn a_day_shown_the_weather_is_counted_and_then_left_out_of_the_saving() {
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
         let mut cheat = day("a", date!(2026 - 02 - 28));
         cheat.foresight_was_perfect = true;
@@ -481,7 +482,7 @@ mod tests {
     fn a_day_that_arrives_twice_is_a_correction_and_not_a_second_day() {
         // A box reconnecting and re-sending yesterday must not double one
         // household's saving inside an average.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
         let mut restated = day("a", date!(2026 - 02 - 27));
         restated.economics = Some(hems_core::report::Economics {
@@ -506,7 +507,7 @@ mod tests {
 
     #[test]
     fn a_site_that_has_stopped_reporting_is_named() {
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(
             day("quiet", date!(2026 - 02 - 20)),
             NOW - time::Duration::days(5),
@@ -518,31 +519,10 @@ mod tests {
     }
 
     #[test]
-    fn the_window_is_bounded_and_the_oldest_day_goes_first() {
-        let mut fleet = Fleet::new(3);
-        for d in 20..26 {
-            fleet.record(
-                day(
-                    "a",
-                    Date::from_calendar_date(2026, time::Month::February, d).unwrap(),
-                ),
-                NOW,
-            );
-        }
-        let history = fleet.site("a").unwrap();
-        assert_eq!(history.days().count(), 3);
-        assert_eq!(
-            history.days().next().unwrap().date,
-            date!(2026 - 02 - 23),
-            "the three newest"
-        );
-    }
-
-    #[test]
     fn the_forecast_merges_as_episodes_so_twenty_days_can_answer_the_question() {
         // One day is one draw. Twenty of them is what makes
         // `is_well_calibrated` answerable rather than structurally false.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         for d in 1..=20 {
             fleet.record(
                 day(
@@ -560,14 +540,14 @@ mod tests {
 
     #[test]
     fn too_few_days_cannot_call_the_forecast_either_way() {
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(day("a", date!(2026 - 02 - 27)), NOW);
         assert!(!fleet.summarise(NOW, SILENT_AFTER).forecast_is_calibrated);
     }
 
     #[test]
     fn an_empty_fleet_summarises_to_nothing_rather_than_to_a_division_by_zero() {
-        let summary = Fleet::new(60).summarise(NOW, SILENT_AFTER);
+        let summary = Fleet::default().summarise(NOW, SILENT_AFTER);
         assert_eq!(summary.sites, 0);
         assert!((summary.saving_eur - 0.0).abs() < f64::EPSILON);
         assert!(summary.is_clean());
@@ -626,7 +606,7 @@ mod what_a_real_box_reports {
         // real saving by a denominator full of households that never had a
         // counterfactual — and publish a number that gets smaller the more
         // customers there are.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         for i in 0..5 {
             fleet.record(from_a_box(&format!("haus-{i}"), 15), NOW);
         }
@@ -662,7 +642,7 @@ mod what_a_real_box_reports {
         // simulator behind them and three real ones. The saving is a mean over
         // the two that have a baseline; the self-sufficiency is a mean over all
         // five, because all five metered it.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         for i in 0..2 {
             fleet.record(from_the_simulator(&format!("sim-{i}"), 15), NOW);
         }
@@ -696,7 +676,7 @@ mod what_a_real_box_reports {
         // Boxes report no forecast score; the simulator does. Merging the boxes
         // as episodes that scored zero would put the fleet's coverage at 0,17
         // and call it a measurement.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(from_the_simulator("sim", 15), NOW);
         for i in 0..5 {
             fleet.record(from_a_box(&format!("haus-{i}"), 15), NOW);
@@ -719,7 +699,7 @@ mod what_a_real_box_reports {
         // They mean different things. A foresight day is an upper bound nobody
         // can reach; a day with no baseline is a real household. A summary that
         // added them would hide which of the two a small `measured_days` meant.
-        let mut fleet = Fleet::new(60);
+        let mut fleet = Fleet::default();
         fleet.record(from_the_simulator("sim-1", 15), NOW);
         fleet.record(
             DayKpis {

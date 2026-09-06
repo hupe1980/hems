@@ -48,15 +48,21 @@ use crate::store::{Store, StoreError};
 /// # Errors
 /// [`StoreError::Sql`], or [`StoreError::NotReadable`] for a stored event this
 /// build cannot parse.
-pub fn data_act(store: &Store, site: &str) -> Result<Value, StoreError> {
-    let quarters = store.quarter_hours(site, None, None)?;
+pub async fn data_act(store: &Store, site: &str) -> Result<Value, StoreError> {
+    // The registers as they **stand**, not every version of them. The table is
+    // append-only, so "everything" could also mean the supersede chain — and a
+    // household exercising Article 4 is asking what its product measured, not
+    // for a diff of its metering point operator's corrections. The versions are
+    // reachable where they are actually needed, which is a settlement being
+    // reproduced (`mispel(?as_of=)`).
+    let quarters = store.quarter_hours(site, None, None).await?;
     Ok(json!({
         "site": site,
         "produced_at": OffsetDateTime::now_utc().unix_timestamp(),
         "notice": "Regulation (EU) 2023/2854 Article 4: the data this product generated, \
                    in full, machine-readable, and free of charge.",
         "quarter_hours": quarters.iter().map(quarter_hour).collect::<Vec<_>>(),
-        "control_events": events(store, site, None, None)?,
+        "control_events": events(store, site, None, None).await?,
     }))
 }
 
@@ -64,7 +70,7 @@ pub fn data_act(store: &Store, site: &str) -> Result<Value, StoreError> {
 ///
 /// # Errors
 /// As [`data_act`].
-pub fn nachweis(
+pub async fn nachweis(
     store: &Store,
     site: &str,
     from: Option<OffsetDateTime>,
@@ -75,19 +81,20 @@ pub fn nachweis(
         "basis": "BK6-22-300 Anlage 1, Ziffer 7.2",
         "retention": "two years from the end of each event, Ziffer 7.3",
         "produced_at": OffsetDateTime::now_utc().unix_timestamp(),
-        "events": events(store, site, from, to)?,
+        "events": events(store, site, from, to).await?,
     }))
 }
 
 /// The events over a window, each as the document that was stored.
-fn events(
+async fn events(
     store: &Store,
     site: &str,
     from: Option<OffsetDateTime>,
     to: Option<OffsetDateTime>,
 ) -> Result<Vec<Value>, StoreError> {
     store
-        .control_events(site, from, to)?
+        .control_events(site, from, to)
+        .await?
         .into_iter()
         .map(|stored| {
             // `ControlEvent`'s own `serde` form, so the document an operator is
@@ -131,6 +138,13 @@ fn quarter_hour(q: &QuarterHour) -> Value {
         "grid_feed_in_kwh": q.grid_feed_in.to_string(),
         "device_consumption_kwh": q.device_consumption.to_string(),
         "device_generation_kwh": q.device_generation.to_string(),
+        // `Z3V¼`/`Z3E¼`, and `null` rather than absent where the store is not
+        // separately metered. Article 4 is "everything the product generated",
+        // and a register a household is settled on is squarely inside that — a
+        // household on Basisfall A4 handed an export without them could not
+        // check its own Nachweis.
+        "storage_consumption_kwh": q.storage_consumption.map(|v| v.to_string()),
+        "storage_generation_kwh": q.storage_generation.map(|v| v.to_string()),
         "anzulegender_wert_ct": q.anzulegender_wert.to_string(),
         "spot_price_ct": q.spot_price.to_string(),
     })
@@ -156,6 +170,26 @@ pub enum MispelExportError {
     /// The window asked for is not a period the chosen option settles over.
     #[error("{0}")]
     WrongWindow(String),
+    /// The period asked for is earlier than the rules that would settle it.
+    ///
+    /// Refused rather than settled anyway, for the same reason
+    /// [`MispelExportError::Undeclared`] is: the arithmetic would be perfect and
+    /// about a regime that did not exist. `hems-grid` versions the Festlegung
+    /// (`RuleSet`) precisely so this question has an answer, and until now
+    /// nothing asked it — a household could have been handed a Nachweis for
+    /// March 2026 computed under rules effective from October.
+    #[error(
+        "{period} ends before {version} takes effect on {effective_from}; \
+         there is no MiSpeL settlement for a period the Festlegung did not reach"
+    )]
+    BeforeTheRules {
+        /// The period asked for.
+        period: String,
+        /// The rule set that would have settled it.
+        version: &'static str,
+        /// The day it takes effect.
+        effective_from: time::Date,
+    },
     /// The month or year asked for is not one.
     #[error("{year}-{month:?} is not a calendar month")]
     NotACalendarMonth {
@@ -218,18 +252,21 @@ impl Completeness {
 /// # Errors
 /// [`MispelExportError`] where the window is not a real calendar period, or the
 /// store cannot be read.
-fn exclusivity(
+async fn exclusivity(
     store: &Store,
     site: &str,
     rules: RuleSet,
     year: i32,
     month: Option<u8>,
+    as_of: Option<OffsetDateTime>,
 ) -> Result<Value, MispelExportError> {
     let (from, to) = match month {
         Some(m) => calendar_month(year, m)?,
         None => calendar_year(year)?,
     };
-    let quarters = store.quarter_hours(site, Some(from), Some(to))?;
+    let quarters = store
+        .quarter_hours_as_of(site, Some(from), Some(to), as_of)
+        .await?;
     let complete = Completeness {
         expected: quarter_hours_between(from, to),
         present: quarters.len(),
@@ -258,6 +295,7 @@ fn exclusivity(
         "effective_from": rules.effective_from().to_string(),
         "year": year,
         "month": month,
+        "as_of": as_of.map(OffsetDateTime::unix_timestamp),
         "settled": false,
         "complete": complete.is_complete(),
         "quarter_hours": { "expected": complete.expected, "present": complete.present },
@@ -291,15 +329,30 @@ fn exclusivity(
 /// lose an hour every March and double one every October — on the two months a
 /// settlement is most likely to be queried.
 ///
+/// # Reproducing a settlement that has already been handed over
+///
+/// `as_of` is the **second** axis, and it is what makes a disputed Nachweis
+/// answerable. Registers are restated after the fact — a substitute value
+/// replaced by a real one, a correction from the metering point operator weeks
+/// later — and by then the month has been settled and the document sent. Two
+/// questions follow: *what did we hand over*, and *what does the correction
+/// change*. Passing the instant the original document was produced at answers
+/// the first; the difference from `None` answers the second.
+///
+/// `None` settles from the registers as they stand now, which is what every
+/// first settlement of a period wants. The instant is echoed onto the document
+/// either way, so a Nachweis says which version of the record it is about.
+///
 /// # Errors
 /// [`MispelExportError`] where the site has declared no option, the window does
 /// not suit the declared one, or the arithmetic refuses the registers.
-pub fn mispel(
+pub async fn mispel(
     store: &Store,
     site: &str,
     declared: Option<MispelSettings>,
     year: i32,
     month: Option<u8>,
+    as_of: Option<OffsetDateTime>,
 ) -> Result<Value, MispelExportError> {
     let declared = declared.ok_or_else(|| MispelExportError::Undeclared {
         site: site.to_owned(),
@@ -310,7 +363,7 @@ pub fn mispel(
     // the grid holds no grey energy — but it is not therefore a period with
     // nothing to say. See [`exclusivity`].
     if matches!(declared, MispelSettings::Ausschliesslichkeit) {
-        return exclusivity(store, site, rules, year, month);
+        return exclusivity(store, site, rules, year, month, as_of).await;
     }
 
     let (from, to, expected, period) = match (&declared, month) {
@@ -340,7 +393,33 @@ pub fn mispel(
         (MispelSettings::Ausschliesslichkeit, _) => unreachable!("answered above"),
     };
 
-    let quarters = store.quarter_hours(site, Some(from), Some(to))?;
+    // A settlement is dated, and so are the rules. `[MiSpeL]` takes effect on
+    // 01.10.2026 with a transition to 30.09.2027, so a period that ends before
+    // that has no Abgrenzung and no Pauschale to compute — and a document that
+    // computed one anyway would be arithmetically perfect and about a regime
+    // nobody was in. The whole point of versioning the Festlegung is to be able
+    // to say so.
+    //
+    // The test is on the **end** of the period rather than its start, so it
+    // refuses only a period the Festlegung never reached at all. A period that
+    // *straddles* the commencement — the month it arrives in, and the first
+    // Pauschal year — settles, and whether that is right is a question about the
+    // transitional provisions rather than about this code: `[MiSpeL A1]`'s
+    // quantities are quarter-hourly sums, so a straddling period is a partial
+    // one, and `Completeness` is already the field that says so on the document.
+    // Narrowing it further needs the Übergangsregelung read rather than
+    // guessed at (ROADMAP).
+    if !rules.applies_on(to.date()) {
+        return Err(MispelExportError::BeforeTheRules {
+            period,
+            version: rules.version(),
+            effective_from: rules.effective_from(),
+        });
+    }
+
+    let quarters = store
+        .quarter_hours_as_of(site, Some(from), Some(to), as_of)
+        .await?;
     let complete = Completeness {
         expected,
         present: quarters.len(),
@@ -372,6 +451,12 @@ pub fn mispel(
         "period": period,
         "from": from.unix_timestamp(),
         "to": to.unix_timestamp(),
+        // Which *version* of the record this document is about. A settlement is
+        // reproducible only if it says which registers it read, and a register
+        // can be restated after the document has been sent — so a Nachweis with
+        // no transaction time on it is one nobody can check twice. `null` is
+        // "the registers as they stand", which is what a first settlement is.
+        "as_of": as_of.map(OffsetDateTime::unix_timestamp),
         "settled": true,
         // The denominator, on the document. A settlement over part of a period
         // is not a settlement, and the reader has to be able to see that

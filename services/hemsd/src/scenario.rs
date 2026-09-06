@@ -1241,6 +1241,8 @@ impl Reference {
             pv: config.pv.unwrap_or(crate::site::PvConfig {
                 kwp: Power::ZERO,
                 ac_nominal: Power::ZERO,
+                tilt_deg: 0.0,
+                azimuth_deg: 180.0,
                 para9: Para9Status::default(),
             }),
             battery: config.battery.ok_or_else(|| missing("battery"))?,
@@ -1309,7 +1311,17 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     let day = Horizon::new(start, 96);
 
     // ── The physical house ──────────────────────────────────────────────────
-    let array = ArrayModel::new(house.pv.kwp, house.pv.ac_nominal, 35.0, 180.0);
+    // The roof the *simulator* runs is the roof the site model describes, down to
+    // the same two numbers. A second copy of 35°/180° here would be a house that
+    // could disagree with the one the box plans against, and the disagreement
+    // would present as a forecast error the residual corrector spent the day
+    // learning.
+    let array = ArrayModel::new(
+        house.pv.kwp,
+        house.pv.ac_nominal,
+        house.pv.tilt_deg,
+        house.pv.azimuth_deg,
+    );
     let mut building = BuildingSim {
         nominal_electrical: house.heat_pump.power,
         // The same floor the planner is given, so the plan and the house agree

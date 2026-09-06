@@ -49,23 +49,40 @@ async fn main() -> anyhow::Result<()> {
     // Opened before anything is served: a daemon that came up and answered
     // enrolments it could not write down would hand out credentials nobody
     // will recognise after the next restart.
-    let store = fleetd::store::Store::open(&settings.store_path)
-        .map_err(|e| anyhow::anyhow!("{}: {e}", settings.store_path.display()))?;
-    let enrolments = store.enrolments()?;
-    let reports = store.reports()?;
+    let db = hems_service::db::connect(&settings.database, hems_service::identity!().name).await?;
+    hems_service::db::migrate(&db, fleetd::store::MIGRATIONS).await?;
+    let store = fleetd::store::Store::new(db);
+    let enrolments = store.enrolments().await?;
+    let reports = store.reports().await?;
     tracing::info!(
         enrolled = enrolments.len(),
         reported = reports.len(),
-        store = %settings.store_path.display(),
         "fleet state restored"
     );
     let registry = Arc::new(RwLock::new(Registry::restore(sites, enrolments, reports)));
-    let store = Arc::new(std::sync::Mutex::new(store));
     let health = Health::new();
-    health.good("registry", time::OffsetDateTime::now_utc());
 
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
+
+    // A `fleetd` that cannot reach its database can still answer from the
+    // registry it restored at start-up — and must not, because the one thing it
+    // is for is *adopting* a box, and an enrolment it cannot write down is a
+    // credential nobody will recognise after the next restart.
+    health.vital(
+        "registry",
+        signal.clone(),
+        hems_service::db::watch(
+            store.db().clone(),
+            health.clone(),
+            "registry",
+            signal.clone(),
+        ),
+    );
+    // The series a probe cannot answer: a saturated pool serves `503`s while
+    // `/livez` and `/readyz` both stay green, because the process is alive and
+    // the database is reachable and there is simply no connection to be had.
+    hems_service::metrics::publish_pool(store.db(), hems_service::identity!().name);
 
     // The roster is every household this fleet has adopted. An operator's
     // credential reads it; a box's own enrolment credential does not.
@@ -87,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&registry),
         settings.releases.clone(),
         operators.clone(),
-        Arc::clone(&store),
+        store.clone(),
     ));
     if settings.mcp.enabled {
         let auth = hems_service::McpAuth::per_caller(&settings.mcp, &operators)?;

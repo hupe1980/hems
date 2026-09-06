@@ -45,6 +45,7 @@ pub mod api;
 pub mod config;
 pub mod fleet;
 pub mod mcp_server;
+pub mod store;
 
 pub use config::Settings;
 pub use fleet::{Fleet, Summary};

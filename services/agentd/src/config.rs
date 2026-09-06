@@ -7,7 +7,11 @@ use std::path::PathBuf;
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     /// The shared daemon settings.
-    #[serde(flatten)]
+    /// A **table** rather than a flattened set of top-level keys, so every
+    /// daemon in this workspace is configured the same way (D160). The
+    /// environment override is unaffected — it goes through `AsMut<Settings>`
+    /// rather than through the file's shape.
+    #[serde(default)]
     pub service: hems_service::Settings,
     /// Where the journal lives.
     ///

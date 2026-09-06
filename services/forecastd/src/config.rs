@@ -34,7 +34,11 @@ impl Location {
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
     /// The shared daemon settings.
-    #[serde(flatten)]
+    /// A **table** rather than a flattened set of top-level keys, so every
+    /// daemon in this workspace is configured the same way (D160). The
+    /// environment override is unaffected — it goes through `AsMut<Settings>`
+    /// rather than through the file's shape.
+    #[serde(default)]
     pub service: hems_service::Settings,
     /// Where to fetch from.
     ///
@@ -92,5 +96,35 @@ impl Default for Settings {
 impl AsMut<hems_service::Settings> for Settings {
     fn as_mut(&mut self) -> &mut hems_service::Settings {
         &mut self.service
+    }
+}
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// The example file that ships with the daemon.
+    ///
+    /// Parsed by a test rather than trusted: a commented example that has
+    /// drifted from the struct it documents is worse than none, because it is
+    /// read by whoever is deploying this and every line of it looks
+    /// authoritative. `include_str!` makes it a build input, and
+    /// `cargo xtask check-examples` fails the build on a daemon that ships
+    /// neither.
+    const EXAMPLE: &str = include_str!("../forecastd.example.toml");
+
+    #[test]
+    fn the_example_configuration_parses_and_describes_a_service() {
+        let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
+        assert!(
+            !settings.locations.is_empty(),
+            "a `forecastd` with no location never becomes ready, so an example \
+             with none would document a service that cannot start usefully"
+        );
+        assert!(
+            settings.endpoint.contains("timeformat=unixtime"),
+            "the parser refuses Open-Meteo's default wall-clock format rather \
+             than guessing a timezone, so the query has to ask for the other one"
+        );
     }
 }

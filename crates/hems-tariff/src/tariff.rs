@@ -413,13 +413,6 @@ impl SharingTariff {
             network_ct_per_kwh: None,
         }
     }
-
-    /// …and carries a network charge of its own for the allocated kilowatt-hours.
-    #[must_use]
-    pub const fn with_network_charge(mut self, ct_per_kwh: Decimal) -> Self {
-        self.network_ct_per_kwh = Some(ct_per_kwh);
-        self
-    }
 }
 
 #[cfg(test)]

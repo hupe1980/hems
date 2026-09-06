@@ -2,7 +2,7 @@
 
 use hems_core::asset::{
     AssetMeta, Battery, Capabilities, Chemistry, DhwTank, Evse, FlexibleLoad, HeatPump,
-    HeatPumpControl, LoadKind, Programme, PvArray,
+    HeatPumpControl, LegacyStatus, LoadKind, Programme, PvArray, SteuVeExemption,
 };
 use hems_core::prelude::*;
 use hems_optimizer::model::{PlanningLimits, SteuVeDevices, TimedLimit};
@@ -21,6 +21,30 @@ pub struct PvConfig {
     pub kwp: Power,
     /// The inverter's alternating-current limit.
     pub ac_nominal: Power,
+    /// How far the modules are tilted from horizontal, degrees.
+    ///
+    /// Zero is flat, 90 a wall. It and [`PvConfig::azimuth_deg`] are the whole
+    /// of the geometry the clear-sky model has, and they are what decides *when*
+    /// the roof produces rather than how much.
+    pub tilt_deg: f64,
+    /// Which way the modules face, degrees clockwise from north — 180 is due
+    /// south, 90 east, 270 west.
+    ///
+    /// # Why this is not a constant
+    ///
+    /// It was one, for every household, at due south: the box modelled an ideal
+    /// roof and let the residual corrector absorb the difference. That works
+    /// for a *level* error and not for a **shape** one. An east–west array
+    /// produces two shoulders where the model predicts one midday peak, and the
+    /// corrector — a multiplicative ratio per hour of the day, bounded at 3 —
+    /// has to learn a factor near its own bound in the morning and near its
+    /// floor at noon, separately for every season, before it can say so. Until
+    /// it has, the plan charges the battery from a sun that is not there and
+    /// leaves the evening short.
+    ///
+    /// A number an installer reads off the roof in ten seconds is not a thing to
+    /// learn from a fortnight of meter readings.
+    pub azimuth_deg: f64,
     /// The § 9 EEG facts declared about the roof.
     ///
     /// The default is the realistic pair rather than the tidy one: an
@@ -93,6 +117,105 @@ pub struct DhwConfig {
     pub heater: Power,
 }
 
+/// The identifiers this daemon gives the household's assets.
+///
+/// Every asset the site model can hold, in one list, because three things index
+/// by it: [`HouseholdConfig::declared`], the `[[drivers]]` list's `asset` key,
+/// and `run --check`. A name that existed in two of the three and not the third
+/// is a declaration an installer wrote and nothing ever read.
+pub const REFERENCE_ASSETS: &[&str] = &[
+    "pv",
+    "battery",
+    "wallbox",
+    "waermepumpe",
+    "warmwasser",
+    "spuelmaschine",
+    "haushalt",
+    "netzanschluss-zaehler",
+];
+
+/// When the reference household's intelligent metering system was fitted.
+///
+/// Every § 14a household has one — the Steuerungseinrichtung a network operator
+/// writes limits through comes with it — so § 51 EEG has been taking the
+/// negative quarter hours since the start of 2025.
+pub const REFERENCE_IMSYS_SINCE: time::Date = time::macros::date!(2024 - 06 - 01);
+
+/// When the reference household was commissioned.
+///
+/// After 25.02.2025, so § 9 Abs. 2 caps its roof at 60 %, and after 31.12.2023,
+/// so `[A1 3.1.b]` makes every controllable device mandatory. Both are what the
+/// reference days are measured under.
+pub const REFERENCE_COMMISSIONING: time::Date = time::macros::date!(2025 - 03 - 01);
+
+/// What an installer declares about one asset, and no datasheet carries.
+///
+/// # Why every one of these has to be asked rather than assumed
+///
+/// Two statutes read a commissioning date and reach opposite conclusions from
+/// silence, and both of them decide money.
+///
+/// **§ 9 EEG** ties all three of its feed-in limitations to one: a system
+/// commissioned from 25.02.2025 is capped at 60 %, one from the window
+/// 01.01.2023–24.02.2025 is capped at nothing at all by § 100 Abs. 3b, and one
+/// from before 2023 is at 70 % only if that is how it met its obligation. A box
+/// that assumed the newest of those would curtail a 2024 roof that the statute
+/// never reached — every sunny midday, for the life of the installation.
+///
+/// **§ 14a EnWG** goes the other way: `[A1 3.1.b]` binds devices commissioned
+/// after 31.12.2023, and `[A1 10]` leaves an older one either out of scope, on
+/// the old reduced network fee until 31.12.2028, or — a Nachtspeicherheizung —
+/// on it indefinitely. Treating such a device as a controllable one hands the
+/// network operator a share of its power it has no right to reduce *and* counts
+/// its consumption as netzwirksamer Leistungsbezug when it is ordinary load.
+///
+/// So the facts are configured, defaulted to the reference household's, and
+/// named at start-up — see `crate::runtime::check_the_declarations` — because an
+/// installer standing in a cellar is the only person who can correct them and
+/// the last person who will ever be asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Declared {
+    /// The date of technical commissioning.
+    ///
+    /// `None` leaves the device **in** the § 14a group (`[A1 3.1.b]`, the safe
+    /// direction there) and **outside** every § 9 EEG limitation (the safe
+    /// direction here) — see `hems_grid::para14a::participation` and
+    /// `hems_grid::para9::GenerationProfile::statutory_limit`.
+    pub commissioned_at: Option<time::Date>,
+    /// What the device brings with it from before 2024, `[A1 10]`.
+    pub legacy_status: LegacyStatus,
+    /// Whether the operator moved it into the netzorientierte Steuerung
+    /// voluntarily, `[A1 10.4]` — irreversible, and the operator may not refuse.
+    pub switched_voluntarily: bool,
+    /// Why it is not a steuerbare Verbrauchseinrichtung at all, `[A1 3.1.b]`.
+    pub exemption: Option<SteuVeExemption>,
+}
+
+/// What the connection agreement says, beyond the fuse in the cupboard.
+///
+/// All optional, and all of it paperwork rather than measurement: the numbers
+/// are on the § 14a agreement and the Netzanschlussvertrag.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConnectionConfig {
+    /// The contractually agreed connection power, where one is agreed.
+    ///
+    /// It narrows three things at once and none of them is cosmetic: the
+    /// guard's physical headroom, the planner's import ceiling, and the
+    /// `ContractualConsumptionNominalMax` an EEBUS Energy Guard is told
+    /// `[LPC-042]`. A box that left it unset told a network operator its only
+    /// limit was a 35 A fuse.
+    pub contract_power: Option<Power>,
+    /// The market location, as it appears on the supplier's invoice.
+    pub malo: Option<MaloId>,
+    /// The metering location.
+    pub melo: Option<MeloId>,
+    /// The network operator's BDEW code number, from the § 14a agreement.
+    pub dso_code: Option<String>,
+    /// The Netzbereich the operator has assigned the connection to, `[A1 8.2.b]`
+    /// — what lets a household find its own row in the monthly publication.
+    pub netzbereich: Option<String>,
+}
+
 /// How the house is put together.
 ///
 /// Every asset is optional, because a site model is a list of what is *there*:
@@ -115,6 +238,20 @@ pub struct HouseholdConfig {
     pub dhw: Option<DhwConfig>,
     /// The main fuse.
     pub fuse: Current,
+    /// What the connection agreement says beyond it.
+    pub connection: ConnectionConfig,
+    /// Which house this is, thermally, until the box has identified its own.
+    ///
+    /// The prior `hems_forecast::building::Record` starts from. It changes the
+    /// **shape** of a heating plan rather than its inputs: the fabric capacity
+    /// decides whether pre-heating into a cheap hour pays at all, and it differs
+    /// by a factor of five across the archetypes.
+    pub building: Rc2,
+    /// The § 14a and § 9 EEG facts declared about each asset, by identifier.
+    ///
+    /// Absent means [`Declared::default`], which is the conservative reading of
+    /// both statutes — see [`Declared`].
+    pub declared: BTreeMap<String, Declared>,
     /// Where the house is.
     pub location: GeoPoint,
     /// The programme a shiftable appliance is loaded with, if the household has
@@ -136,6 +273,12 @@ impl Default for HouseholdConfig {
             pv: Some(PvConfig {
                 kwp: Power::from_kw(9.8),
                 ac_nominal: Power::from_kw(8.0),
+                // The German default roof: 35° pitch, due south. It is what
+                // every figure in this workspace is measured on, and it is the
+                // one thing an installer must not leave alone if the array
+                // faces anywhere else.
+                tilt_deg: 35.0,
+                azimuth_deg: 180.0,
                 // The ordinary German § 14a household of 2026, and the two
                 // halves are deliberately different answers. An intelligent
                 // metering system has been in since 2024 — every § 14a
@@ -146,7 +289,7 @@ impl Default for HouseholdConfig {
                 // because that one runs until the operator's first successful
                 // Ansteuerbarkeit test and nobody has run it. `--imsys` is that
                 // test happening.
-                para9: Para9Status::default().with_imsys_since(time::macros::date!(2024 - 06 - 01)),
+                para9: Para9Status::default().with_imsys_since(REFERENCE_IMSYS_SINCE),
             }),
             battery: Some(BatteryConfig {
                 kwh: Energy::from_kwh(10.0),
@@ -181,6 +324,25 @@ impl Default for HouseholdConfig {
                 heater: Power::from_kw(0.5),
             }),
             fuse: Current::new(35.0),
+            connection: ConnectionConfig::default(),
+            building: Rc2::house(),
+            // Every asset of the reference household went in together, in the
+            // March after the Solarspitzengesetz — so the roof is capped at
+            // 60 % by § 9 Abs. 2 and every controllable device is mandatory
+            // under `[A1 3.1.b]`. One date, stated once, rather than the same
+            // literal repeated at five asset constructors.
+            declared: REFERENCE_ASSETS
+                .iter()
+                .map(|id| {
+                    (
+                        (*id).to_owned(),
+                        Declared {
+                            commissioned_at: Some(REFERENCE_COMMISSIONING),
+                            ..Declared::default()
+                        },
+                    )
+                })
+                .collect(),
             // Ninety minutes: heat the water, wash, heat again to dry. The shape
             // is what makes it worth carrying a programme rather than a duration
             // and an average — a plan allowed to smear 700 W over six hours
@@ -199,6 +361,14 @@ impl Default for HouseholdConfig {
                 altitude_m: 34.0,
             },
         }
+    }
+}
+
+impl HouseholdConfig {
+    /// What was declared about `asset`, or the conservative reading of silence.
+    #[must_use]
+    pub fn declared_for(&self, asset: &str) -> Declared {
+        self.declared.get(asset).copied().unwrap_or_default()
     }
 }
 
@@ -268,7 +438,7 @@ impl Household {
         let site = Site::new(
             SiteId::new(),
             config.location,
-            GridConnection::new(config.fuse),
+            connection(config),
             Circuits::new(vec![
                 Circuit::new(main.clone(), None, config.fuse),
                 Circuit::new(garage.clone(), Some(main.clone()), Current::new(20.0)),
@@ -310,13 +480,16 @@ const HEATING_ROD: Power = Power::new_const(3_000.0);
 /// band it will accept and how the unit takes instructions — and those were once
 /// configurable and silently dropped here, so a household that widened its band
 /// got the plan of one that had not touched it.
-fn heat_pump(hp: &HeatPumpConfig) -> HeatPump {
+fn heat_pump(hp: &HeatPumpConfig, declared: Declared) -> HeatPump {
     HeatPump {
-        meta: AssetMeta::new(
-            AssetId::new("waermepumpe").expect("a literal identifier"),
-            CircuitId::new("main").expect("a literal identifier"),
-            PhaseConnection::Three,
-            hp.power,
+        meta: declare(
+            AssetMeta::new(
+                AssetId::new("waermepumpe").expect("a literal identifier"),
+                CircuitId::new("main").expect("a literal identifier"),
+                PhaseConnection::Three,
+                hp.power,
+            ),
+            declared,
         ),
         electrical_nominal: hp.power,
         heating_rod: Some(HEATING_ROD),
@@ -325,6 +498,32 @@ fn heat_pump(hp: &HeatPumpConfig) -> HeatPump {
         comfort_min_c: hp.comfort_min_c,
         comfort_max_c: hp.comfort_max_c,
         cop: CopCurve::air_source(),
+    }
+}
+
+/// Apply what the installer declared to an asset's own facts.
+///
+/// One place, so a device whose § 14a regime is decided here cannot be built by
+/// a second path that forgets to ask.
+fn declare(meta: AssetMeta, declared: Declared) -> AssetMeta {
+    let mut meta = meta;
+    meta.commissioned_at = declared.commissioned_at;
+    meta.legacy_status = declared.legacy_status;
+    meta.switched_voluntarily = declared.switched_voluntarily;
+    meta.steuve_exemption = declared.exemption;
+    meta
+}
+
+/// The connection point, with whatever the agreement adds to the fuse.
+fn connection(config: &HouseholdConfig) -> GridConnection {
+    let c = &config.connection;
+    GridConnection {
+        malo: c.malo,
+        melo: c.melo.clone(),
+        dso_code: c.dso_code.clone(),
+        netzbereich: c.netzbereich.clone(),
+        contract_power: c.contract_power,
+        ..GridConnection::new(config.fuse)
     }
 }
 
@@ -347,14 +546,16 @@ fn assets_of(
                 circuit: &CircuitId,
                 capabilities: Capabilities|
      -> anyhow::Result<AssetMeta> {
-        Ok(AssetMeta::new(
-            AssetId::new(id)?,
-            circuit.clone(),
-            PhaseConnection::Three,
-            Power::from_kw(kw),
-        )
-        .with_capabilities(Capabilities::MEASURE | capabilities)
-        .commissioned(time::macros::date!(2025 - 03 - 01)))
+        Ok(declare(
+            AssetMeta::new(
+                AssetId::new(id)?,
+                circuit.clone(),
+                PhaseConnection::Three,
+                Power::from_kw(kw),
+            )
+            .with_capabilities(Capabilities::MEASURE | capabilities),
+            config.declared_for(id),
+        ))
     };
     let driven = Capabilities::LIMIT_CONSUMPTION | Capabilities::SET_POWER;
     let mut assets = Vec::new();
@@ -363,8 +564,8 @@ fn assets_of(
             meta: meta("pv", pv.kwp.kw(), main, Capabilities::LIMIT_PRODUCTION)?,
             kwp_dc: pv.kwp,
             ac_nominal: pv.ac_nominal,
-            tilt_deg: 35.0,
-            azimuth_deg: 180.0,
+            tilt_deg: pv.tilt_deg,
+            azimuth_deg: pv.azimuth_deg,
             para9: pv.para9,
         }));
     }
@@ -419,7 +620,7 @@ fn assets_of(
                 main,
                 Capabilities::LIMIT_CONSUMPTION,
             )?,
-            ..heat_pump(hp)
+            ..heat_pump(hp, config.declared_for("waermepumpe"))
         }));
     }
     if let Some(dhw) = &config.dhw {

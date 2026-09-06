@@ -225,6 +225,23 @@ impl SiteScope {
         }
     }
 
+    /// The households this scope names, or `None` for every one of them.
+    ///
+    /// For a caller that can **push the scope down** rather than filter after
+    /// reading. [`SiteScope::covers`] is the right shape for an in-memory
+    /// collection and the wrong one for a query: a tenant-scoped summary that
+    /// read every household's rows and then discarded most of them would be
+    /// doing exactly what D112 says it must not — computing an aggregate over
+    /// the whole fleet and narrowing afterwards.
+    #[must_use]
+    pub fn named(&self) -> Option<Vec<&str>> {
+        match self {
+            Self::One(own) => Some(vec![own.as_str()]),
+            Self::Tenant { sites, .. } => Some(sites.iter().map(String::as_str).collect()),
+            Self::Every => None,
+        }
+    }
+
     /// What to call this scope in a log line.
     #[must_use]
     pub fn name(&self) -> &str {

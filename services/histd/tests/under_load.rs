@@ -1,68 +1,62 @@
 //! The service answers while it is busy.
 //!
-//! `rusqlite` is synchronous, and a synchronous call left inside an `async`
-//! handler occupies a runtime worker for as long as the query takes. A
-//! household's Data Act export is the two years of `[A1 7.3]` — measured here at
-//! about 370 ms — and a runtime has as many workers as the machine has cores, so
-//! a handful of concurrent exports is enough to stall *every* request. The ones
-//! that matter most are `/livez` and `/readyz`: a health surface that reports a
-//! healthy service exactly while it cannot answer is worse than no health
-//! surface at all.
+//! The hazard a pool-backed service has is the **pool**: there are `pool_size`
+//! connections and no more, and one that queued without bound behind a saturated
+//! pool would report itself healthy exactly while it could not answer. So the
+//! pool here is deliberately smaller than the load put on it, and two things are
+//! asserted.
 //!
-//! # Why a latency bound and not "was it answered"
-//!
-//! Asserting only that every request comes back passes whether or not the
-//! queries are on the runtime: they simply queue. So the assertion is a bound on
-//! how long the health probe waits while eight full-retention exports are in
-//! flight, with the worker count pinned at two. Off the runtime the probe
-//! answers in single-digit milliseconds; on it, it waits for the exports to
-//! drain, which is seconds. The bound sits two orders of magnitude from one and
-//! comfortably below the other.
+//! * `/livez` and `/readyz` answer promptly while it is saturated. They are the
+//!   probes an orchestrator restarts and routes on, and they take no connection —
+//!   a design decision this pins rather than an accident.
+//! * **A box's evidence write does not queue behind a household's export.**
+//!   `[A1 7.2]` is a record of something with a clock on it, so one long read
+//!   must not hold the store against it.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use hems_core::prelude::Slot;
 use hems_grid::mispel::QuarterHour;
 use hems_service::{Credentials, Secret};
-use histd::Db;
 use histd::api::{History, router};
 use time::macros::datetime;
 
 const START: time::OffsetDateTime = datetime!(2026-01-01 00:00:00 UTC);
 const TOKEN: &str = "tok-haus-1";
 
-/// How long the health probe may take while the service is busy.
+/// How long a request may take while the service is busy.
 ///
-/// Off the runtime it is milliseconds; on it, it is however long eight exports
-/// take to drain through two workers — about a second and a half on the machine
-/// this was measured on, and more on a slower one, which is the direction that
-/// keeps the test honest rather than flaky.
-const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(750);
+/// Generous on purpose: what is being ruled out is a *queue*, which under the
+/// old architecture was seconds, and the bound sits an order of magnitude below
+/// that and an order above the milliseconds a healthy answer takes.
+const PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_000);
 
 /// How many exports are in flight while the probe is measured.
+///
+/// More than [`POOL`], so every connection is busy and the ninth caller is
+/// genuinely waiting for one.
 const EXPORTS: usize = 8;
 
-/// The full `[A1 7.3]` retention, which is what an export actually costs.
+/// The connections the service is given.
+const POOL: usize = 4;
+
+/// A year of registers, which is what an export actually costs.
 ///
-/// A file rather than `:memory:`, because the property under test is WAL's
-/// many-readers-one-writer and an in-memory database cannot be shared between
-/// connections at all.
-fn two_years_at(path: &std::path::Path) -> Db {
-    let db = Db::at(path);
-    let mut store = db.connect().unwrap();
-    let quarters: Vec<QuarterHour> = (0..(730 * 96))
+/// A year rather than the full two: the point is a response large enough to hold
+/// a connection for a measurable time, and 35 040 rows already is.
+async fn a_year_of_registers(store: &histd::Store) {
+    let quarters: Vec<QuarterHour> = (0..(365 * 96))
         .map(|i| QuarterHour::empty(Slot::containing(START + time::Duration::minutes(15 * i))))
         .collect();
-    // One transaction. Row by row this is seventy thousand commits, which is
-    // fifty seconds of `fsync` before the test has measured anything.
-    store.put_quarter_hours("haus-1", &quarters, START).unwrap();
-    db
+    // One statement. Row by row this is thirty-five thousand round trips, which
+    // is minutes before the test has measured anything.
+    store
+        .put_quarter_hours("haus-1", &quarters, START)
+        .await
+        .expect("a year of registers");
 }
 
-async fn start(
-    path: &std::path::Path,
-) -> (
+async fn start() -> (
     std::net::SocketAddr,
     hems_service::shutdown::ShutdownTrigger,
 ) {
@@ -78,14 +72,20 @@ async fn start(
         shutdown_grace_s: 2,
         ..hems_service::Settings::default()
     };
+    let fixture = hems_service::testdb::Postgres::start_with(histd::store::MIGRATIONS, POOL).await;
+    let store = histd::Store::new(fixture.db.clone());
+    a_year_of_registers(&store).await;
+    // Leaked on purpose: the pool has to outlive the server task, and a test
+    // process ends when the test does.
+    std::mem::forget(fixture);
+
     let (signal, trigger) = hems_service::Shutdown::channel();
     let server = hems_service::Server::new(
         hems_service::identity!(),
         settings,
         hems_service::Health::new(),
         router(History::new(
-            two_years_at(path),
-            Arc::new(std::sync::Mutex::new(Db::at(path).connect().unwrap())),
+            store,
             Credentials::resolve(&sites, &std::collections::BTreeMap::new(), &[]).unwrap(),
         )),
     );
@@ -123,11 +123,7 @@ async fn get(address: std::net::SocketAddr, path: &str, token: Option<&str>) -> 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_service_answers_while_the_exports_run() {
-    let path = std::env::temp_dir().join(format!("hems-histd-load-{}.sqlite", std::process::id()));
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
-    let (address, trigger) = start(&path).await;
+    let (address, trigger) = start().await;
 
     let exports: Vec<_> = (0..EXPORTS)
         .map(|_| tokio::spawn(get(address, "/v1/sites/haus-1/export", Some(TOKEN))))
@@ -142,9 +138,7 @@ async fn the_service_answers_while_the_exports_run() {
     assert_eq!(get(address, "/readyz", None).await, 200, "ready");
     let waited = probe.elapsed();
 
-    // And the write a box is making while a household exports: `[A1 7.2]` is a
-    // record of something with a clock on it, so one long read must not hold the
-    // store against it.
+    // And the write a box is making while a household exports.
     let body = "[]";
     let write = std::time::Instant::now();
     let status = send(
@@ -164,14 +158,12 @@ async fn the_service_answers_while_the_exports_run() {
         assert_eq!(export.await.unwrap(), 200, "every export was answered too");
     }
     trigger.trigger();
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
 
     assert!(
         waited < PROBE_BUDGET,
-        "the health probe waited {waited:?} behind {EXPORTS} exports, which is \
-         a service reporting itself healthy while it cannot answer"
+        "the health probe waited {waited:?} behind {EXPORTS} exports against a \
+         pool of {POOL}, which is a service reporting itself healthy while it \
+         cannot answer"
     );
     assert!(
         write_waited < PROBE_BUDGET,

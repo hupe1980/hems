@@ -37,13 +37,14 @@ use rmcp::{
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::RwLock;
 
 /// What the tools read.
 #[derive(Clone)]
 pub struct State {
-    /// The same fleet view the REST surface answers from.
-    pub fleet: Arc<RwLock<Fleet>>,
+    /// The same store the REST surface answers from.
+    pub store: crate::store::Store,
+    /// How many days of reports a summary is computed over.
+    pub keep_days: usize,
     /// How long a site may be quiet before it is reported silent.
     pub silent_after: time::Duration,
     /// How each caller is authorised.
@@ -69,6 +70,35 @@ pub struct Handler {
     tool_router: ToolRouter<Handler>,
     #[allow(dead_code)]
     prompt_router: PromptRouter<Handler>,
+}
+
+impl Handler {
+    /// The window every tool here answers over, for the households `scope` names.
+    ///
+    /// The same read the REST surface makes, so the two surfaces cannot come to
+    /// different conclusions about one fleet — which is the property `/mcp`
+    /// mounting over the same state was always for, and which an in-memory
+    /// `Fleet` gave for free and a database has to be asked for once. The scope
+    /// is a predicate here for the same reason it is there: an agent acting for
+    /// one tenant must not pull another tenant's rows through its request
+    /// (D111, D112).
+    async fn fleet(&self, scope: &hems_service::SiteScope) -> Result<Fleet, McpError> {
+        let since = crate::store::window_start(
+            self.state.keep_days,
+            time::OffsetDateTime::now_utc().date(),
+        );
+        let read = self
+            .state
+            .store
+            .history(since, scope)
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+        Ok(Fleet::of(
+            read.into_iter()
+                .map(|(site, days)| (site, days.into()))
+                .collect(),
+        ))
+    }
 }
 
 #[tool_router]
@@ -98,7 +128,7 @@ impl Handler {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.fleet_caller(&parts)?;
-        let fleet = self.state.fleet.read().await;
+        let fleet = self.fleet(caller.sites()).await?;
         let summary = fleet.summarise_within(
             caller.sites(),
             time::OffsetDateTime::now_utc(),
@@ -126,7 +156,7 @@ impl Handler {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.fleet_caller(&parts)?;
-        let fleet = self.state.fleet.read().await;
+        let fleet = self.fleet(caller.sites()).await?;
         let summary = fleet.summarise_within(
             caller.sites(),
             time::OffsetDateTime::now_utc(),
@@ -165,7 +195,10 @@ impl Handler {
                 None,
             ));
         }
-        let fleet = self.state.fleet.read().await;
+        // One household, so one household is read.
+        let fleet = self
+            .fleet(&hems_service::SiteScope::One(p.site.clone()))
+            .await?;
         match fleet.site(&p.site) {
             Some(history) => {
                 let days: Vec<serde_json::Value> = history
@@ -197,7 +230,7 @@ impl Handler {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, McpError> {
         let caller = self.fleet_caller(&parts)?;
-        let fleet = self.state.fleet.read().await;
+        let fleet = self.fleet(caller.sites()).await?;
         let s = fleet.summarise_within(
             caller.sites(),
             time::OffsetDateTime::now_utc(),

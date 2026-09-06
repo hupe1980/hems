@@ -11,7 +11,24 @@ license.workspace      = true
 repository.workspace   = true
 rust-version.workspace = true
 
+[features]
+# The fleet daemons' PostgreSQL pool. Off by default because `hemsd` links this
+# crate for its configuration and health surface and keeps its own two years in
+# SQLite on the box — a gateway image has no business carrying a Postgres driver.
+postgres = [
+    "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres",
+    "dep:rustls", "dep:webpki-roots",
+]
+# A real PostgreSQL in a container, for a daemon's own tests. Implies `postgres`
+# because a fixture that could not open a pool would be a fixture for nothing.
+testkit  = ["postgres"]
+
 [dependencies]
+tokio-postgres         = { workspace = true, optional = true }
+tokio-postgres-rustls  = { workspace = true, optional = true }
+deadpool-postgres      = { workspace = true, optional = true }
+rustls                 = { workspace = true, optional = true }
+webpki-roots           = { workspace = true, optional = true }
 
 anyhow             = { workspace = true }
 ed25519-dalek      = { workspace = true }
@@ -19,6 +36,10 @@ hex                = { workspace = true }
 http               = { workspace = true }
 sha2               = { workspace = true }
 axum               = { workspace = true }
+# Prometheus, on the port the daemon already binds. `default-features = false`
+# drops its own HTTP push gateway and protobuf encoder: what is served here is
+# the text exposition format on a route this crate already owns.
+prometheus         = { version = "0.14", default-features = false }
 # The Model Context Protocol surface every fleet daemon mounts at `/mcp`.
 # Server side only: a daemon that could *call* a model is a daemon whose answers
 # depend on one, and none of these answers may.
@@ -28,10 +49,11 @@ serde              = { workspace = true }
 serde_json         = { workspace = true }
 thiserror          = { workspace = true }
 time               = { workspace = true }
-tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net"] }
+tokio              = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "sync"] }
 toml               = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
+hems-service = { workspace = true, features = ["testkit"] }

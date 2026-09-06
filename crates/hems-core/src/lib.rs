@@ -75,7 +75,7 @@ pub mod prelude {
     pub use crate::circuit::{Circuit, Circuits};
     pub use crate::envelope::Envelope;
     pub use crate::error::{IdError, SetpointError, SiteError, UnitError};
-    pub use crate::ids::{AssetId, CircuitId, PlanId, SiteId};
+    pub use crate::ids::{AssetId, CircuitId, MaloId, MeloId, PlanId, SiteId};
     pub use crate::measurement::{Freshness, Measurement};
     pub use crate::plan::{AssetTarget, CostBreakdown, Plan, SlotPlan};
     pub use crate::report::DayKpis;
@@ -84,7 +84,9 @@ pub mod prelude {
     };
     pub use crate::site::{GeoPoint, GridConnection, Site};
     pub use crate::slot::{DayType, Horizon, SLOT, SLOTS_PER_DAY, Slot};
-    pub use crate::thermal::{CompressorState, CopCurve, Rc2, Rc2Discrete, ThermalState};
+    pub use crate::thermal::{
+        BuildingClass, CompressorState, CopCurve, Rc2, Rc2Discrete, ThermalState,
+    };
     pub use crate::units::{
         ApparentPower, Current, Energy, NOMINAL_VOLTAGE, PerPhase, Phase, PhaseConnection,
         PhaseMode, Power, Soc, Voltage,

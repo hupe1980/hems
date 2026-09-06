@@ -1,0 +1,117 @@
+# histd — the fleet's record of what every box did.
+#
+#   histd --config /etc/hems/histd.toml
+#
+# Every value below is the default except the credentials, which have none:
+# what these routes serve is a household's whole consumption record and the
+# evidence a network operator settles on, so "nobody configured it" reads as
+# "nobody may".
+#
+# The environment overrides the file (`HEMS_HISTD_…`), because the file is what
+# somebody wrote down last month and the environment is what an operator reaches
+# for when something is on fire.
+#
+# This file is parsed by a test in `config.rs`, so an example that has drifted
+# from the struct it documents fails the build rather than misleading an
+# operator.
+
+# How often to delete what `[A1 7.3]`'s two years have released, seconds.
+# Daily: two years is not a deadline anybody is racing. It is a top-level key, so
+# it is above every table — in TOML a bare key after `[service]` belongs to
+# `service`.
+retention_sweep_s = 86400
+
+# ── The shell ────────────────────────────────────────────────────────────────
+[service]
+listen = "0.0.0.0:7580"
+log_filter = "info"
+log_json = true
+# Match the orchestrator's own grace period. Longer and the process is killed
+# mid-request anyway; shorter and it hangs up on somebody for no reason.
+shutdown_grace_s = 20
+
+# ── Where the two years live ─────────────────────────────────────────────────
+#
+# PostgreSQL, and not a file. What this daemon holds is every household's § 14a
+# evidence: a file cannot be replicated, cannot be read by a second replica and
+# cannot outlive the node it is on — and SQLite's single write lock put a whole
+# fleet's forwarded evidence behind one mutex.
+[database]
+# The **reference**, never the credential. A PostgreSQL URL carries a password,
+# and one in a configuration file is one in an image, in a backup, and
+# eventually in a repository.
+url = "env:HEMS_HISTD_DATABASE_URL"
+# Per replica. `daemons × replicas × pool_size` has to fit inside the server's
+# own `max_connections`: PostgreSQL costs a backend process per connection.
+pool_size = 10
+# Fail a request rather than queue it for ever, so a saturated pool surfaces as
+# this daemon's own 503 instead of a caller's timeout with nothing in the logs.
+acquire_timeout_s = 5
+# Set on **every** connection, and the only bound that survives a client that
+# has already gone away: a Data Act export over two years of a large site is a
+# long query, and one that has lost its reader holds a backend and its locks
+# until PostgreSQL is told otherwise.
+statement_timeout_s = 30
+# What crosses this socket is a household's whole consumption record. Turn it
+# off only for a unix socket or a test container — the daemon says so in its log
+# when you do.
+tls = true
+
+# ── Who may read and write ───────────────────────────────────────────────────
+#
+# One token per box, and a box may write only its **own** site. The token is a
+# reference to a secret for the same reason the database URL is.
+[site_tokens]
+"reference-household" = "env:HEMS_HISTD_TOKEN_REFERENCE_HOUSEHOLD"
+
+# Which households each tenant covers, for a shared deployment. An operator
+# scoped to a tenant reads that tenant's households and no others; the reach of
+# a token is a property of the token rather than the result of a join.
+# [tenants]
+# stadtwerke-nord = ["reference-household"]
+
+# An operator's credential, scoped to a tenant. `tenant = "*"` is every
+# household this daemon knows — correct for a single-tenant deployment and a
+# cross-tenant read in any other, which is why it has to be written down.
+[[operators]]
+token  = "env:HEMS_HISTD_OPERATOR_TOKEN"
+tenant = "*"
+
+# ── Which MiSpeL option each site settles under ──────────────────────────────
+#
+# A **declared** fact about the installation, like `Para9Status`: no meter
+# reading says whether a storage system has ever been charged from the grid, or
+# which of the three options the Anlagenbetreiber chose. A site that has
+# declared none is refused rather than settled under a guess — every option
+# produces a different Nachweis from the same registers.
+#
+# `[MiSpeL]` takes effect on 01.10.2026, and a period earlier than that is
+# refused rather than computed under rules nobody was in.
+[mispel."reference-household"]
+# "abgrenzung" (per calendar month, with a Basisfall), "pauschal" (per calendar
+# year, with the plant's size) or "ausschliesslichkeit" (a store never charged
+# from the grid, which has nothing to separate and still owes the proof).
+option    = "abgrenzung"
+# The Basisfall is a fact about how the installation is *metered*, not a
+# preference:
+#
+#   a1  storage alone behind the connection point
+#   a2  charge point alone
+#   a3  both, on one meter
+#   a4  both, with the storage system separately metered at `Z3`
+#
+# **a4 needs the box to be reading its battery's own meter.** It reports `Z3V¼`
+# and `Z3E¼` whenever it does, and omits them when it does not — and an omission
+# is not a zero, so a site declared "a4" whose store went unread is refused a
+# settlement rather than handed one claiming the battery stood still. a4 is worth
+# declaring where it is true: `(17)A4` charges the round-trip conversion loss to
+# the store, which a3 cannot see and therefore charges to the household.
+basisfall = "a1"
+
+# ── The agent surface ────────────────────────────────────────────────────────
+#
+# Read-only, on the port already bound, and every tool authorises **the caller
+# that reached it** against the credentials above — so a token cannot reach over
+# `/mcp` what the REST route would refuse it.
+[mcp]
+enabled = false

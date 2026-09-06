@@ -171,14 +171,6 @@ impl Site {
     pub fn asset(&self, id: &AssetId) -> Option<&Asset> {
         self.assets.iter().find(|a| a.id() == id)
     }
-
-    /// The assets that are meters of the grid connection point.
-    pub fn grid_meters(&self) -> impl Iterator<Item = &Asset> {
-        self.assets.iter().filter(
-            |a| matches!(a, Asset::Meter(m) if m.role == crate::asset::MeterRole::GridConnection),
-        )
-    }
-
     /// How far the measured grid power is from the sum of the measured assets.
     ///
     /// With the load convention of [`crate::units`], the site balance is

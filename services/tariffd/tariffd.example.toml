@@ -1,0 +1,105 @@
+# tariffd — what a kilowatt-hour costs, from the five sources that publish it.
+#
+#   tariffd --config /etc/hems/tariffd.toml
+#
+# It fetches, reconciles under a written trust order, and caches two days each
+# way so a WAN outage never costs a box its plan. What it serves is a **net
+# wholesale** curve: a household pays that plus the supplier's markup, the
+# network charge, the levies and VAT, so the *spread* is meaningful and the level
+# is not.
+#
+# The environment overrides the file (`HEMS_TARIFFD_…`).
+#
+# This file is parsed by a test in `config.rs`, so an example that has drifted
+# from the struct it documents fails the build rather than misleading an
+# operator.
+
+# How often to ask each source, seconds. The day-ahead auction clears once a
+# day, so this is not about resolution — it is about how quickly the fleet has
+# tomorrow's curve, and how quickly it recovers from a failed fetch. A quarter
+# of an hour is ninety-six requests a day, which is polite to a free API.
+#
+# Top-level keys, so they are above every table.
+poll_interval_s = 900
+request_timeout_s = 20
+# A fleet retrying a failed public API every fifteen seconds is a denial of
+# service against somebody who is giving the data away.
+max_backoff_s = 3600
+# How many slots the cache must cover before this daemon calls itself ready.
+# Ninety-six is one day: a box asking for a 24-hour horizon can then be answered
+# entirely from cache, which is what "ready" should mean for a price service.
+ready_slots = 96
+
+# ── The shell ────────────────────────────────────────────────────────────────
+[service]
+listen = "0.0.0.0:7380"
+log_filter = "info"
+log_json = true
+shutdown_grace_s = 20
+
+# ── Where the prices come from ───────────────────────────────────────────────
+#
+# Empty by default, and that is the honest default: a `tariffd` nobody has given
+# an endpoint to has nothing to fetch, reports itself **not ready** and says
+# which source it is missing — rather than coming up green over an empty cache.
+#
+# A curve that arrives twice is reconciled under a written trust order rather
+# than by whichever answered last.
+#
+# Every credential is a **reference**. A token in a URL's query string ends up
+# in somebody's access log, so it goes in a header, and the header's value is
+# read from the environment.
+[sources.entsoe]
+url = "https://web-api.tp.entsoe.eu/api"
+[sources.entsoe.headers]
+SECURITY-TOKEN = "env:HEMS_TARIFFD_ENTSOE_TOKEN"
+
+[sources.smard]
+url = "https://www.smard.de/app/chart_data"
+
+# [sources.awattar]
+# url = "https://api.awattar.de/v1/marketdata"
+
+# [sources.tibber]
+# url = "https://api.tibber.com/v1-beta/gql"
+# [sources.tibber.headers]
+# Authorization = "env:HEMS_TARIFFD_TIBBER_TOKEN"
+
+# The grid's carbon intensity, which is what makes a carbon price do something
+# different from an autarky premium: with a flat annual intensity the two are
+# algebraically identical.
+[sources.energy_charts]
+url = "https://api.energy-charts.info"
+
+# ── The curated Modul 3 calendars ────────────────────────────────────────────
+#
+# There is no machine-readable national format for a Zählzeitdefinition — a PDF
+# or an Excel sheet per network operator — so somebody transcribes each one,
+# once per Netzgebiet rather than once per household, and this is where the
+# fleet keeps them.
+#
+# Every entry is checked against the BDEW Anwendungshilfe at start-up and a
+# violation **refuses to start** the daemon: a fleet serving windows nobody may
+# sell is a whole Netzgebiet of households priced against a tariff nobody may be
+# billed on, which is worse than one box getting it wrong.
+#
+# [[modul3]]
+# netzbetreiber = "NB-14A-3"
+# [modul3.calendar]
+# id = "NB-14A-3-2026"
+# year = 2026
+# hochtarif_minutes = [1020, 1200]     # 17:00–20:00
+# niedertarif_minutes = [1320, 360]    # 22:00–06:00
+# billed_quarters = ["Q1", "Q4"]
+# ht_ct_per_kwh = 18.0
+# st_ct_per_kwh = 10.0
+# nt_ct_per_kwh = 4.0
+# source = "https://www.example-netz.de/preisblatt-2026.pdf#modul3"
+
+# ── The agent surface ────────────────────────────────────────────────────────
+#
+# Open like the REST routes when it is switched on: a day-ahead auction result
+# is a published figure and not a household's data. What it costs is the
+# operator's own upstream quota, which is a rate-limiting question.
+[mcp]
+enabled = false

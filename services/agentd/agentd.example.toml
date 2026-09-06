@@ -32,11 +32,12 @@ tenant = "*"
 
 # ── The shell ────────────────────────────────────────────────────────────────
 #
-# Flattened, as on every other cloud daemon: these keys sit at the top level
-# rather than under a table of their own.
+# A table, as on every other daemon in this workspace (D160): an operator who
+# has written `[service]` for one has written it for all of them.
 #
 # Loopback. What this daemon serves is a health surface; the findings go to
 # whatever an operator reads, and that is not built yet.
+[service]
 listen = "127.0.0.1:7880"
 log_filter = "info,agentd=debug"
 log_json = false

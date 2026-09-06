@@ -39,6 +39,18 @@ CREATE TABLE IF NOT EXISTS quarter_hour (
     grid_feed_in_kwh       TEXT    NOT NULL,
     device_consumption_kwh TEXT    NOT NULL,
     device_generation_kwh  TEXT    NOT NULL,
+    -- `Z3V¼`/`Z3E¼` — the storage system **alone**, where the box reads its
+    -- meter. The two columns Basisfall A4 is defined by, `[MiSpeL A1 3.2.4]`:
+    -- `Z2` above is the store and the charge point together, and A4 is the case
+    -- where the store is separately metered so that (17)A4 can charge the
+    -- conversion losses to it rather than to the household.
+    --
+    -- Nullable, and the null means "not separately metered" rather than zero. A
+    -- household on A4 whose store went unread owes its network operator a
+    -- refusal, and `hems_grid::mispel` gives it one; a zero here would be a
+    -- settlement claiming the battery stood still.
+    storage_consumption_kwh TEXT,
+    storage_generation_kwh  TEXT,
     anzulegender_wert_ct   TEXT    NOT NULL,
     spot_price_ct          TEXT    NOT NULL,
     -- What the roof produced, kWh. **Not** a MiSpeL register and deliberately
@@ -49,9 +61,16 @@ CREATE TABLE IF NOT EXISTS quarter_hour (
     -- Nullable, because a box with no production measurement has not measured a
     -- dark roof.
     production_kwh         TEXT,
-    -- A register may be restated — a substitute value replaced by a real one, a
-    -- correction from the metering point operator — and a settlement rerun has
-    -- to be able to ask what was known on the day rather than what is known now.
+    -- When the value in this row was learned. A restated register — a substitute
+    -- value replaced by a real one, a correction from the metering point
+    -- operator — replaces the row and clears `forwarded_at`, so it is owed to
+    -- the fleet again; the box keeps only the current answer.
+    --
+    -- The version *history* lives in `histd`, whose key carries `recorded_at`.
+    -- The asymmetry is deliberate: the box is the source and its two years are a
+    -- buffer against a WAN outage, while "what did we hand over" is a question
+    -- asked of the archive. A gateway keeping every version of every quarter
+    -- hour would spend a household's flash on a question nobody asks it.
     recorded_at            INTEGER NOT NULL,
     forwarded_at           INTEGER
 ) STRICT;

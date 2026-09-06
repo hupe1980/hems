@@ -1,0 +1,93 @@
+# fleetd — enrolment, configuration and releases.
+#
+#   fleetd --config /etc/hems/fleetd.toml
+#
+# The daemon a box talks to **first**, which is why it is the one that has to
+# stay up while another is being deployed — and why its state is in PostgreSQL
+# rather than in a file. The environment overrides the file (`HEMS_FLEETD_…`).
+#
+# This file is parsed by a test in `config.rs`, so an example that has drifted
+# from the struct it documents fails the build rather than misleading an
+# operator.
+
+# How long a box may be quiet before the roster calls it silent, seconds.
+#
+# A top-level key, so it is above every table: in TOML a bare key after
+# `[service]` belongs to `service`.
+silent_after_s = 3600
+
+# ── The shell ────────────────────────────────────────────────────────────────
+[service]
+listen = "0.0.0.0:7180"
+log_filter = "info"
+log_json = true
+shutdown_grace_s = 20
+
+# ── Where the enrolments live ────────────────────────────────────────────────
+#
+# Two facts that exist nowhere else and cannot be re-derived: the credential a
+# box was issued (the box holds the only other copy), and the fact that a site
+# has enrolled at all — because the enrolment secret is single-use, and that
+# property is a **primary key**. A primary key is only single-use across the
+# whole service, so two replicas with a file each would each accept the same
+# installer secret once.
+[database]
+url = "env:HEMS_FLEETD_DATABASE_URL"
+pool_size = 10
+acquire_timeout_s = 5
+statement_timeout_s = 30
+tls = true
+
+# ── Which households exist, and what each should be running ──────────────────
+#
+# The operator's *intent*, declared here rather than in the database: two places
+# holding it would give two answers to one question with no rule for which wins.
+#
+# The configuration is **signed**, and this daemon holds signatures and never a
+# key — so a `fleetd` an attacker owns can serve neither a configuration nor a
+# release a box will accept.
+[sites."reference-household"]
+# What an installer puts on the box. Single-use: a second attempt with the same
+# secret is refused, because a secret that still works once the box is in the
+# field is a credential sitting in an installer's notes.
+enrolment_secret = "env:HEMS_FLEETD_SECRET_REFERENCE_HOUSEHOLD"
+# The configuration document the box should be running, and the version it
+# reports back on. Convergence is what the box *says*, never what was pushed.
+config         = "{}"
+config_version = "1"
+# The Ed25519 signature over `(site, version, config)`, **hexadecimal**, and a
+# public value rather than a credential — so it is written here literally and
+# never as an `env:` reference.
+#
+# Produced **elsewhere**, by whoever holds the signing key: `fleetd` holds
+# signatures and never a key, which is the whole of what "the fleet is not the
+# trust anchor" means. An empty string is allowed and means this site's
+# configuration is *unsigned*, in which case `/v1/config` refuses to serve it —
+# an operator who has not signed a document has not published it.
+config_signature = "3045022100c0ffee…"
+
+# ── What updates are on offer ────────────────────────────────────────────────
+#
+# A signed release manifest per component. The signature is over the manifest,
+# the manifest names the artefact and its digest, and the box checks both.
+# [releases.hemsd]
+# version   = "0.2.0"
+# url       = "https://releases.example.com/hemsd-0.2.0.tar.gz"
+# sha256    = "…"
+# signature = "…"
+
+# ── Who may read the roster ──────────────────────────────────────────────────
+#
+# `/v1/fleet` says which households exist, which build each is on and which have
+# gone quiet — an inventory of who is worth attacking and which of them is
+# unpatched. An **operator's** read, never a box's own enrolment credential.
+[[operators]]
+token  = "env:HEMS_FLEETD_OPERATOR_TOKEN"
+tenant = "*"
+
+# [tenants]
+# stadtwerke-nord = ["reference-household"]
+
+# ── The agent surface ────────────────────────────────────────────────────────
+[mcp]
+enabled = false

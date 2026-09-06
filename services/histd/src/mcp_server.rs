@@ -27,7 +27,7 @@
 
 use std::sync::Arc;
 
-use crate::store::{Db, Store, StoreError};
+use crate::store::{Store, StoreError};
 use hems_service::mcp::{McpAuth, rfc3339, rfc3339_opt};
 use http::request::Parts;
 use rmcp::handler::server::router::prompt::PromptRouter;
@@ -48,8 +48,8 @@ use serde::Deserialize;
 /// What the tools read.
 #[derive(Clone)]
 pub struct State {
-    /// The same database the REST surface answers from.
-    pub db: Db,
+    /// The same store the REST surface answers from.
+    pub store: Store,
     /// How each caller is authorised.
     ///
     /// Not one authority for the whole surface: every tool resolves the request
@@ -133,10 +133,7 @@ impl Handler {
     ) -> Result<CallToolResult, McpError> {
         self.deny_unless_may_read(&parts, &p.site)?;
         let (from, to) = p.range()?;
-        let site = p.site.clone();
-        let value = self
-            .read(move |store| crate::export::nachweis(store, &site, from, to))
-            .await?;
+        let value = failed(crate::export::nachweis(&self.state.store, &p.site, from, to).await)?;
         json(&value)
     }
 
@@ -157,10 +154,7 @@ impl Handler {
     ) -> Result<CallToolResult, McpError> {
         self.deny_unless_may_read(&parts, &p.site)?;
         let (from, to) = p.range()?;
-        let site = p.site.clone();
-        let events = self
-            .read(move |store| store.control_events(&site, from, to))
-            .await?;
+        let events = failed(self.state.store.control_events(&p.site, from, to).await)?;
         let rows: Vec<serde_json::Value> = events
             .iter()
             .map(|stored| {
@@ -206,10 +200,7 @@ impl Handler {
     ) -> Result<CallToolResult, McpError> {
         self.deny_unless_may_read(&parts, &p.site)?;
         let (from, to) = p.range()?;
-        let site = p.site.clone();
-        let quarters = self
-            .read(move |store| store.quarter_hours(&site, from, to))
-            .await?;
+        let quarters = failed(self.state.store.quarter_hours(&p.site, from, to).await)?;
         let rows: Vec<serde_json::Value> = quarters
             .iter()
             .map(|q| {
@@ -245,15 +236,8 @@ impl Handler {
         Parameters(p): Parameters<SiteParams>,
     ) -> Result<CallToolResult, McpError> {
         self.deny_unless_may_read(&parts, &p.site)?;
-        let site = p.site.clone();
-        let (count, earliest) = self
-            .read(move |store| {
-                Ok((
-                    store.control_event_count(&site)?,
-                    store.earliest_event(&site)?,
-                ))
-            })
-            .await?;
+        let count = failed(self.state.store.control_event_count(&p.site).await)?;
+        let earliest = failed(self.state.store.earliest_event(&p.site).await)?;
         json(&serde_json::json!({
             "site": p.site,
             "control_events": count,
@@ -279,22 +263,16 @@ impl Handler {
             ))
         }
     }
+}
 
-    /// One query, off the runtime, on a connection of its own.
-    ///
-    /// `rusqlite` is synchronous: a query left on a runtime thread occupies one
-    /// for the whole of it, and a two-year Nachweis is not a fast query.
-    async fn read<T, F>(&self, work: F) -> Result<T, McpError>
-    where
-        T: Send + 'static,
-        F: FnOnce(&Store) -> Result<T, StoreError> + Send + 'static,
-    {
-        let db = self.state.db.clone();
-        tokio::task::spawn_blocking(move || work(&db.connect()?))
-            .await
-            .map_err(|e| McpError::internal_error(format!("the query panicked: {e}"), None))?
-            .map_err(|e| McpError::internal_error(e.to_string(), None))
-    }
+/// A query that failed, as an MCP error.
+///
+/// The counterpart of `crate::api::failed`, and separate because the two
+/// surfaces speak different protocols about the same fault. What both refuse to
+/// do is answer *something* — an agent handed an empty list where the database
+/// was unreachable would report a household with no § 14a record.
+fn failed<T>(outcome: Result<T, StoreError>) -> Result<T, McpError> {
+    outcome.map_err(|e| McpError::internal_error(e.to_string(), None))
 }
 
 // `#[prompt]` generates an associated function with no doc comment this crate
@@ -404,9 +382,36 @@ pub fn router(
 mod tests {
     use super::*;
 
+    /// A pool onto a port nothing listens on, built without connecting.
+    ///
+    /// `hems_service::db::connect` proves the database answers, which is right
+    /// everywhere except here.
+    fn unreachable_pool() -> hems_service::Db {
+        let config: tokio_postgres::Config = "postgres://nobody@127.0.0.1:1/none"
+            .parse()
+            .expect("a well-formed URL");
+        let manager = deadpool_postgres::Manager::from_config(
+            config,
+            tokio_postgres::NoTls,
+            deadpool_postgres::ManagerConfig::default(),
+        );
+        deadpool_postgres::Pool::builder(manager)
+            .max_size(1)
+            .build()
+            .expect("a pool that will never connect")
+    }
+
+    /// A handler over a pool that will never answer.
+    ///
+    /// These tests are about **authorisation**, which is decided before a query
+    /// is issued: a caller that may not read this site is refused without the
+    /// database being touched. A pool pointed at a port nothing listens on is
+    /// what makes that a property rather than a claim — if the refusal ever
+    /// stopped happening first, the test would fail on a connection error
+    /// instead of passing.
     fn handler(credentials: &hems_service::Credentials) -> Handler {
         Handler::new(std::sync::Arc::new(State {
-            db: crate::store::Db::at("/nonexistent/never-opened.sqlite"),
+            store: crate::Store::new(unreachable_pool()),
             auth: hems_service::McpAuth::per_caller(
                 &hems_service::McpSettings {
                     enabled: true,

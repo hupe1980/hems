@@ -25,10 +25,14 @@ fn a_winter_day_with_a_grid_event_stays_lawful_and_still_saves_money() {
         r.worst_overshoot_w
     );
     assert_eq!(r.limited_minutes, 90, "17:00 to 18:30");
-    // The three minutes of `init` before the manager concluded that nothing was
+    // The two minutes of `init` before the manager concluded that nothing was
     // controlling it are *not* a § 14a event: the network operator said nothing.
     // Counting them as one reports a reduction that never happened.
-    assert_eq!(r.failsafe_minutes, 3, "the `init` state, and nothing else");
+    //
+    // Two, because `[LPC-906]`'s 120 s are up on the stroke of minute 2 — the
+    // second this figure turns on, and the one `lpc_one_machine.rs` holds both
+    // state machines to.
+    assert_eq!(r.failsafe_minutes, 2, "the `init` state, and nothing else");
 
     // The car still got what it was promised, § 14a event or not.
     assert!(

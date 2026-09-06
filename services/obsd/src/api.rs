@@ -10,14 +10,20 @@ use axum::routing::{get, post};
 use hems_core::report::DayKpis;
 use hems_events::webhook::{self, WebhookError};
 use hems_service::auth::Credentials;
-use tokio::sync::RwLock;
 
 use crate::fleet::Fleet;
+use crate::store::Store;
 
 /// What the API reads and writes.
+///
+/// The fleet is **read, not held**: a window out of PostgreSQL per request,
+/// summarised by a pure function. Holding it in the process would lose every
+/// report on a restart and give two replicas half a fleet each, with a
+/// denominator claiming the whole one (D157).
 #[derive(Clone)]
 pub struct Observed {
-    fleet: Arc<RwLock<Fleet>>,
+    store: Store,
+    keep_days: usize,
     silent_after: time::Duration,
     /// Which household each accepted signing key belongs to.
     secrets: Arc<Vec<(String, String)>>,
@@ -38,19 +44,52 @@ impl Observed {
     /// [`crate::Settings::webhook_secrets`].
     #[must_use]
     pub fn new(
-        fleet: Arc<RwLock<Fleet>>,
+        store: Store,
+        keep_days: usize,
         silent_after: time::Duration,
         secrets: Vec<(String, String)>,
         tolerance: time::Duration,
         readers: Credentials,
     ) -> Self {
         Self {
-            fleet,
+            store,
+            keep_days: keep_days.max(1),
             silent_after,
             secrets: Arc::new(secrets),
             tolerance,
             readers: Arc::new(readers),
         }
+    }
+
+    /// The window a summary is computed over, for the households `scope` names.
+    ///
+    /// `keep_days` back from today, which is the same window the retention sweep
+    /// deletes outside — so a figure and the record it rests on cannot disagree
+    /// about how much record there is. Read per request rather than held,
+    /// because two replicas holding their own copy is how a fleet view answers
+    /// about half a fleet.
+    ///
+    /// `scope` goes to the **query**. It is also applied again by
+    /// `Fleet::summarise_within`, and the repetition is deliberate: the
+    /// predicate is what keeps one tenant's rows out of another tenant's
+    /// request, and the filter is what keeps the aggregation correct if a caller
+    /// ever hands it a wider read. Neither is redundant with the other, and the
+    /// one that is easy to forget is the first (D112).
+    async fn fleet_in(
+        &self,
+        scope: &hems_service::SiteScope,
+        now: time::OffsetDateTime,
+    ) -> Result<Fleet, StatusCode> {
+        let since = crate::store::window_start(self.keep_days, now.date());
+        let read = self.store.history(since, scope).await.map_err(|e| {
+            tracing::error!(error = %e, "the fleet could not be read");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        Ok(Fleet::of(
+            read.into_iter()
+                .map(|(site, days)| (site, days.into()))
+                .collect(),
+        ))
     }
 
     /// The authority behind a request, whoever it is.
@@ -154,7 +193,13 @@ async fn report(
     }
     let attention = day.needs_attention();
     let site = day.site.clone();
-    state.fleet.write().await.record(day, now);
+    if let Err(e) = state.store.record(&day, now).await {
+        tracing::error!(site, error = %e, "a reported day could not be stored");
+        // `503` and not `202`: a box that was told its day was accepted keeps no
+        // second copy, so an acknowledgement this service cannot honour destroys
+        // the record. The box's own outbox retries a `5xx` (D110).
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if attention {
         // At `warn`, once, at the moment it arrives. A finding that is only
         // visible by asking the summary is a finding nobody sees until they ask.
@@ -201,10 +246,11 @@ async fn summary(
     // The whole fleet, so only a credential that reaches a whole fleet — and
     // only the households in *its* scope.
     let caller = state.may_read_the_fleet(&headers)?;
-    let fleet = state.fleet.read().await;
+    let now = time::OffsetDateTime::now_utc();
+    let fleet = state.fleet_in(caller.sites(), now).await?;
     Ok(axum::Json(fleet.summarise_within(
         caller.sites(),
-        time::OffsetDateTime::now_utc(),
+        now,
         state.silent_after,
     )))
 }
@@ -215,7 +261,15 @@ async fn site(
     headers: HeaderMap,
 ) -> Result<axum::Json<Vec<DayKpis>>, StatusCode> {
     state.may_read(&headers, &site)?;
-    let fleet = state.fleet.read().await;
+    // One household, so one household is read. Loading the fleet to pick a site
+    // out of it would be a query proportional to the deployment for an answer
+    // that is not.
+    let fleet = state
+        .fleet_in(
+            &hems_service::SiteScope::One(site.clone()),
+            time::OffsetDateTime::now_utc(),
+        )
+        .await?;
     let history = fleet.site(&site).ok_or(StatusCode::NOT_FOUND)?;
     Ok(axum::Json(history.days().cloned().collect()))
 }

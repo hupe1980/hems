@@ -2,10 +2,21 @@
 //! artefact beside the property tests.
 //!
 //! The randomised walk in `lpc.rs` samples paths; this enumerates them. Every
-//! reachable state of the **production** [`LpcMachine`] — not a parallel model
-//! of it, which would test the parallel model — is visited by breadth-first
-//! search over a finite event alphabet, and four invariants are checked in
-//! every one of them. A certifier reading this file gets the two things a
+//! reachable state of [`LpcMachine`] itself — not a parallel model of it, which
+//! would test the parallel model — is visited by breadth-first search over a
+//! finite event alphabet, and four invariants are checked in every one of them.
+//!
+//! # Which machine this is, and which one a box runs
+//!
+//! [`LpcMachine`] is what `hemsd`'s **reference days** run. What a box on a real
+//! network runs is `eebus`'s certifiable Controllable System, through
+//! `hems_drv::eebus::Lpc` — so the invariants below are checked here and the two
+//! machines are held to each other in `hems-drv/tests/lpc_one_machine.rs`
+//! (D167). That pairing is the point: this file says the properties hold in all
+//! reachable states, and that one says the machine a laboratory measures reaches
+//! the same states. Neither alone is enough, and for a while only this one
+//! existed — which is how a one-second disagreement at `[LPC-906]`'s heartbeat
+//! timeout survived in 35 reachable states. A certifier reading this file gets the two things a
 //! hand-written test cannot give: the claim that the properties hold in *all*
 //! reachable states of the machine as shipped, and the alphabet and abstraction
 //! under which "all" is meant.

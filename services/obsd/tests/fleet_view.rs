@@ -8,14 +8,10 @@
 //! the way a box signs one, and three of the tests are about what happens when
 //! it is not.
 
-use std::sync::Arc;
-
 use hems_core::prelude::CostBreakdown;
 use hems_core::report::DayKpis;
 use obsd::api::{Observed, router};
-use obsd::fleet::Fleet;
 use time::macros::date;
-use tokio::sync::RwLock;
 
 /// The secret the box and this fleet share in these tests.
 const SECRET: &str = "whsec_the-test-fleet";
@@ -25,11 +21,17 @@ const SECRET_FOR_HAUS_1: &str = "whsec_haus-1";
 /// The credential an operator reads the fleet view with.
 const OPERATOR: &str = "tok-operator";
 
-/// A day a box would send after a January reduction it respected.
-fn good_day(site: &str, day: u8) -> DayKpis {
+/// A day a box would send after a reduction it respected.
+///
+/// `day` is **how many days ago**, not a calendar date, and that is not a
+/// stylistic choice: the fleet view is a *window* — `keep_days` back from today
+/// — because the retention sweep deletes outside the same window (D157). A
+/// fixture on a fixed date would drift out of it and the test would start
+/// failing on a Tuesday for a reason nobody changed.
+fn good_day(site: &str, days_ago: u8) -> DayKpis {
     DayKpis {
         site: site.into(),
-        date: time::Date::from_calendar_date(2026, time::Month::January, day).unwrap(),
+        date: time::OffsetDateTime::now_utc().date() - time::Duration::days(i64::from(days_ago)),
         imported_kwh: 55.7,
         exported_kwh: 0.3,
         produced_kwh: 8.4,
@@ -88,14 +90,19 @@ async fn start_with_a_site_credential(
         shutdown_grace_s: 2,
         ..hems_service::Settings::default()
     };
-    let fleet = Arc::new(RwLock::new(Fleet::new(60)));
+    let fixture = hems_service::testdb::Postgres::start(obsd::store::MIGRATIONS).await;
+    let store = obsd::store::Store::new(fixture.db.clone());
+    // Leaked on purpose: the pool outlives the server task, and a test process
+    // ends when the test does.
+    std::mem::forget(fixture);
     let (signal, trigger) = hems_service::Shutdown::channel();
     let server = hems_service::Server::new(
         hems_service::identity!(),
         settings,
         hems_service::Health::new(),
         router(Observed::new(
-            fleet,
+            store,
+            60,
             time::Duration::days(2),
             // Every site the tests report for, each with a key of its own — which
             // is the point: two sites sharing one key would make "who signed this"
@@ -248,7 +255,10 @@ async fn a_breach_arrives_as_a_named_finding_and_not_as_a_percentage() {
     let breached = summary["breached"].as_array().unwrap();
     assert_eq!(breached.len(), 1);
     assert_eq!(breached[0]["site"], "site-9");
-    assert_eq!(breached[0]["date"], "2026-01-15");
+    let fifteen_days_ago = (time::OffsetDateTime::now_utc().date() - time::Duration::days(15))
+        .format(&time::format_description::well_known::Iso8601::DATE)
+        .expect("an ISO date");
+    assert_eq!(breached[0]["date"], fifteen_days_ago);
     assert!(breached[0]["detail"].as_str().unwrap().contains("850"));
     trigger.trigger();
 }
@@ -263,7 +273,10 @@ async fn a_site_can_be_asked_about_on_its_own() {
     assert_eq!(status, 200);
     let days: Vec<DayKpis> = serde_json::from_str(&days).unwrap();
     assert_eq!(days.len(), 3);
-    assert_eq!(days[0].date, date!(2026 - 01 - 15));
+    // Oldest first, which is what a chart wants and what the store's own
+    // ordering already is.
+    let today = time::OffsetDateTime::now_utc().date();
+    assert_eq!(days[0].date, today - time::Duration::days(17));
 
     let (status, _) = request(address, "GET", "/v1/sites/nobody", None, &operator()).await;
     assert_eq!(status, 404);
@@ -482,4 +495,233 @@ async fn a_box_cannot_report_a_day_as_another_household() {
     assert_eq!(status, 202);
 
     trigger.trigger();
+}
+
+/// The retention window is a `DELETE` an operator can ask questions of, and the
+/// record survives the process that wrote it (D157).
+#[tokio::test]
+async fn the_window_is_bounded_and_the_oldest_days_go_first() {
+    let fixture = hems_service::testdb::Postgres::start(obsd::store::MIGRATIONS).await;
+    let store = obsd::store::Store::new(fixture.db.clone());
+    let at = time::OffsetDateTime::now_utc();
+    for d in 0..6_i64 {
+        let day = hems_core::report::DayKpis {
+            site: "a".to_owned(),
+            date: date!(2026 - 02 - 20) + time::Duration::days(d),
+            ..hems_core::report::DayKpis::default()
+        };
+        store.record(&day, at).await.expect("a day");
+    }
+
+    assert_eq!(store.prune(date!(2026 - 02 - 23)).await.unwrap(), 3);
+    let left = store
+        .history(date!(2026 - 01 - 01), &hems_service::SiteScope::Every)
+        .await
+        .unwrap();
+    let days = &left["a"].days;
+    assert_eq!(days.len(), 3, "the three newest");
+    assert_eq!(*days.keys().next().unwrap(), date!(2026 - 02 - 23));
+
+    // …and a re-report of a day already on record is a correction, not a second
+    // day. The primary key is the rule, so a fleet cannot double one
+    // household's saving inside an average.
+    let again = hems_core::report::DayKpis {
+        site: "a".to_owned(),
+        date: date!(2026 - 02 - 25),
+        ..hems_core::report::DayKpis::default()
+    };
+    store.record(&again, at).await.expect("a correction");
+    let left = store
+        .history(date!(2026 - 01 - 01), &hems_service::SiteScope::Every)
+        .await
+        .unwrap();
+    assert_eq!(left["a"].days.len(), 3, "still three");
+}
+
+/// A restart does not lose the fleet.
+///
+/// The defect this whole change exists for: every day report `obsd` had ever
+/// accepted lived in one process's memory, so a restart — or a rescheduled pod —
+/// discarded the named list of households that did not respect a network
+/// operator's reduction, with no error anywhere. A box reports a day once, so
+/// what was lost was lost.
+#[tokio::test]
+async fn the_fleets_record_outlives_the_process_that_collected_it() {
+    let fixture = hems_service::testdb::Postgres::start(obsd::store::MIGRATIONS).await;
+    let at = time::OffsetDateTime::now_utc();
+    {
+        let store = obsd::store::Store::new(fixture.db.clone());
+        let day = hems_core::report::DayKpis {
+            site: "haus-1".to_owned(),
+            date: date!(2026 - 02 - 25),
+            respected_the_grid: false,
+            worst_overshoot_w: 1_200.0,
+            ..hems_core::report::DayKpis::default()
+        };
+        store.record(&day, at).await.expect("a breach");
+    }
+
+    // A different collector, over the same database.
+    let store = obsd::store::Store::new(fixture.db.clone());
+    let read = store
+        .history(date!(2026 - 01 - 01), &hems_service::SiteScope::Every)
+        .await
+        .unwrap();
+    let fleet = obsd::fleet::Fleet::of(
+        read.into_iter()
+            .map(|(site, days)| (site, days.into()))
+            .collect(),
+    );
+    let summary = fleet.summarise(at, time::Duration::days(2));
+    assert_eq!(summary.sites, 1);
+    assert_eq!(
+        summary.breached.len(),
+        1,
+        "the finding survived the process that collected it"
+    );
+    assert_eq!(summary.breached[0].site, "haus-1");
+}
+
+/// A scope reaches the **query**, not just the summary.
+///
+/// D112 says an aggregate is computed *within* the caller's scope rather than
+/// filtered afterwards, and for as long as the fleet was a map in memory that
+/// distinction cost nothing. It is a database now, and reading every household's
+/// day reports through one tenant's request to discard most of them afterwards
+/// is exactly what that decision forbids — so the scope is a `WHERE` clause, and
+/// this is the test that fails if it stops being one.
+#[tokio::test]
+async fn one_tenants_read_does_not_pull_anothers_rows() {
+    use std::collections::BTreeSet;
+    use time::macros::date;
+
+    let fixture = hems_service::testdb::Postgres::start(obsd::store::MIGRATIONS).await;
+    let store = obsd::store::Store::new(fixture.db.clone());
+    let at = time::OffsetDateTime::now_utc();
+    for site in ["nord-1", "sued-1"] {
+        let day = hems_core::report::DayKpis {
+            site: site.to_owned(),
+            date: date!(2026 - 02 - 25),
+            ..hems_core::report::DayKpis::default()
+        };
+        store.record(&day, at).await.expect("a day");
+    }
+
+    let nord = hems_service::SiteScope::Tenant {
+        name: "nord".into(),
+        sites: BTreeSet::from(["nord-1".to_owned()]),
+    };
+    let read = store
+        .history(date!(2026 - 01 - 01), &nord)
+        .await
+        .expect("the tenant's window");
+    assert_eq!(
+        read.keys().collect::<Vec<_>>(),
+        vec!["nord-1"],
+        "the other tenant's rows never left the database"
+    );
+
+    // …and one household reads exactly one household.
+    let one = hems_service::SiteScope::One("sued-1".to_owned());
+    let read = store.history(date!(2026 - 01 - 01), &one).await.unwrap();
+    assert_eq!(read.len(), 1);
+    assert!(read.contains_key("sued-1"));
+
+    // `Every` is the only scope that reads everything, and it is a variant
+    // somebody had to configure.
+    let all = store
+        .history(date!(2026 - 01 - 01), &hems_service::SiteScope::Every)
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+}
+
+/// The scoped read is an **index** scan, not a scan with a filter on it.
+///
+/// The companion to `one_tenants_read_does_not_pull_anothers_rows`, which proves
+/// the rows do not come back. This proves they are not *read*: a predicate that
+/// the planner applies after a sequential scan keeps the answer correct and
+/// reads the whole fleet's window to produce it, which on a shared deployment is
+/// one tenant's request touching every other tenant's pages.
+#[tokio::test]
+async fn a_scoped_read_is_an_index_scan() {
+    let fixture = hems_service::testdb::Postgres::start(obsd::store::MIGRATIONS).await;
+    let client = fixture.db.get().await.expect("a connection");
+    // Enough rows that a sequential scan is not the cheapest plan by accident.
+    client
+        .batch_execute(
+            "INSERT INTO site_day
+             SELECT 'site-' || (g % 500), '2026-01-01'::date + (g / 500), '{}'::jsonb, now()
+             FROM generate_series(1, 30000) g ON CONFLICT DO NOTHING;
+             ANALYZE site_day;",
+        )
+        .await
+        .expect("a loaded table");
+
+    let rows = client
+        .query(
+            "EXPLAIN (COSTS OFF)
+             SELECT site, day FROM site_day
+             WHERE day >= '2026-01-01'::date
+               AND (ARRAY['site-3']::text[] IS NULL OR site = ANY(ARRAY['site-3']::text[]))
+             ORDER BY site, day",
+            &[],
+        )
+        .await
+        .expect("a plan");
+    let plan: String = rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("site_day_pkey"),
+        "a tenant's window left the primary key:\n{plan}"
+    );
+    assert!(
+        !plan.contains("Seq Scan"),
+        "one tenant's request must not read every tenant's pages:\n{plan}"
+    );
+}
+
+/// The retention sweep does not read the whole window to delete one day of it.
+///
+/// The primary key leads with `site`, so it cannot answer `day < $1` across
+/// every household — and this test exists because the index that can was once
+/// deleted along with the comment above it, and every other test still passed.
+/// A missing index is not a failure, it is the same answer read a thousand times
+/// more expensively.
+#[tokio::test]
+async fn the_retention_sweep_is_an_index_scan() {
+    let fixture = hems_service::testdb::Postgres::start(obsd::store::MIGRATIONS).await;
+    let client = fixture.db.get().await.expect("a connection");
+    client
+        .batch_execute(
+            "INSERT INTO site_day
+             SELECT 'site-' || (g % 500), '2026-01-01'::date + (g / 500), '{}'::jsonb, now()
+             FROM generate_series(1, 30000) g ON CONFLICT DO NOTHING;
+             ANALYZE site_day;",
+        )
+        .await
+        .expect("a loaded table");
+
+    // A cutoff that removes a small slice, which is what a daily sweep over a
+    // sixty-day window actually does. Asking to delete most of the table
+    // correctly plans as a sequential scan.
+    let rows = client
+        .query(
+            "EXPLAIN (COSTS OFF) DELETE FROM site_day WHERE day < '2026-01-03'::date",
+            &[],
+        )
+        .await
+        .expect("a plan");
+    let plan: String = rows
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan.contains("site_day_by_day"),
+        "the retention sweep left its index:\n{plan}"
+    );
 }

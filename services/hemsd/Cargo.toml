@@ -43,7 +43,12 @@ hems-service   = { workspace = true }
 # process-global — two providers in one binary panic at the first connection.
 # The rest of the workspace already runs `aws-lc-rs` through `reqwest` (D84), so
 # this is the same choice stated twice rather than a second one.
-eebus        = { workspace = true, features = ["runtime", "mdns", "aws-lc-rs"] }
+# `conformance` carries the abstract test catalogue and the device-level
+# harness. It is `eebus`'s own default and is named here because the workspace
+# takes the crate with `default-features = false`: `tests/conformance.rs` drives
+# the seven procedures that are properties of *this process* rather than of the
+# library — a factory reset, a power cut, a start-up — and nothing else can.
+eebus        = { workspace = true, features = ["runtime", "mdns", "aws-lc-rs", "conformance"] }
 if-addrs     = { workspace = true }
 hems-sim       = { workspace = true }
 hems-tariff    = { workspace = true }

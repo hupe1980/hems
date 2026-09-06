@@ -4,16 +4,32 @@
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
-    /// The shared daemon settings.
-    #[serde(flatten)]
+    /// The shared daemon settings — `[service]` in the file.
+    ///
+    /// A **table** rather than a flattened set of top-level keys, so every
+    /// daemon in this workspace is configured the same way (D160): an operator
+    /// who has written `[service] listen = …` for one has written it for all of
+    /// them. The environment override is unaffected either way — it goes through
+    /// `AsMut<Settings>` rather than through the file's shape.
+    #[serde(default)]
     pub service: hems_service::Settings,
     /// How many days of reports to keep per site.
     ///
     /// Sixty: two months is long enough for a calibration figure to be
     /// answerable ([`hems_forecast::CALIBRATION_DAYS`] is twenty) and short
     /// enough that a fleet of ten thousand sites is a few tens of megabytes.
-    /// The *record* is `histd`'s; this is a window.
+    /// The *record* is `histd`'s; this is a window — and now a window the
+    /// retention sweep enforces with a `DELETE` rather than a `while` loop over
+    /// a map a restart emptied anyway (D157).
     pub keep_days: usize,
+    /// How to reach PostgreSQL.
+    ///
+    /// A fleet service, so a database a fleet can reach. What this daemon holds
+    /// is every household's day and the **named list of those that did not
+    /// respect a network operator's reduction**; in memory that list did not
+    /// survive a restart and could not be replicated (D157).
+    #[serde(default)]
+    pub database: hems_service::DbSettings,
     /// How long after a site's last report it counts as silent, seconds.
     ///
     /// A box reports once a day, so two days is a box that has missed one and
@@ -87,6 +103,7 @@ impl Default for Settings {
         Self {
             service: hems_service::Settings::default(),
             keep_days: 60,
+            database: hems_service::DbSettings::default(),
             silent_after_s: 2 * 24 * 3600,
             webhook_secrets: std::collections::BTreeMap::new(),
             tenants: std::collections::BTreeMap::new(),
@@ -102,5 +119,35 @@ impl Default for Settings {
 impl AsMut<hems_service::Settings> for Settings {
     fn as_mut(&mut self) -> &mut hems_service::Settings {
         &mut self.service
+    }
+}
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// The example file that ships with the daemon.
+    ///
+    /// Parsed by a test rather than trusted: a commented example that has
+    /// drifted from the struct it documents is worse than none, because it is
+    /// read by whoever is deploying this and every line of it looks
+    /// authoritative. `include_str!` makes it a build input.
+    const EXAMPLE: &str = include_str!("../obsd.example.toml");
+
+    #[test]
+    fn the_example_configuration_parses_and_describes_a_service() {
+        let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
+        assert!(
+            !settings.operators.is_empty(),
+            "an example with no operator would document a service nobody can read"
+        );
+        assert!(
+            settings.database.tls,
+            "what crosses this socket is a fleet's household data"
+        );
+        assert!(
+            settings.database.statement_timeout_s > 0,
+            "a serving replica needs a bound on a query whose reader has gone"
+        );
     }
 }

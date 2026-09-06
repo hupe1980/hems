@@ -1,0 +1,83 @@
+# obsd — what the fleet is actually doing.
+#
+#   obsd --config /etc/hems/obsd.toml
+#
+# It averages what is an average and **counts** what is a count: every § 14a
+# breach as a named finding with a site and a date, never as a percentage. One
+# household in ten thousand over a network operator's ceiling is a compliance
+# incident with an address, and an average puts it at half a per cent.
+#
+# The environment overrides the file (`HEMS_OBSD_…`).
+#
+# This file is parsed by a test in `config.rs`, so an example that has drifted
+# from the struct it documents fails the build rather than misleading an
+# operator.
+
+# How many days of reports to keep per site.
+#
+# Sixty: two months is long enough for a calibration figure to be answerable
+# (twenty independent days is the floor) and short enough that a fleet of ten
+# thousand sites is a few tens of megabytes. The *record* is `histd`'s; this is
+# a window, and the retention sweep deletes outside exactly the window a summary
+# is computed over.
+#
+# Top-level keys, so they are above every table.
+keep_days = 60
+# How long a box may be quiet before the fleet view names it silent, seconds.
+silent_after_s = 172800
+# How far a report's timestamp may be from now, seconds. Standard Webhooks
+# covers the timestamp, so a captured report stops working.
+webhook_tolerance_s = 300
+
+# ── The shell ────────────────────────────────────────────────────────────────
+[service]
+listen = "0.0.0.0:7780"
+log_filter = "info"
+log_json = true
+shutdown_grace_s = 20
+
+# ── Where the fleet's days live ──────────────────────────────────────────────
+#
+# In memory this was a map that died with the process — and with it every day
+# report the service had ever accepted, including the named list of households
+# that did not respect a reduction. A box sends a day once and keeps no second
+# copy, so what was lost was lost, and the fleet view came back saying
+# `sites: 0` with no error anywhere.
+[database]
+url = "env:HEMS_OBSD_DATABASE_URL"
+pool_size = 10
+acquire_timeout_s = 5
+statement_timeout_s = 30
+tls = true
+
+# ── Which box signed which day ───────────────────────────────────────────────
+#
+# **One key per household**, and that is the whole point: a signature over a
+# shared secret says the bytes were not edited and nothing about who sent them,
+# so any holder could attribute a day to any site. Two sites configured with the
+# same key is a start-up failure rather than a report attributed to whichever
+# one the fold happened to see last.
+#
+# A **signature** and not a bearer token: what this service holds is the list of
+# households that did not respect a network operator's reduction, so an
+# unauthenticated write can put a compliant site on it. A token says who is
+# asking; a signature says what was said.
+[webhook_secrets]
+"reference-household" = ["env:HEMS_OBSD_SECRET_REFERENCE_HOUSEHOLD"]
+
+# ── Who may read the fleet view ──────────────────────────────────────────────
+#
+# The summary carries a named list of households, so only a credential that
+# reaches a whole fleet may read it — and only the households in *its* scope. A
+# tenant's scope reaches the query rather than filtering the answer, so one
+# tenant's rows never leave the database on another tenant's request.
+[[operators]]
+token  = "env:HEMS_OBSD_OPERATOR_TOKEN"
+tenant = "*"
+
+# [tenants]
+# stadtwerke-nord = ["reference-household"]
+
+# ── The agent surface ────────────────────────────────────────────────────────
+[mcp]
+enabled = false

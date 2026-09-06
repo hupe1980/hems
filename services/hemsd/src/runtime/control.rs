@@ -299,6 +299,9 @@ pub async fn run(
         grid_feed_wh: 0.0,
         device_draw_wh: 0.0,
         device_feed_wh: 0.0,
+        storage_draw_wh: 0.0,
+        storage_feed_wh: 0.0,
+        storage_samples: 0,
         failsafe: None,
         evidence: hems_grid::evidence::EvidenceRecorder::new(),
     };
@@ -528,19 +531,34 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
         }
     }
 
-    // …and the four registers a settlement is computed from. The connection
-    // point in both directions, and what the storage system and the charge
-    // point drew and gave — `Z1NB¼`, `Z1NE¼`, `Z2V¼`, `Z2E¼`.
+    // …and the registers a settlement is computed from. The connection point in
+    // both directions, what the storage system and the charge point drew and
+    // gave together — `Z1NB¼`, `Z1NE¼`, `Z2V¼`, `Z2E¼` — and the storage
+    // system's own half of that pair, `Z3V¼` and `Z3E¼`.
     if let Some(grid) = observed.state.grid.and_then(|m| m.power) {
         carried.grid_draw_wh += grid.inflow().get() * hours;
         carried.grid_feed_wh += grid.outflow().get() * hours;
     }
-    for asset in [&managed.battery, &managed.evse].into_iter().flatten() {
+    for (asset, is_storage) in [(&managed.battery, true), (&managed.evse, false)] {
+        let Some(asset) = asset.as_ref() else {
+            continue;
+        };
         let Some(p) = observed.state.asset(asset).and_then(|m| m.power) else {
             continue;
         };
         carried.device_draw_wh += p.inflow().get() * hours;
         carried.device_feed_wh += p.outflow().get() * hours;
+        // `Z3` is a *subset* of `Z2` and is accumulated in the same pass, from
+        // the same measurement, so the two cannot come to disagree about a tick
+        // one of them saw and the other did not. `[MiSpeL A1 (17)A4]` subtracts
+        // them from one another and refuses a settlement where the difference
+        // goes negative — which is exactly what two independent passes over two
+        // different sample sets would eventually produce.
+        if is_storage {
+            carried.storage_draw_wh += p.inflow().get() * hours;
+            carried.storage_feed_wh += p.outflow().get() * hours;
+            carried.storage_samples += 1;
+        }
     }
 }
 
@@ -671,8 +689,18 @@ async fn register(
         grid_feed_in: kwh(carried.grid_feed_wh),
         device_consumption: kwh(carried.device_draw_wh),
         device_generation: kwh(carried.device_feed_wh),
-        storage_consumption: None,
-        storage_generation: None,
+        // `Z3V¼`/`Z3E¼` — the storage system on its own, and the pair Basisfall
+        // A4 cannot be settled without (`[MiSpeL A1 3.2.4]`). Written whenever
+        // the box has actually read the battery's meter this quarter hour, and
+        // `None` otherwise: a household on A4 whose store went unmeasured owes
+        // its network operator a refusal rather than a zero, because a zero here
+        // is a settlement claiming the battery stood still.
+        //
+        // A site with no battery at all reports `None` for the same reason, and
+        // that is the case where `hems_grid::mispel` refuses A4 — correctly, as
+        // A4 is *defined* by a separately metered store.
+        storage_consumption: (carried.storage_samples > 0).then(|| kwh(carried.storage_draw_wh)),
+        storage_generation: (carried.storage_samples > 0).then(|| kwh(carried.storage_feed_wh)),
         anzulegender_wert: price.export_ct,
         spot_price: price.energy_ct,
     };
@@ -976,8 +1004,8 @@ struct Carried {
     heat_pump_wh: f64,
     /// How many ticks contributed to those two.
     samples: u32,
-    /// The quarter hour's metered flows, watt-hours, in the four registers
-    /// MiSpeL and § 42c settle from.
+    /// The quarter hour's metered flows, watt-hours, in the registers MiSpeL
+    /// and § 42c settle from.
     ///
     /// `Z1NB¼` and `Z1NE¼` are what crossed the connection point; `Z2V¼` and
     /// `Z2E¼` are what the storage system and the charge point did. Accumulated
@@ -987,6 +1015,22 @@ struct Carried {
     grid_feed_wh: f64,
     device_draw_wh: f64,
     device_feed_wh: f64,
+    /// `Z3V¼` and `Z3E¼` — the **storage system alone**, which is the pair
+    /// Basisfall A4 is defined by (`[MiSpeL A1 3.2.4]`).
+    ///
+    /// A separate accumulator rather than a subtraction at the slot boundary:
+    /// `Z2 − Z3` is only the charge point where both were measured in the same
+    /// ticks, and a battery whose meter went quiet for a minute would otherwise
+    /// hand the settlement a charge point that briefly ran backwards.
+    ///
+    /// `storage_samples` is the denominator that decides whether they are
+    /// reported at all. Zero is a box with no battery meter — which is a
+    /// different fact from a battery that stood still, and the difference is
+    /// exactly what A4 turns on (D124's argument, applied to the register the
+    /// Festlegung asks for rather than to the roof).
+    storage_draw_wh: f64,
+    storage_feed_wh: f64,
+    storage_samples: usize,
     /// The failsafe last written down, so an unchanged one is not rewritten.
     failsafe: Option<hems_drv::Failsafe>,
     /// The § 14a record, built as the loop runs.
@@ -1136,6 +1180,9 @@ async fn tick(
         carried.grid_feed_wh = 0.0;
         carried.device_draw_wh = 0.0;
         carried.device_feed_wh = 0.0;
+        carried.storage_draw_wh = 0.0;
+        carried.storage_feed_wh = 0.0;
+        carried.storage_samples = 0;
         carried.delivered_slot = slot;
     }
 

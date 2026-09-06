@@ -1,0 +1,67 @@
+# forecastd — what the sky will do, per location.
+#
+#   forecastd --config /etc/hems/forecastd.toml
+#
+# It serves the **sky** and never a finished forecast. The correction for a
+# particular roof — the tree that shades the east string, the chimney, the
+# soiling — is the box's, because it is a property of one address and can only
+# be learned from that address's own meter.
+#
+# The environment overrides the file (`HEMS_FORECASTD_…`).
+#
+# This file is parsed by a test in `config.rs`, so an example that has drifted
+# from the struct it documents fails the build rather than misleading an
+# operator.
+
+# How often to fetch, seconds. ICON-D2 runs eight times a day, so an hour is
+# comfortably inside that and polite to a free endpoint.
+#
+# Top-level keys, so they are above every table.
+poll_interval_s = 3600
+request_timeout_s = 20
+max_backoff_s = 3600
+# How many quarter hours ahead the cache must cover before this daemon calls
+# itself ready.
+ready_slots = 96
+
+# Where to fetch from. `timeformat=unixtime` is not a convenience: Open-Meteo's
+# default is a local wall-clock string with no offset, and reading one of those
+# without knowing which timezone was asked for is an hour wrong twice a year.
+# The parser refuses that format rather than guessing, so the query has to ask
+# for this one.
+endpoint = "https://api.open-meteo.com/v1/forecast?timeformat=unixtime"
+
+# ── The shell ────────────────────────────────────────────────────────────────
+[service]
+listen = "0.0.0.0:7280"
+log_filter = "info"
+log_json = true
+shutdown_grace_s = 20
+
+# ── The places to forecast for ───────────────────────────────────────────────
+#
+# Empty by default, and a `forecastd` with no locations never becomes ready —
+# the same honesty as a `tariffd` with no sources.
+#
+# A box names one of these rather than sending its own coordinates: the sun
+# position a production figure is computed from has to be the one the irradiance
+# was fetched at, so a box that could name its own latitude would be given
+# somebody else's sky.
+[[locations]]
+id        = "berlin"
+latitude  = 52.52
+longitude = 13.40
+altitude_m = 34.0
+
+# [[locations]]
+# id        = "muenchen"
+# latitude  = 48.14
+# longitude = 11.58
+# altitude_m = 519.0
+
+# ── The agent surface ────────────────────────────────────────────────────────
+#
+# Open like the REST routes when it is switched on: irradiance over a location
+# is public weather, not a household's data.
+[mcp]
+enabled = false

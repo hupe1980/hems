@@ -252,12 +252,6 @@ impl Lpc {
             events: Vec::new(),
         })
     }
-
-    /// The SPINE device address this box answers on, for a pairing screen.
-    pub fn spine_address(&self) -> &str {
-        self.engine.device().address().as_str()
-    }
-
     /// Which asset the limit applies to — the connection point, ordinarily.
     pub fn asset(&self) -> &AssetId {
         &self.asset

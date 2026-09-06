@@ -43,8 +43,14 @@ pub struct SiteEntry {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
-    /// The shared daemon settings.
-    #[serde(flatten)]
+    /// The shared daemon settings — `[service]` in the file.
+    ///
+    /// A **table** rather than a flattened set of top-level keys, so every
+    /// daemon in this workspace is configured the same way (D160): an operator
+    /// who has written `[service] listen = …` for one has written it for all of
+    /// them. The environment override is unaffected either way — it goes through
+    /// `AsMut<Settings>` rather than through the file's shape.
+    #[serde(default)]
     pub service: hems_service::Settings,
     /// The sites, by identifier.
     pub sites: BTreeMap<String, SiteEntry>,
@@ -86,11 +92,18 @@ pub struct Settings {
     /// Where the enrolments and the running reports are kept.
     ///
     /// Not optional. The credential a box was issued exists in exactly two
-    /// places — the box and this file — and the enrolment secret that could
+    /// places — the box and this database — and the enrolment secret that could
     /// mint a replacement is single-use and spent. A `fleetd` with nowhere to
     /// write is one restart away from a fleet of households it cannot
     /// recognise, so there is no in-memory mode to fall into by accident.
-    pub store_path: std::path::PathBuf,
+    ///
+    /// PostgreSQL rather than a file, because this is the daemon a box talks to
+    /// **first**: it has to stay up while another is deployed, which needs a
+    /// second replica, which needs a database two processes can share (D156).
+    /// It is also what makes the single-use enrolment single-use across the
+    /// whole service rather than per replica.
+    #[serde(default)]
+    pub database: hems_service::DbSettings,
     /// How long a box may be quiet before the roster calls it silent, seconds.
     ///
     /// A silent box may be perfectly compliant and unreachable — a household
@@ -113,11 +126,60 @@ impl Default for Settings {
             releases: BTreeMap::new(),
             tenants: std::collections::BTreeMap::new(),
             operators: Vec::new(),
-            store_path: std::path::PathBuf::from("fleetd.sqlite"),
+            database: hems_service::DbSettings::default(),
             // Two days. A household that has not reported for two days is worth
             // looking at; one that missed an hour is a router rebooting.
             silent_after_s: 2 * 24 * 3600,
             mcp: hems_service::McpSettings::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod example_tests {
+    use super::*;
+
+    /// The example file that ships with the daemon.
+    ///
+    /// Parsed by a test rather than trusted: a commented example that has
+    /// drifted from the struct it documents is worse than none, because it is
+    /// read by whoever is deploying this and every line of it looks
+    /// authoritative. `include_str!` makes it a build input.
+    const EXAMPLE: &str = include_str!("../fleetd.example.toml");
+
+    #[test]
+    fn the_example_configuration_parses_and_describes_a_service() {
+        let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
+        assert!(
+            !settings.operators.is_empty(),
+            "an example with no operator would document a service nobody can read"
+        );
+        assert!(
+            settings.database.tls,
+            "what crosses this socket is a fleet's household data"
+        );
+        assert!(
+            settings.database.statement_timeout_s > 0,
+            "a serving replica needs a bound on a query whose reader has gone"
+        );
+
+        for (site, entry) in &settings.sites {
+            // The one field on this struct that is **not** a credential: a
+            // signature is public, and an example that wrote it as an `env:`
+            // reference would be copied, taken literally, and produce a
+            // `/v1/config` that quietly refuses to serve — which reads exactly
+            // like a fleet nobody has configured. It parses either way, which is
+            // why this is an assertion and not a parse test.
+            assert!(
+                !entry.config_signature.starts_with("env:")
+                    && !entry.config_signature.starts_with("file:"),
+                "{site}: a configuration signature is a hex value, not a secret reference"
+            );
+            assert!(
+                !entry.config_signature.is_empty(),
+                "{site}: an example with no signature documents a site whose \
+                 configuration is never served"
+            );
         }
     }
 }

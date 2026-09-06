@@ -113,6 +113,24 @@ autarky_eur_per_kwh = 0.0
 [site]
 pv_kwp = 9.8
 pv_ac_kw = 8.0
+
+# The roof's own geometry, and the two numbers an installer reads off it in ten
+# seconds. Tilt is the pitch, 0 flat and 90 a wall; azimuth is degrees clockwise
+# from north, so 180 is due south, 90 east and 270 west.
+#
+# **The azimuth is the field most worth checking and the one nobody changes.** It
+# decides *when* the roof produces, not how much: an east-west array left on due
+# south produces two shoulders where the plan expects one midday peak, so the box
+# charges the battery from a sun that is not there and the evening comes up short.
+# The correction the box learns from its own meter is a *level* per hour of the
+# day and it is bounded, so it takes seasons to absorb a shape error and never
+# absorbs it fully.
+#
+# For a split east-west array, state the string that carries more of the kWp; the
+# residual corrector picks up the rest.
+pv_tilt_deg = 35.0
+pv_azimuth_deg = 180.0
+
 battery_kwh = 10.0
 battery_kw = 5.0
 # Held back for a power cut. The planner never plans below it and the guard
@@ -122,6 +140,23 @@ reserve_soc = 0.1
 # the plan will cycle the pack for a spread that does not cover the damage.
 battery_wear_eur_per_kwh = 0.08
 fuse_a = 35.0
+
+# The contractually agreed connection power, kW, where the Netzanschlussvertrag
+# names one. It narrows three things at once: the guard's physical headroom, the
+# planner's import ceiling, and the `ContractualConsumptionNominalMax` this box
+# reports to an EEBUS Energy Guard [LPC-042]. Omitted, all three see nothing but
+# the fuse above.
+# contract_power_kw = 30.0
+
+# The identifiers a Marktkommunikation message is addressed with, and the
+# Netzbereich [A1 8.2.b] that lets this household find its own row in the
+# operator's monthly § 14a publication. A MaLo-ID carries a check digit and is
+# refused at start-up if it does not match, rather than being put on a message
+# that names somebody else's connection point.
+# malo = "41373559241"
+# melo = "DE0001234567890000000000000123456"
+# dso_code = "9903386000006"
+# netzbereich = "NB-0001"
 
 # The federal state whose public holidays decide a day type — a holiday counts
 # as a Sunday in a load profile, and Fronleichnam is a working day in Berlin and
@@ -163,15 +198,6 @@ evse_max_a = 16.0
 evse_switchable = true
 ev_charge_limit = 0.75
 
-# § 9 Abs. 2 EEG lifts the 60 % feed-in cap only after the network operator's
-# **first successful Ansteuerbarkeit test** — a different event on a different
-# clock from the meter being fitted. So this stays false until that test has
-# happened, however long the meter has been in the cupboard.
-imsys_control_device = false
-# When the intelligent metering system was fitted, which is § 51 EEG's clock:
-# from the end of that calendar year the plant earns nothing in a negative
-# quarter hour. Remove the line for a household that has no such meter.
-imsys_since = "2024-06-01"
 
 # The dishwasher's programme, as the average power in kW of each consecutive
 # quarter hour: heat, wash, wash, wash, dry, finish. Steps rather than a
@@ -179,6 +205,118 @@ imsys_since = "2024-06-01"
 # 700 W into every sunny slot and no dishwasher will do that. Leave the list
 # empty for a household with nothing waiting.
 dishwasher_kw_steps = [2.0, 0.2, 0.2, 0.2, 1.8, 0.1]
+
+# ── What limits this roof's feed-in ──────────────────────────────────────────
+#
+# The § 9 EEG facts, in one table because they are one question and the answer
+# is a decision tree over them rather than four independent switches. The
+# commissioning date is the first thing consulted and it lives in
+# [site.declared.pv] below.
+[site.para9]
+# § 9 Abs. 2 lifts the 60 % cap only after the network operator's **first
+# successful Ansteuerbarkeit test** — a different event on a different clock
+# from the meter being fitted. So this stays false until that test has happened,
+# however long the meter has been in the cupboard.
+imsys_control_device = false
+# When the intelligent metering system was fitted, which is § 51 EEG's clock:
+# from the end of that calendar year the plant earns nothing in a negative
+# quarter hour. Remove the line for a household that has no such meter.
+imsys_since = "2024-06-01"
+# § 9 Abs. 2 S. 4: a Steckersolargerät within **both** size tests — 2 kW DC and
+# 800 W AC — is outside the cap altogether.
+steckersolargeraet = false
+# § 100 Abs. 3 S. 2 Nr. 2: a system commissioned before 2023 that met its
+# obligation by limiting itself to 70 % rather than by accepting a
+# Rundsteuerempfänger. Leave it false for anything newer.
+legacy_70_percent = false
+
+# ── Which house this is, thermally ───────────────────────────────────────────
+#
+# The **prior**. The box identifies its own building from the household's own
+# thermometer once it has watched a few excited days, and what it has fitted
+# always wins over what is written here — so this is what the box plans against
+# in the weeks before that, and for ever in a household whose heat pump nothing
+# measures.
+#
+# It is not cosmetic. The fabric capacity decides whether pre-heating into a
+# cheap hour pays at all, and it differs by a factor of five between an
+# unretrofitted solid-wall house and a new timber frame; the envelope loss
+# differs by four. A box planning every household against the average one
+# over-heats most of them and pays the comfort slack for the overshoot.
+#
+#   average      1990s masonry or a partial retrofit, ~150 m², 6,8 kW at −20 °C
+#   new-build    GEG-era or a deep retrofit, 4,1 kW — light, so it holds little
+#   solid-wall   unretrofitted pre-1979, 16,5 kW — very heavy, moves over a day
+#   apartment    a flat inside a heated block: little envelope, little mass
+[site.building]
+class = "average"
+# Any of the four parameters may be given instead, and overrides the class.
+# `r_air_out_k_per_kw` is ΔT / Q at the design pair: a house losing 6,8 kW at
+# 21 °C indoors and −20 °C outdoors is 41 / 6,8 = 6.
+# air_capacity_kwh_per_k = 0.6
+# mass_capacity_kwh_per_k = 12.0
+# r_air_out_k_per_kw = 6.0
+# r_air_mass_k_per_kw = 0.4
+
+# ── What the paperwork says, per device ──────────────────────────────────────
+#
+# The § 14a and § 9 EEG facts. Every one of them is off a contract or a
+# Netzanschlussportal record rather than off a datasheet, which is why the box
+# has to be told and cannot work them out — and both statutes turn on the same
+# date and read silence in **opposite** directions.
+#
+# § 9 EEG ties all three of its feed-in limitations to the commissioning date: a
+# roof commissioned from 25.02.2025 is capped at 60 %, one from the window
+# 01.01.2023–24.02.2025 at nothing at all (§ 100 Abs. 3b), and one from before
+# 2023 at 70 % only if `[site.para9] legacy_70_percent` says that is how it met its
+# obligation. Get it wrong towards the newest and the box curtails a roof the
+# statute never reached, every sunny midday, for the life of the installation.
+#
+# § 14a goes the other way: [A1 3.1.b] binds devices commissioned after
+# 31.12.2023, and [A1 10] leaves an older one either out of scope, on the old
+# reduced network fee until 31.12.2028, or — a Nachtspeicherheizung —
+# indefinitely. Treating such a device as a controllable one hands the operator
+# a share of its power it may not reduce *and* counts its consumption as
+# netzwirksamer Leistungsbezug when it is ordinary load.
+#
+# Silence therefore leaves a device **in** the § 14a group (the safe direction
+# there) and **outside** every § 9 limitation (the safe direction here). What
+# each declaration produced is written to the log once, at start-up, in the
+# words the paperwork uses — because an installer standing in the cellar is the
+# only person who can correct it.
+#
+# Keys are asset identifiers: pv, battery, wallbox, waermepumpe, warmwasser,
+# spuelmaschine. One this household has none of is refused at start-up, the same
+# way a [[drivers]] entry for one is.
+[site.declared.pv]
+commissioned = "2025-03-01"
+
+[site.declared.battery]
+commissioned = "2025-03-01"
+
+[site.declared.wallbox]
+commissioned = "2025-03-01"
+
+[site.declared.waermepumpe]
+commissioned = "2025-03-01"
+# What it brings from before 2024 [A1 10]: "none", "reduced_network_fee" (the
+# old § 14a Abs. 2 S. 1 reduced network fee, which runs to 31.12.2028) or
+# "nachtspeicher" (a night-storage heater, [A1 10.2.b], indefinitely).
+legacy_status = "none"
+# [A1 10.4]: the operator moved this device into the netzorientierte Steuerung
+# voluntarily. Irreversible, and the operator may not refuse.
+switched_voluntarily = false
+# Why it is not a steuerbare Verbrauchseinrichtung at all [A1 3.1.b]:
+# "public_charge_point", "emergency_services" or
+# "non_residential_heating_or_cooling". The list is closed; anything not on it
+# participates.
+# exemption = "non_residential_heating_or_cooling"
+
+[site.declared.warmwasser]
+commissioned = "2025-03-01"
+
+[site.declared.spuelmaschine]
+commissioned = "2025-03-01"
 
 # ── What a kilowatt-hour costs and earns ─────────────────────────────────────
 #

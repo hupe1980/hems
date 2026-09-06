@@ -226,18 +226,6 @@ impl Power {
     pub fn over(self, duration: time::Duration) -> Energy {
         Energy::new(self.0 * duration.as_seconds_f64() / 3600.0)
     }
-
-    /// Single-phase current at `voltage`, ignoring power factor.
-    #[must_use]
-    pub fn to_current_1p(self, voltage: Voltage) -> Current {
-        Current::new(self.0 / voltage.get())
-    }
-
-    /// Three-phase current at `voltage` (phase-to-neutral), ignoring power factor.
-    #[must_use]
-    pub fn to_current_3p(self, voltage: Voltage) -> Current {
-        Current::new(self.0 / (3.0 * voltage.get()))
-    }
 }
 
 impl Energy {

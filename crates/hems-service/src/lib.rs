@@ -17,8 +17,16 @@
 //! against a fork that is *supposed* to diverge.
 //!
 //! So this is small on purpose. It owns configuration, logging, the health
-//! surface and the shutdown, and it owns nothing about energy. A daemon that
-//! needs an HTTP client, a database or a scheduler brings its own.
+//! surface, the shutdown and — behind the `postgres` feature — the **fleet's
+//! database pool**, and it owns nothing about energy. A daemon that needs an
+//! HTTP client or a scheduler brings its own.
+//!
+//! The database was on that "brings its own" list until three daemons had one.
+//! [`db`] is not a schema — that belongs to whichever daemon's tables it
+//! describes — it is the thirty lines of pool bounds, statement timeout,
+//! credential reference and readiness probe that all three need identically,
+//! and that diverge when written three times in the direction that costs most:
+//! the copy that is wrong is the one whose readiness probe lies.
 //!
 //! # Sans-I/O ends here
 //!
@@ -30,19 +38,33 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::pedantic)]
-#![allow(clippy::module_name_repetitions, clippy::must_use_candidate)]
+#![allow(
+    clippy::module_name_repetitions,
+    clippy::must_use_candidate,
+    // Domain and product nouns — PostgreSQL, SQLite, CloudEvents, Ed25519 — are
+    // capitalised because that is how they are spelled, not because they are
+    // identifiers. The same allowance the daemons carry.
+    clippy::doc_markdown
+)]
 
 pub mod auth;
 pub mod config;
+#[cfg(feature = "postgres")]
+pub mod db;
 pub mod health;
 pub mod mcp;
+pub mod metrics;
 pub mod serve;
 pub mod shutdown;
 pub mod telemetry;
+#[cfg(feature = "testkit")]
+pub mod testdb;
 pub mod update;
 
 pub use auth::{Authority, Capabilities, Credentials, OperatorCredential, SiteScope};
 pub use config::{ConfigError, Secret, Settings, load, load_from};
+#[cfg(feature = "postgres")]
+pub use db::{Db, DbError, DbSettings, Migration};
 pub use health::{Health, Probe, Readiness};
 pub use mcp::{McpAuth, McpSettings};
 pub use serve::{Server, ServerError};

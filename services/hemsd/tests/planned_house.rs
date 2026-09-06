@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::routing::get;
-use hems_core::prelude::{Measurement, Power, Slot, Soc};
+use hems_core::prelude::{Measurement, Power, Rc2, Slot, Soc};
 use hems_service::Shutdown;
 use hemsd::drivers::Registry;
 use hemsd::runtime::planner::{Learned, Planner};
@@ -205,7 +205,7 @@ impl hems_drv::Driver for Reporting {
 
 /// A box that has been running long enough to know its own household.
 fn learned_household(land: metering::Bundesland) -> Learned {
-    let mut learned = Learned::new(land);
+    let mut learned = Learned::new(land, Rc2::house());
     // Three weeks of a flat six hundred watts. Enough support for the profile to
     // answer, and deliberately dull: what is being tested is that a *forecast*
     // reaches the planner, not that this one is good.
@@ -492,7 +492,10 @@ async fn a_box_installed_this_morning_plans_from_persistence() {
             outdoor: Arc::new(RwLock::new(BTreeMap::new())),
         },
         // A box that has learned nothing at all — switched on this morning.
-        Arc::new(Mutex::new(Learned::new(metering::Bundesland::Be))),
+        Arc::new(Mutex::new(Learned::new(
+            metering::Bundesland::Be,
+            Rc2::house(),
+        ))),
         None,
         hems_service::Health::new(),
         signal,

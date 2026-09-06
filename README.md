@@ -74,17 +74,48 @@ $ cargo run -p hemsd -- run --check --config services/hemsd/hemsd.example.toml
 $ cargo run -p hemsd -- run --config /etc/hems/hemsd.toml
 ```
 
+Each of the seven daemons ships an annotated `<name>.example.toml` beside its
+source — parsed by a test, so an example that has drifted from the struct it
+documents fails the build rather than misleading whoever is deploying it.
+
 `--check` builds the site and the drivers and stops before opening a socket — the
 command an installer runs before leaving the cellar. It refuses a driver for an
 asset the site does not have, two drivers that both command or both measure one
 asset, a controllable device no driver can command, a § 14a household with nothing that could hear a
-reduction, and a **Modul 3 calendar the household may not be billed on** — the
+reduction, a **Modul 3 calendar the household may not be billed on** — the
 one thing in the file that is transcribed by hand from a PDF, checked against
-the seven rules of the BDEW Anwendungshilfe. Each of those is silent at runtime
+the seven rules of the BDEW Anwendungshilfe — a market identifier that fails its
+own check digit, a thermal model no house could have, and a § 14a regime declared
+for a device this household does not own. Each of those is silent at runtime
 and loud at start-up, which is the right way round.
 
-Rust 1.94 and [`just`](https://just.systems). Nothing else: the default solver is
-pure Rust, so there is no C++ toolchain and no system library to install.
+It also **says what the paperwork produced**, because the consequence of a date
+is not obvious from the date:
+
+```console
+INFO § 14a asset=waermepumpe commissioned=Some(2019-04-01) participation=Legacy { until: 2028-12-31 } controlled=false
+INFO § 9 EEG: no statutory feed-in cap applies to this roof commissioned=Some(2024-06-01)
+```
+
+A roof commissioned in the window § 100 Abs. 3b EEG exempts is capped at
+*nothing*, and a box that assumed otherwise would curtail it at 60 % every sunny
+midday for the life of the installation. A 2019 heat pump on the old reduced
+network fee is on `[A1 10.1]` until 2028, and counting it as a new SteuVE hands
+the network operator a share of its power it may not reduce. Neither is derivable
+from a nameplate, both take ten seconds to declare, and the installer standing in
+front of the box is the only person who can correct them.
+
+Rust 1.94 and [`just`](https://just.systems) to build and run. The default solver
+is pure Rust, so there is no C++ toolchain and no system library to install.
+
+`just test` additionally needs a **container runtime** (Docker, Podman or
+Colima). The fleet daemons deploy on PostgreSQL, so their queries are tested
+against PostgreSQL — a service checked on a different engine is a service whose
+SQL is checked by nothing. The suite starts **one** container for the whole
+workspace and gives each test a database of its own; `just db-stop` is the
+teardown. `HEMS_TEST_POSTGRES` points it at a server already running instead;
+there is deliberately no way to skip, because a test that passed without reaching
+a database would report green for a query nobody ran.
 
 Released builds are on the
 [releases page](https://github.com/hupe1980/hems/releases) for
@@ -308,7 +339,7 @@ this is reachable.
 | [`hemsd`](services/hemsd) | The house: guard, arbiter, planner and evidence recorder against a simulated site, keeping the household's own two years of § 14a evidence locally with an outbox for the fleet | ⏳ no hardware yet |
 | [`tariffd`](services/tariffd) | Fetches the five published day-ahead sources, reconciles a curve that arrives twice under a written trust order, and keeps two days each way so a WAN outage never costs a plan | ✅ |
 | [`forecastd`](services/forecastd) | ICON-D2 through Open-Meteo at quarter-hour resolution. Serves the **sky**, never a finished forecast — the correction for *this* roof is the box's, because it is a property of one roof | ✅ |
-| [`histd`](services/histd) | The fleet's record: the two years of § 14a evidence `[A1 7.3]`, the quarter-hour registers a settlement is computed from, and both exports — the operator's Nachweis and the household's Data Act Article 4 document, each authorised per site, because Article 4 is a right of the *user* and a fleet token is not a household | ✅ |
+| [`histd`](services/histd) | The fleet's record, in PostgreSQL: the two years of § 14a evidence `[A1 7.3]`, the quarter-hour registers a settlement is computed from as exact `NUMERIC` and **versioned** — a restated register supersedes its predecessor without erasing it, so `?as_of=` reproduces a Nachweis already handed over — and both exports, the operator's Nachweis and the household's Data Act Article 4 document, each authorised per site, because Article 4 is a right of the *user* and a fleet token is not a household | ✅ |
 | [`fleetd`](services/fleetd) | Single-use enrolment, and **signed** configuration and releases it holds signatures for and never a key — so a `fleetd` an attacker owns can serve neither a configuration nor an update any box will accept | ✅ |
 | [`agentd`](services/agentd) | The advisory plane, on [agentplane](https://github.com/hupe1980/agentplane): specialists that correlate across many exact answers — whether one cause accounts for most of a week's § 14a breaches, what the dashboard's saving figure actually rests on. It **proposes**, and cannot act: `Advice` is a leaf type nothing consumes, and an agent's authority is derived by `attenuate`, which refuses to widen | ✅ |
 | [`obsd`](services/obsd) | The fleet view: averages what is an average, and **counts** what is a count — every § 14a breach as a named finding, never as a percentage. A day reaches it over TLS and only as a **signed** CloudEvent, because a list of who broke a grid rule that anybody can write to is not evidence | ✅ |
@@ -370,6 +401,7 @@ obeys that as an instruction not to use it.
 | **Pairing a Steuerbox without a restart** | it dials a box that does not know it, is held pending, is approved mid-handshake, and gets through |
 | **The SHIP session** — TLS 1.2 with mutual authentication, the WebSocket upgrade, the handshake, a trust store and a SKI that survive a reboot, and a `_ship._tcp` announcement so a Steuerbox can find the box at all | a Steuerbox reduces a running household to 4,2 kW over a real socket, and an unapproved one completes TLS and gets no further |
 | The driver registry | `hemsd` checks the drivers against the site *before* a byte moves |
+| **The house in front of the box, described rather than assumed** | the roof's own tilt and azimuth, a thermal archetype for the building, the commissioning date and legacy regime of every asset, and what the connection agreement says beyond the fuse. Each was a constant standing in for a country, and each decides either a statutory limit or the shape of a plan — the commissioning date decides *both*, and § 9 EEG and § 14a read silence in opposite directions |
 | **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided, what it could not hear, and what answered a setpoint without acting on it |
 | **A receding-horizon plan on a real box** | prices from `tariffd`, the sky from `forecastd`, this roof modelled locally and corrected by what it has actually delivered, the battery read off its own meter, the solve off the runtime — and what it learns kept in its own store, so a reboot does not cost a fortnight |
 | **The § 14a record and the quarter-hour registers, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
@@ -377,6 +409,7 @@ obeys that as an instruction not to use it.
 | **The day report, queued before it is sent** | a signed CloudEvent to `obsd` is a row in the box's own store until the fleet takes it, signed **at each attempt** — Standard Webhooks covers the timestamp, so one made when the row was written is stale by the time a box back from an outage sends it. A `5xx` or a refused connection keeps the day; a `4xx` that is not a rate limit is `obsd` having read it and refused it, and asking again changes nothing |
 | **The household's own say** | `boost`, `pause` and `away` per asset, expiring on their own — the one write on the local API, and safe because an override is a *desire* the guard still narrows |
 | The fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
+| **`/livez`, `/readyz` and `/metrics` on every daemon** | live and ready are different questions and an orchestrator does opposite things with the answers; `/metrics` is the third, because a pool-backed service fails by saturating its pool and a saturated pool serves `503`s while both probes stay green. The request label is the **matched route**, never the path — a hems site is called `reference-household`, so a path label would put every household into an endpoint that is scraped and kept for months |
 | **A read-only agent surface on every fleet daemon** | mounted on the port it already binds, over the state its REST routes already read, so the two cannot disagree — and each call is authorised as *its own caller* against the same credentials, so a household's token reads its own site over MCP exactly as it would over REST |
 | **Capabilities that narrow under delegation, and a tenant on every credential** | dotted patterns rather than roles, so an agent can hold strictly less than whoever it acts for; an operator scoped to a tenant cannot read another tenant's breach list, and an aggregate is computed *within* the caller's scope rather than filtered afterwards |
 | **`agentd`** — two specialists on a replayable journal | whether one cause accounts for most of a week's § 14a breaches, and what the saving on a dashboard actually rests on. Advisory by construction: `Advice` is a leaf type nothing consumes, and its authority is derived by attenuation, which refuses to widen |
@@ -384,14 +417,14 @@ obeys that as an instruction not to use it.
 | Not yet | |
 |---|---|
 | A transport that carries an event to `agentd` | the subscription table says which event type wakes which specialist and a test proves every pattern matches something the workspace emits; the hop from `obsd`'s collector is what is missing |
-| EEBUS certification | a conformance harness against the lab's own test list, and interop against another implementation. mDNS/DNS-SD and a pairing flow a person can drive are done |
+| EEBUS certification | the **device-level** half is done — all seven `ATC_*` procedures driven against the box's own store, driver and SPINE session, judged by `eebus`'s harness, six answered and the seventh skipped with its reason on the report. What is left is the protocol-level suite over a real network, interop against another implementation, and the laboratory's own stopwatch on a physical box. mDNS/DNS-SD and a pairing flow a person can drive are done |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-1 019 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 066 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (459 citations across five document
+clock, the whole suite, the workspace guards (468 citations across five document
 families, each resolving to a document the index carries; 126 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
@@ -422,13 +455,20 @@ limitation machine, and a conformance suite over all four certifiable use cases)
 [`ocpp-kit`](https://github.com/hupe1980/ocpp-kit), [`iso15118`](https://github.com/hupe1980/iso15118)
 and [`mako`](https://github.com/hupe1980/mako) (the market side).
 
-The embedded time-series store on the box (`chronix`) and the fleet-side one
-(`meterstore`) are separate crates hems does not depend on yet: the box keeps its
-§ 14a record in an embedded SQLite, and the *measurement series* is what `chronix`
-is for. That split is the answer to *what runs where*: the edge is **one**
-process, `hemsd`, because the § 14a failsafe is a sixty-second heartbeat and a
-two-hour minimum and an IPC hop inside that path buys nothing — so the box's
-stores are embedded, and every other daemon in the table above is cloud.
+**Two tiers, two stores, and the split is the answer to *what runs where*.** The
+edge is **one** process, `hemsd`, because the § 14a failsafe is a sixty-second
+heartbeat and a two-hour minimum and an IPC hop inside that path buys nothing —
+so the box's store is embedded SQLite: one process, one writer, no network,
+offline-first, and a file an installer can copy off a failed unit. Every other
+daemon in the table above is cloud, and every one of those properties is wrong
+there, so the fleet is **PostgreSQL**: a fleet's evidence must not queue behind
+one write lock, a service that cannot run two replicas cannot be deployed without
+downtime, and a settlement quantity should be a `NUMERIC` the database can add up
+rather than a decimal written into a `TEXT` column.
+
+The time-series stores are separate crates hems does not depend on yet:
+`chronix` for the box's own one-second series, `meterstore` — PostgreSQL for the
+recent window, Apache Iceberg for history — for the fleet's.
 
 ## 📄 Licence
 

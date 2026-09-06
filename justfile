@@ -14,6 +14,9 @@ version := `sed -n '/^\[workspace\.package\]/,/^\[/p' Cargo.toml | sed -n 's/^ve
 default:
     @just --list
 
+# `test` needs a container runtime — see the note above it. Everything else here
+# runs on a clone and a toolchain.
+#
 # ✅ Everything CI runs, in CI order
 ci: fmt-check lint purity test guards deny doc
     @echo "✅ all checks passed"
@@ -59,16 +62,49 @@ purity:
     [ "$fail" -eq 0 ] && echo "🧊 pure: no clock, no I/O, no unsafe in the domain crates"
     exit "$fail"
 
+# The fleet daemons deploy on PostgreSQL, so their queries are tested against
+# PostgreSQL — a service checked on a different engine is a service whose SQL is
+# checked by nothing (D156). `hems_service::testdb` starts **one** container for
+# the whole workspace and gives each test a database of its own, so this needs a
+# container runtime (Docker, Podman or Colima) and nothing else installed.
+# `just db-stop` removes it.
+#
+# `HEMS_TEST_POSTGRES=postgres://user:pass@host:5432` points the suite at a server
+# that is already running instead — a developer's own instance, or a CI service
+# container. There is deliberately **no** way to skip: a test that passed without
+# reaching a database would report green for a query nobody ran.
+#
 # 🧪 Every test
 test:
     cargo test --workspace --all-features
+
+# A PostgreSQL to develop against, so `psql` has something to open and
+# `HEMS_TEST_POSTGRES` has something to point at. Ephemeral: `--rm`, no volume,
+# and the port is the standard one so a connection string is guessable.
+#
+# 🐘 A PostgreSQL for development
+db:
+    docker run --rm -d --name hems-postgres -p 5432:5432 \
+        -e POSTGRES_PASSWORD=postgres -e POSTGRES_USER=postgres postgres:18-alpine
+    @echo "  export HEMS_TEST_POSTGRES=postgres://postgres:postgres@127.0.0.1:5432"
+
+# The suite starts **one** container for the whole workspace — `docker run --rm`,
+# by name, on port 55432 — so this is the teardown. `--rm` means stopping it
+# removes it, which is the point: a stopped container that lingered would be a
+# corpse the next run could attach to.
+#
+# 🐘 Stop the development and test databases
+db-stop:
+    -docker rm -f hems-postgres
+    -docker rm -f hems-test-postgres
 
 # 🧪 One crate's tests
 test-crate crate:
     cargo test -p {{ crate }} --all-features
 
 # 🛡️ Workspace guards: citations, the event catalogue, publishable manifests,
-# the wire forms, and that a daemon's background loops can fail its liveness
+# the wire forms, that a daemon's background loops can fail its liveness, and
+# that every daemon ships an example configuration a test parses
 guards:
     cargo xtask check-all
 

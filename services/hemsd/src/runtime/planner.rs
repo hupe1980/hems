@@ -93,13 +93,20 @@ pub const LOAD_MODEL: &str = "load-profile";
 pub const BUILDING_MODEL: &str = "building";
 
 impl Learned {
-    /// A box that has just been switched on and knows nothing.
+    /// A box that has just been switched on and knows nothing but what it was
+    /// told about the house.
+    ///
+    /// `building` is the **prior** — the archetype an installer picked, or the
+    /// four parameters they typed. It is what the box plans against until it has
+    /// identified the real one from the household's own thermometer, which takes
+    /// a few days of an excited house and can never happen at all in a household
+    /// whose heat pump nothing measures.
     #[must_use]
-    pub fn new(land: metering::Bundesland) -> Self {
+    pub fn new(land: metering::Bundesland, building: hems_core::prelude::Rc2) -> Self {
         Self {
             pv: ResidualModel::new(hems_forecast::residual::DEFAULT_ALPHA),
             load: LoadProfile::new(land),
-            building: hems_forecast::building::Record::default(),
+            building: hems_forecast::building::Record::new(building),
         }
     }
 
@@ -114,8 +121,12 @@ impl Learned {
     /// The alternative is a box that will not start after an update because it
     /// cannot read something it can perfectly well rebuild.
     #[must_use]
-    pub fn restored(store: &crate::store::Store, land: metering::Bundesland) -> Self {
-        let mut learned = Self::new(land);
+    pub fn restored(
+        store: &crate::store::Store,
+        land: metering::Bundesland,
+        building: hems_core::prelude::Rc2,
+    ) -> Self {
+        let mut learned = Self::new(land, building);
         match store.learned::<ResidualModel>(PV_MODEL) {
             Ok(Some(pv)) => learned.pv = pv,
             Ok(None) => {}
@@ -913,7 +924,7 @@ fn battery_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hems_core::prelude::Power;
+    use hems_core::prelude::{Power, Rc2};
 
     /// A tank nobody measured is left out of the plan rather than guessed at.
     ///
@@ -1143,7 +1154,7 @@ mod tests {
         let now = time::OffsetDateTime::now_utc();
         let land = metering::Bundesland::Be;
 
-        let mut before = Learned::new(land);
+        let mut before = Learned::new(land, Rc2::house());
         // A fortnight, so every day type has been seen: a profile is indexed by
         // day type and quarter hour, and one day of history teaches Mondays
         // nothing about Sundays.
@@ -1166,7 +1177,7 @@ mod tests {
             .put_learned(LOAD_MODEL, &before.load, now)
             .expect("and so does the household's own profile");
 
-        let after = Learned::restored(&store, land);
+        let after = Learned::restored(&store, land, Rc2::house());
         let slot = Slot::containing(now);
         assert!(
             after.load.support(slot) > 0,
@@ -1190,7 +1201,7 @@ mod tests {
             .put_learned(PV_MODEL, &"a shape from some other version", now)
             .expect("it stores");
 
-        let restored = Learned::restored(&store, metering::Bundesland::Be);
+        let restored = Learned::restored(&store, metering::Bundesland::Be, Rc2::house());
         assert!(
             !restored.pv.is_trained(),
             "the unreadable half is simply relearned"
@@ -1205,10 +1216,10 @@ mod tests {
         // not be handed the old answer back by its own store.
         let store = crate::store::Store::in_memory().expect("a store");
         let now = time::OffsetDateTime::now_utc();
-        let learned = Learned::new(metering::Bundesland::By);
+        let learned = Learned::new(metering::Bundesland::By, Rc2::house());
         learned.remember(&store, now);
 
-        let restored = Learned::restored(&store, metering::Bundesland::Nw);
+        let restored = Learned::restored(&store, metering::Bundesland::Nw, Rc2::house());
         assert_eq!(restored.load.land, metering::Bundesland::Nw);
     }
 }

@@ -75,6 +75,31 @@ pub enum StoreError {
         /// What was in it.
         value: String,
     },
+    /// A factory reset was asked for while the fleet has not taken everything.
+    ///
+    /// Refused rather than performed, because a reset is the one operation here
+    /// that destroys `[A1 7.3]` evidence, and evidence that has not been
+    /// forwarded exists **only** on this box. An installer resetting a box
+    /// before it has drained its outbox would erase the record of a reduction a
+    /// network operator can ask about for two years — and would find out two
+    /// years later.
+    ///
+    /// [`Store::factory_reset_discarding_evidence`] is the way through for a box
+    /// that will never see a WAN again, and it is named so that choosing it is a
+    /// decision rather than a retry.
+    #[error(
+        "the fleet has not taken {events} control event(s), {quarter_hours} \
+         quarter hour(s) and {outbound} report(s) yet; a factory reset now would \
+         erase evidence that exists nowhere else"
+    )]
+    EvidenceNotForwarded {
+        /// Control events still owed to the fleet.
+        events: usize,
+        /// Quarter-hour registers still owed.
+        quarter_hours: usize,
+        /// Day reports still owed.
+        outbound: usize,
+    },
     /// The database is at a revision this build does not know.
     ///
     /// A downgraded box. Two years of § 14a evidence is the last record in this
@@ -195,16 +220,7 @@ pub struct Recorded {
     pub production: Option<rust_decimal::Decimal>,
 }
 
-impl Recorded {
-    /// Registers with no production measurement behind them.
-    #[must_use]
-    pub const fn unmetered(registers: QuarterHour) -> Self {
-        Self {
-            registers,
-            production: None,
-        }
-    }
-}
+impl Recorded {}
 
 /// One event as it is held.
 #[derive(Debug, Clone, PartialEq)]
@@ -222,40 +238,45 @@ pub struct StoredEvent {
 /// one the fleet was given, so it is owed again.
 const QUARTER_HOUR_UPSERT: &str = "INSERT INTO quarter_hour (
      slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
-     device_generation_kwh, anzulegender_wert_ct, spot_price_ct, production_kwh,
-     recorded_at
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+     device_generation_kwh, storage_consumption_kwh, storage_generation_kwh,
+     anzulegender_wert_ct, spot_price_ct, production_kwh, recorded_at
+ ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
  ON CONFLICT(slot_start) DO UPDATE SET
-     grid_draw_kwh          = excluded.grid_draw_kwh,
-     grid_feed_in_kwh       = excluded.grid_feed_in_kwh,
-     device_consumption_kwh = excluded.device_consumption_kwh,
-     device_generation_kwh  = excluded.device_generation_kwh,
-     anzulegender_wert_ct   = excluded.anzulegender_wert_ct,
-     spot_price_ct          = excluded.spot_price_ct,
-     production_kwh         = excluded.production_kwh,
-     recorded_at            = excluded.recorded_at,
-     forwarded_at           = NULL";
+     grid_draw_kwh           = excluded.grid_draw_kwh,
+     grid_feed_in_kwh        = excluded.grid_feed_in_kwh,
+     device_consumption_kwh  = excluded.device_consumption_kwh,
+     device_generation_kwh   = excluded.device_generation_kwh,
+     storage_consumption_kwh = excluded.storage_consumption_kwh,
+     storage_generation_kwh  = excluded.storage_generation_kwh,
+     anzulegender_wert_ct    = excluded.anzulegender_wert_ct,
+     spot_price_ct           = excluded.spot_price_ct,
+     production_kwh          = excluded.production_kwh,
+     recorded_at             = excluded.recorded_at,
+     forwarded_at            = NULL";
 
 /// The columns a [`Recorded`] is read back from, in the order
 /// [`Store::read_quarter_hours`] expects them.
 const QUARTER_HOUR_COLUMNS: &str = "slot_start, grid_draw_kwh, grid_feed_in_kwh, \
-     device_consumption_kwh, device_generation_kwh, anzulegender_wert_ct, \
-     spot_price_ct, production_kwh";
+     device_consumption_kwh, device_generation_kwh, storage_consumption_kwh, \
+     storage_generation_kwh, anzulegender_wert_ct, spot_price_ct, production_kwh";
 
 /// Its parameters, in the order the statement names them.
-fn quarter_hour_params(r: &Recorded, recorded_at: OffsetDateTime) -> [rusqlite::types::Value; 9] {
+fn quarter_hour_params(r: &Recorded, recorded_at: OffsetDateTime) -> [rusqlite::types::Value; 11] {
     use rusqlite::types::Value;
     let q = &r.registers;
+    let optional =
+        |d: Option<rust_decimal::Decimal>| d.map_or(Value::Null, |v| Value::Text(v.to_string()));
     [
         Value::Integer(q.slot.start().unix_timestamp()),
         Value::Text(q.grid_draw.to_string()),
         Value::Text(q.grid_feed_in.to_string()),
         Value::Text(q.device_consumption.to_string()),
         Value::Text(q.device_generation.to_string()),
+        optional(q.storage_consumption),
+        optional(q.storage_generation),
         Value::Text(q.anzulegender_wert.to_string()),
         Value::Text(q.spot_price.to_string()),
-        r.production
-            .map_or(Value::Null, |p| Value::Text(p.to_string())),
+        optional(r.production),
         Value::Integer(recorded_at.unix_timestamp()),
     ]
 }
@@ -841,6 +862,82 @@ impl Store {
         })
     }
 
+    /// Put the box back the way it left the factory.
+    ///
+    /// Two callers want the same operation. `ATC_LPC_COM_PT_CSInit_002` and its
+    /// LPP twin are a device-level conformance case — reset the Controllable
+    /// System, read its parameters back, and the limit must come back
+    /// **inactive** with the failsafe at what the parameter sheet declares — and
+    /// RED/EN 18031 asks the same question from the security side, because a
+    /// device that cannot be returned to a known-good state cannot be safely
+    /// resold. The stake is specific here: the identity in this store is what
+    /// lets a network operator's Steuerbox reduce *this* house, so a box that
+    /// changed hands carrying it would leave the previous household's operator
+    /// controlling the new one.
+    ///
+    /// It clears **every table** — identity and trust store, the failsafe an
+    /// operator wrote, what the box learned about this house, the `[A1 7.2]`
+    /// evidence and its traces, the registers, the outbox — in one transaction,
+    /// because a half-reset box has lost its evidence and kept an identity
+    /// somebody still trusts. The schema stays, so the next open runs no
+    /// migration, and [`Store::eebus_failsafe`] answering `None` is what makes
+    /// `hemsd`'s `failsafe_in_force` fall back to the configured value.
+    ///
+    /// It **refuses** while the fleet is owed anything: unforwarded evidence
+    /// exists only here. See [`StoreError::EvidenceNotForwarded`].
+    ///
+    /// # Errors
+    /// [`StoreError::EvidenceNotForwarded`] where the fleet is still owed
+    /// anything, or [`StoreError::Sql`].
+    pub fn factory_reset(&mut self) -> Result<(), StoreError> {
+        let owed = self.backlog()?;
+        if !owed.is_empty() {
+            return Err(StoreError::EvidenceNotForwarded {
+                events: owed.events,
+                quarter_hours: owed.quarter_hours,
+                outbound: owed.outbound,
+            });
+        }
+        self.wipe()
+    }
+
+    /// The same, for a box that will never reach the fleet again.
+    ///
+    /// Named for what it costs rather than for what it does, because the two
+    /// callers are an installer decommissioning a dead site and an installer who
+    /// has not waited for the outbox to drain, and only the first of those
+    /// should find this function comfortable to type.
+    ///
+    /// # Errors
+    /// [`StoreError::Sql`].
+    pub fn factory_reset_discarding_evidence(&mut self) -> Result<(), StoreError> {
+        self.wipe()
+    }
+
+    /// Empty every table in one transaction.
+    ///
+    /// One transaction because a half-reset box is the worst of the three
+    /// states: it has lost its evidence and kept an identity a network operator
+    /// still trusts.
+    fn wipe(&mut self) -> Result<(), StoreError> {
+        let transaction = self.connection.transaction()?;
+        // `compliance_sample` is not named: it goes with its event by
+        // `ON DELETE CASCADE`, and naming it here would be a second place to
+        // remember a table that already has one.
+        for table in [
+            "outbound_event",
+            "control_event",
+            "quarter_hour",
+            "learned",
+            "eebus_failsafe",
+            "eebus_identity",
+        ] {
+            transaction.execute(&format!("DELETE FROM {table}"), [])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Delete every event whose two years are up, and the registers older than
     /// the same window.
     ///
@@ -918,14 +1015,27 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, Option<String>>(9)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (unix, draw, feed_in, consumption, generation, aw, spot, production) = row?;
+            let (
+                unix,
+                draw,
+                feed_in,
+                consumption,
+                generation,
+                storage_consumption,
+                storage_generation,
+                aw,
+                spot,
+                production,
+            ) = row?;
             let quarter =
                 Slot::containing(OffsetDateTime::from_unix_timestamp(unix).map_err(|_| {
                     StoreError::NotADecimal {
@@ -939,6 +1049,12 @@ impl Store {
                     grid_feed_in: decimal("grid_feed_in_kwh", &feed_in)?,
                     device_consumption: decimal("device_consumption_kwh", &consumption)?,
                     device_generation: decimal("device_generation_kwh", &generation)?,
+                    storage_consumption: storage_consumption
+                        .map(|v| decimal("storage_consumption_kwh", &v))
+                        .transpose()?,
+                    storage_generation: storage_generation
+                        .map(|v| decimal("storage_generation_kwh", &v))
+                        .transpose()?,
                     anzulegender_wert: decimal("anzulegender_wert_ct", &aw)?,
                     spot_price: decimal("spot_price_ct", &spot)?,
                     ..QuarterHour::empty(quarter)
@@ -1042,6 +1158,124 @@ mod tests {
             store.quarter_hours().unwrap()[0].registers.grid_draw,
             Decimal::new(1_234_567, 6)
         );
+    }
+
+    #[test]
+    fn every_register_survives_the_round_trip_and_not_only_the_ones_asked_for() {
+        // `Z3V¼`/`Z3E¼` had no column here, so the box could measure its
+        // battery, write the quarter hour, read it back and hand the fleet a
+        // pair of nulls — and a household declared Basisfall A4 was refused a
+        // settlement for want of registers its own box had taken. A test that
+        // asserts one field cannot see that; this one asserts the whole record.
+        let store = Store::in_memory().unwrap();
+        let written = Recorded {
+            registers: QuarterHour {
+                storage_consumption: Some(Decimal::new(2_000, 3)),
+                storage_generation: Some(Decimal::new(1_700, 3)),
+                ..quarter(NOW).registers
+            },
+            production: Some(Decimal::new(2, 1)),
+        };
+        store.put_quarter_hour(&written, NOW).unwrap();
+        assert_eq!(store.quarter_hours().unwrap(), vec![written]);
+    }
+
+    #[test]
+    fn a_box_with_no_battery_meter_records_no_storage_register() {
+        // The null is the load-bearing half: it means "not separately metered",
+        // and `hems_grid::mispel` refuses Basisfall A4 on it. A zero would be a
+        // settlement claiming the battery stood still.
+        let store = Store::in_memory().unwrap();
+        store.put_quarter_hour(&quarter(NOW), NOW).unwrap();
+        let read = store.quarter_hours().unwrap();
+        assert_eq!(read[0].registers.storage_consumption, None);
+        assert_eq!(read[0].registers.storage_generation, None);
+    }
+
+    #[test]
+    fn a_factory_reset_leaves_a_box_that_looks_like_it_left_the_factory() {
+        // `ATC_LPC_COM_PT_CSInit_002`: reset the Controllable System and its
+        // parameters have to come back as the sheet declares them. `None` here
+        // is exactly that — `failsafe_in_force` then falls back to the
+        // configured value — and the identity has to be gone too, or a resold
+        // box would still answer to the previous household's network operator.
+        let mut store = Store::in_memory().unwrap();
+        store
+            .put_eebus_failsafe(
+                "consumption",
+                &StoredFailsafe {
+                    watts: 4_200.0,
+                    minimum_s: 7_200,
+                },
+                NOW,
+            )
+            .unwrap();
+        store
+            .put_eebus_identity(
+                &StoredIdentity {
+                    ship_id: "hems_test".into(),
+                    key_pem: "-----BEGIN PRIVATE KEY-----".into(),
+                    trusted: "[]".into(),
+                },
+                NOW,
+            )
+            .unwrap();
+        store.put_quarter_hour(&quarter(NOW), NOW).unwrap();
+        store.put_control_event(&event(NOW)).unwrap();
+        // Everything the fleet is owed, taken — a reset refuses otherwise.
+        let slots: Vec<Slot> = store
+            .quarter_hours()
+            .unwrap()
+            .iter()
+            .map(|r| r.registers.slot)
+            .collect();
+        let ids: Vec<i64> = store
+            .control_events()
+            .unwrap()
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        store.mark_forwarded(&ids, &slots, NOW).unwrap();
+
+        store.factory_reset().expect("a drained box resets");
+
+        assert_eq!(store.eebus_failsafe("consumption").unwrap(), None);
+        assert_eq!(store.eebus_identity().unwrap(), None);
+        assert!(store.control_events().unwrap().is_empty());
+        assert!(store.quarter_hours().unwrap().is_empty());
+        assert!(store.backlog().unwrap().is_empty());
+        // …and it is a box with an empty database rather than one with no
+        // database: the next write must not need a migration.
+        store.put_quarter_hour(&quarter(NOW), NOW).unwrap();
+        assert_eq!(store.quarter_hours().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_reset_is_refused_while_the_fleet_is_still_owed_evidence() {
+        // The one operation here that destroys `[A1 7.3]` evidence, and
+        // unforwarded evidence exists nowhere else. An installer who resets a
+        // box before its outbox has drained erases the record of a reduction a
+        // network operator may ask about for two years, and finds out two years
+        // later — so this refuses, and says what is owed.
+        let mut store = Store::in_memory().unwrap();
+        store.put_control_event(&event(NOW)).unwrap();
+
+        let refused = store.factory_reset().expect_err("evidence is still owed");
+        assert!(
+            matches!(refused, StoreError::EvidenceNotForwarded { events: 1, .. }),
+            "{refused}"
+        );
+        assert!(
+            !store.control_events().unwrap().is_empty(),
+            "and a refusal has to leave the record alone"
+        );
+
+        // The way through is named for what it costs, and is a decision rather
+        // than a retry.
+        store
+            .factory_reset_discarding_evidence()
+            .expect("a box that will never see a WAN again");
+        assert!(store.control_events().unwrap().is_empty());
     }
 
     #[test]

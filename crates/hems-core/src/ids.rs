@@ -13,6 +13,14 @@ use uuid::Uuid;
 
 use crate::error::IdError;
 
+/// The German market and metering locations, from `metering`.
+///
+/// Re-exported rather than redefined: a MaLo-ID carries a check digit and a
+/// MeLo-ID a Vergabestelle prefix, and a second implementation of either would
+/// be a second thing that can disagree with the market communication about
+/// whether an identifier is valid.
+pub use metering::{MaloId, MeloId};
+
 /// The identity of one installation, stable across reconfiguration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

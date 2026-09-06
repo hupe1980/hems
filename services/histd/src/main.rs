@@ -26,14 +26,14 @@ async fn main() -> anyhow::Result<()> {
         settings.service.log_json,
     );
 
-    let db = histd::Db::at(&settings.database);
-    // One writer, because SQLite has one; readers open their own connection.
-    let store = Arc::new(std::sync::Mutex::new(db.connect()?));
+    // Eagerly, so a wrong password or an unreachable database stops the daemon
+    // here rather than answering every request with a `500`. The migrations run
+    // under an advisory lock, so several replicas starting together is safe.
+    let db = hems_service::db::connect(&settings.database, hems_service::identity!().name).await?;
+    hems_service::db::migrate(&db, histd::store::MIGRATIONS).await?;
+    let store = Store::new(db);
     let health = Health::new();
-    // A history service is ready the moment its database is open: it has no
-    // upstream, and the thing it is asked for is what it already holds.
-    health.good("store", time::OffsetDateTime::now_utc());
-    tracing::info!(database = ?settings.database, "history open");
+    tracing::info!("history open");
 
     // Resolved once, here, so a reference to a secret that is not there stops
     // the daemon rather than starting one that answers nothing and says why only
@@ -52,6 +52,19 @@ async fn main() -> anyhow::Result<()> {
 
     let (signal, trigger) = Shutdown::channel();
     tokio::spawn(shutdown::on_signal(trigger));
+
+    // The database *is* this daemon's readiness: it has no other upstream, and
+    // what it is asked for is what the database holds. Vital, so a watcher that
+    // died cannot leave a green probe over an unreachable store (D146).
+    health.vital(
+        "store",
+        signal.clone(),
+        hems_service::db::watch(store.db().clone(), health.clone(), "store", signal.clone()),
+    );
+    // The series a probe cannot answer: a saturated pool serves `503`s while
+    // `/livez` and `/readyz` both stay green, because the process is alive and
+    // the database is reachable and there is simply no connection to be had.
+    hems_service::metrics::publish_pool(store.db(), hems_service::identity!().name);
     // **Vital**, and the quietest of the three: a retention loop that has died
     // sweeps nothing, so the two years of `[A1 7.3]` evidence grow without bound
     // and the only symptom is a disk filling up months later. `/livez` used to
@@ -60,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         "retention",
         signal.clone(),
         retention_loop(
-            Arc::clone(&store),
+            store.clone(),
             health.clone(),
             settings.retention_sweep_s,
             signal.clone(),
@@ -70,14 +83,13 @@ async fn main() -> anyhow::Result<()> {
     // The two surfaces answer from the same store and from the same credentials,
     // and each MCP call is authorised as its own caller — so a token cannot
     // reach a site over `/mcp` that the REST route would refuse it.
-    let mut app = router(
-        History::new(db.clone(), store, credentials.clone()).settling(settings.mispel.clone()),
-    );
+    let mut app =
+        router(History::new(store.clone(), credentials.clone()).settling(settings.mispel.clone()));
     if settings.mcp.enabled {
         let auth = hems_service::McpAuth::per_caller(&settings.mcp, &credentials)?;
         app = app.merge(histd::mcp_server::router(
             Arc::new(histd::mcp_server::State {
-                db,
+                store: store.clone(),
                 auth: auth.clone(),
             }),
             auth,
@@ -102,36 +114,18 @@ async fn main() -> anyhow::Result<()> {
 /// A failure here takes the service **out of rotation** rather than down: a
 /// history that cannot prune is still a history that can answer, and the thing
 /// that has gone wrong is a disk rather than the record.
-async fn retention_loop(
-    store: Arc<std::sync::Mutex<Store>>,
-    health: Health,
-    every_s: u64,
-    signal: Shutdown,
-) {
+async fn retention_loop(store: Store, health: Health, every_s: u64, signal: Shutdown) {
     loop {
         let now = time::OffsetDateTime::now_utc();
-        // Off the runtime, like every other query: a sweep over two years of
-        // evidence is a `DELETE` that can take a while, and it must not be taken
-        // out of a worker that a readiness probe is waiting on.
-        let swept = {
-            let store = Arc::clone(&store);
-            tokio::task::spawn_blocking(move || {
-                store
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .prune(now)
-            })
-            .await
-        };
-        match swept {
-            Ok(Ok(0)) => {}
-            Ok(Ok(gone)) => tracing::info!(events = gone, "evidence past its two years deleted"),
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "retention sweep failed");
-                health.bad("store", e.to_string());
-            }
+        // A `DELETE` over two years of evidence can take a while, and on
+        // PostgreSQL it takes it on a backend rather than on a runtime worker —
+        // so the sweep no longer has to be pushed off the runtime to keep a
+        // readiness probe answering.
+        match store.prune(now).await {
+            Ok(0) => {}
+            Ok(gone) => tracing::info!(events = gone, "evidence past its two years deleted"),
             Err(e) => {
-                tracing::error!(error = %e, "the retention sweep could not be run");
+                tracing::error!(error = %e, "retention sweep failed");
                 health.bad("store", e.to_string());
             }
         }

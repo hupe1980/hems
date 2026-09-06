@@ -17,12 +17,16 @@ fn main() -> Result<()> {
         Some("check-manifests") => check_manifests(&root),
         Some("check-wire") => check_wire(&root),
         Some("check-vital") => check_vital(&root),
+        Some("check-examples") => check_examples(&root),
+        Some("check-stats") => check_stats(&root),
         Some("check-all") => {
             check_citations(&root)?;
             check_events(&root)?;
             check_manifests(&root)?;
             check_wire(&root)?;
-            check_vital(&root)
+            check_vital(&root)?;
+            check_examples(&root)?;
+            check_stats(&root)
         }
         Some("help" | "--help" | "-h") | None => {
             print_help();
@@ -51,6 +55,10 @@ cargo xtask <task>
                     go through an f64 or come back as a tuple
   check-vital       a daemon's background loops are spawned through
                     Health::vital, so /livez can actually fail
+  check-examples    every daemon ships an annotated example configuration, and
+                    a test parses it so it cannot drift from the struct
+  check-stats       the landing page's citation and crate counts are the ones
+                    the build actually produces
   check-all         all of the above
 "
     );
@@ -105,6 +113,52 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
 ///
 /// The failure it prevents: a rule that cites a Festlegung nobody can produce,
 /// which is indistinguishable from a rule somebody invented.
+/// Which document each citation prefix belongs to, and a string that must
+/// appear in `specs/README.md` for that document to count as present.
+///
+/// A family is added here only once the document is actually indexed. An entry
+/// whose needle is broad enough to match anything is worse than no entry: it
+/// reports a citation as checked when nothing checked it.
+///
+/// Module-level so `check-citations` and `check-stats` count the same thing —
+/// two lists would be two definitions of what a citation is, and the number on
+/// the landing page would be checked against the wrong one.
+const SOURCES: [(&str, &str, &str); 5] = [
+    ("[A1 ", "BK6-22-300 Anlage 1", "bk6-22-300-anlage1"),
+    (
+        "[MiSpeL A1 ",
+        "MiSpeL Anlage 1 (Abgrenzungsoption)",
+        "mispel-anlage1-abgrenzungsoption",
+    ),
+    (
+        "[MiSpeL A2 ",
+        "MiSpeL Anlage 2 (Pauschaloption)",
+        "mispel-anlage2-pauschaloption",
+    ),
+    (
+        "[LPC-",
+        "EEBUS Limitation of Power Consumption",
+        "LimitationOfPowerConsumption",
+    ),
+    (
+        "[MGCP-",
+        "EEBUS Monitoring of Grid Connection Point",
+        "MonitoringOfGridConnectionPoint",
+    ),
+];
+
+/// How many regulatory citations the workspace carries.
+fn count_citations(root: &Path) -> Result<usize> {
+    let mut citations = 0usize;
+    for file in rust_sources(root)? {
+        let text = std::fs::read_to_string(&file)?;
+        for (prefix, _, _) in &SOURCES {
+            citations += text.matches(prefix).count();
+        }
+    }
+    Ok(citations)
+}
+
 fn check_citations(root: &Path) -> Result<()> {
     let index = root.join("specs/README.md");
     if !index.exists() {
@@ -113,35 +167,7 @@ fn check_citations(root: &Path) -> Result<()> {
     }
     let index = std::fs::read_to_string(&index)?;
 
-    // Which document each citation prefix belongs to, and a string that must
-    // appear in the index for that document to count as present.
-    //
-    // A family is added here only once the document is actually indexed. An
-    // entry whose needle is broad enough to match anything is worse than no
-    // entry: it reports a citation as checked when nothing checked it.
-    let sources: [(&str, &str, &str); 5] = [
-        ("[A1 ", "BK6-22-300 Anlage 1", "bk6-22-300-anlage1"),
-        (
-            "[MiSpeL A1 ",
-            "MiSpeL Anlage 1 (Abgrenzungsoption)",
-            "mispel-anlage1-abgrenzungsoption",
-        ),
-        (
-            "[MiSpeL A2 ",
-            "MiSpeL Anlage 2 (Pauschaloption)",
-            "mispel-anlage2-pauschaloption",
-        ),
-        (
-            "[LPC-",
-            "EEBUS Limitation of Power Consumption",
-            "LimitationOfPowerConsumption",
-        ),
-        (
-            "[MGCP-",
-            "EEBUS Monitoring of Grid Connection Point",
-            "MonitoringOfGridConnectionPoint",
-        ),
-    ];
+    let sources = SOURCES;
 
     let mut used: BTreeSet<&str> = BTreeSet::new();
     let mut citations = 0usize;
@@ -210,6 +236,154 @@ fn check_citations(root: &Path) -> Result<()> {
 ///
 /// The one exception is the signal handler: `shutdown::on_signal` is *supposed*
 /// to return, and failing liveness when it does would fail every clean shutdown.
+/// Every daemon ships an example configuration, and something parses it.
+///
+/// A daemon's configuration is documented in two places: the doc comments on its
+/// `Settings`, which a developer reads, and the annotated example, which is what
+/// whoever deploys it copies. The second is the one that goes stale — nothing
+/// compiles it, and a commented file that has drifted from the struct is worse
+/// than none, because every line of it looks authoritative to the person
+/// standing in front of a broken deployment.
+///
+/// So two things are checked: that the file exists, and that some test
+/// `include_str!`s it. The second is the half that matters — a file nothing
+/// parses is a file that has already drifted and nobody has noticed.
+/// The landing page's numbers are the ones the build produces.
+///
+/// A figure on a landing page is the most-read number in a project and the
+/// least-checked: nothing compiles it, so it is wrong within a fortnight of the
+/// thing it describes moving. Two of the five were — 459 citations against 469,
+/// and 1019 tests against 1050.
+///
+/// Only the ones with a mechanical source are checked. The **citation** count
+/// and the **pure crate** count are computed here; the test count is not, because
+/// producing it means running the suite, and a guard that had to do that would
+/// be the slowest thing in `just ci` for a number on a web page. It is checked
+/// by hand against `cargo test`, and `just ci` runs both.
+fn check_stats(root: &Path) -> Result<()> {
+    let config = root.join("site/config.toml");
+    if !config.exists() {
+        println!("check-stats: no site to check");
+        return Ok(());
+    }
+    let config = std::fs::read_to_string(&config)?;
+    let stated = |key: &str| -> Option<usize> {
+        config
+            .lines()
+            .find(|l| l.trim_start().starts_with(key))
+            .and_then(|l| l.split('"').nth(1))
+            .and_then(|v| v.parse().ok())
+    };
+
+    let mut wrong = Vec::new();
+    let mut check = |key: &str, actual: usize| match stated(key) {
+        Some(claimed) if claimed == actual => {}
+        Some(claimed) => wrong.push(format!(
+            "  {key}: the site says {claimed}, the build counts {actual}"
+        )),
+        None => wrong.push(format!("  {key}: the site does not state it")),
+    };
+
+    check("stat_rules", count_citations(root)?);
+    check("stat_tests", count_tests(root)?);
+    check("stat_crates", pure_crates(root)?);
+
+    if wrong.is_empty() {
+        println!("check-stats: the landing page's counted figures match the build");
+        return Ok(());
+    }
+    eprintln!("check-stats: site/config.toml states a figure the build does not produce:");
+    for line in &wrong {
+        eprintln!("{line}");
+    }
+    bail!("the landing page's numbers have drifted")
+}
+
+/// The crates `just purity` holds to "no clock, no socket".
+/// Every `#[test]` and `#[tokio::test]` in the workspace.
+///
+/// The attributes rather than a `cargo test` summary, so the guard costs a file
+/// walk instead of a full run — and it is the same number a reader would get by
+/// counting. Doctests are not included and are a handful; the figure on the
+/// landing page is "tests", which these are.
+fn count_tests(root: &Path) -> Result<usize> {
+    let mut tests = 0usize;
+    for file in rust_sources(root)? {
+        for line in std::fs::read_to_string(&file)?.lines() {
+            let line = line.trim();
+            if line == "#[test]" || line == "#[tokio::test]" {
+                tests += 1;
+            }
+        }
+    }
+    Ok(tests)
+}
+
+fn pure_crates(root: &Path) -> Result<usize> {
+    let justfile = std::fs::read_to_string(root.join("justfile"))?;
+    Ok(justfile
+        .lines()
+        .find(|l| l.trim_start().starts_with("pure="))
+        .map_or(0, |l| l.matches("hems-").count()))
+}
+
+fn check_examples(root: &Path) -> Result<()> {
+    let mut missing = Vec::new();
+    let mut unparsed = Vec::new();
+    let mut checked = 0usize;
+    let services = root.join("services");
+    if !services.exists() {
+        println!("check-examples: no services to check");
+        return Ok(());
+    }
+    let mut daemons: Vec<PathBuf> = std::fs::read_dir(&services)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.join("src/main.rs").exists())
+        .collect();
+    daemons.sort();
+
+    for daemon in daemons {
+        let name = daemon
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        checked += 1;
+        let example = daemon.join(format!("{name}.example.toml"));
+        if !example.exists() {
+            missing.push(name.clone());
+            continue;
+        }
+        // Anywhere in the crate: `config.rs` for most, `lib.rs` for `agentd`.
+        let needle = format!("{name}.example.toml");
+        let mut sources = Vec::new();
+        collect(&daemon.join("src"), &mut sources)?;
+        let parsed = sources.into_iter().any(|p| {
+            std::fs::read_to_string(&p)
+                .map(|text| text.contains("include_str!") && text.contains(&needle))
+                .unwrap_or(false)
+        });
+        if !parsed {
+            unparsed.push(name);
+        }
+    }
+
+    if missing.is_empty() && unparsed.is_empty() {
+        println!("check-examples: {checked} daemons, each with an example a test parses");
+        return Ok(());
+    }
+    for name in &missing {
+        eprintln!("check-examples: {name} ships no services/{name}/{name}.example.toml");
+    }
+    for name in &unparsed {
+        eprintln!(
+            "check-examples: {name}.example.toml is not `include_str!`-ed by anything, so \
+             nothing would notice it drifting from the struct it documents"
+        );
+    }
+    bail!("every daemon owes an example configuration that a test parses")
+}
+
 fn check_vital(root: &Path) -> Result<()> {
     let mut bare = Vec::new();
     let mut checked = 0usize;

@@ -143,13 +143,24 @@ of them.
 
 | Module | Predicts | From |
 |---|---|---|
-| `solar` | what the roof would produce under a clear sky | geometry, tilt, azimuth, the inverter's limit |
+| `solar` | what the roof would produce under a clear sky | geometry, and **this** roof's tilt and azimuth from the configuration, and the inverter's limit |
 | `residual` | what it *will* produce | the same roof's own history against that model |
 | `load` | the household's uncontrolled draw | its own quarter hours, by day type |
 | `session` | when the car comes home and how empty | its own charging sessions, by weekday |
-| `building` | which house this is | indoor and outdoor temperature against the heat put in |
+| `building` | which house this is | indoor and outdoor temperature against the heat put in, starting from the archetype the installer picked |
 | `naive` | any of them, badly, with almost nothing | one reading, on a box that has no profile yet |
 | `metrics` | nothing — it scores the rest | pinball, coverage, bias, CRPS |
+
+Two of them start from something the installer typed rather than from a constant,
+and the distinction matters differently in each. The roof's **azimuth** is not
+something `residual` can learn its way out of: the corrector is a multiplicative
+level per hour of the local day, bounded, and learned separately per season, so
+it absorbs soiling and the tree in front of the east string in a fortnight and
+takes seasons to absorb a wrong compass bearing. The **building** archetype is
+only a prior, and `building::identify` replaces it with a fit from the house's own
+thermometer as soon as it has one — but the fabric capacity spans a factor of five
+across the archetypes and decides whether pre-heating into a cheap hour pays at
+all, so the weeks before the fit are not free.
 
 Three of them are asymmetric on purpose:
 

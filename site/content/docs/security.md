@@ -55,6 +55,22 @@ right answer: *is this manifest from us*, and *is this the artefact it
 describes*. “A tampered manifest is refused” is therefore a unit test rather than
 a thing somebody tries once against a real server.
 
+## A box has to be able to go back to the factory
+
+The box's store holds the EEBUS identity a network operator's control box
+reduces *this* household by, and two years of evidence about what it did. A
+gateway that changed hands carrying either would let the previous household's
+operator go on controlling the new one. So there is a **factory reset**: every
+table in one transaction — a half-reset box has lost its evidence and kept an
+identity somebody still trusts — leaving a box whose failsafe falls back to what
+its parameter sheet declares.
+
+It **refuses** while the fleet is still owed anything, because unforwarded
+evidence exists only on the box and the discovery would come two years later.
+The way through for a box that will never see a network again is named for what
+it costs, so choosing it is a decision rather than a retry. The same operation is
+one of the seven device-level EEBUS conformance procedures, and a test drives it.
+
 ## A credential in a configuration file is a credential in a repository
 
 Configuration is read from a file and then the environment, which is right for a
@@ -292,3 +308,30 @@ filesystem, the network or `unsafe`.
 - There is no pairing *flow*. A Steuerbox is trusted by putting its SKI in the
   configuration or by the box being given one to remember; a screen an installer
   can approve one on is not built.
+
+## The fleet's database
+
+Three daemons hold household data in PostgreSQL, and three things about that are
+security decisions rather than deployment ones: the connection string is a
+**reference** to a credential and never the credential, **TLS is on by default**
+and turning it off is a decision the daemon logs, and an error message never
+carries the URL — because a malformed connection string is exactly what gets
+pasted into a ticket, and a real one has the password in it.
+
+Encryption at rest is the deployment's, and hems does not attempt a second layer
+over a managed instance's own. What it does owe is retention that actually
+happens: `[A1 7.3]`'s two years in `histd` and a bounded window in `obsd`, both
+as sweeps an operator can query rather than policies somebody remembers to run.
+
+## `/metrics`
+
+On the same footing as `/livez` and `/readyz`: an **operational** surface, not an
+authenticated one, and a deployment puts it behind its own network boundary the
+same way it does the probes.
+
+What it deliberately does not carry is any household. The request label is the
+matched route — `/v1/sites/{site}/export` — and never the path, because a hems
+site identifier is a name like `reference-household` that no heuristic normaliser
+would recognise, and a metrics endpoint is scraped, stored for months and read by
+everybody. A request that matched no route is labelled `unmatched` rather than by
+its URI, which is attacker-controlled. Both are held by tests.

@@ -259,15 +259,24 @@ drivers](@/docs/devices.md#eebus-the-ss-14a-side).
 
 The machine is also **explored exhaustively**, not only sampled: a
 breadth-first search over a finite event alphabet visits every reachable state
-of the production machine (deduplicated on the timing differences the machine
-actually compares), checks four invariants in each, and quantifies the
-release-on-silence bound over all of them. Its first run found what two
+(deduplicated on the timing differences the machine actually compares), checks
+four invariants in each, and quantifies the release-on-silence bound over all of
+them. Its first run found what two
 thousand random steps never had: one heartbeat in `unlimited/autonomous` used
 to open the write gate for ever, so a control box that heartbeated once and
 died could limit the household days later with a single delayed write. A write
 now counts only within sixty seconds of a heartbeat — the implementation
 guide's own window, and the same gate the `eebus` crate's certifiable machine
 runs.
+
+A second exploration runs **both** machines — the one the reference days drive
+and the certifiable one a real box runs — through the same alphabet in lockstep,
+and asserts they agree on the ceiling, on whether an operator is in control and
+on the state itself after every edge. The time grains land *on* each constant the
+specification names as well as either side of it, because a boundary the alphabet
+steps over is one no test can see: "no heartbeat for 120 s" means the release
+happens on the stroke of 120, and that second is where a certification laboratory
+measures.
 
 `init` and `failsafe` are also not § 14a events. The limit in force there is the
 device's own preconfigured value, applied because nothing is talking to it — the
@@ -475,14 +484,11 @@ aggregators currently price both households at "30 % of nominal".
 
 `[A1 8.4]` makes the network operator publish how much it has been reducing —
 per Netzbereich, per month, as an Eingriffsdauer in hours and an
-Eingriffsintensität in percent. hems models that document (`hems-grid::stress`),
-including the two things about it that are easy to get wrong. The publication has
-**no timestamps in it**: it is a monthly aggregate over a postcode area, so it
-cannot tell a household when it will be reduced. And the Eingriffsdauer is a
-**maximum over the devices in that area**, not a total — the format's own worked
-example is an 11 kW device held at 4,2 kW for two hours a day, which is 5,2 %
-intensity, and hems reproduces that number in a test so a misread formula fails
-in the build rather than in a filing.
+Eingriffsintensität in percent. It has **no timestamps in it**: it is a monthly
+aggregate over a postcode area, so it cannot tell a household when it will be
+reduced, and it says nothing at all about one connection point. hems does not
+model it, and the absence is deliberate — nothing fetches it, and a type
+mirroring a document no service reads is a schema rather than a feature.
 
 The question a household actually wants answered — *how often does my operator
 reduce me, in which quarter hour, and to what?* — can therefore only come from
@@ -516,8 +522,9 @@ is exactly where the price has already told the plan not to be — both signals
 track residual load — so anticipating it moved the reference days by between
 €0,000 and €0,011. On a *flat* tariff, where the price cannot stand in for it, it
 was worth **−€0,018**, because a charging deadline priced at €5/kWh already
-front-loads the session. Four measurements, none of them positive, so the wiring
-went and the number stayed.
+front-loads the session. Four measurements, none of them positive — so the
+wiring went, and so did the mechanism behind it. What stayed is the number a
+household reads.
 
 ## Modul 3 — time-variable network charges
 
@@ -589,6 +596,17 @@ impossible; energy a car brought home from somebody else's charge point
 (**Fremdtankstrom**) is taken back out before anything is settled or supported;
 and storage losses are privilegeable only where the storage system's own meter
 can see them.
+
+That last clause is a **Basisfall**, and it is worth its own paragraph because
+it decides who pays for the conversion loss. `Z2V¼`/`Z2E¼` are the store and the
+charge point together, which is Basisfall A3 — and a pair of meters that cannot
+be told apart cannot say which of them lost the energy, so A3 charges it to the
+household. **A4** is the installation where the store has a meter of its own,
+reported as `Z3V¼`/`Z3E¼`, and `(17)A4` then charges the round-trip loss to the
+store where it belongs. A box that reads its battery writes both pairs; one that
+does not writes `Z3` as *absent*, which is not zero — a zero would be a
+settlement claiming the battery stood still — and a household that declared A4
+is then refused a Nachweis rather than handed a wrong one.
 
 **Pauschaloption** (Anlage 2, formulas (P1)–(P15)) is open to solar up to
 30 kWp and draws two flat lines through the year instead: 500 kWh per kilowatt

@@ -25,10 +25,9 @@ pub struct Fleet {
     operators: Arc<hems_service::Credentials>,
     /// The half of the registry that has to outlive the process.
     ///
-    /// Behind a blocking mutex rather than an async one because every use is a
-    /// single-row statement handed to `spawn_blocking`: the lock is held for the
-    /// statement and never across an `await`.
-    store: Arc<std::sync::Mutex<Store>>,
+    /// A pool handle, cheap to clone, and shared — which is what lets a second
+    /// replica serve the same enrolments (D156).
+    store: Store,
 }
 
 impl Fleet {
@@ -38,7 +37,7 @@ impl Fleet {
         registry: Arc<RwLock<Registry>>,
         releases: BTreeMap<String, Release>,
         operators: hems_service::Credentials,
-        store: Arc<std::sync::Mutex<Store>>,
+        store: Store,
     ) -> Self {
         Self {
             registry,
@@ -93,28 +92,18 @@ async fn enrol(
         token: mint_token(),
         enrolled_at: now,
     };
-    let store = Arc::clone(&fleet.store);
-    let site = request.site.clone();
-    let written = {
-        let enrolment = enrolment.clone();
-        tokio::task::spawn_blocking(move || {
-            store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .enrol(&site, &enrolment)
-        })
-        .await
-    };
-    match written {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::error!(site = %request.site, error = %e, "the enrolment could not be stored");
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
+    if let Err(e) = fleet.store.enrol(&request.site, &enrolment).await {
+        // A **primary-key collision** is a second box presenting a secret this
+        // one has already spent, and it is the single-use property doing its
+        // job rather than a fault: two replicas racing the same enrolment both
+        // reach the database, and exactly one wins. `409` rather than `503`,
+        // because retrying will never help.
+        if e.is_already_taken() {
+            tracing::warn!(site = %request.site, "a second enrolment for a site already adopted");
+            return Err(StatusCode::CONFLICT);
         }
-        Err(e) => {
-            tracing::error!(site = %request.site, error = %e, "the enrolment write panicked");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
+        tracing::error!(site = %request.site, error = %e, "the enrolment could not be stored");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     let enrolled = registry.adopt(&request.site, enrolment.token, now);
@@ -179,25 +168,9 @@ async fn report_running(
         running_version: report.config_version.clone(),
         last_seen: now,
     };
-    let store = Arc::clone(&fleet.store);
-    let for_store = site.clone();
-    let written = tokio::task::spawn_blocking(move || {
-        store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .report(&for_store, &stored)
-    })
-    .await;
-    match written {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::error!(site, error = %e, "the running report could not be stored");
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        Err(e) => {
-            tracing::error!(site, error = %e, "the running report write panicked");
-            return Err(StatusCode::INTERNAL_SERVER_ERROR);
-        }
+    if let Err(e) = fleet.store.report(&site, &stored).await {
+        tracing::error!(site, error = %e, "the running report could not be stored");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
 
     registry.report(&site, &report.config_version, now);

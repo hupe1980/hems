@@ -412,14 +412,21 @@ impl LpcMachine {
     ///
     /// Returns the transition it made, if any. Calling it more often than
     /// [`LpcMachine::next_deadline`] asks is harmless.
+    ///
+    /// Every deadline here is `>=`. `[LPC-906]` is "no heartbeat for 120 s", and
+    /// *at* 120 s it has been missing for 120 s, so the deadline is reached
+    /// rather than passed — the same reading the limit's own expiry and the
+    /// Failsafe Duration Minimum already had. `eebus`'s certifiable machine
+    /// parts from this one at exactly that second if it is written `>`, which is
+    /// what `hems-drv/tests/lpc_one_machine.rs` holds.
     pub fn tick(&mut self, now: OffsetDateTime) -> Option<Transition> {
         let contact_lost = self
             .last_heartbeat
-            .is_none_or(|hb| now - hb > HEARTBEAT_TIMEOUT);
+            .is_none_or(|hb| now - hb >= HEARTBEAT_TIMEOUT);
 
         let next = match self.state {
             // [LPC-906] no heartbeat *and* limit write within 120 s of starting.
-            LpcState::Init if now - self.entered_at > HEARTBEAT_TIMEOUT => {
+            LpcState::Init if now - self.entered_at >= HEARTBEAT_TIMEOUT => {
                 Some(LpcState::UnlimitedAutonomous)
             }
             // Contact lost → failsafe.
@@ -435,7 +442,7 @@ impl LpcMachine {
                 // A heartbeat arrived but no write followed within 120 s.
                 let contact_without_command = self
                     .heartbeat_in_state
-                    .is_some_and(|hb| now - hb > HEARTBEAT_TIMEOUT);
+                    .is_some_and(|hb| now - hb >= HEARTBEAT_TIMEOUT);
                 // [LPC-922] the release valve: a dead Energy Guard must not hold
                 // the device down for ever.
                 (min_elapsed || contact_without_command).then_some(LpcState::UnlimitedAutonomous)

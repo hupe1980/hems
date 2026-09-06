@@ -78,16 +78,21 @@ async fn start_with(
     std::net::SocketAddr,
     hems_service::shutdown::ShutdownTrigger,
 ) {
-    start_on(sites, std::path::Path::new(":memory:")).await
+    let fixture = hems_service::testdb::Postgres::start(fleetd::store::MIGRATIONS).await;
+    let db = fixture.db.clone();
+    // Leaked on purpose: the pool outlives the server task, and a test process
+    // ends when the test does.
+    std::mem::forget(fixture);
+    start_on(sites, db).await
 }
 
-/// A daemon whose durable half is `store_path`.
+/// A daemon whose durable half is `db`.
 ///
-/// Two of these in a row over one path is a restart, which is the only way to
-/// test the property the store exists for.
+/// Two of these in a row over one database is a restart, which is the only way
+/// to test the property the store exists for.
 async fn start_on(
     sites: BTreeMap<String, SiteEntry>,
-    store_path: &std::path::Path,
+    db: hems_service::Db,
 ) -> (
     std::net::SocketAddr,
     hems_service::shutdown::ShutdownTrigger,
@@ -100,13 +105,12 @@ async fn start_on(
         shutdown_grace_s: 2,
         ..hems_service::Settings::default()
     };
-    let store = fleetd::store::Store::open(store_path).unwrap();
+    let store = fleetd::store::Store::new(db);
     let registry = Arc::new(RwLock::new(Registry::restore(
         sites,
-        store.enrolments().unwrap(),
-        store.reports().unwrap(),
+        store.enrolments().await.unwrap(),
+        store.reports().await.unwrap(),
     )));
-    let store = Arc::new(std::sync::Mutex::new(store));
     let releases = [("hemsd".to_owned(), release())].into_iter().collect();
     let (signal, trigger) = hems_service::Shutdown::channel();
     let server = hems_service::Server::new(
@@ -393,13 +397,9 @@ async fn a_restart_does_not_orphan_the_fleet() {
     // holding the other copy could not enrol again, because its single-use
     // secret was spent. This is that property, and it is the reason `fleetd`
     // has a database at all.
-    let file =
-        std::env::temp_dir().join(format!("hems-fleetd-restart-{}.sqlite", std::process::id()));
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
-    }
+    let fixture = hems_service::testdb::Postgres::start(fleetd::store::MIGRATIONS).await;
 
-    let (address, trigger) = start_on(sites(), &file).await;
+    let (address, trigger) = start_on(sites(), fixture.db.clone()).await;
     let (status, body) = request(
         address,
         "POST",
@@ -425,8 +425,8 @@ async fn a_restart_does_not_orphan_the_fleet() {
     assert_eq!(status, 204);
     trigger.trigger();
 
-    // …and now the daemon comes back.
-    let (address, trigger) = start_on(sites(), &file).await;
+    // …and now the daemon comes back, against the same database.
+    let (address, trigger) = start_on(sites(), fixture.db.clone()).await;
 
     let (status, body) = request(address, "GET", "/v1/config", Some(&token), None).await;
     assert_eq!(
@@ -459,7 +459,4 @@ async fn a_restart_does_not_orphan_the_fleet() {
     assert_eq!(roster[0]["converged"], true);
 
     trigger.trigger();
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
-    }
 }

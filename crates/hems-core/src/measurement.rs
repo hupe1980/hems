@@ -134,14 +134,6 @@ impl Measurement {
             ..Self::at(at)
         }
     }
-
-    /// Mark this observation as substituted rather than measured.
-    #[must_use]
-    pub fn substituted(mut self) -> Self {
-        self.quality = QualityFlag::Substituted;
-        self
-    }
-
     /// How old the observation is at `now`. Negative ages (a device clock
     /// running ahead) are reported as zero.
     #[must_use]

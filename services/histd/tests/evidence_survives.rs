@@ -46,16 +46,17 @@ fn winter_event() -> ControlEvent {
     event
 }
 
-#[test]
-fn a_reduction_is_still_there_after_the_process_has_gone() {
-    let dir = std::env::temp_dir().join("hems-histd-e2e");
-    std::fs::create_dir_all(&dir).ok();
-    let path = dir.join("evidence.sqlite");
-    std::fs::remove_file(&path).ok();
+#[tokio::test]
+async fn a_reduction_is_still_there_after_the_process_has_gone() {
+    let fixture = hems_service::testdb::Postgres::start(histd::store::MIGRATIONS).await;
 
     {
-        let mut store = Store::open(&path).unwrap();
-        store.put_control_event("site-1", &winter_event()).unwrap();
+        // One handle writes, and is then dropped along with its pool.
+        let store = Store::new(fixture.db.clone());
+        store
+            .put_control_event("site-1", &winter_event())
+            .await
+            .unwrap();
         for i in 0..96 {
             let slot = Slot::containing(datetime!(2026-01-15 00:00:00 UTC)).offset(i);
             store
@@ -68,13 +69,15 @@ fn a_reduction_is_still_there_after_the_process_has_gone() {
                     },
                     RECEIVED,
                 )
+                .await
                 .unwrap();
         }
     }
 
-    // A different process, a different `Store`, the same record.
-    let store = Store::open(&path).unwrap();
-    let record = nachweis(&store, "site-1", None, None).unwrap();
+    // A different `Store`, over the same database: the record outlives whatever
+    // wrote it, which is the whole of `[A1 7.3]`.
+    let store = Store::new(fixture.db.clone());
+    let record = nachweis(&store, "site-1", None, None).await.unwrap();
     let events = record["events"].as_array().expect("events");
     assert_eq!(events.len(), 1);
     let event = &events[0];
@@ -92,18 +95,20 @@ fn a_reduction_is_still_there_after_the_process_has_gone() {
         event["below_minimum"], true,
         "4,2 kW is below the 10,5 owed"
     );
-
-    std::fs::remove_file(&path).ok();
 }
 
-#[test]
-fn the_data_act_export_is_everything_and_the_quantities_are_exact() {
+#[tokio::test]
+async fn the_data_act_export_is_everything_and_the_quantities_are_exact() {
     // Regulation (EU) 2023/2854 Article 4: everything the product generated,
     // machine-readable, free. And the settlement quantities travel as decimal
     // strings, because a JSON number is a double to every reader that has ever
     // parsed one.
-    let mut store = Store::in_memory().unwrap();
-    store.put_control_event("site-1", &winter_event()).unwrap();
+    let fixture = hems_service::testdb::Postgres::start(histd::store::MIGRATIONS).await;
+    let store = Store::new(fixture.db.clone());
+    store
+        .put_control_event("site-1", &winter_event())
+        .await
+        .unwrap();
     store
         .put_quarter_hour(
             "site-1",
@@ -113,9 +118,10 @@ fn the_data_act_export_is_everything_and_the_quantities_are_exact() {
             },
             RECEIVED,
         )
+        .await
         .unwrap();
 
-    let export = data_act(&store, "site-1").unwrap();
+    let export = data_act(&store, "site-1").await.unwrap();
     assert_eq!(export["control_events"].as_array().unwrap().len(), 1);
     let quarters = export["quarter_hours"].as_array().unwrap();
     assert_eq!(quarters.len(), 1);
@@ -126,10 +132,14 @@ fn the_data_act_export_is_everything_and_the_quantities_are_exact() {
     assert!(quarters[0]["grid_draw_kwh"].is_string());
 }
 
-#[test]
-fn an_operator_can_ask_about_one_window_rather_than_the_whole_record() {
-    let mut store = Store::in_memory().unwrap();
-    store.put_control_event("site-1", &winter_event()).unwrap();
+#[tokio::test]
+async fn an_operator_can_ask_about_one_window_rather_than_the_whole_record() {
+    let fixture = hems_service::testdb::Postgres::start(histd::store::MIGRATIONS).await;
+    let store = Store::new(fixture.db.clone());
+    store
+        .put_control_event("site-1", &winter_event())
+        .await
+        .unwrap();
 
     let before = nachweis(
         &store,
@@ -137,6 +147,7 @@ fn an_operator_can_ask_about_one_window_rather_than_the_whole_record() {
         Some(datetime!(2026-01-01 00:00:00 UTC)),
         Some(datetime!(2026-01-15 00:00:00 UTC)),
     )
+    .await
     .unwrap();
     assert!(before["events"].as_array().unwrap().is_empty());
 
@@ -146,17 +157,25 @@ fn an_operator_can_ask_about_one_window_rather_than_the_whole_record() {
         Some(datetime!(2026-01-15 00:00:00 UTC)),
         Some(datetime!(2026-01-16 00:00:00 UTC)),
     )
+    .await
     .unwrap();
     assert_eq!(during["events"].as_array().unwrap().len(), 1);
 }
 
-#[test]
-fn one_households_export_never_contains_anothers() {
+#[tokio::test]
+async fn one_households_export_never_contains_anothers() {
     // The whole of the multi-tenancy a box needs, and the thing that would be
     // most embarrassing to get wrong in a document a household is entitled to.
-    let mut store = Store::in_memory().unwrap();
-    store.put_control_event("site-1", &winter_event()).unwrap();
-    store.put_control_event("site-2", &winter_event()).unwrap();
+    let fixture = hems_service::testdb::Postgres::start(histd::store::MIGRATIONS).await;
+    let store = Store::new(fixture.db.clone());
+    store
+        .put_control_event("site-1", &winter_event())
+        .await
+        .unwrap();
+    store
+        .put_control_event("site-2", &winter_event())
+        .await
+        .unwrap();
     store
         .put_quarter_hour(
             "site-2",
@@ -166,9 +185,10 @@ fn one_households_export_never_contains_anothers() {
             },
             RECEIVED,
         )
+        .await
         .unwrap();
 
-    let export = data_act(&store, "site-1").unwrap();
+    let export = data_act(&store, "site-1").await.unwrap();
     assert_eq!(export["control_events"].as_array().unwrap().len(), 1);
     assert!(
         export["quarter_hours"].as_array().unwrap().is_empty(),

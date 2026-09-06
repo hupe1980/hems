@@ -379,14 +379,6 @@ impl AssetMeta {
         self.steuve_exemption = Some(reason);
         self
     }
-
-    /// Record what the device brings with it from before 2024, `[A1 10]`.
-    #[must_use]
-    pub fn with_legacy_status(mut self, legacy_status: LegacyStatus) -> Self {
-        self.legacy_status = legacy_status;
-        self
-    }
-
     /// Record the irreversible move into the netzorientierte Steuerung,
     /// `[A1 10.4]`.
     #[must_use]
@@ -754,17 +746,6 @@ impl DhwTank {
     pub fn stored_heat(&self, temperature_c: f64) -> Energy {
         let above = (temperature_c - self.t_min_c).max(0.0);
         Energy::from_kwh(self.heat_capacity_kwh_per_k() * above).min(self.usable_heat())
-    }
-
-    /// The temperature `stored` corresponds to, °C — the number to show a
-    /// household, which does not think in kilowatt-hours of water.
-    #[must_use]
-    pub fn temperature_at(&self, stored: Energy) -> f64 {
-        let c = self.heat_capacity_kwh_per_k();
-        if c <= 0.0 {
-            return self.t_min_c;
-        }
-        self.t_min_c + stored.kwh() / c
     }
 }
 

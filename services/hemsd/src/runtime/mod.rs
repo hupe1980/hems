@@ -153,7 +153,12 @@ pub fn assemble(
     }
     registry.validate(&household.site, now)?;
     check_modul3(settings, now)?;
-    check_the_physics(&settings.site, &household)?;
+    check_the_physics(&settings.site, &config, &household)?;
+    // The Berlin calendar date, through the same helper `classify_at` uses.
+    // `[A1 3.1.b]`'s cutoff is 31.12.2023 and `[A1 10.1]`'s is 31.12.2028, and
+    // both are German dates — a start-up line that disagreed with the decision
+    // it is describing would be worse than no line at all.
+    name_the_statutory_limits(&household, metering::calendar::local_day(now));
 
     Ok(Running {
         drivers,
@@ -264,10 +269,11 @@ fn check_modul3(settings: &Settings, now: time::OffsetDateTime) -> Result<(), St
 /// size, where explicit Euler at a quarter-hour step gives the air node's
 /// eigenvalue the wrong sign and rings — and is only conditionally stable, with
 /// nothing checking the condition. [`Rc2Discrete::is_contraction`] is that
-/// property, and until now it was asserted in a unit test against
-/// `Rc2::house()` and never against the building a box was actually given. It
-/// cannot fail for physically valid parameters, which is exactly why checking
-/// it is cheap and why a failure means the parameters are not physical.
+/// property, and it is asserted here against the building the box was actually
+/// **given** — the archetype the installer picked, or the four numbers they
+/// typed. It cannot fail for physically valid parameters, which is exactly why
+/// checking it is cheap and why a failure means the parameters are not
+/// physical: a capacity or a resistance of zero, or a negative one.
 ///
 /// # And the heat pump has to be able to heat the house
 ///
@@ -282,11 +288,12 @@ fn check_modul3(settings: &Settings, now: time::OffsetDateTime) -> Result<(), St
 /// in, because that is what the unit can actually deliver.
 fn check_the_physics(
     site: &crate::config::SiteSettings,
+    config: &crate::site::HouseholdConfig,
     household: &Household,
 ) -> Result<(), StartError> {
-    use hems_core::prelude::{Asset, Rc2};
+    use hems_core::prelude::Asset;
 
-    let building = Rc2::house();
+    let building = config.building;
     // The planner's own step, which is the quarter hour every price, every
     // register and every plan in this workspace is written in.
     let step = hems_core::prelude::SLOT;
@@ -315,9 +322,20 @@ fn check_the_physics(
     };
     let needed = building.steady_state_heat_kw(site.comfort_min_c, NORM_AUSSENTEMPERATUR_C);
     // Electrical, through the coefficient of performance the unit would have at
-    // that temperature — a 5 kW unit at a COP of 2,4 delivers 12 kW of heat.
+    // that temperature — a 5 kW compressor at a COP of 2,48 delivers 12,4 kW of
+    // heat.
+    //
+    // The **Heizstab is not multiplied by it**, and that is not a rounding
+    // matter: a resistive element puts one kilowatt of heat in for one kilowatt
+    // of electricity, by construction. `group_power()` is the Fallgruppe's
+    // summed *electrical* power — the right number for `[A1 2.4.1.b]` and the
+    // wrong one to hand a coefficient of performance — and putting the whole of
+    // it through the COP credited an ordinary 3 kW rod with 7,4 kW of heat at
+    // −12 °C, which is more than the entire design load of the average house.
+    // The warning could then not fire for any household anybody would install.
     let cop = hems_core::prelude::CopCurve::air_source().at(NORM_AUSSENTEMPERATUR_C);
-    let deliverable = unit.group_power().kw() * cop;
+    let rod_kw = unit.heating_rod.unwrap_or(Power::ZERO).kw();
+    let deliverable = unit.electrical_nominal.kw() * cop + rod_kw;
     if deliverable < needed {
         tracing::warn!(
             needed_kw = format!("{needed:.1}"),
@@ -330,6 +348,68 @@ fn check_the_physics(
         );
     }
     Ok(())
+}
+
+/// Say out loud which statutory regime each declaration produced.
+///
+/// # Why this is a log line and not a check
+///
+/// Nothing here can be *wrong* in a way software can detect: a commissioning
+/// date is a fact off a Netzanschlussportal record, and a box has no way to
+/// verify one. What it can do is state the consequence in the words the
+/// paperwork uses, once, at start-up, where an installer is standing in front of
+/// it — because the consequence is not obvious from the date and it is expensive
+/// in both directions.
+///
+/// A roof commissioned in the window 01.01.2023–24.02.2025 is capped at
+/// **nothing** by § 100 Abs. 3b EEG, and a box that had been left on the default
+/// would curtail it at 60 % every sunny midday for the life of the installation.
+/// A heat pump commissioned in 2019 on the old reduced network fee is on
+/// `[A1 10.1]` until 31.12.2028, and treating it as a new SteuVE hands the
+/// network operator a share of its power it may not reduce *and* counts its
+/// consumption as netzwirksamer Leistungsbezug when it is ordinary load.
+///
+/// So: one line per controllable device, one for the roof, and the installer can
+/// read them against the folder in their hand.
+fn name_the_statutory_limits(household: &Household, today: time::Date) {
+    use hems_core::prelude::Asset;
+
+    for asset in &household.site.assets {
+        let meta = asset.meta();
+        if matches!(asset, Asset::Meter(_) | Asset::Load(_)) {
+            continue;
+        }
+        let participation = hems_grid::para14a::participation(
+            meta.commissioned_at,
+            meta.steuve_exemption,
+            meta.legacy_status,
+            meta.switched_voluntarily,
+        );
+        tracing::info!(
+            asset = %meta.id,
+            commissioned = ?meta.commissioned_at,
+            participation = ?participation,
+            controlled = participation.is_controlled_on(today),
+            "§ 14a"
+        );
+    }
+
+    let Some(profile) = hems_grid::para9::GenerationProfile::of_site(&household.site) else {
+        return;
+    };
+    if let Some(limit) = profile.statutory_limit() {
+        tracing::info!(
+            limit = ?limit,
+            ceiling_kw = profile.statutory_cap().map(|p| format!("{:.2}", p.kw())),
+            commissioned = ?profile.commissioned_at,
+            "§ 9 EEG: this roof's feed-in is capped by statute"
+        );
+    } else {
+        tracing::info!(
+            commissioned = ?profile.commissioned_at,
+            "§ 9 EEG: no statutory feed-in cap applies to this roof"
+        );
+    }
 }
 
 /// The design outdoor temperature the heating check is made at, °C.
@@ -346,7 +426,7 @@ const NORM_AUSSENTEMPERATUR_C: f64 = -12.0;
 /// A literal in one place rather than at the two call sites: a box that wrote
 /// its failsafe under one spelling and looked for it under another would look,
 /// from every screen, exactly like a box no operator had ever written to.
-pub(crate) const FAILSAFE_CONSUMPTION: &str = "consumption";
+pub const FAILSAFE_CONSUMPTION: &str = "consumption";
 
 /// [`assemble`], with the box's own record behind a lock.
 ///
@@ -400,7 +480,16 @@ fn register_map(
 /// own configuration would have quietly undone it —
 /// `ATC_LPC_COM_PT_CSInit_003`, and a household restrained to the wrong number
 /// with nobody talking to it.
-fn failsafe_in_force(
+///
+/// **Public because it is the thing under test.** Two device-level conformance
+/// cases are questions about exactly this function: `CSInit_003` asks that an
+/// operator's write survives a power cut, and `CSInit_002` asks that a factory
+/// reset puts the declared defaults back — which here is the *fallback* arm,
+/// reached because [`crate::store::Store::factory_reset`] leaves no written
+/// value. `tests/conformance.rs` calls it rather than reimplementing the
+/// precedence, because a harness that decided the answer for itself would be
+/// testing the harness.
+pub fn failsafe_in_force(
     kept: Option<&crate::store::Store>,
     configured: Power,
     configured_for: std::time::Duration,
@@ -936,9 +1025,16 @@ async fn start_planner(
     // observations is what makes a forecast worth having, and relearning it
     // every reboot is the difference between a box that plans on its first
     // evening and one that does not.
+    // The building the installer described is the *prior*; a record the box has
+    // already fitted from its own thermometer wins over it, which is what
+    // `restored` decides. Configuring one therefore helps a new box and never
+    // overrides a box that has learned better.
+    let building = settings.site.building.rc2()?;
     let learned = Arc::new(Mutex::new(match &store {
-        Some(store) => planner::Learned::restored(&*store.lock().await, settings.site.bundesland),
-        None => planner::Learned::new(settings.site.bundesland),
+        Some(store) => {
+            planner::Learned::restored(&*store.lock().await, settings.site.bundesland, building)
+        }
+        None => planner::Learned::new(settings.site.bundesland, building),
     }));
 
     let fleet = fleet::Fleet::new(&settings.fleet)?;
@@ -956,6 +1052,30 @@ async fn start_planner(
             "no forecastd is configured, so the box cannot plan",
         );
         return Ok((plan, prices, published, learned));
+    }
+
+    // The other half of the same seam, and it was written and never asked. A
+    // household on a **fixed** tariff legitimately has no `tariffd`: there is no
+    // day-ahead curve to optimise against, and shifting load for a spread the
+    // household is not charged is not a saving. A household with *neither* is a
+    // different thing — it plans against `fallback_ct_per_kwh`, which is a flat
+    // number, and a flat price makes the plan indifferent about *when* to act.
+    // That is the whole economic case for a planner, gone, with a box that looks
+    // from every screen exactly like one that is optimising.
+    //
+    // A warning rather than a refusal, for the reason the fallback exists: the
+    // plan is still right about the roof, the battery and the § 14a ceiling, and
+    // a box that would not plan at all would be worse.
+    if !fleet.has_prices() && settings.tariff.fixed_ct_per_kwh.is_none() {
+        tracing::warn!(
+            fallback_ct_per_kwh = settings.tariff.fallback_ct_per_kwh,
+            "no `tariffd` is configured and no fixed tariff is set, so every hour \
+             costs the same fallback price: the plan will be right about the roof, \
+             the battery and the § 14a ceiling and will not shift a kilowatt-hour \
+             for a spread it cannot see. Set `[fleet] tariffd_url` for a dynamic \
+             tariff, or `[tariff] fixed_ct_per_kwh` if the household is on a fixed \
+             one"
+        );
     }
 
     health.bad("planner", "no plan has been produced yet");
@@ -993,6 +1113,13 @@ async fn start_planner(
 /// nameplate figures are the household's configuration. Reading the asset rather
 /// than the settings for the geometry keeps one source of truth for what the
 /// planner and the S2 description both describe.
+///
+/// A site with no roof cannot reach here — the planner is only built where there
+/// is one — so the fallback is a flat, south-facing plane rather than a second
+/// copy of the reference household's pitch. A constant that is *also* the
+/// default is the one that hides a broken chain: it was 35°/180° here, and for
+/// as long as the asset carried the same pair it was impossible to tell whether
+/// this line was reading the configuration or ignoring it.
 fn array_of(site: &Site, settings: &crate::config::SiteSettings) -> hems_forecast::ArrayModel {
     let (tilt, azimuth) = site
         .assets
@@ -1001,7 +1128,7 @@ fn array_of(site: &Site, settings: &crate::config::SiteSettings) -> hems_forecas
             hems_core::prelude::Asset::Pv(pv) => Some((pv.tilt_deg, pv.azimuth_deg)),
             _ => None,
         })
-        .unwrap_or((35.0, 180.0));
+        .unwrap_or((0.0, 180.0));
     hems_forecast::ArrayModel::new(
         Power::from_kw(settings.pv_kwp),
         Power::from_kw(settings.pv_ac_kw),
@@ -1117,7 +1244,7 @@ mod tests {
         // is read from the site rather than declared a second time on the
         // tariff, so the two can never disagree.
         let mut settings = on_modul_3(Some(calendar()));
-        settings.site.imsys_since = None;
+        settings.site.para9.imsys_since = None;
         assert!(check_modul3(&settings, NOW).is_err());
     }
 }
@@ -1125,37 +1252,65 @@ mod tests {
 #[cfg(test)]
 mod physics_tests {
     use super::*;
-    use crate::config::SiteSettings;
+    use crate::config::{BuildingSettings, SiteSettings};
+    use hems_core::prelude::{BuildingClass, Rc2};
+
+    fn built(settings: &SiteSettings) -> (crate::site::HouseholdConfig, Household) {
+        let config = settings.household().expect("a household");
+        let household = Household::build(&config).expect("a site");
+        (config, household)
+    }
 
     #[test]
     fn the_reference_household_passes_its_own_physics_check() {
         // A gate that refuses everything is not a gate, and a gate that accepts
-        // everything is not one either — so the pair is the test.
+        // everything is not one either — so the pair is the test, and
+        // `a_building_that_is_not_physical_is_refused` is the other half.
         let settings = SiteSettings::default();
-        let household = Household::build(&settings.household().unwrap()).unwrap();
-        assert!(check_the_physics(&settings, &household).is_ok());
+        let (config, household) = built(&settings);
+        assert!(check_the_physics(&settings, &config, &household).is_ok());
     }
 
     #[test]
-    fn the_discretisation_the_planner_would_use_is_a_contraction() {
-        // D17's property, checked against the building a box is actually given
-        // rather than only against `Rc2::house()` in a unit test. It is what
-        // makes the exact zero-order hold safe at a quarter-hour step where
-        // explicit Euler gives the air node's eigenvalue the wrong sign, rings
-        // after every change of heat input, and diverges outright at a flat's
-        // air capacity.
-        let step = hems_core::prelude::SLOT;
-        assert!(
-            hems_core::prelude::Rc2::house()
-                .discretise(step)
-                .is_contraction()
-        );
-        // …and at every other step size, which is the half explicit Euler does
-        // not have. A contraction at one step and not another would be a
-        // conditional stability nothing checks.
-        for minutes in [1_i64, 5, 15, 60, 240] {
-            let d = hems_core::prelude::Rc2::house().discretise(time::Duration::minutes(minutes));
-            assert!(d.is_contraction(), "not a contraction at {minutes} minutes");
+    fn a_building_that_is_not_physical_is_refused() {
+        // The half that could not previously happen: the check ran against
+        // `Rc2::house()`, a constant, so it was a gate in front of an open door.
+        // A `HouseholdConfig` assembled by hand — which is what the reference-day
+        // harness and any embedder do — can carry parameters `BuildingSettings`
+        // would have rejected, and this is where they are caught.
+        let settings = SiteSettings::default();
+        let (mut config, household) = built(&settings);
+        config.building = Rc2 {
+            r_air_out_k_per_kw: 0.0,
+            ..Rc2::house()
+        };
+        assert!(matches!(
+            check_the_physics(&settings, &config, &household),
+            Err(StartError::Physics(_))
+        ));
+    }
+
+    #[test]
+    fn every_archetype_is_a_contraction_at_every_step_size() {
+        // D17's property, over the whole span an installer can pick rather than
+        // over one constant. It is what makes the exact zero-order hold safe at
+        // a quarter-hour step where explicit Euler gives the air node's
+        // eigenvalue the wrong sign, rings after every change of heat input, and
+        // diverges outright at a flat's air capacity — which is exactly the
+        // archetype that would otherwise have gone unchecked.
+        for class in [
+            BuildingClass::Average,
+            BuildingClass::NewBuild,
+            BuildingClass::SolidWall,
+            BuildingClass::Apartment,
+        ] {
+            for minutes in [1_i64, 5, 15, 60, 240] {
+                let d = class.rc2().discretise(time::Duration::minutes(minutes));
+                assert!(
+                    d.is_contraction(),
+                    "{class:?} is not a contraction at {minutes} minutes"
+                );
+            }
         }
     }
 
@@ -1167,8 +1322,48 @@ mod physics_tests {
             heat_pump_kw: 0.0,
             ..SiteSettings::default()
         };
-        let household = Household::build(&settings.household().unwrap()).unwrap();
+        let (config, household) = built(&settings);
         assert!(household.heat_pump.is_none());
-        assert!(check_the_physics(&settings, &household).is_ok());
+        assert!(check_the_physics(&settings, &config, &household).is_ok());
+    }
+
+    #[test]
+    fn the_heating_check_now_depends_on_which_house_it_is() {
+        // The reference 5 kW unit plus its 3 kW rod holds the average house at
+        // −12 °C and cannot hold an unretrofitted solid-wall one: 32 K over
+        // 2,5 K/kW is 12,8 kW of loss against 8 kW at a coefficient of 2,48.
+        // Before the building was configurable both answers were the same
+        // number, which is what made this warning unable to fire.
+        let average = SiteSettings::default().building.rc2().unwrap();
+        let solid = BuildingSettings {
+            class: BuildingClass::SolidWall,
+            ..BuildingSettings::default()
+        }
+        .rc2()
+        .unwrap();
+        // 5 kW of compressor at a COP of 2,48 plus 3 kW of resistive rod at 1,0
+        // is 15,4 kW of heat. The average house asks 5,3 kW of that at −12 °C
+        // and the solid-wall one 12,8 — so the reference unit covers both, and
+        // the *bigger* house that does not fit is a 1970s one with the 3 kW
+        // unit an installer sizes from a heat-load calculation somebody did for
+        // the retrofit rather than for the building as it stands.
+        let cop = hems_core::prelude::CopCurve::air_source().at(NORM_AUSSENTEMPERATUR_C);
+        let small = 3.0 * cop + 3.0;
+        assert!(
+            average.steady_state_heat_kw(20.0, NORM_AUSSENTEMPERATUR_C) < small,
+            "a 3 kW unit holds the average house"
+        );
+        assert!(
+            solid.steady_state_heat_kw(20.0, NORM_AUSSENTEMPERATUR_C) > small,
+            "and cannot hold an unretrofitted solid-wall one"
+        );
+
+        // …and the rod is worth its own kilowatts and no more. Crediting it with
+        // the compressor's coefficient — which is what `group_power() * cop`
+        // did — inflates a 3 kW element to 7,4 kW of heat.
+        assert!(
+            ((3.0 + 3.0) * cop - small - 3.0 * (cop - 1.0)).abs() < 1e-9,
+            "the difference is exactly (COP − 1) × the rod"
+        );
     }
 }

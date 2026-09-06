@@ -7,14 +7,12 @@
 //! service *is*, and every rule below is checked over a real socket.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use hems_core::prelude::{GuardRule, Power};
 use hems_grid::evidence::ControlEvent;
 use hems_grid::mispel::QuarterHour;
 use hems_grid::para14a::ControlMode;
 use hems_service::{Credentials, Secret};
-use histd::Db;
 use histd::api::{History, router};
 use time::macros::datetime;
 
@@ -62,24 +60,20 @@ async fn start() -> (
 
     // A record already exists for `haus-1`, so a refusal below is a refusal
     // rather than an empty answer that happens to look like one.
-    let path = std::env::temp_dir().join(format!(
-        "hems-histd-auth-{}-{:?}.sqlite",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    for suffix in ["", "-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-    }
-    let db = Db::at(&path);
-    let mut store = db.connect().unwrap();
-    store.put_control_event("haus-1", &event()).unwrap();
+    let fixture = hems_service::testdb::Postgres::start(histd::store::MIGRATIONS).await;
+    let store = histd::Store::new(fixture.db.clone());
+    store
+        .put_control_event("haus-1", &event())
+        .await
+        .expect("a record to be refused access to");
     store
         .put_quarter_hour(
             "haus-1",
             &QuarterHour::empty(hems_core::prelude::Slot::containing(NOW)),
             NOW,
         )
-        .unwrap();
+        .await
+        .expect("a register");
 
     let settings = hems_service::Settings {
         listen: bound,
@@ -91,11 +85,7 @@ async fn start() -> (
         hems_service::identity!(),
         settings,
         hems_service::Health::new(),
-        router(History::new(
-            db.clone(),
-            Arc::new(std::sync::Mutex::new(store)),
-            credentials(),
-        )),
+        router(History::new(store.clone(), credentials())),
     );
     tokio::spawn(async move { server.run_until(signal).await.unwrap() });
     for _ in 0..200 {

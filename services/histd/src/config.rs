@@ -1,13 +1,17 @@
 //! What `histd` is told.
 
-use std::path::PathBuf;
-
 /// Everything `histd` is configured with.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Settings {
-    /// The shared daemon settings.
-    #[serde(flatten)]
+    /// The shared daemon settings — `[service]` in the file.
+    ///
+    /// A **table** rather than a flattened set of top-level keys, so every
+    /// daemon in this workspace is configured the same way (D160): an operator
+    /// who has written `[service] listen = …` for one has written it for all of
+    /// them. The environment override is unaffected either way — it goes through
+    /// `AsMut<Settings>` rather than through the file's shape.
+    #[serde(default)]
     pub service: hems_service::Settings,
     /// One bearer token per site — the credential its box presents.
     ///
@@ -40,12 +44,15 @@ pub struct Settings {
     /// The operator credentials, each scoped to a tenant.
     #[serde(default)]
     pub operators: Vec<hems_service::OperatorCredential>,
-    /// Where the database lives.
+    /// How to reach PostgreSQL.
     ///
-    /// `:memory:` is honoured and is what the tests use. A box uses a path on
-    /// its own flash, and a fleet deployment points this at a volume — because a
-    /// two-year record on an ephemeral filesystem is a two-hour record.
-    pub database: PathBuf,
+    /// A fleet service, so a database a fleet can reach: what this daemon holds
+    /// is every household's § 14a evidence, and a file on one node cannot be
+    /// replicated, cannot be read by a second replica and cannot outlive the
+    /// node (D156). The URL itself is a reference to a credential rather than
+    /// the credential — see [`hems_service::DbSettings`].
+    #[serde(default)]
+    pub database: hems_service::DbSettings,
     /// How often to delete what has aged out, seconds.
     ///
     /// Daily. `[A1 7.3]`'s two years are not a number anybody is racing, and a
@@ -84,7 +91,7 @@ impl Default for Settings {
             tenants: std::collections::BTreeMap::new(),
             operators: Vec::new(),
             mispel: std::collections::BTreeMap::new(),
-            database: PathBuf::from("hems-history.sqlite"),
+            database: hems_service::DbSettings::default(),
             retention_sweep_s: 24 * 3600,
             mcp: hems_service::McpSettings::default(),
         }
@@ -141,4 +148,48 @@ pub enum MispelSettings {
         /// keep out.
         storage_kwh: f64,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The example file that ships with the daemon.
+    ///
+    /// Parsed by a test rather than trusted, because a commented example that
+    /// has drifted from the struct it documents is worse than none: it is read
+    /// by whoever is deploying this, and every line of it looks authoritative.
+    /// `include_str!` makes it a build input.
+    const EXAMPLE: &str = include_str!("../histd.example.toml");
+
+    #[test]
+    fn the_example_configuration_parses_and_describes_a_service() {
+        let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
+        assert!(
+            !settings.site_tokens.is_empty(),
+            "an example with no site token would document a service that refuses \
+             every box"
+        );
+        assert!(
+            !settings.operators.is_empty(),
+            "…and one with no operator would document a Nachweis nobody can read"
+        );
+        assert!(
+            settings.database.tls,
+            "what crosses this socket is a fleet's § 14a evidence"
+        );
+        assert!(
+            settings.database.statement_timeout_s > 0,
+            "a serving replica needs a bound on a query whose reader has gone"
+        );
+    }
+
+    #[test]
+    fn the_example_declares_a_mispel_option_that_the_export_can_settle() {
+        // A site that has declared none is refused rather than settled under a
+        // guess, so an example that declared none would document the one case
+        // that produces no document at all.
+        let settings: Settings = toml::from_str(EXAMPLE).expect("the shipped example parses");
+        assert!(settings.mispel.values().next().is_some());
+    }
 }

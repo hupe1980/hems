@@ -10,6 +10,11 @@
 -- was issued, and what it has said since. Both are facts about the world rather
 -- than about the operator's intent, and neither can be re-derived — a lost token
 -- is a fleet of boxes holding a credential nothing recognises.
+--
+-- Instants are `TIMESTAMPTZ`. They were RFC 3339 *strings* on SQLite, which had
+-- no instant type, so a row nothing in this daemon could have written was a
+-- whole error variant here; PostgreSQL parses and stores one, so the variant is
+-- gone and "when did this box last report" is a comparison rather than a parse.
 
 -- One row per box that has enrolled.
 --
@@ -17,11 +22,11 @@
 -- enrolment attempt collides with the first rather than being refused by a map
 -- that a restart emptied.
 CREATE TABLE IF NOT EXISTS enrolment (
-    site        TEXT    PRIMARY KEY,
+    site        TEXT        PRIMARY KEY,
     -- The credential the box presents from now on.
-    token       TEXT    NOT NULL UNIQUE,
-    enrolled_at TEXT    NOT NULL
-) STRICT;
+    token       TEXT        NOT NULL UNIQUE,
+    enrolled_at TIMESTAMPTZ NOT NULL
+);
 
 -- What each box last said it is running.
 --
@@ -30,10 +35,10 @@ CREATE TABLE IF NOT EXISTS enrolment (
 -- "has not said yet" and "is on version zero" are different facts, and a
 -- default would collapse them.
 CREATE TABLE IF NOT EXISTS running (
-    site            TEXT    PRIMARY KEY REFERENCES enrolment(site) ON DELETE CASCADE,
-    running_version TEXT    NOT NULL,
-    last_seen       TEXT    NOT NULL
-) STRICT;
+    site            TEXT        PRIMARY KEY REFERENCES enrolment(site) ON DELETE CASCADE,
+    running_version TEXT        NOT NULL,
+    last_seen       TIMESTAMPTZ NOT NULL
+);
 
 -- Answering "which of my boxes have gone quiet" without reading every row.
 CREATE INDEX IF NOT EXISTS running_by_last_seen ON running (last_seen);
