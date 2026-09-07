@@ -24,9 +24,9 @@ Four things fall out of that split:
   append-only and keyed by the instant a value was learned: an ordinary read
   returns the current answer, and `?as_of=` returns the one the document was
   computed from.
-- **A fleet's writes do not queue behind one lock.** They used to, because
-  SQLite has one: a box's evidence write waited 2,7 s behind eight household
-  exports, on the path a Nachweis is built from.
+- **A fleet's writes do not queue behind one lock.** A box's evidence write is
+  on the path a network operator's Nachweis is built from, and it does not wait
+  behind eight household exports.
 
 ## Three exports, authorised differently
 
@@ -93,8 +93,9 @@ household's forwarded evidence behind one mutex; **one node** could not be
 replicated, deployed without downtime, or outlive its machine; and **no exact
 decimal** would make every settlement quantity a string to parse back.
 
-The box is the other case, and SQLite is right there: one process, one writer, no
-network, offline-first, and a file an installer can copy off a failed unit.
+The box is the other case, and an embedded store is right there: one process,
+one writer, no network, offline-first, and a file an installer can copy off a
+failed unit.
 
 The tests run against PostgreSQL because the daemon does — a query checked on a
 different engine is checked by nothing. A container runtime is a prerequisite;

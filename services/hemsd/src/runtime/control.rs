@@ -227,6 +227,13 @@ pub struct Live {
     pub learned: Arc<Mutex<crate::runtime::planner::Learned>>,
     /// The box's own two years, where it has one.
     pub store: Option<Arc<Mutex<crate::store::Store>>>,
+    /// The one-second measurement series, where the box keeps one.
+    ///
+    /// Separate from `store` and not behind the same lock: it is written on
+    /// every tick and the evidence record is written on a state change, so
+    /// sharing a lock would make the rarer and more important write wait behind
+    /// the commonest one.
+    pub series: Option<Arc<crate::series::Series>>,
     /// What the household itself has asked for, shared with the HTTP surface.
     pub overrides: crate::runtime::overrides::Overrides,
 }
@@ -246,6 +253,7 @@ pub async fn run(
         prices,
         learned,
         store,
+        series,
         overrides,
     } = shared;
     let arbiter = Arbiter::new(ArbiterConfig {
@@ -333,6 +341,7 @@ pub async fn run(
             &learned,
             &prices,
             store.as_ref(),
+            series.as_deref(),
             &mut carried,
             period,
             now,
@@ -1111,6 +1120,39 @@ impl Carried {
     }
 }
 
+/// Write this tick's measurements to the box's own series.
+///
+/// Every failure is a **warning**, never an error that reaches the loop: the
+/// series is the household's diagnostic history, and a full disk or a locked
+/// directory must not stop a box from managing a house or from keeping the
+/// record a network operator can ask for.
+fn record_series(
+    series: Option<&crate::series::Series>,
+    observed: &Observed,
+    netzwirksam: Option<Power>,
+    now: OffsetDateTime,
+) {
+    let Some(series) = series else { return };
+    // Absent where no driver measured it, and absent is not zero: a box with no
+    // roof has not measured a dark one (D124). The roof is an asset like any
+    // other and needs no point of its own; the two that are not assets are the
+    // connection point and the figure a § 14a ceiling is measured against.
+    let assets: Vec<(hems_core::prelude::AssetId, Power)> = observed
+        .state
+        .assets
+        .iter()
+        .filter_map(|(id, m)| m.power.map(|p| (id.clone(), p)))
+        .collect();
+    let points = crate::series::tick_points(
+        observed.state.grid.and_then(|m| m.power),
+        netzwirksam,
+        &assets,
+    );
+    if let Err(error) = series.record(now, &points) {
+        tracing::warn!(%error, "a tick could not be written to the measurement series");
+    }
+}
+
 /// Record how far the connection point went over its § 9 EEG ceiling.
 ///
 /// The guard derives that ceiling from the site on every tick — § 9 Abs. 2
@@ -1151,6 +1193,7 @@ async fn tick(
     learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
     prices: &Arc<tokio::sync::RwLock<Option<hems_tariff::PriceStack>>>,
     store: Option<&Arc<Mutex<crate::store::Store>>>,
+    series: Option<&crate::series::Series>,
     carried: &mut Carried,
     period: std::time::Duration,
     now: OffsetDateTime,
@@ -1281,6 +1324,12 @@ async fn tick(
     // this tick, and nothing is invented: a house nobody measured did not use
     // nothing.
     meter(managed, carried, &observed, seconds);
+
+    // …and the tick itself, for the household's own history. Written **after**
+    // the evidence record and the meters: a series is diagnostic, and a store
+    // that could not take it must not delay a record `[A1 7.2]` asks for.
+    record_series(series, &observed, Some(decision.verdict.netzwirksam), now);
+
     carried.refresh_exposure(store, learned, now).await;
 
     carried.previous.clone_from(&decision.commanded);

@@ -14,7 +14,7 @@
     clippy::module_name_repetitions,
     clippy::must_use_candidate,
     clippy::cast_precision_loss,
-    // Domain nouns — MiSpeL, SQLite, Nachweis, ENTSO-E — are capitalised because
+    // Domain nouns — MiSpeL, Nachweis, ENTSO-E, CloudEvents — are capitalised because
     // that is how they are spelled, not because they are identifiers. The same
     // allowance the domain crates carry.
     clippy::doc_markdown
@@ -27,6 +27,7 @@ pub mod forecasting;
 pub mod report;
 pub mod runtime;
 pub mod scenario;
+pub mod series;
 pub mod site;
 pub mod store;
 

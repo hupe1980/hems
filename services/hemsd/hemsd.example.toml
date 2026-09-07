@@ -23,7 +23,24 @@
 # has been uploaded is an intention with a network dependency. It is also where
 # the correction this roof has earned and this household's own quarter hours are
 # kept, and without it every reboot costs a fortnight of both.
-store_path = "/var/lib/hemsd/hemsd.sqlite"
+store_path = "/var/lib/hemsd/hemsd.redb"
+
+# ── The household's own measurement history ──────────────────────────────────
+#
+# Every meter reading the guard acts on, kept so that "what was the battery doing
+# at half past two" has an answer. Served at `/v1/series/{point}`, where a point
+# is `grid`, `netzwirksam` or an asset id.
+#
+# A **separate** store from `store_path`, holding no settlement quantity: a
+# series field is an `f64` and a MiSpeL register is an exact decimal.
+#
+# Remove the section to keep no series. `/v1/series` then answers 404 rather
+# than an empty list — nothing kept and nothing happened are different answers.
+[series]
+path = "/var/lib/hemsd/series"
+# A diagnostic window, not the statutory one: `[A1 7.3]`'s two years are the
+# events and registers above.
+keep_days = 7
 
 # ── The shell ────────────────────────────────────────────────────────────────
 [service]
@@ -503,10 +520,9 @@ listens_only = true
 # The hot-water tank, over EEBUS MDT — the other direction entirely. § 14a is a
 # network operator dialling *this* box; a hot-water circuit is a device on the
 # household's own network that this box dials. Uncomment it where the tank has
-# one: the planner has modelled a hot-water store since the optimiser was
-# written and has never been given one on a running box, for want of a single
-# number — how warm the water is now. Without it the tank is left out of the
-# plan entirely rather than guessed at, because a store whose state of charge is
+# one: it carries the single number the planner needs to schedule the store —
+# how warm the water is now. Without it the tank is left out of the plan
+# entirely rather than guessed at, because a store whose state of charge is
 # assumed is one the plan will decide not to heat on exactly the mornings it
 # matters.
 #
@@ -515,9 +531,9 @@ listens_only = true
 # from anything on the network that offered one.
 #
 # The car, over EEBUS EVCC and EVSOC — whether one is plugged in and how full it
-# is. This is the fact the plan was always missing about a charge point: the
-# arbiter has commanded amperes since the first day, and nothing reported an
-# arrival, so `EvSession` was in the optimiser and never built on a running box.
+# is. Without it the arbiter still commands amperes, but no `EvSession` reaches
+# the planner, so a charge is spread over the hours the car happens to be there
+# rather than the cheap ones before it leaves.
 #
 # `departure` and `target_soc` are the household's, not the car's: no EEBUS use
 # case carries either, and a car that published a departure time would be

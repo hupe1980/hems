@@ -1,12 +1,9 @@
 //! The database, and the only place SQL is written.
 //!
-//! PostgreSQL, through the pool `hems_service::db` builds. What that changes
-//! against the SQLite store this replaces is set out in
-//! [`hems_service::db`] and in `migrations/0001_schema.sql`;
-//! the short of it is that a fleet's writes no longer queue behind one lock, the
-//! service can run more than one replica, and a settlement quantity is a
-//! `NUMERIC` the database can add up rather than a decimal written into a `TEXT`
-//! column and parsed back here.
+//! PostgreSQL, through the pool [`hems_service::db`] builds: a fleet's writes do
+//! not queue behind one lock, the service can run more than one replica, and a
+//! settlement quantity is a `NUMERIC` the database adds up itself (D156). The
+//! schema is `migrations/0001_schema.sql`.
 
 use hems_core::prelude::{GuardRule, Power, Slot};
 use hems_grid::evidence::{ComplianceSample, ControlEvent};

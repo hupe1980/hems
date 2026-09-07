@@ -33,21 +33,15 @@ hems-optimizer = { workspace = true, features = ["highs"] }
 hems-realtime  = { workspace = true }
 hems-service   = { workspace = true }
 
-# The SHIP session under the EEBUS Controllable System: TCP, TLS 1.2 with mutual
-# authentication, the WebSocket upgrade and the handshake. This is the process
-# that owns the sockets, so it is the one place the transport is allowed to
-# exist — `hems-drv` stays sans-I/O and the purity gate keeps it that way.
-#
-# `aws-lc-rs` rather than `ring`, and named rather than inherited: `rustls` 0.23
-# supports both and picking one is the consumer's decision because it is
-# process-global — two providers in one binary panic at the first connection.
-# The rest of the workspace already runs `aws-lc-rs` through `reqwest` (D84), so
-# this is the same choice stated twice rather than a second one.
-# `conformance` carries the abstract test catalogue and the device-level
-# harness. It is `eebus`'s own default and is named here because the workspace
-# takes the crate with `default-features = false`: `tests/conformance.rs` drives
-# the seven procedures that are properties of *this process* rather than of the
-# library — a factory reset, a power cut, a start-up — and nothing else can.
+# **The I/O half of EEBUS, which `hems-drv` may not have.** That crate is on the
+# purity list and owns the SPINE engine, so what crosses its edge is a datagram
+# (D88); everything under one — the node, TLS 1.2 with mutual authentication,
+# the SHIP handshake, the key the SKI follows, `_ship._tcp` — is the daemon's.
+# `aws-lc-rs` rather than `ring`, named rather than inherited: the provider is
+# process-global, so picking one is the binary's job (D84).
+# `conformance` carries the harness `tests/conformance.rs` drives over the seven
+# device-level procedures, and is named only because the workspace takes the
+# crate with `default-features = false`.
 eebus        = { workspace = true, features = ["runtime", "mdns", "aws-lc-rs", "conformance"] }
 if-addrs     = { workspace = true }
 hems-sim       = { workspace = true }
@@ -63,7 +57,13 @@ clap         = { version = "4", features = ["derive", "env"] }
 # asynchronous context (D115). Taken from the workspace so the box and the fleet
 # share one HTTP client and one TLS provider (D84, D85).
 reqwest      = { workspace = true }
-rusqlite     = { workspace = true }
+# **Two stores, and the split is forced rather than tidy.** `redb` holds
+# everything that is not a series — the § 14a evidence, the registers, the
+# outbox, the identity, the learned models — and `chronix` the one-second
+# series, which is the only half whose values may be `f64` (D168, D169).
+redb         = { workspace = true }
+chronix      = { workspace = true }
+arrow        = { workspace = true }
 rust_decimal = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }

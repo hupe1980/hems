@@ -24,6 +24,8 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::State;
+use axum::extract::{Path, Query};
+use axum::http::StatusCode;
 use axum::routing::{get, put};
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -44,6 +46,12 @@ pub struct Local {
     /// `None` where this household has no EEBUS identity at all, which is a box
     /// with no § 14a driver and nothing to pair.
     trust: Option<crate::runtime::ship::Trust>,
+    /// The box's own measurement series, where it keeps one.
+    ///
+    /// Read-only here. The Data Act gives a user the data their product
+    /// generates, and on the box that means the household's own local API rather
+    /// than a fleet service — this is the one-second half of it.
+    series: Option<Arc<crate::series::Series>>,
 }
 
 impl Local {
@@ -55,6 +63,7 @@ impl Local {
         ski: Option<String>,
         overrides: crate::runtime::overrides::Overrides,
         trust: Option<crate::runtime::ship::Trust>,
+        series: Option<Arc<crate::series::Series>>,
     ) -> Self {
         Self {
             status,
@@ -62,6 +71,7 @@ impl Local {
             ski,
             overrides,
             trust,
+            series,
         }
     }
 }
@@ -169,11 +179,53 @@ pub fn router(local: Local) -> axum::Router {
         .route("/v1/pairing/{ski}", axum::routing::delete(forget_peer))
         .route("/v1/pairing/{ski}/refuse", axum::routing::post(refuse_peer))
         .route("/v1/overrides", get(list_overrides).delete(clear_overrides))
+        .route("/v1/series/{point}", get(series))
         .route(
             "/v1/overrides/{asset}",
             put(set_override).delete(clear_override),
         )
         .with_state(local)
+}
+
+/// The window a series is asked for.
+#[derive(Debug, serde::Deserialize)]
+pub struct Window {
+    /// The first instant, RFC 3339. Absent means an hour ago, which is what a
+    /// screen wants and what stops an unbounded default returning a week.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub from: Option<time::OffsetDateTime>,
+    /// The instant after the last, RFC 3339. Absent means now.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub to: Option<time::OffsetDateTime>,
+}
+
+/// One point of measurement over a window — `grid`, `netzwirksam`, or an asset.
+///
+/// The household's own one-second history, from the box that took it. A box with
+/// no series configured answers `404` rather than an empty list: *nothing was
+/// kept* and *nothing happened* are different answers, and an empty array would
+/// say the second.
+async fn series(
+    State(local): State<Local>,
+    Path(point): Path<String>,
+    Query(window): Query<Window>,
+) -> Result<axum::Json<Vec<crate::series::Reading>>, StatusCode> {
+    let Some(series) = local.series.as_ref() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let now = time::OffsetDateTime::now_utc();
+    let to = window.to.unwrap_or(now);
+    let from = window.from.unwrap_or(to - time::Duration::hours(1));
+    if to <= from {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    series
+        .between(&point, from, to)
+        .map(axum::Json)
+        .map_err(|error| {
+            tracing::warn!(%error, %point, "the measurement series could not be read");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
 }
 
 /// What the household is asking for, and until when.
@@ -359,6 +411,7 @@ mod exposure_tests {
             None,
             crate::runtime::overrides::Overrides::default(),
             None,
+            None,
         );
 
         let Json(body) = status(State(local)).await;
@@ -384,6 +437,7 @@ mod exposure_tests {
             "haus".into(),
             None,
             crate::runtime::overrides::Overrides::default(),
+            None,
             None,
         );
 
@@ -498,4 +552,74 @@ async fn forget_peer(
         .await
         .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(list_trusted(State(local)).await)
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_box_that_keeps_no_series_says_so_rather_than_answering_nothing() {
+        // `404`, not an empty array. *Nothing was kept* and *nothing happened*
+        // are different answers, and an empty list gives the second to a
+        // household asking the first.
+        let local = Local::new(
+            Arc::new(Mutex::new(Status::default())),
+            "haus".into(),
+            None,
+            crate::runtime::overrides::Overrides::default(),
+            None,
+            None,
+        );
+        let outcome = series(
+            State(local),
+            Path("grid".to_owned()),
+            Query(Window {
+                from: None,
+                to: None,
+            }),
+        )
+        .await;
+        assert_eq!(outcome.err(), Some(StatusCode::NOT_FOUND));
+    }
+
+    #[tokio::test]
+    async fn the_household_reads_back_the_history_its_own_box_took() {
+        // The Data Act half of the box: the user's own data, from the process
+        // that measured it, over the local API rather than a fleet service.
+        let dir = std::env::temp_dir().join(format!("hems-api-series-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::series::Series::open(&dir, 7).expect("a series");
+        let at = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        store
+            .record(
+                at,
+                &[(crate::series::GRID, hems_core::prelude::Power::from_kw(2.5))],
+            )
+            .expect("a tick");
+
+        let local = Local::new(
+            Arc::new(Mutex::new(Status::default())),
+            "haus".into(),
+            None,
+            crate::runtime::overrides::Overrides::default(),
+            None,
+            Some(Arc::new(store)),
+        );
+        // No window: the default hour back is what a screen asks for, and it has
+        // to be wide enough to contain a reading five minutes old.
+        let Json(readings) = series(
+            State(local),
+            Path(crate::series::GRID.to_owned()),
+            Query(Window {
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .expect("a box with a series answers");
+        assert_eq!(readings.len(), 1, "{readings:?}");
+        assert!((readings[0].watts - 2_500.0).abs() < 1e-6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

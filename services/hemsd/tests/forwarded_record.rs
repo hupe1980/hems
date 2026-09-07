@@ -165,7 +165,7 @@ async fn a_fleet_that_refuses_the_registers_keeps_them_owed() {
     // The property the whole design rests on: a record is safe on the box first.
     // A refusal is a warning and a retry, never a row that quietly stops
     // existing.
-    let mut store = Store::in_memory().expect("a store");
+    let store = Store::in_memory().expect("a store");
     let day: Vec<Recorded> = (0..4).map(register).collect();
     store.put_quarter_hours(&day, NOW).expect("its registers");
 

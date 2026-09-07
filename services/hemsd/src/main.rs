@@ -364,6 +364,7 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
             running.ski,
             running.overrides,
             running.trust,
+            running.series,
         )),
     )
     .run_until(signal)

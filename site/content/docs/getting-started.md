@@ -91,13 +91,13 @@ Each is minutes rather than seconds, which is why none of them is in CI.
 ### Keeping the day
 
 ```console
-$ cargo run -p hemsd -- simulate --day winter --store ./box.db
+$ cargo run -p hemsd -- simulate --day winter --store ./box.redb
 ```
 
 `--store` keeps the day's § 14a evidence and quarter-hour registers in the box's
-own database — the two years `[A1 7.3]` asks for, written *before* anything is
-reported anywhere, with an outbox column so what the fleet has not acknowledged
-is a backlog rather than a gap.
+own embedded store — the two years `[A1 7.3]` asks for, written *before*
+anything is reported anywhere, with an outbox so what the fleet has not
+acknowledged is a backlog rather than a gap.
 
 ## Use one crate
 

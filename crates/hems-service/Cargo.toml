@@ -14,7 +14,7 @@ rust-version.workspace = true
 [features]
 # The fleet daemons' PostgreSQL pool. Off by default because `hemsd` links this
 # crate for its configuration and health surface and keeps its own two years in
-# SQLite on the box — a gateway image has no business carrying a Postgres driver.
+# `redb` on the box — a gateway image has no business carrying a Postgres driver.
 postgres = [
     "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres",
     "dep:rustls", "dep:webpki-roots",

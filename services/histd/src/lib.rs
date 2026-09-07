@@ -22,28 +22,27 @@
 //! heartbeat and a two-hour minimum, and an IPC hop inside that path buys
 //! nothing. So a gateway runs `hemsd` and nothing else, and the box's own copy
 //! of these records belongs in *its* embedded stores (`chronix`, `redb`) behind
-//! a store-and-forward outbox — which is the half that is not written yet. This
+//! a store-and-forward outbox. This
 //! daemon is the **fleet** side: everybody's two years, queryable, which is what
 //! a network operator's Nachweis and a Data Act export are asked for at scale.
 //!
-//! # Why SQLite today, and what it is a prototype of
+//! # PostgreSQL, and what it is a prototype of
 //!
+//! A fleet service needs a server for three reasons a file cannot give: writes
+//! that do not queue behind one lock, more than one replica, and an exact
+//! decimal a settlement quantity can be summed in (D156). Beyond this workspace,
 //! `meterstore` — PostgreSQL for the recent window, Apache Iceberg for history —
-//! is where a fleet holding millions of measuring points ends up. SQLite
-//! (`bundled`) is what is here now because it needs no server
-//! and no system library, so every query in this daemon is exercised against a
-//! *real* database in `cargo test` rather than against a mock, and `just ci`
-//! stays a clone-and-run. The schema is written in `mako`'s layout so the move
-//! is a second migration directory rather than a rewrite.
+//! is where a fleet holding millions of measuring points ends up; the schema is
+//! written in `mako`'s layout so that move is a second migration directory
+//! rather than a rewrite.
 //!
 //! # The schema is a `migrations/` directory, as in `mako`
 //!
 //! `migrations/NNNN_*.sql`, a new file per revision and never an edit to one
-//! already applied. `mako` is PostgreSQL and applies them with
-//! `sqlx::migrate!`; this is SQLite, so the files are compiled in and the
-//! applied revision lives in SQLite's own `user_version`. A database written by
-//! a **newer** build is refused rather than used: two years of § 14a evidence is
-//! the last record in this workspace that should be repaired by guesswork.
+//! already applied, applied by [`hems_service::db::migrate`] under an advisory
+//! lock so several replicas may start at once. An edited revision is refused by
+//! its checksum rather than used: two years of § 14a evidence is the last record
+//! in this workspace that should be repaired by guesswork.
 //!
 //! # Retention is a column, not a policy
 //!

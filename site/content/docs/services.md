@@ -22,7 +22,7 @@ readiness probe rather than looking like a box that is planning badly.
 <pre class="mermaid">
 flowchart TB
   subgraph box["the household"]
-    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of evidence<br/>what its roof has learned<br/>+ an outbox"]
+    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of evidence<br/>its own one-second history<br/>what its roof has learned<br/>+ an outbox"]
   end
   subgraph fleet["the fleet"]
     T["<b>tariffd</b><br/>five day-ahead sources"]
@@ -268,7 +268,7 @@ shell's own settings are a `[service]` table in all seven, so an operator who ha
 configured one has configured all of them.
 
 The three stateful daemons additionally take the same `[database]` block, because
-they need the same thirty lines and three copies of thirty lines diverge in the
+they need the same connection handling, and three copies of it diverge in the
 direction that costs most — the copy that is wrong is the one whose readiness
 probe lies:
 

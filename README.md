@@ -422,7 +422,7 @@ obeys that as an instruction not to use it.
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-1 066 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 072 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
 clock, the whole suite, the workspace guards (468 citations across five document
 families, each resolving to a document the index carries; 126 quantities,
@@ -458,17 +458,21 @@ and [`mako`](https://github.com/hupe1980/mako) (the market side).
 **Two tiers, two stores, and the split is the answer to *what runs where*.** The
 edge is **one** process, `hemsd`, because the § 14a failsafe is a sixty-second
 heartbeat and a two-hour minimum and an IPC hop inside that path buys nothing —
-so the box's store is embedded SQLite: one process, one writer, no network,
-offline-first, and a file an installer can copy off a failed unit. Every other
+so the box's store is an embedded **`redb`**: pure Rust, one process, one
+writer — enforced, because it locks its own file — no network, offline-first,
+and a file an installer can copy off a failed unit. Every other
 daemon in the table above is cloud, and every one of those properties is wrong
 there, so the fleet is **PostgreSQL**: a fleet's evidence must not queue behind
 one write lock, a service that cannot run two replicas cannot be deployed without
 downtime, and a settlement quantity should be a `NUMERIC` the database can add up
 rather than a decimal written into a `TEXT` column.
 
-The time-series stores are separate crates hems does not depend on yet:
-`chronix` for the box's own one-second series, `meterstore` — PostgreSQL for the
-recent window, Apache Iceberg for history — for the fleet's.
+The box also keeps a **`chronix`** store beside the `redb` one for its own
+one-second series — every meter reading the guard acts on, kept seven days and
+served at `/v1/series/{point}`. `meterstore` — PostgreSQL for the recent window,
+Apache Iceberg for history — is the fleet's equivalent and is not a dependency
+yet. Neither takes the registers, and the reason is the same in both cases: a
+settlement quantity is an exact decimal, and a time-series field is a `double`.
 
 ## 📄 Licence
 

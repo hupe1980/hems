@@ -326,9 +326,16 @@ impl Drop for BoxStore {
 
 /// What the box comes up holding, asked of `hemsd`'s own resolution rather than
 /// of a copy of it.
-fn comes_up_holding(store: &Store) -> (Power, StdDuration) {
+///
+/// It opens the store and lets it go again, which is what a box does at
+/// start-up — and is what this has to do anyway: `redb` takes an **exclusive
+/// lock** on its file, so a second open while the first is alive is refused.
+/// That is the property that stops two `hemsd` on one box writing over each
+/// other, and a test that held two handles would be asking it to give it up.
+fn comes_up_holding(disk: &BoxStore) -> (Power, StdDuration) {
+    let store = disk.open();
     failsafe_in_force(
-        Some(store),
+        Some(&store),
         Power::new(DECLARED_FAILSAFE_W),
         DECLARED_FAILSAFE_FOR,
     )
@@ -389,30 +396,32 @@ fn the_seven_device_level_procedures_pass_against_this_box() {
 /// and a box with nothing written has no operator limit to be holding.
 fn factory_reset() -> DeviceObservation {
     let disk = BoxStore::new("factory-reset");
-    let mut store = disk.open();
-
-    // An operator has been here: a failsafe of their own, and the identity that
-    // lets their Steuerbox reach this house.
-    store
-        .put_eebus_failsafe(
-            FAILSAFE_CONSUMPTION,
-            &StoredFailsafe {
-                watts: 4_200.0,
-                minimum_s: 4 * 3_600,
-            },
-            START,
-        )
-        .expect("the operator's failsafe is kept");
+    {
+        // An operator has been here: a failsafe of their own.
+        let store = disk.open();
+        store
+            .put_eebus_failsafe(
+                FAILSAFE_CONSUMPTION,
+                &StoredFailsafe {
+                    watts: 4_200.0,
+                    minimum_s: 4 * 3_600,
+                },
+                START,
+            )
+            .expect("the operator's failsafe is kept");
+    }
     assert_eq!(
-        comes_up_holding(&store).0,
+        comes_up_holding(&disk).0,
         Power::new(4_200.0),
         "the operator's value has to be in force before the reset, or this \
          procedure would pass on a box that never took it"
     );
+    {
+        let mut store = disk.open();
+        store.factory_reset().expect("a drained box resets");
+    }
 
-    store.factory_reset().expect("a drained box resets");
-
-    let (watts, duration) = comes_up_holding(&store);
+    let (watts, duration) = comes_up_holding(&disk);
     DeviceObservation::FactoryReset {
         // Nothing written and no session: there is no operator limit in force.
         limit_active: false,
@@ -439,10 +448,10 @@ fn persistence() -> DeviceObservation {
             .put_eebus_failsafe(FAILSAFE_CONSUMPTION, &written, START)
             .expect("the operator's failsafe is kept");
     }
-    // The power cut: everything in memory is gone, and what comes back is built
-    // from the file.
-    let store = disk.open();
-    let (watts, duration) = comes_up_holding(&store);
+    // The power cut: everything in memory is gone — including the exclusive
+    // lock `redb` holds on the file — and what comes back is built from what
+    // survived on disk.
+    let (watts, duration) = comes_up_holding(&disk);
     DeviceObservation::Persistence {
         written_watts: written.watts,
         written_duration: StdDuration::from_secs(written.minimum_s.unsigned_abs()),
@@ -455,8 +464,7 @@ fn persistence() -> DeviceObservation {
 /// Controllable System come back.
 fn controllable_system_black_start() -> DeviceObservation {
     let disk = BoxStore::new("cs-black-start");
-    let store = disk.open();
-    let mut wire = Wire::new(comes_up_holding(&store), START);
+    let mut wire = Wire::new(comes_up_holding(&disk), START);
     wire.open(0);
     wire.require(LimitWrite::active(4_200.0), 62);
     assert_eq!(
@@ -469,8 +477,7 @@ fn controllable_system_black_start() -> DeviceObservation {
     // The power cut. Everything in memory goes; the store stays.
     let restart = 60 + DECLARED_START_UP.as_secs() as i64;
     drop(wire);
-    let store = disk.open();
-    let mut wire = Wire::new(comes_up_holding(&store), at(restart));
+    let mut wire = Wire::new(comes_up_holding(&disk), at(restart));
     wire.open(restart);
     // The Energy Guard finds it again and the limit exchange resumes.
     wire.require(LimitWrite::active(4_200.0), restart + 5);
@@ -489,8 +496,7 @@ fn controllable_system_black_start() -> DeviceObservation {
 /// again when it returns, rather than staying restrained or staying free.
 fn energy_guard_black_start() -> DeviceObservation {
     let disk = BoxStore::new("eg-black-start");
-    let store = disk.open();
-    let mut wire = Wire::new(comes_up_holding(&store), START);
+    let mut wire = Wire::new(comes_up_holding(&disk), START);
     wire.open(0);
     wire.require(LimitWrite::active(4_200.0), 62);
 
@@ -518,7 +524,7 @@ fn energy_guard_black_start() -> DeviceObservation {
     // and leaves its failsafe, and the assertion above is what makes the
     // failsafe part of the same story rather than a separate test.
     let back = stale + 30;
-    let mut wire = Wire::new(comes_up_holding(&store), at(back));
+    let mut wire = Wire::new(comes_up_holding(&disk), at(back));
     drop(alone);
     wire.open(back);
     wire.require(LimitWrite::active(4_200.0), back + 62);
@@ -534,8 +540,7 @@ fn energy_guard_black_start() -> DeviceObservation {
 /// wait for its opening exchange.
 fn energy_guard_reboot() -> DeviceObservation {
     let disk = BoxStore::new("eg-reboot");
-    let store = disk.open();
-    let mut wire = Wire::new(comes_up_holding(&store), START);
+    let mut wire = Wire::new(comes_up_holding(&disk), START);
     wire.open(0);
     wire.require(LimitWrite::active(4_200.0), 62);
 
@@ -546,7 +551,7 @@ fn energy_guard_reboot() -> DeviceObservation {
     // has, which `[E-DT60]` bounds at sixty seconds.
     drop(wire);
     let rebooted = 300;
-    let mut wire = Wire::new(comes_up_holding(&store), at(rebooted));
+    let mut wire = Wire::new(comes_up_holding(&disk), at(rebooted));
     let opened_at = rebooted;
     wire.open(opened_at);
     // `open` runs the binding, the subscription and the first heartbeat, and it
@@ -576,8 +581,7 @@ fn energy_guard_reboot() -> DeviceObservation {
 /// operator it had reduced a household it had not.
 fn appliance_ceiling() -> DeviceObservation {
     let disk = BoxStore::new("appliance-ceiling");
-    let store = disk.open();
-    let mut wire = Wire::new(comes_up_holding(&store), START);
+    let mut wire = Wire::new(comes_up_holding(&disk), START);
     wire.open(0);
     // Well above a 63 A three-phase connection.
     let written = 100_000.0;

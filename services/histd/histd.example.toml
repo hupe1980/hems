@@ -100,12 +100,11 @@ option    = "abgrenzung"
 #   a3  both, on one meter
 #   a4  both, with the storage system separately metered at `Z3`
 #
-# **a4 needs the box to be reading its battery's own meter.** It reports `Z3V¼`
-# and `Z3E¼` whenever it does, and omits them when it does not — and an omission
-# is not a zero, so a site declared "a4" whose store went unread is refused a
-# settlement rather than handed one claiming the battery stood still. a4 is worth
-# declaring where it is true: `(17)A4` charges the round-trip conversion loss to
-# the store, which a3 cannot see and therefore charges to the household.
+# **a4 needs the box to be reading its battery's own meter**, and is worth
+# declaring where it is true: `(17)A4` charges the round-trip loss to the store,
+# which a3 charges to the household. A site declared a4 whose store went unread
+# is refused a settlement rather than handed one claiming the battery stood
+# still — an omitted register is not a zero.
 basisfall = "a1"
 
 # ── The agent surface ────────────────────────────────────────────────────────

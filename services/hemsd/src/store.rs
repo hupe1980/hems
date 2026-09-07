@@ -10,47 +10,131 @@
 //! same mechanism that keeps `DayKpis` honest between here and `obsd`: a renamed
 //! field is a compile error rather than a column that quietly stops matching.
 //!
+//! # `redb`, and every value a document
+//!
+//! A key-value store with ordered ranges, which is what this record always was:
+//! it has **no joins**, its only aggregates are the backlog's counts, and every
+//! ordering is on the natural key (D169). What SQL bought it was a way to lose a
+//! field — `Z3V¼`/`Z3E¼` existed in `QuarterHour`, had no column, and were
+//! dropped through four layers while everything compiled (D165). A
+//! `TableDefinition` over a serde document cannot do that: the value *is* the
+//! type, and adding a field to it cannot lose one.
+//!
+//! What `redb` does not give is a schema, so the refusal has to be explicit —
+//! [`StoreError::NotReadable`] where a stored document is not one this build can
+//! parse, named with the row rather than swallowed.
+//!
 //! # The outbox
 //!
 //! A box records **first** and forwards **second**. [`Store::pending_events`]
 //! and [`Store::pending_quarter_hours`] are what the fleet has not acknowledged
 //! and [`Store::mark_forwarded`] is the acknowledgement, so a box offline for a
-//! week keeps its own two years and
-//! reconciles when it comes back. The other order makes the WAN a dependency of
-//! the record, and the day a network operator asks about is the day the link was
-//! down.
+//! week keeps its own two years and reconciles when it comes back. The other
+//! order makes the WAN a dependency of the record, and the day a network
+//! operator asks about is the day the link was down.
+//!
+//! "Not yet acknowledged" is a **set** rather than a scan: three small tables
+//! holding the keys still owed, written in the same transaction as the row
+//! itself, so they cannot come to disagree with it. Everything else is answered
+//! from a key's own order — a Nachweis window from `EVENTS_BY_RECEIVED`, a
+//! register range from the register table — and the two-year sweep walks the
+//! events, of which two years holds a few thousand.
 //!
 //! Forwarded is not deleted: the two years are the household's, so [`Store::prune`]
 //! follows the retention window and never an acknowledgement.
 //!
 //! # One household, one process
 //!
-//! The edge is a single daemon, so there is no `site_id` here: a column
-//! holding the same value in every row is a join key for a join nobody makes.
-//! The site's name belongs to the report that leaves the box, not to its own
-//! record.
+//! The edge is a single daemon, so there is no `site_id` here: a key holding the
+//! same value in every row is a join key for a join nobody makes. The site's
+//! name belongs to the report that leaves the box, not to its own record.
 
 use std::path::Path;
 
-use hems_core::prelude::{GuardRule, Power, Slot};
+use hems_core::prelude::{Power, Slot};
 use hems_grid::evidence::{ComplianceSample, ControlEvent};
 use hems_grid::mispel::QuarterHour;
-use rusqlite::OptionalExtension;
-use rusqlite::{Connection, params};
+use redb::{Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use thiserror::Error;
 use time::OffsetDateTime;
 
 /// How long a § 14a control event is kept, `[A1 7.3]`.
 pub const RETENTION: time::Duration = time::Duration::days(2 * 365);
 
+/// The schema this build writes and understands.
+///
+/// `redb` has no schema of its own, so the revision is a row: a box downgraded
+/// onto a file a newer build wrote is refused rather than left to interpret
+/// documents it may not understand.
+const SCHEMA: u64 = 1;
+
+// ── The tables ──────────────────────────────────────────────────────────────
+//
+// Values are `serde_json` documents of the types this workspace already
+// exchanges, so a field added to one of them travels without a schema change —
+// which is the whole reason this is not a column list (D165, D169).
+
+/// `"schema"`, and the two counters that hand out row identifiers.
+const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
+
+/// The quarter-hour registers, keyed by the slot's start as Unix seconds.
+///
+/// An instant, not a local string: a household's own day boundary is
+/// `metering`'s question, and a wall-clock key would ask it twice, differently,
+/// twice a year. The key's order *is* the slot order, so a window and the
+/// retention sweep are both range scans with no index behind them.
+const REGISTERS: TableDefinition<i64, &[u8]> = TableDefinition::new("registers");
+
+/// The registers the fleet has not acknowledged.
+const REGISTERS_OWED: TableDefinition<i64, ()> = TableDefinition::new("registers_owed");
+
+/// One § 14a control event, `[A1 7.2]`, keyed by the identifier an
+/// acknowledgement names.
+const EVENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("events");
+
+/// `(received_at, id)`, so a Nachweis window is a range scan.
+const EVENTS_BY_RECEIVED: TableDefinition<(i64, u64), ()> =
+    TableDefinition::new("events_by_received");
+
+/// The events the fleet has not acknowledged.
+const EVENTS_OWED: TableDefinition<u64, ()> = TableDefinition::new("events_owed");
+
+/// The minute-resolution trace, keyed `(event, instant)`.
+///
+/// A table of its own rather than a field on the event, so each fact has one
+/// home and a trace of ten thousand samples is not re-parsed to answer "how
+/// many". The composite key makes one event's trace a range scan, and deleting
+/// it with the event an explicit drain — `redb` has no cascade, and an explicit
+/// one is a line of code rather than a property somebody has to remember.
+const SAMPLES: TableDefinition<(u64, i64), &[u8]> = TableDefinition::new("samples");
+
+/// What the box has learned about its own house, one document per model.
+const LEARNED: TableDefinition<&str, &[u8]> = TableDefinition::new("learned");
+
+/// The box's EEBUS identity and trust store. One row, under `"self"`.
+const IDENTITY: TableDefinition<&str, &[u8]> = TableDefinition::new("identity");
+
+/// The failsafe a network operator wrote, per direction.
+const FAILSAFE: TableDefinition<&str, &[u8]> = TableDefinition::new("failsafe");
+
+/// The CloudEvents queued for the fleet.
+const OUTBOUND: TableDefinition<u64, &[u8]> = TableDefinition::new("outbound");
+
+/// The CloudEvents the fleet has not taken.
+const OUTBOUND_OWED: TableDefinition<u64, ()> = TableDefinition::new("outbound_owed");
+
+/// A CloudEvent's own id to the row that carries it, so a re-reported day
+/// amends one message rather than queueing a second.
+const OUTBOUND_BY_EVENT: TableDefinition<&str, u64> = TableDefinition::new("outbound_by_event");
+
 /// Why the store could not answer.
 #[derive(Debug, Error)]
 pub enum StoreError {
     /// The database itself.
     #[error("the box's store failed: {0}")]
-    Sql(#[from] rusqlite::Error),
-    /// An event could not be turned into a document to store.
-    #[error("the event could not be serialised: {detail}")]
+    Sql(String),
+    /// A value could not be turned into a document to store.
+    #[error("the record could not be serialised: {detail}")]
     NotSerialisable {
         /// What `serde` said.
         detail: String,
@@ -59,21 +143,14 @@ pub enum StoreError {
     ///
     /// Named with the row rather than swallowed: one unreadable event in two
     /// years of them is a fact an operator has to be told, not a gap in a
-    /// Nachweis nobody can account for.
-    #[error("the stored event {id} cannot be read by this build: {detail}")]
+    /// Nachweis nobody can account for. It matters more without a schema than
+    /// with one — nothing but this checks that a document still parses.
+    #[error("the stored record {id} cannot be read by this build: {detail}")]
     NotReadable {
         /// Which row.
         id: i64,
         /// What `serde` said.
         detail: String,
-    },
-    /// A stored quantity is not the exact decimal it was written as.
-    #[error("the stored quantity {value:?} in {column} is not a decimal")]
-    NotADecimal {
-        /// Which column.
-        column: &'static str,
-        /// What was in it.
-        value: String,
     },
     /// A factory reset was asked for while the fleet has not taken everything.
     ///
@@ -107,26 +184,26 @@ pub enum StoreError {
     #[error("the store is at schema revision {found}, and this build understands {understood}")]
     FromTheFuture {
         /// What the file says.
-        found: i32,
+        found: u64,
         /// The newest revision this build carries.
-        understood: i32,
+        understood: u64,
     },
 }
 
-/// The schema, one numbered file per revision, applied in order.
-///
-/// The layout is `mako`'s — `services/<daemon>/migrations/NNNN_*.sql`, a new
-/// file per change and never an edit to one already applied. `mako` applies
-/// them with `sqlx::migrate!`; this is SQLite, so they are compiled in and the
-/// applied revision lives in SQLite's own `user_version`.
-const MIGRATIONS: &[(i32, &str)] = &[(1, include_str!("../migrations/0001_schema.sql"))];
+/// Every `redb` error arrives as [`StoreError::Sql`], because a caller can do
+/// nothing different about a transaction, a table and a commit.
+macro_rules! sql {
+    ($e:expr) => {
+        ($e).map_err(|e| StoreError::Sql(e.to_string()))
+    };
+}
 
 /// The box's EEBUS identity, as it is stored.
 ///
 /// The SKI is derived from the key rather than stored beside it: two fields that
 /// can disagree about one identity is one field too many, and the derivation is
 /// `eebus::cert::ski_from_public_key`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct StoredIdentity {
     /// The SHIP ID the certificate carries as its common name.
     pub ship_id: String,
@@ -150,7 +227,7 @@ impl core::fmt::Debug for StoredIdentity {
 }
 
 /// A failsafe the network operator wrote, as it is stored.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StoredFailsafe {
     /// The power the household restrains itself to.
     pub watts: f64,
@@ -211,16 +288,19 @@ pub struct OutboundEvent {
 ///
 /// The absence of a production meter is `None` rather than zero: a box with none
 /// has not measured a dark roof (D124).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Recorded {
     /// The registers a settlement is computed from.
     pub registers: QuarterHour,
     /// What the roof produced in this quarter hour, kWh — `None` where the box
     /// has no production measurement to read.
+    ///
+    /// A decimal **string** on the wire and on disk, like every other quantity
+    /// a settlement is computed from: a JSON number is a `double` to every
+    /// reader that has ever parsed one (P3).
+    #[serde(default, with = "rust_decimal::serde::str_option")]
     pub production: Option<rust_decimal::Decimal>,
 }
-
-impl Recorded {}
 
 /// One event as it is held.
 #[derive(Debug, Clone, PartialEq)]
@@ -231,59 +311,64 @@ pub struct StoredEvent {
     pub event: ControlEvent,
 }
 
-/// The upsert both write paths use, so a single row and a batch cannot come to
-/// mean different things.
-///
-/// It clears `forwarded_at`: a restated register is a different number from the
-/// one the fleet was given, so it is owed again.
-const QUARTER_HOUR_UPSERT: &str = "INSERT INTO quarter_hour (
-     slot_start, grid_draw_kwh, grid_feed_in_kwh, device_consumption_kwh,
-     device_generation_kwh, storage_consumption_kwh, storage_generation_kwh,
-     anzulegender_wert_ct, spot_price_ct, production_kwh, recorded_at
- ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
- ON CONFLICT(slot_start) DO UPDATE SET
-     grid_draw_kwh           = excluded.grid_draw_kwh,
-     grid_feed_in_kwh        = excluded.grid_feed_in_kwh,
-     device_consumption_kwh  = excluded.device_consumption_kwh,
-     device_generation_kwh   = excluded.device_generation_kwh,
-     storage_consumption_kwh = excluded.storage_consumption_kwh,
-     storage_generation_kwh  = excluded.storage_generation_kwh,
-     anzulegender_wert_ct    = excluded.anzulegender_wert_ct,
-     spot_price_ct           = excluded.spot_price_ct,
-     production_kwh          = excluded.production_kwh,
-     recorded_at             = excluded.recorded_at,
-     forwarded_at            = NULL";
+/// A register row as it is stored: the record, and the two instants the store
+/// itself owns.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct RegisterRow {
+    recorded: Recorded,
+    recorded_at: i64,
+    #[serde(default)]
+    forwarded_at: Option<i64>,
+}
 
-/// The columns a [`Recorded`] is read back from, in the order
-/// [`Store::read_quarter_hours`] expects them.
-const QUARTER_HOUR_COLUMNS: &str = "slot_start, grid_draw_kwh, grid_feed_in_kwh, \
-     device_consumption_kwh, device_generation_kwh, storage_consumption_kwh, \
-     storage_generation_kwh, anzulegender_wert_ct, spot_price_ct, production_kwh";
+/// An event row: the event **without** its trace, and what the store knows about
+/// it that the event does not.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EventRow {
+    event: ControlEvent,
+    received_at: i64,
+    expires_at: i64,
+    #[serde(default)]
+    forwarded_at: Option<i64>,
+}
 
-/// Its parameters, in the order the statement names them.
-fn quarter_hour_params(r: &Recorded, recorded_at: OffsetDateTime) -> [rusqlite::types::Value; 11] {
-    use rusqlite::types::Value;
-    let q = &r.registers;
-    let optional =
-        |d: Option<rust_decimal::Decimal>| d.map_or(Value::Null, |v| Value::Text(v.to_string()));
-    [
-        Value::Integer(q.slot.start().unix_timestamp()),
-        Value::Text(q.grid_draw.to_string()),
-        Value::Text(q.grid_feed_in.to_string()),
-        Value::Text(q.device_consumption.to_string()),
-        Value::Text(q.device_generation.to_string()),
-        optional(q.storage_consumption),
-        optional(q.storage_generation),
-        Value::Text(q.anzulegender_wert.to_string()),
-        Value::Text(q.spot_price.to_string()),
-        optional(r.production),
-        Value::Integer(recorded_at.unix_timestamp()),
-    ]
+/// One sample of the trace.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct SampleRow {
+    netzwirksam: f64,
+    ceiling: f64,
+}
+
+/// A queued CloudEvent as it is stored.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct OutboundRow {
+    event_id: String,
+    event_type: String,
+    body: Vec<u8>,
+    attempts: i64,
+    created_at: i64,
+    #[serde(default)]
+    forwarded_at: Option<i64>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError> {
+    serde_json::to_vec(value).map_err(|e| StoreError::NotSerialisable {
+        detail: e.to_string(),
+    })
+}
+
+fn decode<T: serde::de::DeserializeOwned>(id: i64, bytes: &[u8]) -> Result<T, StoreError> {
+    serde_json::from_slice(bytes).map_err(|e| StoreError::NotReadable {
+        id,
+        detail: e.to_string(),
+    })
 }
 
 /// The box's own record.
 pub struct Store {
-    connection: Connection,
+    db: Database,
 }
 
 impl Store {
@@ -293,14 +378,8 @@ impl Store {
     /// [`StoreError::Sql`], or [`StoreError::FromTheFuture`] for a file written
     /// by a newer build.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        let connection = if path.as_os_str() == ":memory:" {
-            Connection::open_in_memory()?
-        } else {
-            Connection::open(path)?
-        };
-        let store = Self { connection };
-        store.migrate()?;
-        Ok(store)
+        let db = sql!(Database::create(path))?;
+        Self::from_database(db)
     }
 
     /// A store in memory, for a test.
@@ -308,38 +387,58 @@ impl Store {
     /// # Errors
     /// As [`Store::open`].
     pub fn in_memory() -> Result<Self, StoreError> {
-        Self::open(Path::new(":memory:"))
+        let db =
+            sql!(Database::builder().create_with_backend(redb::backends::InMemoryBackend::new()))?;
+        Self::from_database(db)
     }
 
-    /// Bring the database up to the newest revision in [`MIGRATIONS`].
-    fn migrate(&self) -> Result<(), StoreError> {
-        // Every `PRAGMA` this store needs, on every open. `journal_mode` is
-        // persistent and cannot be set inside the transaction a migration runs
-        // in; `foreign_keys` and `busy_timeout` are per *connection*. WAL lets a
-        // reader and a writer run at once and does nothing about two writers —
-        // a retention sweep and an evidence write are two — so the busy timeout
-        // is what turns `SQLITE_BUSY` into a short wait rather than a failed
-        // write.
-        self.connection.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;",
-        )?;
+    /// Create every table and settle the schema revision.
+    ///
+    /// The tables are opened in one write transaction whether they exist or
+    /// not: `redb` creates on first open, and a store whose tables appeared
+    /// lazily would answer "no such table" to a read on a fresh box rather than
+    /// an empty result.
+    fn from_database(db: Database) -> Result<Self, StoreError> {
+        let store = Self { db };
+        let write = sql!(store.db.begin_write())?;
+        {
+            sql!(write.open_table(REGISTERS))?;
+            sql!(write.open_table(REGISTERS_OWED))?;
+            sql!(write.open_table(EVENTS))?;
+            sql!(write.open_table(EVENTS_BY_RECEIVED))?;
+            sql!(write.open_table(EVENTS_OWED))?;
+            sql!(write.open_table(SAMPLES))?;
+            sql!(write.open_table(LEARNED))?;
+            sql!(write.open_table(IDENTITY))?;
+            sql!(write.open_table(FAILSAFE))?;
+            sql!(write.open_table(OUTBOUND))?;
+            sql!(write.open_table(OUTBOUND_OWED))?;
+            sql!(write.open_table(OUTBOUND_BY_EVENT))?;
 
-        let at: i32 = self
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let newest = MIGRATIONS.last().map_or(0, |(v, _)| *v);
-        if at > newest {
-            return Err(StoreError::FromTheFuture {
-                found: at,
-                understood: newest,
-            });
+            let mut meta = sql!(write.open_table(META))?;
+            let found = sql!(meta.get("schema"))?.map(|v| v.value());
+            match found {
+                Some(found) if found > SCHEMA => {
+                    return Err(StoreError::FromTheFuture {
+                        found,
+                        understood: SCHEMA,
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    sql!(meta.insert("schema", SCHEMA))?;
+                }
+            }
         }
-        for (version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v > at) {
-            self.connection.execute_batch(&format!(
-                "BEGIN; {sql}\nPRAGMA user_version = {version}; COMMIT;"
-            ))?;
-        }
-        Ok(())
+        sql!(write.commit())?;
+        Ok(store)
+    }
+
+    /// The next identifier from a counter, inside the caller's transaction.
+    fn next_id(meta: &mut redb::Table<'_, &str, u64>, counter: &str) -> Result<u64, StoreError> {
+        let next = sql!(meta.get(counter))?.map_or(1, |v| v.value() + 1);
+        sql!(meta.insert(counter, next))?;
+        Ok(next)
     }
 
     /// The box's EEBUS identity and the peers it trusts, if it has been given
@@ -348,50 +447,34 @@ impl Store {
     /// # Errors
     /// [`StoreError`] where the read fails.
     pub fn eebus_identity(&self) -> Result<Option<StoredIdentity>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT ship_id, key_pem, trusted FROM eebus_identity WHERE id = 1",
-                [],
-                |row| {
-                    Ok(StoredIdentity {
-                        ship_id: row.get(0)?,
-                        key_pem: row.get(1)?,
-                        trusted: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        let read = sql!(self.db.begin_read())?;
+        let table = sql!(read.open_table(IDENTITY))?;
+        match sql!(table.get("self"))? {
+            Some(bytes) => Ok(Some(decode(0, bytes.value())?)),
+            None => Ok(None),
+        }
     }
 
-    /// Keep it.
-    ///
-    /// The key is the one thing in this store whose leak would let another
-    /// device be this household to a network operator, so it is written and
-    /// never logged.
+    /// Keep it. The SKI follows the key, so a box that regenerated one on every
+    /// boot would be a different device to its network operator every morning.
     ///
     /// # Errors
     /// [`StoreError`] where the write fails.
     pub fn put_eebus_identity(
         &self,
         identity: &StoredIdentity,
-        now: OffsetDateTime,
+        _now: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO eebus_identity (id, ship_id, key_pem, trusted, created_at)
-             VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(id) DO UPDATE SET ship_id = ?1, key_pem = ?2, trusted = ?3",
-            params![
-                identity.ship_id,
-                identity.key_pem,
-                identity.trusted,
-                now.unix_timestamp()
-            ],
-        )?;
-        Ok(())
+        let bytes = encode(identity)?;
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut table = sql!(write.open_table(IDENTITY))?;
+            sql!(table.insert("self", bytes.as_slice()))?;
+        }
+        sql!(write.commit())
     }
 
-    /// What the network operator has said this household falls back to.
+    /// The failsafe a network operator last wrote, for `direction`.
     ///
     /// `None` where no operator has ever written one, which is the ordinary
     /// case: the configured value stands until somebody changes it.
@@ -399,19 +482,12 @@ impl Store {
     /// # Errors
     /// [`StoreError`] where the read fails.
     pub fn eebus_failsafe(&self, direction: &str) -> Result<Option<StoredFailsafe>, StoreError> {
-        self.connection
-            .query_row(
-                "SELECT watts, minimum_s FROM eebus_failsafe WHERE direction = ?1",
-                params![direction],
-                |row| {
-                    Ok(StoredFailsafe {
-                        watts: row.get(0)?,
-                        minimum_s: row.get(1)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        let read = sql!(self.db.begin_read())?;
+        let table = sql!(read.open_table(FAILSAFE))?;
+        match sql!(table.get(direction))? {
+            Some(bytes) => Ok(Some(decode(0, bytes.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// Keep it, so the next power cut does not undo the operator's write.
@@ -422,27 +498,21 @@ impl Store {
         &self,
         direction: &str,
         failsafe: &StoredFailsafe,
-        now: OffsetDateTime,
+        _now: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "INSERT INTO eebus_failsafe (direction, watts, minimum_s, written_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(direction) DO UPDATE SET watts = ?2, minimum_s = ?3, written_at = ?4",
-            params![
-                direction,
-                failsafe.watts,
-                failsafe.minimum_s,
-                now.unix_timestamp()
-            ],
-        )?;
-        Ok(())
+        let bytes = encode(failsafe)?;
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut table = sql!(write.open_table(FAILSAFE))?;
+            sql!(table.insert(direction, bytes.as_slice()))?;
+        }
+        sql!(write.commit())
     }
 
     /// Keep what the box has learned about its own house.
     ///
     /// Overwrites: there is one current model per name, and a history of a
-    /// forecast's own past states is not something anybody asks a box for. The
-    /// two years above are the history, and this is derived from them.
+    /// forecast's own past states is not something anybody asks a box for.
     ///
     /// # Errors
     /// [`StoreError`] where the write fails, or where the model cannot be
@@ -454,218 +524,279 @@ impl Store {
         &self,
         name: &str,
         model: &T,
-        now: OffsetDateTime,
+        _now: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        let json = serde_json::to_string(model).map_err(|e| StoreError::NotSerialisable {
-            detail: format!("`{name}`: {e}"),
-        })?;
-        self.connection.execute(
-            "INSERT INTO learned (name, model, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(name) DO UPDATE SET model = ?2, updated_at = ?3",
-            rusqlite::params![name, json, now.unix_timestamp()],
-        )?;
-        Ok(())
+        let bytes = encode(model)?;
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut table = sql!(write.open_table(LEARNED))?;
+            sql!(table.insert(name, bytes.as_slice()))?;
+        }
+        sql!(write.commit())
     }
 
-    /// Read one back, or `None` where the box has never learned it.
+    /// Read one back.
     ///
-    /// A stored model whose *shape* has moved on — a field added, a bucket key
-    /// changed — comes back as `None` with a warning rather than as an error.
-    /// The alternative is a box that will not start after an update because it
-    /// cannot read a fortnight of learning it can perfectly well relearn, and
-    /// the trade is a week of slightly worse forecasts against a household with
-    /// no energy manager at all.
+    /// `None` where the box has never stored one. A document that no longer
+    /// parses is an **error** rather than a `None`: a box that silently forgot
+    /// its roof because the model's shape moved would look exactly like one
+    /// that had just been installed, and would spend a fortnight relearning
+    /// what it already knew.
     ///
     /// # Errors
-    /// [`StoreError`] where the read itself fails.
+    /// [`StoreError`] where the read fails or the document has moved on.
     pub fn learned<T: serde::de::DeserializeOwned>(
         &self,
         name: &str,
     ) -> Result<Option<T>, StoreError> {
-        let json: Option<String> = self
-            .connection
-            .query_row(
-                "SELECT model FROM learned WHERE name = ?1",
-                rusqlite::params![name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(json) = json else { return Ok(None) };
-        match serde_json::from_str(&json) {
-            Ok(model) => Ok(Some(model)),
-            Err(e) => {
-                tracing::warn!(
-                    name,
-                    %e,
-                    "a stored model no longer matches the shape this build expects; \
-                     relearning it"
-                );
-                Ok(None)
-            }
+        let read = sql!(self.db.begin_read())?;
+        let table = sql!(read.open_table(LEARNED))?;
+        match sql!(table.get(name))? {
+            Some(bytes) => Ok(Some(decode(0, bytes.value())?)),
+            None => Ok(None),
         }
     }
 
     /// Write one quarter hour's registers.
     ///
-    /// **Upsert, and it clears `forwarded_at`.** A restated register is a
-    /// different number from the one the fleet was given, so it is owed again.
-    ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn put_quarter_hour(
         &self,
         quarter: &Recorded,
         recorded_at: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            QUARTER_HOUR_UPSERT,
-            rusqlite::params_from_iter(quarter_hour_params(quarter, recorded_at)),
-        )?;
-        Ok(())
+        self.put_quarter_hours(std::slice::from_ref(quarter), recorded_at)
     }
 
-    /// Write a whole day's registers in **one** transaction.
+    /// Write many in one transaction.
     ///
-    /// Ninety-six rows, and one statement per row is one commit — and one
-    /// `fsync` — each. A day's registers are also one *fact*: a settlement that
-    /// can observe half of them is a settlement that can be run on half a day.
+    /// A day is one *fact*: a settlement that can observe half of it is a
+    /// settlement that can be run on half a day. A restated register is owed to
+    /// the fleet again — it is a different number from the one they were given.
     ///
     /// # Errors
-    /// [`StoreError::Sql`]. Nothing is written if any row fails.
+    /// [`StoreError`]. Nothing is written if any row fails.
     pub fn put_quarter_hours(
-        &mut self,
+        &self,
         quarters: &[Recorded],
         recorded_at: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction()?;
+        if quarters.is_empty() {
+            return Ok(());
+        }
+        let write = sql!(self.db.begin_write())?;
         {
-            let mut statement = transaction.prepare(QUARTER_HOUR_UPSERT)?;
+            let mut table = sql!(write.open_table(REGISTERS))?;
+            let mut owed = sql!(write.open_table(REGISTERS_OWED))?;
             for quarter in quarters {
-                statement.execute(rusqlite::params_from_iter(quarter_hour_params(
-                    quarter,
-                    recorded_at,
-                )))?;
+                let slot = quarter.registers.slot.start().unix_timestamp();
+                let row = RegisterRow {
+                    recorded: *quarter,
+                    recorded_at: recorded_at.unix_timestamp(),
+                    forwarded_at: None,
+                };
+                sql!(table.insert(slot, encode(&row)?.as_slice()))?;
+                sql!(owed.insert(slot, ()))?;
             }
         }
-        transaction.commit()?;
-        Ok(())
+        sql!(write.commit())
     }
 
-    /// Write a closed control event and its compliance trace.
+    /// Write a control event and its trace, and return the identifier an
+    /// acknowledgement names.
     ///
     /// # Errors
-    /// [`StoreError::Sql`] or [`StoreError::NotSerialisable`].
+    /// [`StoreError`].
     pub fn put_control_event(&mut self, event: &ControlEvent) -> Result<i64, StoreError> {
         // Two years from the day it *closed*, not from the day it arrived: an
         // event that ran for a week is documented for two years after it ended.
         let expires_at = event.released_at.unwrap_or(event.received_at) + RETENTION;
+        let received_at = event.received_at.unix_timestamp();
         let mut document = event.clone();
         document.samples.clear();
-        let document =
-            serde_json::to_string(&document).map_err(|e| StoreError::NotSerialisable {
-                detail: e.to_string(),
-            })?;
 
-        let transaction = self.connection.transaction()?;
-        transaction.execute(
-            "INSERT INTO control_event (
-                 document, rule, received_at, released_at, first_ceiling_w,
-                 strictest_ceiling_w, minimum_power_w, below_minimum, expires_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-            params![
-                document,
-                rule_name(event.rule),
-                event.received_at.unix_timestamp(),
-                event.released_at.map(OffsetDateTime::unix_timestamp),
-                event.first_ceiling().get(),
-                event.strictest_ceiling().get(),
-                event
-                    .ceilings
-                    .first()
-                    .map_or(0.0, |c| c.minimum_power.get()),
-                i32::from(event.below_minimum()),
-                expires_at.unix_timestamp(),
-            ],
-        )?;
-        let id = transaction.last_insert_rowid();
+        let write = sql!(self.db.begin_write())?;
+        let id;
         {
-            let mut sample = transaction.prepare(
-                "INSERT OR REPLACE INTO compliance_sample (event_id, at, netzwirksam_w, ceiling_w)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
+            let mut meta = sql!(write.open_table(META))?;
+            id = Self::next_id(&mut meta, "next_event")?;
+            let row = EventRow {
+                event: document,
+                received_at,
+                expires_at: expires_at.unix_timestamp(),
+                forwarded_at: None,
+            };
+            let mut events = sql!(write.open_table(EVENTS))?;
+            sql!(events.insert(id, encode(&row)?.as_slice()))?;
+            let mut by_received = sql!(write.open_table(EVENTS_BY_RECEIVED))?;
+            sql!(by_received.insert((received_at, id), ()))?;
+            let mut owed = sql!(write.open_table(EVENTS_OWED))?;
+            sql!(owed.insert(id, ()))?;
+            let mut samples = sql!(write.open_table(SAMPLES))?;
             for s in &event.samples {
-                sample.execute(params![
-                    id,
-                    s.at.unix_timestamp(),
-                    s.netzwirksam.get(),
-                    s.ceiling.get(),
-                ])?;
+                let row = SampleRow {
+                    netzwirksam: s.netzwirksam.get(),
+                    ceiling: s.ceiling.get(),
+                };
+                sql!(samples.insert((id, s.at.unix_timestamp()), encode(&row)?.as_slice()))?;
             }
         }
-        transaction.commit()?;
-        Ok(id)
+        sql!(write.commit())?;
+        Ok(i64::try_from(id).unwrap_or(i64::MAX))
     }
 
     /// Every control event on record, oldest first, with its trace re-attached.
     ///
     /// # Errors
-    /// [`StoreError::Sql`] or [`StoreError::NotReadable`].
+    /// [`StoreError`].
     pub fn control_events(&self) -> Result<Vec<StoredEvent>, StoreError> {
-        self.read_events(
-            "SELECT id, document FROM control_event ORDER BY received_at, id",
-            [],
-        )
+        self.events_in(i64::MIN, i64::MAX, usize::MAX, false)
     }
 
     /// The events the fleet has not acknowledged, oldest first, at most `limit`.
     ///
     /// # Errors
-    /// As [`Store::control_events`].
+    /// [`StoreError`].
     pub fn pending_events(&self, limit: usize) -> Result<Vec<StoredEvent>, StoreError> {
-        self.read_events(
-            "SELECT id, document FROM control_event
-             WHERE forwarded_at IS NULL ORDER BY received_at, id LIMIT ?1",
-            params![i64::try_from(limit).unwrap_or(i64::MAX)],
+        self.events_in(i64::MIN, i64::MAX, limit, true)
+    }
+
+    /// The events received in `[from, to)`, oldest first.
+    ///
+    /// # Errors
+    /// [`StoreError`].
+    pub fn control_events_between(
+        &self,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        self.events_in(
+            from.unix_timestamp(),
+            to.unix_timestamp(),
+            usize::MAX,
+            false,
         )
     }
 
-    /// The quarter hours the fleet has not acknowledged, oldest first.
+    /// The events whose `received_at` falls in `[from, to)`, in that order.
+    ///
+    /// Ordered by `EVENTS_BY_RECEIVED` rather than by the primary key, because
+    /// the identifier is a counter and two events can arrive in an order the
+    /// counter does not reflect once a clock has been corrected.
+    fn events_in(
+        &self,
+        from: i64,
+        to: i64,
+        limit: usize,
+        owed_only: bool,
+    ) -> Result<Vec<StoredEvent>, StoreError> {
+        let read = sql!(self.db.begin_read())?;
+        let by_received = sql!(read.open_table(EVENTS_BY_RECEIVED))?;
+        let events = sql!(read.open_table(EVENTS))?;
+        let owed = sql!(read.open_table(EVENTS_OWED))?;
+        let samples = sql!(read.open_table(SAMPLES))?;
+
+        let mut out = Vec::new();
+        for entry in sql!(by_received.range((from, u64::MIN)..(to, u64::MIN)))? {
+            let (key, _) = sql!(entry)?;
+            let (_, id) = key.value();
+            if owed_only && sql!(owed.get(id))?.is_none() {
+                continue;
+            }
+            let Some(bytes) = sql!(events.get(id))? else {
+                continue;
+            };
+            let signed = i64::try_from(id).unwrap_or(i64::MAX);
+            let row: EventRow = decode(signed, bytes.value())?;
+            let mut event = row.event;
+            for sample in sql!(samples.range((id, i64::MIN)..(id, i64::MAX)))? {
+                let (key, value) = sql!(sample)?;
+                let (_, at) = key.value();
+                let s: SampleRow = decode(signed, value.value())?;
+                event.samples.push(ComplianceSample {
+                    at: OffsetDateTime::from_unix_timestamp(at)
+                        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
+                    netzwirksam: Power::new(s.netzwirksam),
+                    ceiling: Power::new(s.ceiling),
+                });
+            }
+            out.push(StoredEvent { id: signed, event });
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// The registers the fleet has not acknowledged, oldest first, at most
+    /// `limit`.
     ///
     /// # Errors
-    /// [`StoreError::Sql`] or [`StoreError::NotADecimal`].
+    /// [`StoreError`].
     pub fn pending_quarter_hours(&self, limit: usize) -> Result<Vec<Recorded>, StoreError> {
-        self.read_quarter_hours(
-            &format!(
-                "SELECT {QUARTER_HOUR_COLUMNS} FROM quarter_hour \
-                 WHERE forwarded_at IS NULL ORDER BY slot_start LIMIT ?1"
-            ),
-            params![i64::try_from(limit).unwrap_or(i64::MAX)],
-        )
+        let read = sql!(self.db.begin_read())?;
+        let owed = sql!(read.open_table(REGISTERS_OWED))?;
+        let registers = sql!(read.open_table(REGISTERS))?;
+        let mut out = Vec::new();
+        for entry in sql!(owed.iter())? {
+            let (slot, _) = sql!(entry)?;
+            let Some(bytes) = sql!(registers.get(slot.value()))? else {
+                continue;
+            };
+            let row: RegisterRow = decode(slot.value(), bytes.value())?;
+            out.push(row.recorded);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Every quarter hour on record, oldest first.
     ///
     /// # Errors
-    /// As [`Store::pending_quarter_hours`].
+    /// [`StoreError`].
     pub fn quarter_hours(&self) -> Result<Vec<Recorded>, StoreError> {
-        self.read_quarter_hours(
-            &format!("SELECT {QUARTER_HOUR_COLUMNS} FROM quarter_hour ORDER BY slot_start"),
-            [],
-        )
+        self.registers_in(i64::MIN, i64::MAX)
     }
 
-    /// Queue a CloudEvent for the fleet, or replace the one already queued.
+    /// The quarter hours whose slot starts in `[from, to)`, oldest first.
     ///
-    /// An upsert on `event_id`, because `hemsd` derives that id from what the
-    /// report is *about* — the site and the day — so a box re-reporting a day it
-    /// has corrected is amending one message rather than sending a second. The
+    /// # Errors
+    /// [`StoreError`].
+    pub fn quarter_hours_between(
+        &self,
+        from: OffsetDateTime,
+        to: OffsetDateTime,
+    ) -> Result<Vec<Recorded>, StoreError> {
+        self.registers_in(from.unix_timestamp(), to.unix_timestamp())
+    }
+
+    fn registers_in(&self, from: i64, to: i64) -> Result<Vec<Recorded>, StoreError> {
+        let read = sql!(self.db.begin_read())?;
+        let registers = sql!(read.open_table(REGISTERS))?;
+        let mut out = Vec::new();
+        for entry in sql!(registers.range(from..to))? {
+            let (slot, bytes) = sql!(entry)?;
+            let row: RegisterRow = decode(slot.value(), bytes.value())?;
+            out.push(row.recorded);
+        }
+        Ok(out)
+    }
+
+    /// Queue a CloudEvent for the fleet.
+    ///
+    /// Keyed on the CloudEvent's own id, which is derived from what the report
+    /// is *about* — the site and the day — so a box re-reporting a day it has
+    /// corrected is amending one message rather than sending a second. The
     /// attempt count resets with the body: what was stuck was the old document.
     ///
     /// Returns the row identifier, which is what an acknowledgement names. It is
     /// stable across a re-queue of the same `event_id`, because the row is.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn queue_event(
         &mut self,
         event_id: &str,
@@ -673,62 +804,82 @@ impl Store {
         body: &[u8],
         at: OffsetDateTime,
     ) -> Result<i64, StoreError> {
-        // `RETURNING` rather than `last_insert_rowid`, which reports nothing
-        // useful for the `DO UPDATE` half of an upsert.
-        self.connection
-            .query_row(
-                "INSERT INTO outbound_event (event_id, event_type, body, created_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(event_id) DO UPDATE SET
-                 body = ?3, created_at = ?4, forwarded_at = NULL,
-                 attempts = 0, last_error = NULL
-             RETURNING id",
-                params![event_id, event_type, body, at.unix_timestamp()],
-                |row| row.get(0),
-            )
-            .map_err(StoreError::Sql)
+        let write = sql!(self.db.begin_write())?;
+        let id;
+        {
+            let mut by_event = sql!(write.open_table(OUTBOUND_BY_EVENT))?;
+            let existing = sql!(by_event.get(event_id))?.map(|found| found.value());
+            id = if let Some(found) = existing {
+                found
+            } else {
+                let mut meta = sql!(write.open_table(META))?;
+                let fresh = Self::next_id(&mut meta, "next_outbound")?;
+                sql!(by_event.insert(event_id, fresh))?;
+                fresh
+            };
+            let row = OutboundRow {
+                event_id: event_id.to_owned(),
+                event_type: event_type.to_owned(),
+                body: body.to_vec(),
+                attempts: 0,
+                created_at: at.unix_timestamp(),
+                forwarded_at: None,
+                last_error: None,
+            };
+            let mut outbound = sql!(write.open_table(OUTBOUND))?;
+            sql!(outbound.insert(id, encode(&row)?.as_slice()))?;
+            let mut owed = sql!(write.open_table(OUTBOUND_OWED))?;
+            sql!(owed.insert(id, ()))?;
+        }
+        sql!(write.commit())?;
+        Ok(i64::try_from(id).unwrap_or(i64::MAX))
     }
 
     /// The CloudEvents the fleet has not taken, oldest first, at most `limit`.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn pending_outbound(&self, limit: usize) -> Result<Vec<OutboundEvent>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT id, event_id, event_type, body, attempts FROM outbound_event
-             WHERE forwarded_at IS NULL ORDER BY created_at, id LIMIT ?1",
-        )?;
-        let rows =
-            statement.query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
-                Ok(OutboundEvent {
-                    id: row.get(0)?,
-                    event_id: row.get(1)?,
-                    event_type: row.get(2)?,
-                    body: row.get(3)?,
-                    attempts: row.get(4)?,
-                })
-            })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Sql)
+        let read = sql!(self.db.begin_read())?;
+        let owed = sql!(read.open_table(OUTBOUND_OWED))?;
+        let outbound = sql!(read.open_table(OUTBOUND))?;
+        let mut rows: Vec<(i64, u64, OutboundRow)> = Vec::new();
+        for entry in sql!(owed.iter())? {
+            let (id, _) = sql!(entry)?;
+            let id = id.value();
+            let Some(bytes) = sql!(outbound.get(id))? else {
+                continue;
+            };
+            let signed = i64::try_from(id).unwrap_or(i64::MAX);
+            let row: OutboundRow = decode(signed, bytes.value())?;
+            rows.push((row.created_at, id, row));
+        }
+        // Oldest first, by the instant the row was queued and then by its
+        // identifier — the order the outbox drained in before, and the one that
+        // keeps a re-reported day in the place its first attempt had.
+        rows.sort_by_key(|(created, id, _)| (*created, *id));
+        Ok(rows
+            .into_iter()
+            .take(limit)
+            .map(|(_, id, row)| OutboundEvent {
+                id: i64::try_from(id).unwrap_or(i64::MAX),
+                event_id: row.event_id,
+                event_type: row.event_type,
+                body: row.body,
+                attempts: row.attempts,
+            })
+            .collect())
     }
 
     /// Record that the fleet has taken these CloudEvents.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn mark_sent(&mut self, ids: &[i64], at: OffsetDateTime) -> Result<(), StoreError> {
         if ids.is_empty() {
             return Ok(());
         }
-        let transaction = self.connection.transaction()?;
-        {
-            let mut update =
-                transaction.prepare("UPDATE outbound_event SET forwarded_at = ?2 WHERE id = ?1")?;
-            for id in ids {
-                update.execute(params![id, at.unix_timestamp()])?;
-            }
-        }
-        transaction.commit()?;
-        Ok(())
+        self.close_outbound(ids, at, None)
     }
 
     /// Record that an attempt on this row failed, and why.
@@ -737,13 +888,21 @@ impl Store {
     /// on what" is asked days after the log line has rotated away.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn mark_attempted(&mut self, id: i64, error: &str) -> Result<(), StoreError> {
-        self.connection.execute(
-            "UPDATE outbound_event SET attempts = attempts + 1, last_error = ?2 WHERE id = ?1",
-            params![id, error],
-        )?;
-        Ok(())
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut outbound = sql!(write.open_table(OUTBOUND))?;
+            let key = u64::try_from(id).unwrap_or(0);
+            let existing = sql!(outbound.get(key))?.map(|b| b.value().to_vec());
+            if let Some(bytes) = existing {
+                let mut row: OutboundRow = decode(id, &bytes)?;
+                row.attempts += 1;
+                row.last_error = Some(error.to_owned());
+                sql!(outbound.insert(key, encode(&row)?.as_slice()))?;
+            }
+        }
+        sql!(write.commit())
     }
 
     /// Give up on a row the fleet will never take.
@@ -755,110 +914,106 @@ impl Store {
     /// and visible to anybody asking what happened to that day.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn abandon_event(
         &mut self,
         id: i64,
         error: &str,
         at: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        self.connection.execute(
-            "UPDATE outbound_event
-             SET forwarded_at = ?3, attempts = attempts + 1, last_error = ?2
-             WHERE id = ?1",
-            params![id, error, at.unix_timestamp()],
-        )?;
-        Ok(())
+        self.close_outbound(&[id], at, Some(error))
     }
 
-    /// The quarter hours whose slot begins inside `[from, to)`.
-    ///
-    /// A **half-open** window, so a day's last register and the next day's first
-    /// belong to exactly one day each.
-    ///
-    /// # Errors
-    /// As [`Store::quarter_hours`].
-    pub fn quarter_hours_between(
-        &self,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> Result<Vec<Recorded>, StoreError> {
-        self.read_quarter_hours(
-            &format!(
-                "SELECT {QUARTER_HOUR_COLUMNS} FROM quarter_hour \
-                 WHERE slot_start >= ?1 AND slot_start < ?2 ORDER BY slot_start"
-            ),
-            params![from.unix_timestamp(), to.unix_timestamp()],
-        )
+    /// Take rows out of the outbox, optionally recording why.
+    fn close_outbound(
+        &mut self,
+        ids: &[i64],
+        at: OffsetDateTime,
+        error: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut outbound = sql!(write.open_table(OUTBOUND))?;
+            let mut owed = sql!(write.open_table(OUTBOUND_OWED))?;
+            for id in ids {
+                let key = u64::try_from(*id).unwrap_or(0);
+                let existing = sql!(outbound.get(key))?.map(|b| b.value().to_vec());
+                if let Some(bytes) = existing {
+                    let mut row: OutboundRow = decode(*id, &bytes)?;
+                    row.forwarded_at = Some(at.unix_timestamp());
+                    if let Some(error) = error {
+                        // The attempt that was refused still happened, and
+                        // "which of my reports is stuck, and on what" is asked
+                        // days after the log line has rotated away.
+                        row.attempts += 1;
+                        row.last_error = Some(error.to_owned());
+                    }
+                    sql!(outbound.insert(key, encode(&row)?.as_slice()))?;
+                }
+                sql!(owed.remove(key))?;
+            }
+        }
+        sql!(write.commit())
     }
 
-    /// The control events **received** inside `[from, to)`.
+    /// Record that the fleet has taken these events and registers.
     ///
-    /// By when the command arrived rather than when it was released: a reduction
-    /// that ran over midnight belongs to the day a network operator commanded
-    /// it, which is the day they will ask about.
-    ///
-    /// # Errors
-    /// As [`Store::control_events`].
-    pub fn control_events_between(
-        &self,
-        from: OffsetDateTime,
-        to: OffsetDateTime,
-    ) -> Result<Vec<StoredEvent>, StoreError> {
-        self.read_events(
-            "SELECT id, document FROM control_event
-             WHERE received_at >= ?1 AND received_at < ?2 ORDER BY received_at, id",
-            params![from.unix_timestamp(), to.unix_timestamp()],
-        )
-    }
-
-    /// Record that the fleet has these events and these quarter hours.
+    /// One transaction over both, because a partial acknowledgement is a claim
+    /// about rows nobody can point at.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn mark_forwarded(
         &mut self,
         events: &[i64],
         slots: &[Slot],
         at: OffsetDateTime,
     ) -> Result<(), StoreError> {
-        if events.is_empty() && slots.is_empty() {
-            return Ok(());
-        }
-        let transaction = self.connection.transaction()?;
+        let write = sql!(self.db.begin_write())?;
         {
-            let mut by_id =
-                transaction.prepare("UPDATE control_event SET forwarded_at = ?2 WHERE id = ?1")?;
+            let mut event_rows = sql!(write.open_table(EVENTS))?;
+            let mut events_owed = sql!(write.open_table(EVENTS_OWED))?;
             for id in events {
-                by_id.execute(params![id, at.unix_timestamp()])?;
+                let key = u64::try_from(*id).unwrap_or(0);
+                let existing = sql!(event_rows.get(key))?.map(|b| b.value().to_vec());
+                if let Some(bytes) = existing {
+                    let mut row: EventRow = decode(*id, &bytes)?;
+                    row.forwarded_at = Some(at.unix_timestamp());
+                    sql!(event_rows.insert(key, encode(&row)?.as_slice()))?;
+                }
+                sql!(events_owed.remove(key))?;
             }
-            let mut by_slot = transaction
-                .prepare("UPDATE quarter_hour SET forwarded_at = ?2 WHERE slot_start = ?1")?;
+            let mut register_rows = sql!(write.open_table(REGISTERS))?;
+            let mut registers_owed = sql!(write.open_table(REGISTERS_OWED))?;
             for slot in slots {
-                by_slot.execute(params![slot.start().unix_timestamp(), at.unix_timestamp()])?;
+                let key = slot.start().unix_timestamp();
+                let existing = sql!(register_rows.get(key))?.map(|b| b.value().to_vec());
+                if let Some(bytes) = existing {
+                    let mut row: RegisterRow = decode(key, &bytes)?;
+                    row.forwarded_at = Some(at.unix_timestamp());
+                    sql!(register_rows.insert(key, encode(&row)?.as_slice()))?;
+                }
+                sql!(registers_owed.remove(key))?;
             }
         }
-        transaction.commit()?;
-        Ok(())
+        sql!(write.commit())
     }
 
-    /// How much the box is still holding for the fleet.
+    /// What the fleet has not taken.
     ///
-    /// A backlog that only grows is a fleet link that has been down for longer
-    /// than anybody noticed, and it is invisible in every other KPI: the
-    /// household was managed correctly throughout.
+    /// Three counts of three small sets rather than three scans of the record:
+    /// the sets hold exactly what is owed, so this is bounded by the backlog and
+    /// not by two years.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn backlog(&self) -> Result<Backlog, StoreError> {
-        let count = |sql: &str| -> Result<usize, StoreError> {
-            let n: i64 = self.connection.query_row(sql, [], |row| row.get(0))?;
-            Ok(usize::try_from(n).unwrap_or(0))
-        };
+        let read = sql!(self.db.begin_read())?;
+        let count = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
         Ok(Backlog {
-            outbound: count("SELECT COUNT(*) FROM outbound_event WHERE forwarded_at IS NULL")?,
-            events: count("SELECT COUNT(*) FROM control_event WHERE forwarded_at IS NULL")?,
-            quarter_hours: count("SELECT COUNT(*) FROM quarter_hour WHERE forwarded_at IS NULL")?,
+            events: count(sql!(sql!(read.open_table(EVENTS_OWED))?.len())?),
+            quarter_hours: count(sql!(sql!(read.open_table(REGISTERS_OWED))?.len())?),
+            outbound: count(sql!(sql!(read.open_table(OUTBOUND_OWED))?.len())?),
         })
     }
 
@@ -875,13 +1030,12 @@ impl Store {
     /// changed hands carrying it would leave the previous household's operator
     /// controlling the new one.
     ///
-    /// It clears **every table** — identity and trust store, the failsafe an
-    /// operator wrote, what the box learned about this house, the `[A1 7.2]`
-    /// evidence and its traces, the registers, the outbox — in one transaction,
-    /// because a half-reset box has lost its evidence and kept an identity
-    /// somebody still trusts. The schema stays, so the next open runs no
-    /// migration, and [`Store::eebus_failsafe`] answering `None` is what makes
-    /// `hemsd`'s `failsafe_in_force` fall back to the configured value.
+    /// It clears **every table** in one transaction, because a half-reset box
+    /// has lost its evidence and kept an identity somebody still trusts. The
+    /// schema row is written again afterwards, so a reset box is a commissioned
+    /// box with nothing in it rather than one with no database; and
+    /// [`Store::eebus_failsafe`] answering `None` is what makes `hemsd`'s
+    /// `failsafe_in_force` fall back to the configured value.
     ///
     /// It **refuses** while the fleet is owed anything: unforwarded evidence
     /// exists only here. See [`StoreError::EvidenceNotForwarded`].
@@ -914,197 +1068,154 @@ impl Store {
         self.wipe()
     }
 
-    /// Empty every table in one transaction.
-    ///
-    /// One transaction because a half-reset box is the worst of the three
-    /// states: it has lost its evidence and kept an identity a network operator
-    /// still trusts.
+    /// Empty every table in one transaction, and put the schema row back.
     fn wipe(&mut self) -> Result<(), StoreError> {
-        let transaction = self.connection.transaction()?;
-        // `compliance_sample` is not named: it goes with its event by
-        // `ON DELETE CASCADE`, and naming it here would be a second place to
-        // remember a table that already has one.
-        for table in [
-            "outbound_event",
-            "control_event",
-            "quarter_hour",
-            "learned",
-            "eebus_failsafe",
-            "eebus_identity",
-        ] {
-            transaction.execute(&format!("DELETE FROM {table}"), [])?;
+        let write = sql!(self.db.begin_write())?;
+        {
+            sql!(sql!(write.open_table(REGISTERS))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(REGISTERS_OWED))?.retain(|_, ()| false))?;
+            sql!(sql!(write.open_table(EVENTS))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(EVENTS_BY_RECEIVED))?.retain(|_, ()| false))?;
+            sql!(sql!(write.open_table(EVENTS_OWED))?.retain(|_, ()| false))?;
+            sql!(sql!(write.open_table(SAMPLES))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(LEARNED))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(IDENTITY))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(FAILSAFE))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(OUTBOUND))?.retain(|_, _| false))?;
+            sql!(sql!(write.open_table(OUTBOUND_OWED))?.retain(|_, ()| false))?;
+            sql!(sql!(write.open_table(OUTBOUND_BY_EVENT))?.retain(|_, _| false))?;
+            // The counters go with it — a reset box hands out identifiers from
+            // one again, like the box it now is — and the schema row stays, so
+            // the next open runs no migration.
+            let mut meta = sql!(write.open_table(META))?;
+            sql!(meta.retain(|_, _| false))?;
+            sql!(meta.insert("schema", SCHEMA))?;
         }
-        transaction.commit()?;
-        Ok(())
+        sql!(write.commit())
+    }
+
+    /// How many registers one sweep transaction may delete.
+    ///
+    /// A **bound on the transaction**, not on the work: the loop keeps going
+    /// until nothing older is left, committing between batches.
+    ///
+    /// `redb` is copy-on-write, so a delete holds the old pages until its
+    /// transaction commits — and one enormous transaction has to hold all of
+    /// them at once. Measured: two years of registers occupy 56,6 MB, thirty
+    /// daily sweeps leave it at 56,6 MB, and deleting a *year* in one
+    /// transaction takes the file to **793 MB**. The daily case is the ordinary
+    /// one and was never in danger; the year is a box that has been off — a
+    /// holiday home, a unit back from repair — whose first sweep after it comes
+    /// back would otherwise try to clear the whole backlog at once, on a
+    /// gateway's flash.
+    const SWEEP_BATCH: usize = 4 * 96;
+
+    /// Delete registers older than `oldest`, a bounded batch at a time.
+    fn sweep_registers(&self, oldest: i64) -> Result<(), StoreError> {
+        loop {
+            let doomed: Vec<i64> = {
+                let read = sql!(self.db.begin_read())?;
+                let registers = sql!(read.open_table(REGISTERS))?;
+                let mut out = Vec::new();
+                for entry in sql!(registers.range(i64::MIN..=oldest))? {
+                    let (slot, _) = sql!(entry)?;
+                    out.push(slot.value());
+                    if out.len() >= Self::SWEEP_BATCH {
+                        break;
+                    }
+                }
+                out
+            };
+            if doomed.is_empty() {
+                return Ok(());
+            }
+            let write = sql!(self.db.begin_write())?;
+            {
+                let mut registers = sql!(write.open_table(REGISTERS))?;
+                let mut owed = sql!(write.open_table(REGISTERS_OWED))?;
+                for slot in &doomed {
+                    sql!(registers.remove(*slot))?;
+                    sql!(owed.remove(*slot))?;
+                }
+            }
+            sql!(write.commit())?;
+        }
     }
 
     /// Delete every event whose two years are up, and the registers older than
     /// the same window.
     ///
-    /// Returns how many events went; their traces go with them by
-    /// `ON DELETE CASCADE`, because a trace whose event has been deleted is a
-    /// set of numbers nobody can interpret.
+    /// Returns how many events went. Their traces go with them explicitly:
+    /// `redb` has no cascade, and a trace whose event has been deleted is a set
+    /// of numbers nobody can interpret.
+    ///
+    /// The events are **scanned** rather than indexed by expiry. Two years holds
+    /// a few thousand of them, this runs once a day, and an index on a value
+    /// that is `released_at + two years` — not monotonic in the key, because an
+    /// event that ran a week expires later than one that arrived after it —
+    /// would be a second thing to keep in step for no measurable gain.
     ///
     /// # Errors
-    /// [`StoreError::Sql`].
+    /// [`StoreError`].
     pub fn prune(&self, now: OffsetDateTime) -> Result<usize, StoreError> {
-        let events = self.connection.execute(
-            "DELETE FROM control_event WHERE expires_at <= ?1",
-            params![now.unix_timestamp()],
-        )?;
-        self.connection.execute(
-            "DELETE FROM quarter_hour WHERE slot_start <= ?1",
-            params![(now - RETENTION).unix_timestamp()],
-        )?;
-        Ok(events)
-    }
+        let cutoff = now.unix_timestamp();
+        let expired: Vec<(u64, i64)> = {
+            let read = sql!(self.db.begin_read())?;
+            let events = sql!(read.open_table(EVENTS))?;
+            let mut out = Vec::new();
+            for entry in sql!(events.iter())? {
+                let (id, bytes) = sql!(entry)?;
+                let id = id.value();
+                let row: EventRow = decode(i64::try_from(id).unwrap_or(i64::MAX), bytes.value())?;
+                if row.expires_at <= cutoff {
+                    out.push((id, row.received_at));
+                }
+            }
+            out
+        };
 
-    /// Run a query whose columns are `(id, document)`.
-    fn read_events(
-        &self,
-        sql: &str,
-        args: impl rusqlite::Params,
-    ) -> Result<Vec<StoredEvent>, StoreError> {
-        let mut statement = self.connection.prepare(sql)?;
-        let rows: Vec<(i64, String)> = statement
-            .query_map(args, |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (id, document) in rows {
-            let mut event: ControlEvent =
-                serde_json::from_str(&document).map_err(|e| StoreError::NotReadable {
-                    id,
-                    detail: e.to_string(),
-                })?;
-            event.samples = self.samples_of(id)?;
-            out.push(StoredEvent { id, event });
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut events = sql!(write.open_table(EVENTS))?;
+            let mut by_received = sql!(write.open_table(EVENTS_BY_RECEIVED))?;
+            let mut owed = sql!(write.open_table(EVENTS_OWED))?;
+            let mut samples = sql!(write.open_table(SAMPLES))?;
+            for (id, received_at) in &expired {
+                sql!(events.remove(*id))?;
+                sql!(by_received.remove((*received_at, *id)))?;
+                sql!(owed.remove(*id))?;
+                sql!(samples.retain_in((*id, i64::MIN)..(*id, i64::MAX), |_, _| false))?;
+            }
         }
-        Ok(out)
-    }
+        sql!(write.commit())?;
 
-    /// One event's compliance trace, oldest first.
-    fn samples_of(&self, event_id: i64) -> Result<Vec<ComplianceSample>, StoreError> {
-        let mut statement = self.connection.prepare(
-            "SELECT at, netzwirksam_w, ceiling_w FROM compliance_sample
-             WHERE event_id = ?1 ORDER BY at",
-        )?;
-        let samples = statement
-            .query_map(params![event_id], |row| {
-                Ok(ComplianceSample {
-                    at: OffsetDateTime::from_unix_timestamp(row.get(0)?)
-                        .unwrap_or(OffsetDateTime::UNIX_EPOCH),
-                    netzwirksam: Power::new(row.get(1)?),
-                    ceiling: Power::new(row.get(2)?),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(samples)
-    }
-
-    /// Run a query whose columns are [`QUARTER_HOUR_COLUMNS`].
-    fn read_quarter_hours(
-        &self,
-        sql: &str,
-        args: impl rusqlite::Params,
-    ) -> Result<Vec<Recorded>, StoreError> {
-        let mut statement = self.connection.prepare(sql)?;
-        let rows = statement.query_map(args, |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, String>(7)?,
-                row.get::<_, String>(8)?,
-                row.get::<_, Option<String>>(9)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (
-                unix,
-                draw,
-                feed_in,
-                consumption,
-                generation,
-                storage_consumption,
-                storage_generation,
-                aw,
-                spot,
-                production,
-            ) = row?;
-            let quarter =
-                Slot::containing(OffsetDateTime::from_unix_timestamp(unix).map_err(|_| {
-                    StoreError::NotADecimal {
-                        column: "slot_start",
-                        value: unix.to_string(),
-                    }
-                })?);
-            out.push(Recorded {
-                registers: QuarterHour {
-                    grid_draw: decimal("grid_draw_kwh", &draw)?,
-                    grid_feed_in: decimal("grid_feed_in_kwh", &feed_in)?,
-                    device_consumption: decimal("device_consumption_kwh", &consumption)?,
-                    device_generation: decimal("device_generation_kwh", &generation)?,
-                    storage_consumption: storage_consumption
-                        .map(|v| decimal("storage_consumption_kwh", &v))
-                        .transpose()?,
-                    storage_generation: storage_generation
-                        .map(|v| decimal("storage_generation_kwh", &v))
-                        .transpose()?,
-                    anzulegender_wert: decimal("anzulegender_wert_ct", &aw)?,
-                    spot_price: decimal("spot_price_ct", &spot)?,
-                    ..QuarterHour::empty(quarter)
-                },
-                production: production
-                    .map(|p| decimal("production_kwh", &p))
-                    .transpose()?,
-            });
-        }
-        Ok(out)
-    }
-}
-
-fn decimal(column: &'static str, value: &str) -> Result<rust_decimal::Decimal, StoreError> {
-    value.parse().map_err(|_| StoreError::NotADecimal {
-        column,
-        value: value.to_owned(),
-    })
-}
-
-/// The name a `GuardRule` is stored under.
-///
-/// Written out rather than taken from `Debug`, which is not a wire format:
-/// nothing promises it round trips, and renaming a variant would silently change
-/// what two years of evidence say. Only the *projection* uses this; the event
-/// itself is reconstructed from its `serde` document.
-fn rule_name(rule: GuardRule) -> &'static str {
-    match rule {
-        GuardRule::Lpc => "lpc",
-        GuardRule::Lpp => "lpp",
-        GuardRule::Para9Cap => "para9_cap",
-        GuardRule::Failsafe => "failsafe",
-        GuardRule::CircuitLimit => "circuit_limit",
-        GuardRule::ContractLimit => "contract_limit",
-        GuardRule::Unbalance => "unbalance",
-        GuardRule::DeviceLimit => "device_limit",
-        GuardRule::BackupReserve => "backup_reserve",
+        self.sweep_registers((now - RETENTION).unix_timestamp())?;
+        Ok(expired.len())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hems_core::prelude::AssetId;
+    use hems_core::prelude::{AssetId, GuardRule};
     use hems_grid::evidence::Action;
     use hems_grid::para14a::ControlMode;
     use rust_decimal::Decimal;
     use time::macros::datetime;
 
     const NOW: OffsetDateTime = datetime!(2026-01-15 17:00:00 UTC);
+
+    /// A file of its own. `redb` takes an exclusive lock on its path, and
+    /// `cargo test` runs binaries in parallel, so a shared name would be one
+    /// test failing on another.
+    fn temp_path(what: &str) -> std::path::PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("hems-box-{what}-{}-{n}.redb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
 
     fn quarter(at: OffsetDateTime) -> Recorded {
         Recorded {
@@ -1279,13 +1390,53 @@ mod tests {
     }
 
     #[test]
+    fn a_backlog_larger_than_one_sweep_is_cleared_all_the_same() {
+        // The sweep bounds its **transaction**, not its work: `redb` is
+        // copy-on-write, so a delete holds the old pages until it commits and
+        // one enormous transaction has to hold all of them at once. Measured on
+        // two years of registers (56,6 MB): thirty daily sweeps leave it at
+        // 56,6 MB, and deleting a year in **one** transaction took the file to
+        // 793 MB — on a gateway's flash. The daily case was never in danger;
+        // the year is a box that has been off and comes back.
+        //
+        // Bounding it introduces the obvious bug — a loop that clears one batch
+        // and stops — so this writes more than a batch and asserts the lot goes.
+        let store = Store::in_memory().unwrap();
+        let old = NOW - RETENTION - time::Duration::days(30);
+        let count = Store::SWEEP_BATCH + 50;
+        let backlog: Vec<Recorded> = (0..count)
+            .map(|i| {
+                let at = old + time::Duration::minutes(15 * i64::try_from(i).unwrap_or(0));
+                Recorded {
+                    registers: QuarterHour::empty(Slot::containing(at)),
+                    production: None,
+                }
+            })
+            .collect();
+        store.put_quarter_hours(&backlog, old).unwrap();
+        // …and one inside the window, which must survive.
+        store.put_quarter_hour(&quarter(NOW), NOW).unwrap();
+        assert_eq!(store.quarter_hours().unwrap().len(), count + 1);
+
+        store.prune(NOW).unwrap();
+
+        let left = store.quarter_hours().unwrap();
+        assert_eq!(
+            left.len(),
+            1,
+            "a backlog of {count} has to clear in one call, not one batch of it"
+        );
+        assert_eq!(left[0].registers.slot, Slot::containing(NOW));
+    }
+
+    #[test]
     fn a_whole_day_goes_in_one_call() {
         // Ninety-six rows, one statement each, one commit for the lot. The
         // *atomicity* is structural — `transaction()` and one `commit()` — and
         // is deliberately not asserted here: there is no way to make this batch
         // fail part-way from outside the store, and a test that cannot fail is
         // not a test. What this pins is that every row arrives.
-        let mut store = Store::in_memory().unwrap();
+        let store = Store::in_memory().unwrap();
         let day: Vec<Recorded> = (0..96)
             .map(|i| quarter(NOW + time::Duration::minutes(15 * i)))
             .collect();
@@ -1298,7 +1449,7 @@ mod tests {
     fn a_batch_and_a_single_row_write_the_same_thing() {
         // Two write paths, one statement: the single row and the batch share the
         // upsert, so they cannot come to disagree about what a register is.
-        let mut batched = Store::in_memory().unwrap();
+        let batched = Store::in_memory().unwrap();
         batched.put_quarter_hours(&[quarter(NOW)], NOW).unwrap();
         let one = Store::in_memory().unwrap();
         one.put_quarter_hour(&quarter(NOW), NOW).unwrap();
@@ -1413,33 +1564,47 @@ mod tests {
         // A day after, it is not — and its trace went with it.
         assert_eq!(store.prune(almost + time::Duration::days(2)).unwrap(), 1);
         assert!(store.control_events().unwrap().is_empty());
-        let samples: i64 = store
-            .connection
-            .query_row("SELECT COUNT(*) FROM compliance_sample", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(samples, 0, "ON DELETE CASCADE");
+        // The trace went with it. `redb` has no cascade, so this is the
+        // assertion that the explicit drain in `prune` actually ran — a trace
+        // whose event has been deleted is a set of numbers nobody can interpret,
+        // and it would sit there for ever.
+        let read = store.db.begin_read().unwrap();
+        let samples = read.open_table(SAMPLES).unwrap();
+        assert_eq!(
+            samples.len().unwrap(),
+            0,
+            "the trace is drained with its event"
+        );
     }
 
     #[test]
     fn a_store_written_by_a_newer_build_is_refused_rather_than_used() {
-        let store = Store::in_memory().unwrap();
-        store
-            .connection
-            .execute_batch("PRAGMA user_version = 9999")
-            .unwrap();
+        // `redb` has no schema of its own, so the revision is a row — and this
+        // is what makes a downgraded box refuse the file rather than interpret
+        // documents it may not understand.
+        let path = temp_path("from-the-future");
+        {
+            let store = Store::open(&path).unwrap();
+            let write = store.db.begin_write().unwrap();
+            {
+                let mut meta = write.open_table(META).unwrap();
+                meta.insert("schema", 9999_u64).unwrap();
+            }
+            write.commit().unwrap();
+        }
         assert!(matches!(
-            store.migrate(),
+            Store::open(&path),
             Err(StoreError::FromTheFuture {
                 found: 9999,
                 understood: 1
             })
         ));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn a_reopened_store_still_has_everything_and_re_runs_no_migration() {
-        let path = std::env::temp_dir().join(format!("hems-box-{}.sqlite", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let path = temp_path("reopen");
         {
             let mut store = Store::open(&path).unwrap();
             store.put_control_event(&event(NOW)).unwrap();
@@ -1448,11 +1613,14 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.control_events().unwrap().len(), 1);
         assert_eq!(store.quarter_hours().unwrap().len(), 1);
-        let at: i32 = store
-            .connection
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(at, MIGRATIONS.last().unwrap().0);
+        let read = store.db.begin_read().unwrap();
+        let meta = read.open_table(META).unwrap();
+        assert_eq!(
+            meta.get("schema").unwrap().unwrap().value(),
+            SCHEMA,
+            "the revision is what it was, so the next open runs no migration"
+        );
+        drop(read);
         drop(store);
         let _ = std::fs::remove_file(&path);
     }
@@ -1536,15 +1704,15 @@ mod outbound_tests {
 
         assert!(store.pending_outbound(10).unwrap().is_empty());
         assert_eq!(store.backlog().unwrap().outbound, 0);
-        let (attempts, error): (i64, String) = store
-            .connection
-            .query_row(
-                "SELECT attempts, last_error FROM outbound_event WHERE id = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(attempts, 1);
-        assert_eq!(error, "HTTP 400", "and why, on the row, days later");
+        let read = store.db.begin_read().unwrap();
+        let outbound = read.open_table(OUTBOUND).unwrap();
+        let bytes = outbound.get(1_u64).unwrap().unwrap();
+        let row: OutboundRow = serde_json::from_slice(bytes.value()).unwrap();
+        assert_eq!(row.attempts, 1);
+        assert_eq!(
+            row.last_error.as_deref(),
+            Some("HTTP 400"),
+            "and why, on the row, days later"
+        );
     }
 }

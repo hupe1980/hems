@@ -32,9 +32,19 @@ time          = { workspace = true }
 default = ["microlp", "serde"]
 ## Pure-Rust linear and mixed-integer solver.
 microlp = ["good_lp/microlp"]
-## HiGHS — markedly faster on larger models, but needs cmake and a C++ compiler.
-## What a production box should be built with, and what wins when both solver
-## features are enabled.
+## HiGHS — faster, but needs cmake and a C++ compiler. What a production box
+## should be built with, and what wins when both solver features are enabled.
+##
+## **Measured** rather than assumed, because "markedly faster" was doing more
+## work here than it had earned: the 66 planning tests in `tests/planning.rs`,
+## release build, take 10,84 s on HiGHS and 15,81 s on `microlp` — a factor of
+## 1,46 over the suite, not the order of magnitude the folklore suggests. What
+## that aggregate hides is the tail, and the tail is what a box's ten-second
+## re-plan budget is about: the on/off heat pump's day is fourteen times the
+## modulating unit's (ROADMAP), and it is the model where branch and bound has
+## the most to do. So HiGHS stays the production default and `microlp` is a
+## genuine fallback rather than a toy — which is worth knowing for a target
+## where a C++ toolchain is the harder half.
 highs = ["good_lp/highs"]
 ## Serialize/deserialize every public type.
 serde = ["dep:serde", "hems-core/serde"]

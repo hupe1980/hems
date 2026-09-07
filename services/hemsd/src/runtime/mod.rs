@@ -111,6 +111,9 @@ pub struct Running {
     pub status: Arc<Mutex<Status>>,
     /// What the household itself has asked for, shared with the HTTP surface.
     pub overrides: overrides::Overrides,
+    /// The box's own measurement series, shared with the HTTP surface so the
+    /// household can read the history its box took.
+    pub series: Option<Arc<crate::series::Series>>,
     /// Each configured driver's registry identity, in the order `[[drivers]]`
     /// lists them.
     ///
@@ -164,11 +167,35 @@ pub fn assemble(
         drivers,
         ski: None,
         overrides: overrides::Overrides::new(),
+        series: None,
         trust: None,
         household,
         registry: Arc::new(Mutex::new(registry)),
         status: Arc::new(Mutex::new(Status::default())),
     })
+}
+
+/// The box's own two years, where it has a store to keep them in.
+fn open_store(settings: &Settings) -> anyhow::Result<Option<Arc<Mutex<crate::store::Store>>>> {
+    let Some(path) = &settings.store_path else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(Mutex::new(crate::store::Store::open(path)?))))
+}
+
+/// The box's measurement series, where the household keeps one.
+///
+/// Opened at start-up so a locked directory — which is what a second `hemsd` on
+/// the same box looks like — is a start-up failure rather than a warning on
+/// every tick for ever.
+fn open_series(settings: &Settings) -> anyhow::Result<Option<Arc<crate::series::Series>>> {
+    let Some(configured) = &settings.series else {
+        return Ok(None);
+    };
+    Ok(Some(Arc::new(crate::series::Series::open(
+        &configured.path,
+        configured.keep_days,
+    )?)))
 }
 
 /// Check a Modul 3 household's calendar against the Anwendungshilfe
@@ -672,10 +699,7 @@ pub async fn run(
     // network operator wrote is kept here, and a Controllable System built from
     // the configuration file alone would come back from a power cut having
     // undone it.
-    let store = match &settings.store_path {
-        Some(path) => Some(Arc::new(Mutex::new(crate::store::Store::open(path)?))),
-        None => None,
-    };
+    let store = open_store(settings)?;
     let mut running = assembled(settings, store.as_ref(), now).await?;
 
     if settings.drivers.is_empty() {
@@ -730,6 +754,7 @@ pub async fn run(
 
     let overrides = overrides::Overrides::new();
     running.overrides = overrides.clone();
+    running.series = open_series(settings)?;
 
     let (plan, prices, published, learned) =
         start_planner(settings, &running, store.clone(), health, shutdown).await?;
@@ -792,6 +817,7 @@ pub async fn run(
                 prices,
                 learned,
                 store,
+                series: running.series.clone(),
                 overrides: overrides.clone(),
             },
             settings.control.clone(),

@@ -8,6 +8,16 @@ and a two-hour minimum, and an IPC hop inside that path buys nothing — so the
 guard, the arbiter, the planner, the drivers, the evidence recorder and the box's
 own stores all live here, and every other daemon in the workspace is cloud.
 
+Two stores, and the split is forced rather than tidy. **`redb`** holds the § 14a
+evidence, the settlement registers, the outbox and what the box has learned —
+every value a serde document, so a field added to one of them cannot be lost the
+way a hand-written column list once lost two. It also takes an exclusive lock on
+its file, so a second `hemsd` against the same store is refused rather than
+becoming a second writer on one household's record. **`chronix`** holds the
+one-second measurement series — every reading the guard acts on, kept seven days
+and served at `/v1/series/{point}`. The registers stay out of it: a series field
+is a `double` and a settlement quantity is an exact decimal.
+
 ```mermaid
 flowchart TB
   M["measurements, every second"] --> G
@@ -72,7 +82,7 @@ nothing that could hear a reduction.
 ## The record is written first
 
 `[A1 7.3]` keeps a control event for two years. The box holds its **own** copy in
-an embedded SQLite and forwards second, with an outbox column — so what the fleet
+its own embedded store and forwards second, keeping what is owed as a set — so what the fleet
 has not acknowledged is a backlog rather than a gap. A record that exists only
 once it has been uploaded is an intention with a network dependency, and the day
 a network operator asks about is the day the link was down.

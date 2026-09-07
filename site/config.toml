@@ -38,8 +38,8 @@ tagline    = "open-source home energy management for the German grid"
 # figure on a landing page that nothing compares is a figure that is wrong
 # within a fortnight; the last two are set by hand and are properties of the
 # reference days rather than of the tree.
-stat_rules   = "487"
-stat_tests   = "1066"
+stat_rules   = "491"
+stat_tests   = "1073"
 stat_crates  = "10"
 stat_days    = "7"
 stat_horizon = "192"

@@ -83,6 +83,42 @@ pub struct Settings {
     /// the correction its own roof has earned and its own household's quarter
     /// hours — and without it a reboot costs a fortnight of both.
     pub store_path: Option<std::path::PathBuf>,
+    /// Where the box keeps its own one-second measurement series, and for how
+    /// long.
+    ///
+    /// `None` keeps none, which is what a demonstration wants. On a household
+    /// box it is the difference between being able to answer *what was the
+    /// battery doing at half past two* and not: the guard reads every meter once
+    /// a control period, and without this every one of those readings is
+    /// discarded the moment it has been acted on.
+    ///
+    /// It is a **separate** store from `store_path` and holds no settlement
+    /// quantity — a series field is an `f64` and a MiSpeL register is an exact
+    /// decimal (D168).
+    #[serde(default)]
+    pub series: Option<SeriesSettings>,
+}
+
+/// The box's measurement series.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesSettings {
+    /// The directory it lives in. `chronix` takes an exclusive lock on it, so
+    /// two `hemsd` processes on one box is a start-up failure rather than two
+    /// half-written histories.
+    pub path: std::path::PathBuf,
+    /// How many days of it to keep.
+    ///
+    /// Seven by default. It is a *diagnostic* history rather than the statutory
+    /// one — `[A1 7.3]`'s two years are events and registers, and they are in
+    /// the other store — so the window is what somebody would actually look
+    /// back over, and the flash it costs is a household's.
+    #[serde(default = "default_series_days")]
+    pub keep_days: u16,
+}
+
+const fn default_series_days() -> u16 {
+    7
 }
 
 impl AsMut<hems_service::Settings> for Settings {

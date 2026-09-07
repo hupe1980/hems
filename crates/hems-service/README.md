@@ -23,15 +23,16 @@ the shutdown and — behind the `postgres` feature — the fleet's **database po
 and it owns nothing about energy.
 
 The database was outside that list until three daemons had one. What is here is
-not a schema — that belongs to whichever daemon's tables it describes — it is the
-thirty lines every one of them needs identically: a connection string that is a
+not a schema — that belongs to whichever daemon's tables it describes — it is
+what every one of them needs identically: a connection string that is a
 *reference* to a credential, a pool with bounds that suit a container, a
 statement timeout so one abandoned query cannot hold a backend for ever, a
 migration runner with a checksum and an advisory lock, and a **bounded**
 readiness ping so a dead database marks a pod `NotReady` instead of hanging its
 probe. The shape is `mako_service::config::DatabaseConfig`'s deliberately; the
-driver is `tokio-postgres` rather than `sqlx` because cargo's `links` rule makes
-`sqlx` and the edge daemon's `rusqlite` mutually exclusive in one workspace.
+driver is `tokio-postgres` rather than `sqlx` because what `sqlx` adds over it
+is a compile-time `query!` these daemons do not use and a `migrate!` this module
+already replaces (D158).
 
 ## Live and ready are different questions
 

@@ -3,8 +3,8 @@
 //!
 //! # Why the fleet is PostgreSQL and the box is not
 //!
-//! `hemsd` keeps its own two years in SQLite: one process, one writer, no
-//! network, and a file an installer can copy off a failed box. Every property
+//! `hemsd` keeps its own two years in an embedded `redb`: one process, one
+//! writer, no network, and a file an installer can copy off a failed box. Every property
 //! that makes that right on a gateway makes it wrong for a service holding the
 //! § 14a evidence of a whole fleet (D156) — one write lock puts every
 //! household's forwarded evidence behind a mutex, a file cannot be replicated so
@@ -33,21 +33,18 @@
 //! succeed before anything is served, and a **bounded** readiness ping so a dead
 //! database marks a pod `NotReady` instead of hanging its probe.
 //!
-//! The **driver** cannot agree, and it is cargo rather than taste: `sqlx`
-//! declares `sqlx-sqlite` as an optional dependency, and the `links = "sqlite3"`
-//! uniqueness rule is enforced during *resolution* — over optional dependencies
-//! that may never be enabled — so `sqlx` and the box's `rusqlite` conflict on
-//! `libsqlite3-sys`. Measured at `sqlx =0.8.6` beside `rusqlite 0.40` with
-//! `bundled`, `default-features = false` and `["postgres", "runtime-tokio"]`
-//! resolves, and adding any one of `macros`, `migrate`, `json` or `any` — and so
-//! `sqlx`'s own defaults — does not. What is left after those exclusions is a
-//! driver with no compile-time queries, no migration runner and no JSON, which
-//! is this module with extra steps. mako has no edge daemon and so no SQLite.
-//! `tokio-postgres` links no native library, which leaves the safety-critical
-//! edge daemon alone.
+//! The **driver** did not agree, and the reason was cargo rather than taste:
+//! `sqlx` declares `sqlx-sqlite` as an optional dependency, `links = "sqlite3"`
+//! uniqueness is enforced during *resolution* over optional dependencies that
+//! may never be enabled, and the box carried `rusqlite` with `bundled`. That is
+//! history — D169 moved the box to `redb`, so `sqlx` resolves here now, and so
+//! does `meterstore`, which is built on it.
 //!
-//! It is the same constraint that keeps `meterstore` out of the fleet tier, and
-//! for the same reason rather than a second one (`METERSTORE_FEEDBACK.md`).
+//! What keeps `tokio-postgres` is that it is written, tested and deployed, and
+//! that what `sqlx` would add over it is a compile-time `query!` this module
+//! does not use and a `migrate!` macro [`migrate`] already replaces with eighty
+//! lines that carry an advisory lock, a checksum and a refusal to run backwards.
+//! Nothing forbids the alternative any more; nothing asks for it either.
 
 use std::time::Duration;
 
