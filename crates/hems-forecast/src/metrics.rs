@@ -14,13 +14,12 @@
 //!   99 % of the time is uselessly wide, and one that manages 40 % is lying.
 //! * **bias** — the mean signed error, which says whether the model is
 //!   systematically optimistic.
-//! * **CRPS** — the continuous ranked probability score, which is the number
-//!   the forecasting literature compares models on, so a claim about this
-//!   crate's forecasts can be put beside a published one. It is the pinball
-//!   loss integrated over every quantile level; with three levels the integral
-//!   is approximated by their mean, doubled — the standard quantile
-//!   approximation, and it is stated here rather than hidden because with three
-//!   levels it is an approximation and not the score itself.
+//! * **CRPS** — the continuous ranked probability score, the number the
+//!   forecasting literature compares models on. It is the pinball loss
+//!   integrated over every quantile level; this band has three, so the integral
+//!   is their mean, doubled. **That is a three-node quadrature and it is biased
+//!   low** — see [`band_crps`] for by how much, and for why a CRPS from this
+//!   crate is comparable with itself and not with one from a paper.
 //!
 //! # What is not scored, and why leaving it in was worse than a bug
 //!
@@ -73,12 +72,33 @@ pub fn band_pinball(band: Band, actual: f64) -> f64 {
 /// The continuous ranked probability score of a band against one outcome.
 ///
 /// `CRPS = 2 ∫₀¹ QL_q dq`, approximated by the mean of the quantile losses
-/// actually held. With three levels that approximation is coarse — it is exact
-/// only in the limit of a dense grid — but it is the one the M-competitions and
-/// most published benchmarks use, so a CRPS from this crate is comparable with
-/// a CRPS from a paper. It is in the unit of the quantity, and a deterministic
-/// forecast's CRPS is its absolute error, which is the property that makes it
-/// the right score to compare a band against a point forecast.
+/// actually held. Two of the three things that used to be claimed here are
+/// true and the third was not.
+///
+/// **True**: it is in the unit of the quantity, and a deterministic forecast's
+/// CRPS is exactly its absolute error — because the three levels average to
+/// 0,5, so a band collapsed to a point gives `2 · |e| · 0,5`. That is the
+/// property that makes it the right score to put a band beside a point
+/// forecast, and it holds under any symmetric weighting of the three.
+///
+/// **Not true**: that it is therefore comparable with a published CRPS. A
+/// published one is computed analytically or over a dense grid — the energy
+/// competitions use ninety-nine levels — and three equally weighted nodes at
+/// 0,1, 0,5 and 0,9 are a *coarse quadrature that under-states the integral*.
+/// Measured against the analytic CRPS of a calibrated standard normal, this
+/// returns **0,50 against 0,56 — about 11 % low**. The claim is withdrawn
+/// rather than the estimator changed, for a reason that is the whole of
+/// [`crate::residual`]'s argument: the weighting that would make the three
+/// nodes unbiased is `0,261 / 0,477 / 0,261`, and 0,261 is a constant *fitted
+/// to a normal*. A roof's residual is not normal — it has a hard ceiling at the
+/// clear sky and a long tail down (D62) — so correcting the bias with that
+/// number would import exactly the distributional assumption this crate removed
+/// from the band itself.
+///
+/// So it is a score to compare with **itself**: across days, across households,
+/// across two candidate models on the same band. That is what
+/// [`Calibration::merge`] and the fleet view actually do with it, and no
+/// caller anywhere puts it beside a figure from a paper (D176).
 #[must_use]
 pub fn band_crps(band: Band, actual: f64) -> f64 {
     2.0 * band_pinball(band, actual)
@@ -483,5 +503,88 @@ mod tests {
         let c = Calibration::score((0..5).map(|_| (Band::certain(1.0), 1.0)));
         assert_eq!(c.merge(Calibration::default()), c);
         assert_eq!(Calibration::default().merge(c), c);
+    }
+}
+
+#[cfg(test)]
+mod crps_tests {
+    use super::{Band, band_crps};
+
+    /// The property the score is chosen for: a band with no width scores its own
+    /// absolute error, exactly.
+    ///
+    /// It works because the three levels average to 0,5. Anything that changed
+    /// them — or weighted them asymmetrically — would break the one claim this
+    /// score makes that a reader might act on.
+    #[test]
+    fn a_point_forecast_scores_its_own_absolute_error() {
+        for (forecast, actual) in [(0.0, 0.0), (100.0, 100.5), (100.0, 40.0), (0.0, 7.25)] {
+            let point = Band {
+                p10: forecast,
+                p50: forecast,
+                p90: forecast,
+            };
+            assert!(
+                (band_crps(point, actual) - (actual - forecast).abs()).abs() < 1e-9,
+                "point {forecast} against {actual}: {}",
+                band_crps(point, actual)
+            );
+        }
+    }
+
+    /// And the bias the module note names, held to the number it names.
+    ///
+    /// A calibrated standard normal has an analytic CRPS whose expectation is
+    /// `1/√π − 2/√(2π) · ... ` — rather than derive it here, this checks the
+    /// three-node estimate against a value computed from the closed form, so a
+    /// change to the levels or the weighting cannot quietly move the score by
+    /// more than the documented amount.
+    #[test]
+    fn the_three_node_estimate_is_low_by_about_a_ninth_on_a_normal() {
+        // Standard-normal quantiles at 10, 50 and 90 %.
+        let band = Band {
+            p10: -1.281_551_565_5,
+            p50: 0.0,
+            p90: 1.281_551_565_5,
+        };
+        // A deterministic quadrature over the outcome instead of a sample, so
+        // the test cannot flap: 2 001 points of the normal's own grid.
+        let (mut estimated, mut analytic, mut weight) = (0.0, 0.0, 0.0);
+        for i in 0..=2000 {
+            let y = -5.0 + 10.0 * f64::from(i) / 2000.0;
+            let w = (-0.5 * y * y).exp();
+            estimated += w * band_crps(band, y);
+            analytic += w * crps_of_standard_normal(y);
+            weight += w;
+        }
+        let ratio = (estimated / weight) / (analytic / weight);
+        assert!(
+            (0.87..0.90).contains(&ratio),
+            "three-node CRPS is {ratio} of the analytic one; the module note says about 0,89"
+        );
+    }
+
+    /// `CRPS(N(0,1), y) = y(2Φ(y) − 1) + 2φ(y) − 1/√π`.
+    fn crps_of_standard_normal(y: f64) -> f64 {
+        let phi = (-0.5 * y * y).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let cdf = 0.5 * (1.0 + erf(y / std::f64::consts::SQRT_2));
+        y.mul_add(2.0f64.mul_add(cdf, -1.0), 2.0 * phi) - 1.0 / std::f64::consts::PI.sqrt()
+    }
+
+    /// Abramowitz & Stegun 7.1.26 — enough for a test that asserts a range.
+    fn erf(x: f64) -> f64 {
+        let sign = if x < 0.0 { -1.0 } else { 1.0 };
+        let x = x.abs();
+        let t = 1.0 / x.mul_add(0.327_591_1, 1.0);
+        let y = t
+            * (-x * x).exp()
+            * t.mul_add(
+                t.mul_add(
+                    t.mul_add(t.mul_add(1.061_405_429, -1.453_152_027), 1.421_413_741),
+                    -0.284_496_736,
+                ),
+                0.254_829_592,
+            );
+        sign * (1.0 - y)
     }
 }

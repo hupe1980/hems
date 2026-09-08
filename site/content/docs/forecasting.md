@@ -96,8 +96,16 @@ Every day prints what its forecasts were worth:
 ```
 
 **CRPS** is the continuous ranked probability score — the number the forecasting
-literature compares models on, in the unit of the quantity, so a claim about
-these forecasts can be put beside a published one. The percentage is how often
+literature compares models on, in the unit of the quantity, and here a score to
+compare with **itself**: across days, across households, across two candidate
+models on the same band. It is deliberately *not* claimed comparable with a
+published figure. A published CRPS is analytic or computed over a dense grid of
+quantile levels; this band has three, and three equally weighted nodes are a
+coarse quadrature that under-states the integral — measured against the analytic
+CRPS of a calibrated normal it comes out about 11 % low. The weighting that would
+correct that is a constant fitted to a normal, and a roof's residual is not
+normal, so correcting it would put back the distributional assumption the band
+itself no longer makes. The percentage is how often
 the outcome landed inside the 10–90 band, which should be near 80 — and `of 32
 lit` is how many quarter hours it is a percentage *of*. A production score is
 about the part of the day the sun was up; the other sixty-four slots of a January
