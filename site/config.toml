@@ -39,7 +39,7 @@ tagline    = "open-source home energy management for the German grid"
 # within a fortnight; the last two are set by hand and are properties of the
 # reference days rather than of the tree.
 stat_rules   = "492"
-stat_tests   = "1103"
+stat_tests   = "1106"
 stat_crates  = "10"
 stat_days    = "7"
 stat_horizon = "192"

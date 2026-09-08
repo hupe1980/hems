@@ -235,9 +235,10 @@ pub fn envelope_command(
 mod tests {
     use super::*;
     use crate::describe::{
-        HeatPumpDescription, describe_battery, describe_evse, describe_heat_pump, describe_pv,
+        HeatPumpDescription, describe_battery, describe_dhw, describe_evse, describe_heat_pump,
+        describe_pv,
     };
-    use hems_core::asset::{AssetMeta, Chemistry, Evse, HeatPump, PvArray};
+    use hems_core::asset::{AssetMeta, Chemistry, DhwTank, Evse, HeatPump, PvArray};
     use s2energy::common::{Duration, Id};
     use time::OffsetDateTime;
     use time::macros::datetime;
@@ -296,6 +297,51 @@ mod tests {
             battery_power(&d, &discharge, &b).unwrap(),
             Power::from_kw(-5.0)
         );
+    }
+
+    fn tank() -> DhwTank {
+        DhwTank {
+            meta: meta("dhw", 3.0, PhaseConnection::Single { phase: Phase::L1 }),
+            volume_l: 300.0,
+            heater: Power::from_kw(3.0),
+            cop: 3.0,
+            standing_loss: Power::from_kw(0.06),
+            t_min_c: 45.0,
+            t_set_c: 55.0,
+            t_max_c: 65.0,
+        }
+    }
+
+    /// A tank is one-way, and naming its non-existent discharge is the same
+    /// error as naming somebody else's actuator.
+    ///
+    /// `dhw_power` had no caller and no test — the session decodes through
+    /// `actuator_factor` directly — so the half of the pair that a household's
+    /// *tank* depends on was the untested half.
+    #[test]
+    fn a_tank_takes_its_heaters_share_and_refuses_a_mode_it_has_not_got() {
+        let t = tank();
+        let d = describe_dhw(&t, T0);
+
+        let full = frbc_instruction(d.actuator.clone(), d.heat.clone(), 1.0);
+        assert_eq!(dhw_power(&d, &full, &t).unwrap(), Power::from_kw(3.0));
+
+        let half = frbc_instruction(d.actuator.clone(), d.heat.clone(), 0.5);
+        assert_eq!(dhw_power(&d, &half, &t).unwrap(), Power::from_kw(1.5));
+
+        let idle = frbc_instruction(d.actuator.clone(), d.heat.clone(), 0.0);
+        assert_eq!(dhw_power(&d, &idle, &t).unwrap(), Power::ZERO);
+
+        // A mode from somebody else's description. There is no discharge to
+        // name, so this is the only way to get it wrong and it has to be
+        // refused rather than read as "heat".
+        let b = battery();
+        let bd = describe_battery(&b, T0);
+        let wrong = frbc_instruction(d.actuator.clone(), bd.discharge.clone(), 1.0);
+        assert!(matches!(
+            dhw_power(&d, &wrong, &t),
+            Err(InstructError::UnknownOperationMode)
+        ));
     }
 
     #[test]

@@ -187,7 +187,10 @@ impl EvSession {
         }
         let from = self.arrival.unwrap_or(now).max(now);
         let slots = from.distance_to(self.departure).max(0) as f64;
-        let deliverable = self.max_charge.get() * self.efficiency.clamp(0.0, 1.0) * slots * 0.25;
+        let deliverable = self.max_charge.get()
+            * self.efficiency.clamp(0.0, 1.0)
+            * slots
+            * hems_core::prelude::SLOT_HOURS;
         if deliverable <= 0.0 {
             return 1.0;
         }

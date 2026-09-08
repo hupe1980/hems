@@ -1124,6 +1124,55 @@ mod tests {
         );
     }
 
+    /// What became of an instruction reaches the CEM, and only while the session
+    /// is up.
+    ///
+    /// `instruction_became` had no caller and no test: it is the second half of
+    /// the pair — acceptance says the household intends to carry an instruction
+    /// out, this says whether it did — and a CEM planning against a resource
+    /// whose instructions all end `ABORTED` is planning against a household that
+    /// is quietly refusing. A method nothing calls and nothing checks is a
+    /// message nobody would notice going missing.
+    #[test]
+    fn what_became_of_an_instruction_is_reported_while_the_session_is_up() {
+        let (mut session, _description) = battery_session();
+        let id = Id::generate();
+
+        // Before the handshake there is nobody to tell, and the message must not
+        // queue up waiting for one: a status update about an instruction the
+        // peer never sent is a protocol error at the far end.
+        let fresh = {
+            let (mut s, _) = battery_session();
+            s.instruction_became(id.clone(), InstructionStatus::Started, T0);
+            sent(&mut s)
+        };
+        assert!(
+            fresh.is_empty(),
+            "nothing is queued for a peer that is not there: {fresh:?}"
+        );
+
+        let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
+        let _ = sent(&mut session);
+
+        session.instruction_became(id.clone(), InstructionStatus::Started, T0);
+        session.instruction_became(id.clone(), InstructionStatus::Aborted, T0);
+        let out = sent(&mut session);
+        let updates: Vec<_> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::InstructionStatusUpdate(u) if u.instruction_id == id => {
+                    Some(u.status_type)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            updates,
+            vec![InstructionStatus::Started, InstructionStatus::Aborted],
+            "both, in order, and about the instruction they name: {out:?}"
+        );
+    }
+
     /// An instruction naming somebody else's actuator is refused on both
     /// channels, and the refusal reaches the box as an event.
     ///

@@ -100,13 +100,6 @@ impl SlotPrice {
         let kwh = Decimal::try_from(energy.kwh()).unwrap_or(Decimal::ZERO);
         kwh * self.import_ct / Decimal::ONE_HUNDRED
     }
-
-    /// What feeding in `energy` in this slot earns, in euros.
-    #[must_use]
-    pub fn revenue_of(&self, energy: Energy) -> Decimal {
-        let kwh = Decimal::try_from(energy.kwh().abs()).unwrap_or(Decimal::ZERO);
-        kwh * self.export_ct / Decimal::ONE_HUNDRED
-    }
 }
 
 /// The resolved prices over a horizon.

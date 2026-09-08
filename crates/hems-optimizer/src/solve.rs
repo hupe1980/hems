@@ -84,7 +84,11 @@ use time::OffsetDateTime;
 use crate::model::{EvSession, Problem};
 
 /// Hours in one slot — the factor between power in watts and energy in watt-hours.
-const DT_HOURS: f64 = 0.25;
+///
+/// `hems-core`'s, not a local `0.25`: four crates were each carrying their own
+/// copy of this quarter, and a rate written per tick is right at exactly one
+/// cadence (D140).
+const DT_HOURS: f64 = hems_core::prelude::SLOT_HOURS;
 
 /// What to assume a kilowatt-hour costs where the price stack does not reach.
 ///

@@ -241,7 +241,8 @@ impl StressProfile {
     /// What a household would call "how much have they actually taken from me".
     #[must_use]
     pub fn hours_reduced(&self) -> f64 {
-        f64::from(self.cells.iter().map(|(_, _, b)| b.reduced).sum::<u32>()) / 4.0
+        f64::from(self.cells.iter().map(|(_, _, b)| b.reduced).sum::<u32>())
+            * hems_core::prelude::SLOT_HOURS
     }
 
     /// The quarter hour of the day a reduction is most often in force in.

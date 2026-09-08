@@ -89,8 +89,8 @@ pub struct Rc2 {
     /// a house identified in one season would then be wrong in the other by the
     /// ratio of the two, which at 52° north is about three.
     ///
-    /// Zero is a building with no glazing modelled — the old behaviour, and what
-    /// [`Rc2::adiabatic_gains`] returns to.
+    /// Zero is a building with no glazing modelled, which is a *worse* model rather
+    /// than a safer one — see [`Rc2::free_heat_kw`] for which way it is wrong.
     pub solar_aperture_m2: f64,
     /// Heat from people, cooking, and everything electric that ends up as heat,
     /// kW.
@@ -320,20 +320,6 @@ impl Rc2 {
             // 150 m² at 3 W/m².
             internal_gain_kw: 0.45,
         }
-    }
-
-    /// The same fabric with the free heat switched off.
-    ///
-    /// For a caller that has no irradiance to drive the aperture with and would
-    /// rather plan against a house that is only ever heated deliberately than
-    /// against one whose sun it is inventing. It is the pre-D175 model, and it
-    /// is a **worse** model rather than a safer one: see the note on
-    /// [`Rc2::free_heat_kw`] for which way it is wrong.
-    #[must_use]
-    pub const fn adiabatic_gains(mut self) -> Self {
-        self.solar_aperture_m2 = 0.0;
-        self.internal_gain_kw = 0.0;
-        self
     }
 
     /// Heat this building gets for nothing, kW.

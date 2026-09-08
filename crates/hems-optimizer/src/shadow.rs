@@ -77,7 +77,7 @@ use crate::model::Problem;
 const WH_PER_KWH: f64 = 1000.0;
 
 /// Hours in a slot.
-const DT_HOURS: f64 = 0.25;
+const DT_HOURS: f64 = hems_core::prelude::SLOT_HOURS;
 
 /// The marginal value of energy in one slot, per asset.
 ///

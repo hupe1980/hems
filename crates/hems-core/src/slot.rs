@@ -30,6 +30,18 @@ pub const SLOT: Duration = Duration::minutes(15);
 /// Slots in a day without a DST transition.
 pub const SLOTS_PER_DAY: usize = 96;
 
+/// One slot, in hours — the factor between a power in watts and an energy in
+/// watt-hours over a slot.
+///
+/// Derived from [`SLOT`] rather than written as `0,25`, because a rate written
+/// per tick is correct at exactly one cadence and silently wrong at every other
+/// (D140), and four different crates were each carrying their own copy of this
+/// quarter. It is the same argument this module is here to make: nothing may
+/// disagree about what a quarter hour is, and a literal in another crate is a
+/// second opinion waiting to be right about the wrong thing.
+#[allow(clippy::cast_precision_loss)]
+pub const SLOT_HOURS: f64 = SLOT.whole_seconds() as f64 / 3600.0;
+
 /// One quarter-hour of the planning grid, identified by its UTC start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -332,5 +344,18 @@ impl DayType {
             metering::load_profile::SlpDayType::SonnFeiertag => DayType::Sunday,
             metering::load_profile::SlpDayType::Werktag => DayType::Workday,
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_hours_tests {
+    use super::{SLOT, SLOT_HOURS, SLOTS_PER_DAY};
+
+    /// The reason the constant is derived rather than written: it has to be
+    /// `SLOT` and nothing else, at whatever `SLOT` is.
+    #[test]
+    fn the_hours_in_a_slot_are_the_slots_own() {
+        assert!((SLOT_HOURS - SLOT.as_seconds_f64() / 3600.0).abs() < f64::EPSILON);
+        assert!((SLOT_HOURS * SLOTS_PER_DAY as f64 - 24.0).abs() < 1e-12);
     }
 }

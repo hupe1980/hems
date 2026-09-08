@@ -83,7 +83,7 @@ pub mod prelude {
         Authority, Command, FallbackCause, GuardRule, RealtimeCause, Reason, Setpoint, UserOverride,
     };
     pub use crate::site::{GeoPoint, GridConnection, Site};
-    pub use crate::slot::{DayType, Horizon, SLOT, SLOTS_PER_DAY, Slot};
+    pub use crate::slot::{DayType, Horizon, SLOT, SLOT_HOURS, SLOTS_PER_DAY, Slot};
     pub use crate::thermal::{
         BuildingClass, CompressorState, CopCurve, Rc2, Rc2Discrete, ThermalState,
     };
