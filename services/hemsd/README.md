@@ -15,8 +15,10 @@ way a hand-written column list once lost two. It also takes an exclusive lock on
 its file, so a second `hemsd` against the same store is refused rather than
 becoming a second writer on one household's record. **`chronix`** holds the
 one-second measurement series — every reading the guard acts on, kept seven days
-and served at `/v1/series/{point}`. The registers stay out of it: a series field
-is a `double` and a settlement quantity is an exact decimal.
+and served at `/v1/series/{point}`. The registers stay out of it for a
+transactional reason rather than a typing one: a register and the outbox marker
+saying the fleet still owes it are written in **one** `redb` transaction, and two
+stores have no shared one.
 
 ```mermaid
 flowchart TB

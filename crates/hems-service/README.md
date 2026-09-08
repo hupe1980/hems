@@ -4,9 +4,9 @@ The shell every [hems](https://github.com/hupe1980/hems) daemon shares:
 configuration from a file and the environment, structured logging, a health and
 readiness surface, and a shutdown that finishes what it started.
 
-Six daemons is six copies of the same forty lines — and written six times, those
-forty lines diverge in the direction that costs most, because the one that is
-wrong is the one whose readiness probe lies.
+Seven daemons is seven copies of the same forty lines — and written seven times,
+those forty lines diverge in the direction that costs most, because the one that
+is wrong is the one whose readiness probe lies.
 
 ## What it is not
 
@@ -18,9 +18,16 @@ domain-free modules is cheaper than maintaining a diff guard against a fork that
 is *supposed* to diverge.
 
 So this is small on purpose. It owns configuration, logging, the health surface
-and `GET /metrics`,
-the shutdown and — behind the `postgres` feature — the fleet's **database pool**,
-and it owns nothing about energy.
+and `GET /metrics`, the shutdown, the `/mcp` mount every fleet daemon shares, the
+one **outbound HTTP client** they all build through, and — behind the `postgres`
+feature — the fleet's **database pool**. It owns nothing about energy.
+
+The outbound client is here for the same reason the readiness probe is. A daemon
+that reaches out has to decide who it trusts and whether the link is
+confidential, and seven call sites deciding that separately is six chances to
+decide it differently — so `TlsRoots` is one setting an operator writes down, and
+plain `http` to anything but a loopback address is refused at start-up rather
+than at whichever call site remembered to look (D85, D171).
 
 The database was outside that list until three daemons had one. What is here is
 not a schema — that belongs to whichever daemon's tables it describes — it is

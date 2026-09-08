@@ -124,13 +124,16 @@ async fn both_halves_of_the_record_reach_the_fleet_and_leave_the_backlog() {
         "owed before the drain"
     );
 
-    let outbox = Outbox::new(&HistdSettings {
-        url: Some(address),
-        site: Some("haus-1".to_owned()),
-        token: Some(Secret::literal("tok")),
-        every_s: 300,
-        batch: 50,
-    })
+    let outbox = Outbox::new(
+        &HistdSettings {
+            url: Some(address),
+            site: Some("haus-1".to_owned()),
+            token: Some(Secret::literal("tok")),
+            every_s: 300,
+            batch: 50,
+        },
+        &hems_service::HttpSettings::default(),
+    )
     .expect("a client")
     .expect("a configured fleet");
 
@@ -169,14 +172,17 @@ async fn a_fleet_that_refuses_the_registers_keeps_them_owed() {
     let day: Vec<Recorded> = (0..4).map(register).collect();
     store.put_quarter_hours(&day, NOW).expect("its registers");
 
-    let outbox = Outbox::new(&HistdSettings {
-        // A port nothing is listening on.
-        url: Some("http://127.0.0.1:1".to_owned()),
-        site: Some("haus-1".to_owned()),
-        token: Some(Secret::literal("tok")),
-        every_s: 300,
-        batch: 50,
-    })
+    let outbox = Outbox::new(
+        &HistdSettings {
+            // A port nothing is listening on.
+            url: Some("http://127.0.0.1:1".to_owned()),
+            site: Some("haus-1".to_owned()),
+            token: Some(Secret::literal("tok")),
+            every_s: 300,
+            batch: 50,
+        },
+        &hems_service::HttpSettings::default(),
+    )
     .expect("a client")
     .expect("a configured fleet");
 

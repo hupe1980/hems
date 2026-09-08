@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
     let poller = Poller::new(
         Http::new(
             settings.endpoint.clone(),
+            &settings.service.http,
             std::time::Duration::from_secs(settings.request_timeout_s),
         )?,
         settings.locations.clone(),

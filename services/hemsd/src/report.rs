@@ -79,14 +79,15 @@ impl DeliveryError {
 /// connection, a timeout, a certificate the box does not trust.
 pub async fn post_event(
     endpoint: &str,
+    http: &hems_service::HttpSettings,
     body: Vec<u8>,
     headers: &[(&'static str, String)],
 ) -> anyhow::Result<u16> {
-    let mut request = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(concat!("hemsd/", env!("CARGO_PKG_VERSION")))
-        .build()?
+    // The shared builder, so this one-shot send trusts exactly what the box's
+    // long-lived clients trust. A command-line report that verified against a
+    // different root store from the daemon's would be the worst kind of
+    // difference: one that only shows up in the field.
+    let mut request = hems_service::http::client(hems_service::identity!(), http)?
         .post(endpoint)
         // CloudEvents structured mode: the whole event is the body, so the media
         // type is the event's rather than the payload's.
@@ -99,32 +100,12 @@ pub async fn post_event(
 
 /// Whether an endpoint keeps a household's day confidential in transit.
 ///
-/// `https` anywhere, plain `http` only to a loopback address. Anything else is
-/// refused rather than warned about: a warning on a box nobody is watching is a
-/// warning nobody reads.
-///
-/// # Errors
-/// When `endpoint` is not a URL, or would send the day across a network in the
-/// clear.
-pub fn is_confidential(endpoint: &str) -> anyhow::Result<()> {
-    let url: reqwest::Url = endpoint.parse()?;
-    if url.scheme() == "https" {
-        return Ok(());
-    }
-    let loopback = url.host_str().is_some_and(|host| {
-        host == "localhost"
-            || host
-                .trim_matches(['[', ']'])
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
-    anyhow::ensure!(
-        loopback,
-        "{endpoint} would send this household's day across a network in the clear; \
-         use https, or report to a loopback address"
-    );
-    Ok(())
-}
+/// [`hems_service::http::confidential`], re-exported so the box's own call sites
+/// read the same as everybody else's. The rule — `https` anywhere, plain `http`
+/// only to a loopback address, refused rather than warned about (D85) — moved to
+/// the shared shell when it turned out that of the seven places this workspace
+/// builds an outbound client, exactly **one** was checking it.
+pub use hems_service::http::confidential as is_confidential;
 
 /// Sign `body` and `POST` it, once, classifying whatever comes back.
 ///

@@ -1,11 +1,11 @@
 //! The shell every hems daemon shares.
 //!
-//! Six daemons is six copies of the same forty lines: read a configuration file,
-//! let the environment override it, start structured logging, bind a socket,
-//! answer a health probe, and stop when the orchestrator says so. Written six
-//! times, those forty lines diverge — and they diverge in the direction that
-//! costs most, because the one that is wrong is the one whose readiness probe
-//! lies.
+//! Seven daemons is seven copies of the same forty lines: read a configuration
+//! file, let the environment override it, start structured logging, bind a
+//! socket, answer a health probe, and stop when the orchestrator says so.
+//! Written seven times, those forty lines diverge — and they diverge in the
+//! direction that costs most, because the one that is wrong is the one whose
+//! readiness probe lies.
 //!
 //! # What it deliberately is not
 //!
@@ -52,6 +52,7 @@ pub mod config;
 #[cfg(feature = "postgres")]
 pub mod db;
 pub mod health;
+pub mod http;
 pub mod mcp;
 pub mod metrics;
 pub mod serve;
@@ -66,6 +67,7 @@ pub use config::{ConfigError, Secret, Settings, load, load_from};
 #[cfg(feature = "postgres")]
 pub use db::{Db, DbError, DbSettings, Migration};
 pub use health::{Health, Probe, Readiness};
+pub use http::{HttpError, HttpSettings, TlsRoots};
 pub use mcp::{McpAuth, McpSettings};
 pub use serve::{Server, ServerError};
 pub use shutdown::Shutdown;

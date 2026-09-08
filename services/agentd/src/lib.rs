@@ -41,9 +41,12 @@
 //! | Module | Purpose |
 //! |---|---|
 //! | [`advice`] | what a specialist may say, and the reason it cannot say anything else |
-//! | [`config`] | the journal's path, and which tenant the specialists read |
+//! | [`api`] | the one route an operator reads, and why there is no second one |
+//! | [`config`] | the journal, the fleet it reads, and how often |
+//! | [`mcp_server`] | the same queue, for an agent rather than a person |
+//! | [`review`] | the cadence, and what each specialist is run to answer |
 //! | [`skills`] | the specialists, whose work is computation |
-//! | [`subscriptions`] | which `CloudEvent` type reaches which specialist |
+//! | [`upstream`] | where the days come from, and why it is `obsd`'s API rather than its database |
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs, clippy::pedantic)]
@@ -53,13 +56,18 @@ use std::sync::Arc;
 use agentplane::prelude::*;
 
 pub mod advice;
+pub mod api;
 pub mod config;
+pub mod mcp_server;
+pub mod review;
 pub mod skills;
-pub mod subscriptions;
+pub mod upstream;
 
 pub use advice::{Advice, AtRisk, Proposal, advisory};
+pub use api::{Advisory, router};
 pub use config::Settings;
-pub use subscriptions::{Subscription, specialists_for};
+pub use review::{Queue, Reviewed, SPECIALISTS, Specialist, review_loop, review_once};
+pub use upstream::{Obsd, Upstream, UpstreamError, Window};
 
 /// Every specialist this daemon registers, by name.
 ///
@@ -87,56 +95,14 @@ pub fn runtime(store: Arc<dyn JournalStore>) -> Arc<Runtime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hems_core::report::DayKpis;
     use serde_json::json;
 
     #[tokio::test]
-    async fn a_specialist_runs_and_the_run_replays_to_the_same_answer() {
-        // The property that makes the journal worth having even for a pure
-        // function: the replay re-executes the logic and reads every effect
-        // back, so "why did the queue say that" is answered rather than argued.
-        let store: Arc<dyn JournalStore> =
-            Arc::new(RedbStore::open_in_memory().expect("an in-memory journal"));
-        let runtime = runtime(Arc::clone(&store));
-
-        let days: Vec<DayKpis> = (0..4)
-            .map(|i| DayKpis {
-                site: format!("haus-{i}"),
-                date: time::macros::date!(2026 - 01 - 15),
-                respected_the_grid: false,
-                minutes_without_a_plan: 90,
-                ..DayKpis::default()
-            })
-            .collect();
-
-        let outcome = runtime
-            .run(
-                skills::compliance::NAME,
-                Tainted::trusted(json!({ "days": days })),
-            )
-            .await
-            .expect("the run completed");
-        let run_id = outcome.run_id;
-        let output = outcome.output.clone();
-
-        let answer = outcome.success().expect("an answer");
-        let proposal: Proposal = serde_json::from_value(answer.peek().clone()).expect("a proposal");
-        assert_eq!(proposal.considered, 4);
-        assert_eq!(proposal.advice.len(), 1);
-        assert!(proposal.advice[0].headline.contains("4 of 4"));
-
-        let replayed = runtime
-            .replay(run_id, Mode::Strict)
-            .await
-            .expect("the replay completed");
-        assert_eq!(replayed.output, output, "the same answer, re-derived");
-    }
-
-    #[tokio::test]
     async fn an_unreadable_input_fails_the_run_rather_than_the_daemon() {
-        // A specialist reads whatever an event carried, and an event this build
-        // cannot parse is a bad day rather than a crash: the queue loses one
-        // finding, and the box it is about is unaffected either way.
+        // A specialist reads whatever the review handed it, and a document this
+        // build cannot parse is a bad day rather than a crash: the queue keeps
+        // whatever it said last, and the households it is about are unaffected
+        // either way.
         let store: Arc<dyn JournalStore> =
             Arc::new(RedbStore::open_in_memory().expect("an in-memory journal"));
         let outcome = runtime(store)
@@ -173,17 +139,5 @@ mod tests {
         )
         .expect("a tenant and its households");
         assert_eq!(shared.tenants["stadtwerke-nord"].len(), 2);
-    }
-
-    #[test]
-    fn every_registered_specialist_is_subscribed_to_something() {
-        // The mirror of the subscription table's own test. A specialist nothing
-        // wakes is a specialist that never runs.
-        for name in registered_specialists() {
-            assert!(
-                subscriptions::TABLE.iter().any(|s| s.specialist == name),
-                "{name} is registered and nothing wakes it"
-            );
-        }
     }
 }

@@ -337,7 +337,17 @@ impl Lpc {
         // where the heartbeat this box owes goes out and where a missed one
         // becomes the failsafe of `[LPC-911]`.
         self.engine.handle_timeout(elapsed);
-        let _ = self.actor.handle_timeout(&mut self.engine, elapsed);
+        // The actor's `CsEvent` goes to the **same** watcher the datagram path
+        // uses, rather than being discarded. Today `handle_timeout` can only
+        // return `StateChanged`, which `drain` reads back out of the state
+        // machine below — so discarding it would be correct *right now* and
+        // would stop being correct the moment `eebus` returns anything else
+        // here. One event, one watcher, is what makes that a non-question:
+        // `watch_failsafe` ignores what it does not recognise, and a new variant
+        // arriving on this path reaches the code that already knows what to do
+        // with the equivalent one from a write.
+        let decided = self.actor.handle_timeout(&mut self.engine, elapsed);
+        self.watch_failsafe(decided.as_ref(), elapsed);
         self.consume_engine_events(elapsed);
         self.drain(now);
     }

@@ -579,13 +579,16 @@ async fn what_the_fleet_acknowledges_leaves_the_backlog_and_nothing_else_does() 
     assert_eq!(store.backlog().expect("a backlog").events, 4);
 
     let store = Arc::new(Mutex::new(store));
-    let outbox = hemsd::runtime::outbox::Outbox::new(&hemsd::runtime::outbox::HistdSettings {
-        url: Some(url),
-        site: Some("reference-household".into()),
-        token: Some(hems_service::Secret::literal("tok-test")),
-        every_s: 300,
-        batch: 50,
-    })
+    let outbox = hemsd::runtime::outbox::Outbox::new(
+        &hemsd::runtime::outbox::HistdSettings {
+            url: Some(url),
+            site: Some("reference-household".into()),
+            token: Some(hems_service::Secret::literal("tok-test")),
+            every_s: 300,
+            batch: 50,
+        },
+        &hems_service::HttpSettings::default(),
+    )
     .expect("a client")
     .expect("a configured histd");
 

@@ -117,7 +117,10 @@ impl Reporter {
     /// # Errors
     /// Where the secret cannot be resolved, or where a URL would send a
     /// household's day across a network in the clear.
-    pub fn new(settings: &ObsdSettings) -> anyhow::Result<Option<Self>> {
+    pub fn new(
+        settings: &ObsdSettings,
+        http: &hems_service::HttpSettings,
+    ) -> anyhow::Result<Option<Self>> {
         let Some(url) = &settings.url else {
             return Ok(None);
         };
@@ -130,11 +133,7 @@ impl Reporter {
         // finding out on the thirtieth night.
         crate::report::is_confidential(&endpoint)?;
         Ok(Some(Self {
-            client: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(30))
-                .user_agent(concat!("hemsd/", env!("CARGO_PKG_VERSION")))
-                .build()?,
+            client: hems_service::http::client(hems_service::identity!(), http)?,
             endpoint,
             secret: secret.resolve_from_process()?.into_bytes(),
         }))
@@ -218,10 +217,15 @@ impl Outbox {
     /// A client for a configured `histd`, or `None` where there is none.
     ///
     /// # Errors
-    /// Where the credential cannot be resolved. Coming up and sending the
-    /// literal string `env:HEMS_HISTD_TOKEN` as a bearer token would look
-    /// exactly like a fleet that had started rejecting this box.
-    pub fn new(settings: &HistdSettings) -> anyhow::Result<Option<Self>> {
+    /// Where the credential cannot be resolved, or where the URL would carry
+    /// this box's § 14a evidence — and the bearer token that writes it — across
+    /// a network in the clear. That check was **missing** here while its
+    /// neighbour twenty lines up had it: the same defect, on the endpoint that
+    /// carries the record a network operator asks about (D85).
+    pub fn new(
+        settings: &HistdSettings,
+        http: &hems_service::HttpSettings,
+    ) -> anyhow::Result<Option<Self>> {
         let (Some(url), Some(site)) = (&settings.url, &settings.site) else {
             return Ok(None);
         };
@@ -231,10 +235,9 @@ impl Outbox {
                 anyhow::bail!("a `histd` is configured with no token, and it will refuse every row")
             }
         };
+        crate::report::is_confidential(url)?;
         Ok(Some(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
+            client: hems_service::http::client(hems_service::identity!(), http)?,
             url: url.trim_end_matches('/').to_string(),
             site: site.clone(),
             token,

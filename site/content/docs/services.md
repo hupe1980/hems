@@ -475,8 +475,9 @@ nothing about the sender, which for this endpoint means any box could write a
 ## Every one of them answers an agent too
 
 Each fleet service mounts a read-only Model Context Protocol surface on the port
-it already binds, and `agentd` is the advisory plane that reads them. Both are on
-their own page — see [Agents](@/docs/agents.md).
+it already binds, and `agentd` is the advisory plane that reads `obsd`'s summary
+and correlates across its findings. Both are on their own page — see
+[Agents](@/docs/agents.md).
 
 ## A store beats a passthrough
 

@@ -303,7 +303,7 @@ the index records the retrieval URL of each.
 
 | Crate | What it is | I/O |
 |---|---|---|
-| [`hems-core`](crates/hems-core) | Domain model: one sign convention, the quarter-hour grid, assets, circuits, setpoints that must name a reason, the building as an exactly discretised RC model, the hot-water tank as a store, an appliance's programme as the shape it draws | none |
+| [`hems-core`](crates/hems-core) | Domain model: one sign convention, the quarter-hour grid, assets, circuits, setpoints that must name a reason, the building as an exactly discretised RC model, the hot-water tank as a store, an appliance's programme as the shape it draws — and the types the edge and the fleet exchange, so a renamed field is a compile error rather than a dashboard reading zero | none |
 | [`hems-grid`](crates/hems-grid) | § 14a EnWG, the EEBUS LPC/LPP state machine, § 9 EEG, Modul 3, MiSpeL flow bookkeeping, § 42c sharing, the two-year evidence record — all cited, and the ones `metering` owns are called rather than copied | none |
 | [`hems-tariff`](crates/hems-tariff) | The price stack; parsers for what ENTSO-E, SMARD, aWATTar, Tibber and Energy-Charts publish; an advisor that compares Modul 1/2/3 against a household's own history | none |
 | [`hems-forecast`](crates/hems-forecast) | Solar geometry and a physical photovoltaic model, an online residual corrector that learns what *this* roof delivers, load profiles by day type, charging-session statistics by weekday, RC identification of the building from its own record, naive fallbacks, and the metrics that score all of it | none |
@@ -314,7 +314,7 @@ the index records the retrieval URL of each.
 | [`hems-flex`](crates/hems-flex) | The household's flexibility in S2 (EN 50491-12-2): which control type each asset is, every description a whole site would send — the same wallbox is a store with a car on it and an envelope without one — what an instruction means, and the sans-I/O **Resource Manager session** that has the conversation | none |
 | [`hems-sim`](crates/hems-sim) | Battery, charge point, inverter, building, hot-water tank, a dishwasher that will not be paused, and Steuerbox simulators on virtual time — each with at least one way of saying no — and a seeded weather realisation, so the day that happens is not the day that was forecast | none |
 | [`hems-events`](crates/hems-events) | The CloudEvents catalogue, enforced by a workspace guard | none |
-| [`hems-service`](crates/hems-service) | The shell every daemon shares: configuration from a file then the environment, a **`Secret`** whose configured value may be an `env:` or `file:` reference rather than the credential itself, **live and ready as separate questions**, a bounded shutdown, and Ed25519 verification of a release *and of the box's own configuration* — whose trust anchor is a key the box was built with, not the server that offered it | tokio, axum |
+| [`hems-service`](crates/hems-service) | The shell every daemon shares: configuration from a file then the environment, a **`Secret`** whose configured value may be an `env:` or `file:` reference rather than the credential itself, **live and ready as separate questions**, a bounded shutdown, Ed25519 verification of a release *and of the box's own configuration* — whose trust anchor is a key the box was built with, not the server that offered it — and the one outbound HTTP client every daemon builds through | tokio, axum, reqwest |
 
 ## 🛰️ Daemons
 
@@ -341,10 +341,10 @@ this is reachable.
 | [`forecastd`](services/forecastd) | ICON-D2 through Open-Meteo at quarter-hour resolution. Serves the **sky**, never a finished forecast — the correction for *this* roof is the box's, because it is a property of one roof | ✅ |
 | [`histd`](services/histd) | The fleet's record, in PostgreSQL: the two years of § 14a evidence `[A1 7.3]`, the quarter-hour registers a settlement is computed from as exact `NUMERIC` and **versioned** — a restated register supersedes its predecessor without erasing it, so `?as_of=` reproduces a Nachweis already handed over — and both exports, the operator's Nachweis and the household's Data Act Article 4 document, each authorised per site, because Article 4 is a right of the *user* and a fleet token is not a household | ✅ |
 | [`fleetd`](services/fleetd) | Single-use enrolment, and **signed** configuration and releases it holds signatures for and never a key — so a `fleetd` an attacker owns can serve neither a configuration nor an update any box will accept | ✅ |
-| [`agentd`](services/agentd) | The advisory plane, on [agentplane](https://github.com/hupe1980/agentplane): specialists that correlate across many exact answers — whether one cause accounts for most of a week's § 14a breaches, what the dashboard's saving figure actually rests on. It **proposes**, and cannot act: `Advice` is a leaf type nothing consumes, and an agent's authority is derived by `attenuate`, which refuses to widen | ✅ |
+| [`agentd`](services/agentd) | The advisory plane, on [agentplane](https://github.com/hupe1980/agentplane): specialists that correlate across `obsd`'s exact answers — whether one cause accounts for most of a week's § 14a breaches, whether a roof over its § 9 EEG ceiling is misconfigured or unlucky, what the dashboard's saving figure actually rests on. It **proposes**, and cannot act: `Advice` is a leaf type nothing consumes, no route writes, and an agent's authority is derived by `attenuate`, which refuses to widen | ✅ |
 | [`obsd`](services/obsd) | The fleet view: averages what is an average, and **counts** what is a count — every § 14a breach as a named finding, never as a percentage. A day reaches it over TLS and only as a **signed** CloudEvent, because a list of who broke a grid rule that anybody can write to is not evidence | ✅ |
 
-Each of the five mounts a **read-only** MCP server at `/mcp` on the port it
+Each of the six mounts a **read-only** MCP server at `/mcp` on the port it
 already binds, over the state its REST routes already read — an agent gets the
 same numbers and gets told what they mean: that an absent price slot is not free
 electricity, that a § 14a breach is a list with a site and a date rather than a
@@ -412,17 +412,17 @@ obeys that as an instruction not to use it.
 | **`/livez`, `/readyz` and `/metrics` on every daemon** | live and ready are different questions and an orchestrator does opposite things with the answers; `/metrics` is the third, because a pool-backed service fails by saturating its pool and a saturated pool serves `503`s while both probes stay green. The request label is the **matched route**, never the path — a hems site is called `reference-household`, so a path label would put every household into an endpoint that is scraped and kept for months |
 | **A read-only agent surface on every fleet daemon** | mounted on the port it already binds, over the state its REST routes already read, so the two cannot disagree — and each call is authorised as *its own caller* against the same credentials, so a household's token reads its own site over MCP exactly as it would over REST |
 | **Capabilities that narrow under delegation, and a tenant on every credential** | dotted patterns rather than roles, so an agent can hold strictly less than whoever it acts for; an operator scoped to a tenant cannot read another tenant's breach list, and an aggregate is computed *within* the caller's scope rather than filtered afterwards |
-| **`agentd`** — two specialists on a replayable journal | whether one cause accounts for most of a week's § 14a breaches, and what the saving on a dashboard actually rests on. Advisory by construction: `Advice` is a leaf type nothing consumes, and its authority is derived by attenuation, which refuses to widen |
+| **`agentd`** — two specialists on a replayable journal, and the cadence that runs them | every six hours it reads one `Summary` from `obsd` and hands the **same** one to each specialist, so two findings read together are about one set of days. Whether one cause accounts for most of a week's § 14a breaches, whether a roof over its § 9 EEG ceiling is misconfigured or unlucky, what the saving on a dashboard rests on. Served at `GET /v1/advice` and `/mcp`. Advisory by construction: `Advice` is a leaf type nothing consumes, no route writes, and the authority is derived by attenuation, which refuses to widen |
+| **One outbound client, built in one place** | where a daemon's TLS trust anchors come from is configuration — the platform store for one calling the open web, a pinned bundle for a box that talks only to its own fleet — and plain `http` to anything but a loopback address is refused at start-up on every configured endpoint, rather than checked at whichever call site remembered |
 
 | Not yet | |
 |---|---|
-| A transport that carries an event to `agentd` | the subscription table says which event type wakes which specialist and a test proves every pattern matches something the workspace emits; the hop from `obsd`'s collector is what is missing |
 | EEBUS certification | the **device-level** half is done — all seven `ATC_*` procedures driven against the box's own store, driver and SPINE session, judged by `eebus`'s harness, six answered and the seventh skipped with its reason on the report. What is left is the protocol-level suite over a real network, interop against another implementation, and the laboratory's own stopwatch on a physical box. mDNS/DNS-SD and a pairing flow a person can drive are done |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-1 072 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 095 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
 clock, the whole suite, the workspace guards (468 citations across five document
 families, each resolving to a document the index carries; 126 quantities,
@@ -471,8 +471,12 @@ The box also keeps a **`chronix`** store beside the `redb` one for its own
 one-second series — every meter reading the guard acts on, kept seven days and
 served at `/v1/series/{point}`. `meterstore` — PostgreSQL for the recent window,
 Apache Iceberg for history — is the fleet's equivalent and is not a dependency
-yet. Neither takes the registers, and the reason is the same in both cases: a
-settlement quantity is an exact decimal, and a time-series field is a `double`.
+yet.
+
+Neither takes the **settlement registers**, and the reason is a transaction
+rather than a type. A register and the outbox marker saying the fleet still owes
+it are written together; two stores have no shared transaction, so splitting them
+would make "forwarded but never stored" something a power cut can produce.
 
 ## 📄 Licence
 

@@ -762,8 +762,8 @@ pub async fn run(
     // The record's last leg. The box has already kept its own copy, so this is
     // the fleet's convenience rather than the household's safety — which is why
     // a failure here is a retry and never a reason to stop controlling a house.
-    let to_histd = outbox::Outbox::new(&settings.histd)?;
-    let to_obsd = outbox::Reporter::new(&settings.obsd)?;
+    let to_histd = outbox::Outbox::new(&settings.histd, &settings.service.http)?;
+    let to_obsd = outbox::Reporter::new(&settings.obsd, &settings.service.http)?;
     match store.clone() {
         Some(store) if to_histd.is_some() || to_obsd.is_some() => {
             tokio::spawn(outbox::run(
@@ -1063,7 +1063,7 @@ async fn start_planner(
         None => planner::Learned::new(settings.site.bundesland, building),
     }));
 
-    let fleet = fleet::Fleet::new(&settings.fleet)?;
+    let fleet = fleet::Fleet::new(&settings.fleet, &settings.service.http)?;
     if !fleet.has_weather() {
         // Loud, because this is the seam the box is most likely to be quietly
         // broken at: a household that is being kept safe and is not being kept

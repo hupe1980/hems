@@ -31,6 +31,11 @@ rustls                 = { workspace = true, optional = true }
 webpki-roots           = { workspace = true, optional = true }
 
 anyhow             = { workspace = true }
+# **The one place an outbound client is built** (`http`). Every daemon that
+# reaches out goes through it, so the trust anchors and the "no plaintext across
+# a network" rule are decided once rather than at seven call sites.
+reqwest            = { workspace = true }
+url                = "2"
 ed25519-dalek      = { workspace = true }
 hex                = { workspace = true }
 http               = { workspace = true }

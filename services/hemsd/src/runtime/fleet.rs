@@ -199,19 +199,29 @@ impl Fleet {
     /// A client for whatever is configured. Both halves are optional.
     ///
     /// # Errors
-    /// Where the HTTP client itself cannot be built, which is a TLS backend
-    /// problem rather than a configuration one.
-    pub fn new(settings: &crate::config::FleetSettings) -> anyhow::Result<Self> {
+    /// Where the HTTP client cannot be built, and where either URL would carry
+    /// this box's questions across a network in the clear (D85).
+    pub fn new(
+        settings: &crate::config::FleetSettings,
+        http: &hems_service::HttpSettings,
+    ) -> anyhow::Result<Self> {
+        for url in [&settings.tariffd_url, &settings.forecastd_url]
+            .into_iter()
+            .flatten()
+        {
+            crate::report::is_confidential(url)?;
+        }
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(
-                    settings.request_timeout_s.max(1),
-                ))
-                // A box on a household connection, asking two questions every
-                // five minutes. Keeping the connection open costs one socket and
-                // saves a TLS handshake on a link that is often slow.
-                .pool_max_idle_per_host(2)
-                .build()?,
+            // The box's own timeout for these two questions, over the shell's
+            // trust decision. `pool_max_idle_per_host` is the shell's too — a
+            // box asking `tariffd` and `forecastd` something every five minutes
+            // keeps one socket each and saves a TLS handshake on a slow link.
+            client: hems_service::http::client(
+                hems_service::identity!(),
+                &http
+                    .clone()
+                    .with_timeout_s(settings.request_timeout_s.max(1)),
+            )?,
             tariffd: settings.tariffd_url.clone(),
             forecastd: settings.forecastd_url.clone(),
             location: settings.location.clone(),
@@ -440,7 +450,11 @@ mod tests {
         // The offline case, and it has to be a `None` rather than an error: a
         // household on a fixed tariff has no day-ahead curve to ask for, and a
         // box with no WAN still keeps the house safe and lawful.
-        let fleet = Fleet::new(&crate::config::FleetSettings::default()).expect("a client");
+        let fleet = Fleet::new(
+            &crate::config::FleetSettings::default(),
+            &hems_service::HttpSettings::default(),
+        )
+        .expect("a client");
         assert!(!fleet.is_configured());
         assert!(!fleet.has_prices());
         assert!(!fleet.has_weather());

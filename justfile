@@ -223,12 +223,16 @@ msrv:
 agent-demo:
     #!/usr/bin/env bash
     set -euo pipefail
-    cargo test -q -p agentd 2>&1 | tail -3
-    @echo
-    @echo "  The specialists are pure functions; the journal is why they run on a"
-    @echo "  runtime. A replay re-executes the logic and reads every effect back,"
-    @echo "  so \"why did the queue say that in March\" is a replay rather than an"
-    @echo "  argument — and nothing an agent says moves a watt."
+    # The end-to-end test, printing. A window of a fleet's days goes in, every
+    # specialist runs on the *same* window, and what comes out is the queue an
+    # operator reads over `GET /v1/advice` — followed by the replay of one
+    # finding, which is the whole reason pure functions run on a runtime.
+    cargo test -q -p agentd --test review -- --nocapture 2>&1 \
+        | sed -n '/The advisory queue/,/re-derived/p'
+    echo
+    echo "  Nothing an agent says moves a watt: Advice is a leaf type nothing"
+    echo "  consumes, the authority is derived by attenuation and cannot widen,"
+    echo "  and the plane has no route that writes."
 
 # 🛰️ One box reporting a day into the fleet view
 fleet-demo day="winter":

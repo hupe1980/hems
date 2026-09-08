@@ -143,10 +143,30 @@ impl Proposal {
         })
     }
 
-    /// Name at most [`Self::EVIDENCE_SHOWN`] of `sites`.
+    /// The evidence for a finding about `sites`, and how many households it
+    /// stands for.
+    ///
+    /// **Distinct, and counted from the same list.** [`Advice::evidence`] and
+    /// [`Advice::covers`] describe one set, so deriving them from two different
+    /// quantities is how a queue comes to say *2 households at stake across 4*
+    /// with one household named twice. `obsd` lists a finding per **day**, so
+    /// the caller's list repeats a household that breached on three of them.
+    ///
+    /// One place rather than three call sites, and order is first-seen — the
+    /// order the days were read, which is the one somebody looking for the
+    /// earliest wants.
     #[must_use]
-    pub fn some_of(sites: &[String]) -> Vec<String> {
-        sites.iter().take(Self::EVIDENCE_SHOWN).cloned().collect()
+    pub fn evidence_for(sites: &[String]) -> (Vec<String>, usize) {
+        let mut seen = std::collections::BTreeSet::new();
+        let distinct: Vec<&String> = sites.iter().filter(|s| seen.insert(*s)).collect();
+        (
+            distinct
+                .iter()
+                .take(Self::EVIDENCE_SHOWN)
+                .map(|s| (*s).clone())
+                .collect(),
+            distinct.len(),
+        )
     }
 }
 
@@ -280,6 +300,36 @@ mod tests {
             order,
             vec!["two households", "many minutes", "few minutes", "many days"],
             "§ 14a first, then minutes largest-first, then days"
+        );
+    }
+
+    #[test]
+    fn the_evidence_and_the_count_describe_one_set_of_households() {
+        // The defect this replaced: the list was one entry per *day*, so a
+        // household that breached three times was named three times and counted
+        // three times, against an `at_risk` that counted households once. A
+        // queue saying "2 households at stake across 4" is a queue whose two
+        // numbers are about different things.
+        let sites = vec![
+            "haus-1".to_owned(),
+            "haus-1".to_owned(),
+            "haus-2".to_owned(),
+            "haus-1".to_owned(),
+        ];
+        let (evidence, covers) = Proposal::evidence_for(&sites);
+        assert_eq!(evidence, vec!["haus-1", "haus-2"], "each named once");
+        assert_eq!(covers, 2, "and counted once");
+    }
+
+    #[test]
+    fn the_evidence_is_cut_and_the_count_still_says_how_many_there_were() {
+        let sites: Vec<String> = (0..40).map(|i| format!("haus-{i}")).collect();
+        let (evidence, covers) = Proposal::evidence_for(&sites);
+        assert_eq!(evidence.len(), Proposal::EVIDENCE_SHOWN);
+        assert_eq!(covers, 40);
+        assert_eq!(
+            evidence[0], "haus-0",
+            "first seen first, so the earliest day is the one named"
         );
     }
 

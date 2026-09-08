@@ -235,7 +235,28 @@ have no answer.
 
 TLS is the other half and it is a different guarantee: the signature says the
 report is the one this box sent and has not been edited; TLS says nobody read it
-on the way. Plain `http` is allowed only to a loopback address.
+on the way.
+
+**Plain `http` only to a loopback address**, refused at start-up rather than
+warned about, on every outbound endpoint a daemon is configured with — a warning
+on a box nobody is watching is a warning nobody reads. It is one check in the
+shell every daemon shares, not seven checks each call site has to remember.
+
+### Where the trust anchors come from
+
+`reqwest` on `rustls`/`aws-lc-rs`, and the anchors are configuration rather than
+a default nobody looked at:
+
+| `[service.http] tls_roots` | For | The trade |
+|---|---|---|
+| `platform` | a daemon calling the **open web** — `tariffd` reaching ENTSO-E, `forecastd` reaching Open-Meteo | the public root store is the question being asked, and it updates with the operating system rather than with the firmware. The image has to carry one |
+| `pinned` | a box that talks only to **its own fleet** | a bundle and nothing else. "Any of a hundred and fifty public CAs may vouch for `obsd`" is weaker than anybody means by it, and it removes the packaging question a gateway with a decades-long service life would otherwise carry |
+
+`pinned` *replaces* the platform roots rather than adding to them — the
+distinction that decides whether pinning is a control or a decoration. A bundle
+that is missing, or that parses to no certificate, stops the daemon: an empty
+root store refuses every endpoint, and from the far end that looks exactly like
+the service being down.
 
 Because the timestamp is signed, a queued report cannot carry a signature made
 when it was queued — a receiver refuses one outside five minutes, which is what

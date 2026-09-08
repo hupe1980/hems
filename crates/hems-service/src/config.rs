@@ -100,6 +100,20 @@ pub struct Settings {
     /// the process is killed mid-request anyway; shorter and it hangs up on
     /// somebody for no reason.
     pub shutdown_grace_s: u64,
+    /// How this daemon's **outbound** calls are made — timeouts, and where the
+    /// TLS trust anchors come from.
+    ///
+    /// In the shared table rather than in each daemon's own, for D160's reason:
+    /// an operator who has written it for one has written it for all of them.
+    /// It is inert for a daemon that never reaches out, and there are two of
+    /// those.
+    ///
+    /// The trust decision is the half worth configuring. See
+    /// [`crate::http::TlsRoots`]: the platform's own store is right for a daemon
+    /// calling the open web and requires the image to carry one; a pinned bundle
+    /// is right for a box that talks only to its own fleet.
+    #[serde(default)]
+    pub http: crate::http::HttpSettings,
 }
 
 impl Default for Settings {
@@ -112,6 +126,7 @@ impl Default for Settings {
             log_filter: "info".into(),
             log_json: false,
             shutdown_grace_s: 20,
+            http: crate::http::HttpSettings::default(),
         }
     }
 }

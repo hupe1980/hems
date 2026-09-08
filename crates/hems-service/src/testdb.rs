@@ -73,6 +73,14 @@ const PORT: u16 = 55_432;
 /// a suite that can fail on a Tuesday for a reason nobody changed.
 const IMAGE: &str = "postgres:18-alpine";
 
+/// How much `/dev/shm` the server gets.
+///
+/// Docker's default is 64 MB and PostgreSQL puts its parallel workers' shared
+/// memory there, so the default is enough for a fresh server and runs out on one
+/// that has been up for a day. 256 MB is what the official image's own
+/// documentation suggests for anything but a toy.
+const SHM_SIZE: &str = "256m";
+
 /// How long to wait for a freshly started server to accept connections.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -255,6 +263,16 @@ fn ensure_container() -> Result<(), String> {
             "-d",
             "--name",
             CONTAINER,
+            // **Docker gives a container 64 MB of `/dev/shm`, and PostgreSQL
+            // puts its parallel workers' shared memory there.** The default is
+            // enough for a fresh server and runs out on one that has been up for
+            // a day accumulating a database per fixture: the failure is
+            // `SqlState(53100)`, "could not resize shared memory segment … No
+            // space left on device", on a host with hundreds of gigabytes free —
+            // so it reads as a full disk and is not one, and it lands on
+            // whichever test happened to plan a parallel scan.
+            "--shm-size",
+            SHM_SIZE,
             "-p",
             &format!("{PORT}:5432"),
             "-e",

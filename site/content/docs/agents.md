@@ -104,11 +104,11 @@ matters here is the line it draws:
 ## `agentd` — it proposes, and it cannot act
 
 Two specialists, each answering one of those population questions. Both are pure
-computation over days the fleet already holds; neither invents a number.
+computation over what the fleet already counted; neither invents a number.
 
 | Specialist | What it notices |
 |---|---|
-| `compliance-triage` | whether most of a week's § 14a breaches were on boxes that also spent time with no plan — which points at the planner's inputs rather than at the devices that overshot. And below-minimum commands grouped **by date**, because one command reaching many households is one network operator's mistake, not many households' bad luck |
+| `compliance-triage` | whether most of a week's § 14a breaches were on boxes that also spent time with no plan, which points at the planner's inputs rather than at the devices that overshot. Below-minimum commands grouped **by date** — one command reaching many households is one network operator's mistake. Roofs over the § 9 EEG ceiling grouped **by site** — that ceiling is a fixed fraction of installed capacity and does not move, so a plant crossing it repeatedly is misconfigured rather than unlucky |
 | `saving-provenance` | that the saving rests on three modelled days while forty from real boxes are excluded; that most days on record were run with the weather known in advance; that the coverage figure is sixteen episodes short of being a calibration |
 
 **Advisory by construction, not by policy.** Two things make that a property:
@@ -134,20 +134,109 @@ append-only hash-chained log, and a replay re-executes the logic while reading
 each effect back. *"Why did the queue say that in March"* becomes a replay
 rather than an argument — and for a pure function the replay is exact.
 
+### How a review runs
+
+A **cadence**, not a subscription. Both specialists answer a question about a
+population over a window, and one box reporting one day moves such an answer by
+one row — so a per-event trigger would be ten thousand reviews a day on a fleet
+of ten thousand households, each reading the whole window to reach very nearly
+the previous answer.
+
+The window is read **once** per review and handed to every specialist. That is a
+property rather than an optimisation: two findings an operator reads together
+have to be about one set of days, or they cannot be read together at all.
+
+It reads `obsd`'s `GET /v1/fleet` — its API, not its database. The predicate
+that keeps one tenant's rows out of another tenant's answer lives in `obsd`'s
+store, and a second reader with its own `SELECT` is a second place for that rule
+to be got wrong.
+
+**The summary, not the rows.** `Summary` is bounded by *findings*: every
+compliance answer in it is a list with a site and a date, and everything else is
+a count. A fleet in good order is a handful of numbers whatever its size. The
+rows would be `keep_days × sites` documents — sixty days of ten thousand
+households is six hundred thousand — with no bound on the body at all.
+
+The correlation stays at `agentd`. `obsd` says *which* households breached and
+*which* spent time on the fallback; whether those are the same `(site, date)`
+pairs is the question neither list contains. The summary arrives labelled
+*untrusted*, because it crossed a socket, and it is the run's **input** — so the
+journal answers *"why did the queue say that in March"* by replay rather than by
+asking `obsd` what it says now.
+
+`Summary` and `Finding` live in `hems-core` beside `DayKpis`. A wire type defined
+inside the service that computes it and mirrored by hand at the far end is held
+together by two people remembering the same field names.
+
 ```toml
 # services/agentd/agentd.example.toml — the annotated starting point,
 # parsed by a test, so an example that has drifted fails the build.
-journal = "/var/lib/agentd/journal.redb"
-tenant  = "*"
+journal        = "/var/lib/agentd/journal.redb"
+tenant         = "*"
+obsd           = "http://obsd:7780"
+obsd_token     = "env:HEMS_AGENTD_OBSD_TOKEN"
+review_every_s = 21600           # six hours
 ```
 
 The journal is the **plan of record**, so a path on an ephemeral filesystem is a
 log that answers nothing. `tenant` is which operator's households the specialists
 may read: `"*"` is every household this deployment knows, which is right for a
 single tenant and is a cross-tenant read in any other — so it is written down
-rather than being what happens when a field is missing.
+rather than being what happens when a field is missing. An unset `obsd_token`
+stops the daemon: a plane whose every review is refused has an empty queue, and
+an empty queue is what a fleet in good order looks like.
+
+### Reading the queue
+
+| Surface | What it answers |
+|---|---|
+| `GET /v1/advice` | what each specialist last concluded, when, about which window, and the journal run that produced it — plus every specialist and whether it has reported at all |
+| `/mcp` → `list_advice`, `list_specialists` | the same queue for an agent, with the tool descriptions saying what a finding is *not*: a correlation over a window, never a fact about one household |
+
+Both ask for `hems.fleet.read` **by name**. A box's own token reaches its own
+household and must not reach a list of the households that failed to respect a
+network operator's reduction — and asking that as "may this caller read a site?"
+with no site is how the same question was once answered wrongly elsewhere.
+
+There is no `POST`. `Advice` is a leaf type nothing consumes, and a route that
+accepted one would be the first half of the path this daemon exists not to have.
 
 ```console
 $ just agent-demo
+
+  The advisory queue, 20 January 2026:
+
+    [compliance-triage] on 2026-01-16, 5 households were commanded below the
+    [A1 4.5] minimum (5 households at stake across 5) — one command reached
+    several households, so ask the network operator rather than the boxes —
+    hems applied it, because refusing is not a box's decision, and the minimum
+    is the customer's entitlement
+
+    [compliance-triage] 3 of 4 § 14a breaches were on boxes that also spent
+    time with no plan (4 households at stake across 4) — look at the planner's
+    inputs first — prices, the sky, the site's own history — rather than at the
+    devices that overshot
+
+    [compliance-triage] 1 roof fed in above the § 9 EEG ceiling on 3 days or
+    more (worst: 4) (1 household at stake across 1) — a § 9 Abs. 2 ceiling is a
+    fixed fraction of installed capacity and does not move, so a plant that
+    crosses it repeatedly is configured wrongly rather than unlucky
+
+    [saving-provenance] the saving rests on 2 modelled days while 181 from real
+    boxes are excluded (2 days at stake across 2) — quote it as a simulation
+    result, or say what share of the fleet it stands for
+
+  …over 183 days from 14 households, read from https://obsd.example/v1/fleet.
+
+    replayed run_01M1YP8S0AS88Y26TR2KC4W90V — the same answer, re-derived.
 ```
+
+Four findings out of a hundred and eighty-three days, on a fixture that is mostly
+in good order — the shape a queue has to have to be worth opening. Compliance
+leads because it is the one with a regulator behind it, and within a kind the
+larger count leads; the saving provenance is a different unit and is grouped
+rather than ranked against it.
+
+The last line is what makes this a runtime rather than a cron job: the finding
+was re-derived from the journal, reading the summary the original run saw.
 

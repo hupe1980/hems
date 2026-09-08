@@ -11,7 +11,6 @@ rust-version.workspace = true
 
 [dependencies]
 hems-core    = { workspace = true, features = ["serde"] }
-hems-events  = { workspace = true }
 hems-service = { workspace = true }
 
 # The runtime whose journal is the plan of record. `redb` is the embedded store
@@ -20,15 +19,32 @@ hems-service = { workspace = true }
 agentplane   = { workspace = true }
 
 anyhow       = { workspace = true }
+async-trait  = "0.1"
 axum         = { workspace = true }
 clap         = { version = "4", features = ["derive", "env"] }
+http         = { workspace = true }
+# The one outbound call: `obsd`'s `GET /v1/days`. Taken from the workspace so the
+# fleet shares one HTTP client and one TLS provider (D84, D85).
+reqwest      = { workspace = true }
+rmcp         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
+thiserror    = { workspace = true }
 time         = { workspace = true }
+tokio-util   = { workspace = true }
 tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing      = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# **The fleet view this daemon reads, in the end-to-end test only.**
+#
+# `tests/review.rs` builds the days a box would report, folds them with `obsd`'s
+# own `Fleet::summarise` and runs the specialists on the result — so the test
+# covers the whole chain rather than a `Summary` assembled by hand here, which
+# could drift from the one `obsd` actually produces. A dev-dependency, so the two
+# daemons stay separate deployables: nothing in `src/` may name it.
+obsd  = { path = "../obsd" }
 toml  = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }

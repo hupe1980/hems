@@ -41,7 +41,7 @@ uuid         = { version = "1", features = ["v4", "v7", "serde"] }
 tracing      = "0.1"
 # The advisory runtime `agentd` is built on: durable, replayable, and the
 # journal is the plan of record. `redb` is the embedded store one instance uses.
-agentplane   = { version = "0.26", default-features = false, features = ["redb", "manifest"] }
+agentplane   = { version = "0.31", default-features = false, features = ["redb", "manifest"] }
 anyhow       = "1"
 toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 
@@ -125,7 +125,12 @@ axum         = { version = "0.8", default-features = false, features = ["http1",
 # is measured in decades and whose traffic can be recorded today. `deny.toml`
 # bans `ring` so the choice is a build failure to change rather than a
 # resolution to notice — two providers in one binary is a runtime panic.
-reqwest      = { version = "0.13", default-features = false, features = ["rustls", "webpki-roots", "http2", "json", "charset"] }
+#
+# **No root-store feature here, deliberately.** `reqwest` 0.13 verifies with
+# `rustls-platform-verifier` and exposes no way to install a compiled-in list, so
+# where a client's trust anchors come from is a deployment's decision and
+# `hems_service::http::TlsRoots` is where it is written down (D171).
+reqwest      = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "charset"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "json", "std", "ansi"] }
 # The Model Context Protocol. Every fleet daemon mounts a **read-only** tool
 # surface at `/mcp` on the socket it already binds, so an agent reads the same
@@ -142,16 +147,23 @@ tokio-util   = { version = "0.7", default-features = false }
 # **The box's own**, `redb`: a pure-Rust embedded key-value store with ordered
 # ranges and ACID transactions across tables, which is the shape that record has
 # — no joins, no aggregate but the backlog's counts, every ordering on the
-# natural key (D169). Version 3 because `agentplane` is, and two majors of a
-# storage library would compile two of them into one fleet.
-redb         = { version = "3" }
-# The box's **measurement series**, and only that: `FieldValue` is
-# `f64`/`i64`/`u64`/`bool`/`String` and a MiSpeL register is an exact decimal
-# (P3, D168). An embedded TSDB that maintains itself — flush, compaction,
-# rollups, retention — so a gateway needs nothing started.
-# `default-features = false` drops the SQL surface and with it DataFusion, which
-# is 52 MiB of object code for a query API this box does not have.
-chronix      = { version = "0.2", default-features = false }
+# natural key (D169). The major tracks `agentplane`'s deliberately: two majors of
+# a storage library would compile two of them into one fleet. `cargo tree -i redb`
+# is the check, and it answers with one version.
+redb         = { version = "4" }
+# The box's **measurement series**, and only that. An embedded TSDB that
+# maintains itself — flush, compaction, rollups, retention — so a gateway needs
+# nothing started.
+#
+# The settlement registers stay in `redb` for a *transactional* reason rather than
+# a typing one — `FieldValue::Decimal` is exact — because a register and the
+# outbox marker saying the fleet still owes it are one write, and two stores have
+# no shared transaction (D168).
+#
+# `default-features = false` drops the SQL surface and with it DataFusion: 52 MiB
+# of object code for a query API this box does not have. It is on by default, so
+# this is a choice rather than an inheritance.
+chronix      = { version = "0.3", default-features = false }
 # The `arrow` major `chronix` returns query results in, named so the two cannot
 # drift. Needed to read the time column as the `Int64` it is: through an `f64`
 # every instant rounds to the nearest 256 ns, because nanoseconds since the
@@ -187,6 +199,9 @@ deadpool-postgres     = { version = "0.14", default-features = false, features =
 # `ring` precisely so this is a build failure rather than a resolution to
 # notice, and two providers in one binary is a runtime panic.
 rustls                = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12", "logging"] }
+# Mozilla's CA list, used **directly** by `hems_service::db` for the
+# `rustls::RootCertStore` a managed PostgreSQL instance is verified against — the
+# fleet's database link, and not the HTTP client, whose anchors are `TlsRoots`.
 webpki-roots          = { version = "1" }
 # A real PostgreSQL for the tests, in a container the test starts. It is the
 # price of the paragraph above: SQLite was what made `just ci` a clone-and-run,

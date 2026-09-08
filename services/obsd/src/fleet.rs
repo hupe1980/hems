@@ -192,7 +192,7 @@ impl Fleet {
                 }
                 if day.minutes_without_a_plan > 0 {
                     summary.unplanned_minutes += u64::from(day.minutes_without_a_plan);
-                    summary.sites_without_a_plan.push(Finding {
+                    summary.without_a_plan.push(Finding {
                         site: name.clone(),
                         date: day.date,
                         detail: format!("{} minutes on the fallback", day.minutes_without_a_plan),
@@ -205,7 +205,7 @@ impl Fleet {
                 // it at half a per cent and read as fine.
                 summary.clipped_kwh += day.clipped_kwh;
                 if day.clipped_ticks > 0 {
-                    summary.sites_clipping.push(Finding {
+                    summary.clipping.push(Finding {
                         site: name.clone(),
                         date: day.date,
                         detail: format!(
@@ -250,120 +250,15 @@ fn one_episode(coverage: f64, crps: f64) -> hems_forecast::Calibration {
     }
 }
 
-/// One thing worth a human looking at.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct Finding {
-    /// Which site.
-    pub site: String,
-    /// Which day.
-    #[serde(with = "hems_core::wire::iso_date")]
-    pub date: Date,
-    /// What happened.
-    pub detail: String,
-}
-
-/// The whole fleet in one answer.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
-pub struct Summary {
-    /// How many sites have ever reported.
-    pub sites: usize,
-    /// How many days are on record.
-    pub days: usize,
-    /// How many of them a saving may be computed from.
-    pub measured_days: usize,
-    /// How many were run with the weather known in advance and left out.
-    pub foresight_days: usize,
-    /// How many carried **no baseline**, and were therefore left out too.
-    ///
-    /// A baseline is what the day would have cost with no energy manager, and it
-    /// is a counterfactual: only a simulator can re-run a day as an unmanaged
-    /// house. So a box on a wall reports none, and every day from real hardware
-    /// lands here (D116).
-    ///
-    /// Reported rather than hidden, because `measured_days` silently excluding
-    /// most of the fleet is exactly the shape of a number that reads as a
-    /// measurement and is not one. A summary where this is large and
-    /// `measured_days` is small is a saving figure computed from simulations.
-    pub unmeasurable_days: usize,
-
-    /// The mean saving per measured day, euros.
-    pub saving_eur: f64,
-    /// The same on the electricity bill alone.
-    pub bill_saving_eur: f64,
-    /// The mean self-sufficiency, over **[`Summary::days`]** — every day on
-    /// record, not the ones a saving can be computed from.
-    ///
-    /// Its denominator is deliberately not [`Summary::measured_days`]. A saving
-    /// is a counterfactual and needs a baseline; how much of its own electricity
-    /// a household made is three meter readings, and every box reports them. The
-    /// two were shared, and the consequence was that a fleet of real boxes —
-    /// which never carry economics (D116) — reported nought (D127).
-    pub self_sufficiency: f64,
-
-    /// **Every** day a network operator's instruction was not respected.
-    ///
-    /// A list and never a rate: one household in ten thousand is a compliance
-    /// incident with a name and a date, and "99,99 %" reads as success.
-    pub breached: Vec<Finding>,
-    /// **Every** day a roof fed in above its § 9 EEG ceiling.
-    ///
-    /// The other statutory limit on the same connection point, and for a long
-    /// time the fleet had no answer about it at all: § 14a arrives as an
-    /// instruction and leaves a record, § 9 Abs. 2 applies by force of law and
-    /// leaves none, so the one that needed watching hardest was the one nothing
-    /// watched. A list rather than a rate, for the same reason as
-    /// [`Summary::breached`].
-    pub over_feed_in_ceiling: Vec<Finding>,
-    /// Every day a commanded ceiling went below the minimum of `[A1 4.5]`.
-    ///
-    /// Not a fault of the box — hems applies such a command, because refusing a
-    /// network operator is not a decision a box takes on its own — but the
-    /// entitlement is the customer's and somebody has to be able to see it.
-    pub below_minimum: Vec<Finding>,
-    /// Every day a box spent time on the fallback.
-    pub sites_without_a_plan: Vec<Finding>,
-    /// How many minutes that came to across the fleet.
-    pub unplanned_minutes: u64,
-    /// Every day a device could not hold a command the arbiter gave it.
-    ///
-    /// The seam between the control loop and the wiring: a charge point is off
-    /// or above the 6 A of IEC 61851 with nothing in between, so the arbiter
-    /// routinely decides a value a device cannot hold and
-    /// `hems_device::realisable` resolves it — correctly, and silently, while
-    /// every layer above goes on believing the decided value. A **named** day
-    /// rather than a rate, for the same reason `breached` is: a wallbox that
-    /// refuses a third of its commands is one household with one installation
-    /// problem, and a fleet average puts it at half a per cent.
-    pub sites_clipping: Vec<Finding>,
-    /// How much energy that came to across the fleet, kWh.
-    pub clipped_kwh: f64,
-    /// Sites that have not reported recently.
-    pub silent: Vec<String>,
-
-    /// The production band's coverage across every measured day.
-    pub pv_coverage: f64,
-    /// Its CRPS, watts.
-    pub pv_crps: f64,
-    /// The load band's coverage.
-    pub load_coverage: f64,
-    /// Its CRPS, watts.
-    pub load_crps: f64,
-    /// How many independent days the two rest on.
-    pub forecast_episodes: usize,
-    /// Whether that is enough days, and the bands the width they claim.
-    pub forecast_is_calibrated: bool,
-}
-
-impl Summary {
-    /// Whether anything here needs a human.
-    #[must_use]
-    pub fn is_clean(&self) -> bool {
-        self.breached.is_empty()
-            && self.over_feed_in_ceiling.is_empty()
-            && self.sites_without_a_plan.is_empty()
-            && self.silent.is_empty()
-    }
-}
+/// The two shared wire types, from the crate that owns them.
+///
+/// They were defined here until `agentd` became a second reader of `/v1/fleet`.
+/// A summary defined inside the service that computes it and mirrored by hand at
+/// the far end is a wire contract held together by two people remembering the
+/// same field names, which is the failure `hems_core::report`'s own module note
+/// opens with — so they moved to the domain crate both sides already depend on,
+/// exactly as `DayKpis` did.
+pub use hems_core::report::{Finding, Summary};
 
 #[cfg(test)]
 mod tests {

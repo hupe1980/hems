@@ -473,6 +473,11 @@ async fn main() -> anyhow::Result<()> {
                 })?;
                 report_day(
                     &url,
+                    // `simulate` loads no configuration file, so the shell's
+                    // defaults are the only trust decision available here: the
+                    // platform's own store. A box on a wall reads its own
+                    // `[service.http]` and may pin instead.
+                    &hems_service::HttpSettings::default(),
                     secret.as_bytes(),
                     &site,
                     &result.kpis(&site, scenario.date),
@@ -618,6 +623,7 @@ fn record_day(
 /// de-duplicates on the same string the signature covers.
 async fn report_day(
     url: &str,
+    http: &hems_service::HttpSettings,
     secret: &[u8],
     site: &str,
     kpis: &hems_core::report::DayKpis,
@@ -652,7 +658,7 @@ async fn report_day(
     };
 
     let signature = hems_events::webhook::sign(secret, &event.id, now, &body);
-    match hemsd::report::post_event(&endpoint, body, &signature.headers()).await {
+    match hemsd::report::post_event(&endpoint, http, body, &signature.headers()).await {
         Ok(status) if (200..300).contains(&status) => {
             println!("\n  reported to {endpoint} — HTTP {status}");
             if let (Some(path), Some(id)) = (store, queued) {

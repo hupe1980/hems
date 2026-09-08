@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
 
     let upstream = Http::new(
         resolved_sources(&settings)?,
+        &settings.service.http,
         std::time::Duration::from_secs(settings.request_timeout_s),
     )?;
     let poller = Poller::new(

@@ -8,12 +8,17 @@
 //!
 //! # What goes here, and what must not
 //!
-//! **The series, never the settlement.** `chronix`'s `FieldValue` is
-//! `f64`/`i64`/`u64`/`bool`/`String`; a MiSpeL register is an exact decimal, and
-//! P3 forbids one through an `f64` (D168). So the quarter-hour registers, the
-//! § 14a evidence and the box's identity stay in `redb` ([`crate::store`]), and
-//! what lives here is measured power — an `f64` before it arrived, and
-//! diagnostic rather than statutory.
+//! **The series, never the settlement.** What lives here is measured power — an
+//! `f64` before it arrived, and diagnostic rather than statutory. The
+//! quarter-hour registers, the § 14a evidence and the box's identity stay in
+//! `redb` ([`crate::store`]).
+//!
+//! The reason is a **transaction** rather than a type. A register and the outbox
+//! marker saying the fleet still owes it are written in one `redb` write
+//! ([`crate::store::Store::put_quarter_hours`]); two stores have no shared
+//! transaction, so splitting them would make a settlement that was stored and
+//! never forwarded — or forwarded and never stored — something a power cut can
+//! produce (D168).
 //!
 //! That split is also what makes the durability trade acceptable.
 //! `ChronixConfig::small` coalesces its WAL fsync to every five seconds, so a

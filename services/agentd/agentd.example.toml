@@ -2,7 +2,7 @@
 #
 #   agentd --config /etc/hems/agentd.toml
 #
-# It reads what the fleet has recorded and proposes; nothing it says moves a
+# It reads what `obsd` has recorded and proposes; nothing it says moves a
 # watt. That is a property of the code rather than of this file — `Advice` is a
 # leaf type nothing consumes, and a specialist's authority is derived by
 # attenuation, which refuses to widen (D118).
@@ -30,15 +30,74 @@ tenant = "*"
 #   stadtwerke-nord = ["haus-1", "haus-2"]
 #   stadtwerke-sued = ["haus-3"]
 
+# ── Where the days come from ─────────────────────────────────────────────────
+#
+# `obsd`'s **API**, not its database. The predicate that keeps one tenant's rows
+# out of another tenant's answer lives in `obsd`'s store (D112), and a second
+# reader with its own SELECT is a second place for that rule to be got wrong.
+obsd = "https://obsd:7780"
+
+# The credential this daemon presents there. It has to hold `hems.fleet.read` at
+# that end — a finding is about a population, and a box's own token reaches one
+# household. Unset stops the daemon: a plane whose every review is refused has an
+# empty queue, and an empty queue is what a fleet in good order looks like.
+obsd_token = "env:HEMS_AGENTD_OBSD_TOKEN"
+
+# A background review rather than a request somebody is waiting on.
+obsd_timeout_s = 30
+
+# ── How often a review runs ──────────────────────────────────────────────────
+#
+# Six hours. The specialists answer questions about a *window* of days, so a much
+# shorter cadence repeats the same answer at the cost of a read each time, and a
+# much longer one makes a § 14a pattern wait a day to be seen. Boxes report once
+# a day. Clamped to a minute at the low end.
+review_every_s = 21600
+
+# ── Who may read the queue ───────────────────────────────────────────────────
+#
+# It names households that did not respect a network operator's reduction, so it
+# is the fleet credential and not a site's. Empty means nothing is served — the
+# reviews still run and are still journaled.
+#
+# [[operators]]
+# token = "env:HEMS_AGENTD_OPERATOR_TOKEN"
+# tenant = "*"
+
+# ── The Model Context Protocol surface ───────────────────────────────────────
+#
+# Off by default. It speaks about households, so a token is required when it is
+# switched on, and every call is authorised as whatever authority that token
+# already carries here — the same credential the REST route reads, so the two
+# surfaces cannot come to different conclusions about one caller (D111).
+[mcp]
+enabled = false
+# token = "env:HEMS_AGENTD_MCP_TOKEN"
+
 # ── The shell ────────────────────────────────────────────────────────────────
 #
 # A table, as on every other daemon in this workspace (D160): an operator who
 # has written `[service]` for one has written it for all of them.
 #
-# Loopback. What this daemon serves is a health surface; the findings go to
-# whatever an operator reads, and that is not built yet.
+# Loopback by default: what this daemon serves is a health surface, the advisory
+# queue at `GET /v1/advice`, and `/mcp` where it is switched on.
 [service]
 listen = "127.0.0.1:7880"
 log_filter = "info,agentd=debug"
 log_json = false
 shutdown_grace_s = 3
+
+# ── Outbound TLS ─────────────────────────────────────────────────────────────
+#
+# `platform` (the default) is the operating system's trust store, and the image
+# has to carry one. `pinned` is a PEM bundle and nothing else — it *replaces*
+# the platform roots, which is what makes pinning a control rather than a
+# decoration. Right when this daemon talks only to its own fleet. A bundle that
+# is missing or empty stops the daemon.
+#
+# [service.http]
+# timeout_s = 30
+#
+# [service.http.tls_roots]
+# from = "pinned"
+# bundle = "/etc/hems/fleet-ca.pem"

@@ -397,8 +397,8 @@ standing_charge_eur_per_year = 120.0
 # `/v1/status` and on the readiness probe, rather than looking like a box that
 # is planning badly.
 [fleet]
-tariffd_url = "http://tariffd.internal:7380"
-forecastd_url = "http://forecastd.internal:7280"
+tariffd_url = "https://tariffd.internal:7380"
+forecastd_url = "https://forecastd.internal:7280"
 # Which of `forecastd`'s **configured** locations is this household's. A name
 # rather than a latitude: the sun position a production figure is computed from
 # has to be the one the irradiance was fetched at, so a box that could name its
@@ -413,7 +413,7 @@ request_timeout_s = 10
 # the day the link was down. What has not been acknowledged stays in the store's
 # outbox, and forwarded is never deleted — the two years are the household's.
 [histd]
-url = "http://histd.internal:7580"
+url = "https://histd.internal:7580"
 site = "reference-household"
 # The *reference*, never the credential: one in a configuration file is one in
 # an image, in a backup and eventually in a repository.
@@ -635,3 +635,18 @@ asset = "netzanschluss"
 failsafe_hours = 2
 spine_vendor = "n:hems"
 spine_unique = "hems-1"
+
+# ── Outbound TLS ─────────────────────────────────────────────────────────────
+#
+# `platform` (the default) is the operating system's trust store, and the image
+# has to carry one. `pinned` is a PEM bundle and nothing else — it *replaces*
+# the platform roots, which is what makes pinning a control rather than a
+# decoration. Right when this daemon talks only to its own fleet. A bundle that
+# is missing or empty stops the daemon.
+#
+# [service.http]
+# timeout_s = 30
+#
+# [service.http.tls_roots]
+# from = "pinned"
+# bundle = "/etc/hems/fleet-ca.pem"

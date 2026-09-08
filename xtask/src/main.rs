@@ -19,6 +19,7 @@ fn main() -> Result<()> {
         Some("check-vital") => check_vital(&root),
         Some("check-examples") => check_examples(&root),
         Some("check-stats") => check_stats(&root),
+        Some("check-deps") => check_deps(&root),
         Some("check-all") => {
             check_citations(&root)?;
             check_events(&root)?;
@@ -26,6 +27,7 @@ fn main() -> Result<()> {
             check_wire(&root)?;
             check_vital(&root)?;
             check_examples(&root)?;
+            check_deps(&root)?;
             check_stats(&root)
         }
         Some("help" | "--help" | "-h") | None => {
@@ -55,10 +57,13 @@ cargo xtask <task>
                     go through an f64 or come back as a tuple
   check-vital       a daemon's background loops are spawned through
                     Health::vital, so /livez can actually fail
-  check-examples    every daemon ships an annotated example configuration, and
-                    a test parses it so it cannot drift from the struct
+  check-examples    every daemon ships an annotated example configuration, a
+                    test parses it so it cannot drift from the struct, and every
+                    endpoint it sets is one the daemon will accept
   check-stats       the landing page's citation and crate counts are the ones
                     the build actually produces
+  check-deps        the sibling-crate versions the architecture notes state are
+                    the ones the workspace manifest resolves
   check-all         all of the above
 "
     );
@@ -330,6 +335,7 @@ fn pure_crates(root: &Path) -> Result<usize> {
 fn check_examples(root: &Path) -> Result<()> {
     let mut missing = Vec::new();
     let mut unparsed = Vec::new();
+    let mut plaintext = Vec::new();
     let mut checked = 0usize;
     let services = root.join("services");
     if !services.exists() {
@@ -364,24 +370,88 @@ fn check_examples(root: &Path) -> Result<()> {
                 .unwrap_or(false)
         });
         if !parsed {
-            unparsed.push(name);
+            unparsed.push(name.clone());
+        }
+
+        // Every URL the example actually sets — commented lines are suggestions
+        // a reader has to uncomment, and this guard is about what a copied file
+        // does. A `key = "http://host"` that is not loopback is a deployment the
+        // daemon refuses at start-up, so shipping one is shipping a file that
+        // looks authoritative and does not work.
+        for (n, line) in std::fs::read_to_string(&example)?.lines().enumerate() {
+            let line = line.trim();
+            if line.starts_with('#') {
+                continue;
+            }
+            let Some(url) = line.split('"').nth(1) else {
+                continue;
+            };
+            if (url.starts_with("http://") || url.starts_with("https://"))
+                && !is_confidential_url(url)
+            {
+                plaintext.push(format!("  {name}.example.toml:{}: {url}", n + 1));
+            }
         }
     }
 
-    if missing.is_empty() && unparsed.is_empty() {
+    if missing.is_empty() && unparsed.is_empty() && plaintext.is_empty() {
         println!("check-examples: {checked} daemons, each with an example a test parses");
         return Ok(());
     }
-    for name in &missing {
-        eprintln!("check-examples: {name} ships no services/{name}/{name}.example.toml");
+    if !missing.is_empty() {
+        eprintln!("check-examples: a daemon ships no annotated example, or nothing parses it:");
+        for line in &missing {
+            eprintln!("{line}");
+        }
     }
-    for name in &unparsed {
+    if !unparsed.is_empty() {
+        eprintln!("check-examples: an example exists and no test reads it:");
+        for line in &unparsed {
+            eprintln!("{line}");
+        }
+    }
+    if !plaintext.is_empty() {
         eprintln!(
-            "check-examples: {name}.example.toml is not `include_str!`-ed by anything, so \
-             nothing would notice it drifting from the struct it documents"
+            "check-examples: an example configures an endpoint the daemon will refuse at \
+             start-up — `https` anywhere, plain `http` only to a loopback address (D85):"
         );
+        for line in &plaintext {
+            eprintln!("{line}");
+        }
     }
-    bail!("every daemon owes an example configuration that a test parses")
+    bail!("a shipped example is wrong")
+}
+
+/// Whether a URL in a shipped example is one the daemon will actually accept.
+///
+/// The parse check says an example matches its struct; this says it describes a
+/// deployment that can start. An example recommending `http://histd.internal`
+/// recommends that a household's § 14a evidence and the token that writes it
+/// cross a network in the clear, and it looks as authoritative as the line above
+/// it (D85).
+///
+/// The same rule as `hems_service::http::confidential`, spelled out rather than
+/// called: `xtask` guards the workspace and so may not depend on it.
+fn is_confidential_url(url: &str) -> bool {
+    if let Some(rest) = url.strip_prefix("https://") {
+        return !rest.is_empty();
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        // Not a URL at all — a path, a bare host, an `env:` reference. Not this
+        // guard's question.
+        return true;
+    };
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit_once(':')
+        .map_or(rest, |(host, _)| host);
+    let host = host.trim_matches(['[', ']']);
+    host == "localhost"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn check_vital(root: &Path) -> Result<()> {
@@ -734,4 +804,116 @@ fn decimal_field(trimmed: &str) -> Option<&str> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()))
     .then_some(name)
+}
+
+/// The versions the architecture notes state are the ones the manifest requires.
+///
+/// A dependency table in prose is the most quoted fact about a workspace and the
+/// least checked one: nothing compiles it, so it drifts within a release of
+/// whatever it describes — and a design argument resting on "what version X
+/// does" then rests on a version nobody builds against.
+///
+/// Only the version is checked. What follows it in that cell is the reasoning,
+/// which cannot be mechanised; the number can.
+///
+/// `concepts/` is internal and absent from a clone, so a missing file is not a
+/// failure — the same rule [`check_stats`] follows for a missing site.
+fn check_deps(root: &Path) -> Result<()> {
+    let notes = root.join("concepts/ARCHITECTURE.md");
+    if !notes.exists() {
+        println!("check-deps: no architecture notes to check");
+        return Ok(());
+    }
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+    let required = workspace_requirements(&manifest);
+    let notes = std::fs::read_to_string(&notes)?;
+
+    let mut checked = 0usize;
+    let mut wrong = Vec::new();
+    for line in notes.lines() {
+        // `| `crate` | role | 0.9, and then some prose |`
+        let mut cells = line.split('|').map(str::trim);
+        if cells.next().is_some_and(|before| !before.is_empty()) {
+            continue;
+        }
+        let (Some(name), Some(_role), Some(state)) = (cells.next(), cells.next(), cells.next())
+        else {
+            continue;
+        };
+        let Some(name) = name.strip_prefix('`').and_then(|n| n.strip_suffix('`')) else {
+            continue;
+        };
+        let Some(want) = required.get(name) else {
+            continue;
+        };
+        let stated = state
+            .split(|c: char| !c.is_ascii_digit() && c != '.')
+            .find(|token| token.contains('.') && token.starts_with(|c: char| c.is_ascii_digit()));
+        checked += 1;
+        match stated {
+            Some(stated) if stated == want => {}
+            Some(stated) => wrong.push(format!(
+                "  {name}: the notes say {stated}, the manifest requires {want}"
+            )),
+            None => wrong.push(format!(
+                "  {name}: the notes state no version, the manifest requires {want}"
+            )),
+        }
+    }
+
+    if wrong.is_empty() {
+        println!("check-deps: {checked} stated sibling-crate versions, all matching the manifest");
+        return Ok(());
+    }
+    eprintln!("check-deps: concepts/ARCHITECTURE.md states a version the manifest does not:");
+    for line in &wrong {
+        eprintln!("{line}");
+    }
+    bail!("the architecture notes' dependency table has drifted")
+}
+
+/// Every `[workspace.dependencies]` entry that names a version, by crate name.
+///
+/// A hand-rolled scan rather than a TOML parser: `xtask` is a guard that has to
+/// build before anything else does, the section is a flat list of one-line
+/// entries, and the alternative is a dependency for twenty lines of `split`.
+fn workspace_requirements(manifest: &str) -> std::collections::BTreeMap<String, String> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut inside = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            inside = trimmed == "[workspace.dependencies]";
+            continue;
+        }
+        if !inside || trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        let Some((name, rest)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let name = name.trim();
+        // `name = "0.9"` or `name = { version = "0.9", … }`.
+        let after = rest.trim();
+        // A `path` entry is one of this workspace's own crates. Its version is
+        // the workspace's own and moves with every release of it, so a table
+        // stating one would be a table restating `[workspace.package]` — and the
+        // crate table this scan also walks lists dependencies in that column
+        // rather than a version.
+        if after.contains("path =") {
+            continue;
+        }
+        let version = if let Some(quoted) = after.strip_prefix('"') {
+            quoted.split('"').next().map(str::to_owned)
+        } else {
+            after
+                .split_once("version")
+                .and_then(|(_, v)| v.split('"').nth(1))
+                .map(str::to_owned)
+        };
+        if let Some(version) = version {
+            out.insert(name.to_owned(), version);
+        }
+    }
+    out
 }

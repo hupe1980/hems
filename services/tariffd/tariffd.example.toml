@@ -103,3 +103,14 @@ url = "https://api.energy-charts.info"
 # operator's own upstream quota, which is a rate-limiting question.
 [mcp]
 enabled = false
+
+# ── Outbound TLS ─────────────────────────────────────────────────────────────
+#
+# `platform` is the operating system's trust store — right here, because this
+# daemon calls the open web, and the image then has to carry one.
+#
+# [service.http]
+# timeout_s = 30
+#
+# [service.http.tls_roots]
+# from = "platform"

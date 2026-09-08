@@ -31,9 +31,15 @@ allow = [
     "CC0-1.0",
     "0BSD",
     # `webpki-roots`: Mozilla's CA root list, which is *data* rather than code
-    # and carries a data licence. It is here deliberately rather than reached for
-    # — the alternative is `rustls-native-certs`, and a distroless image has no
-    # system trust store to read, which is the whole point of building one.
+    # and carries a data licence.
+    #
+    # It reaches this workspace through **`hems_service::db`**, which builds the
+    # `rustls::RootCertStore` a managed PostgreSQL instance is verified against.
+    # That is the fleet's database link and nothing else. It is *not* what the
+    # HTTP client verifies against — `reqwest` 0.13.0 removed its rustls root
+    # features in favour of `rustls-platform-verifier`, and this comment claimed
+    # otherwise for months. Where an outbound client's anchors come from is now
+    # `hems_service::http::TlsRoots`, written down by an operator.
     "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9

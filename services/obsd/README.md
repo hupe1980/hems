@@ -38,6 +38,7 @@ notice.
 | `POST /v1/days` | a box reports a day (signed) |
 | `GET /v1/fleet` | the summary, with breaches as a list |
 | `GET /v1/sites/{site}` | one household's recent days |
+| `/mcp` | the same answers for an agent, authorised as its own caller |
 
 ## It holds a window, not a history
 

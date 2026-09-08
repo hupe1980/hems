@@ -260,7 +260,8 @@ async fn a_box_with_a_fleet_plans_against_real_prices_and_a_real_sky() {
             wear_eur_per_kwh: 0.08,
         },
         Arc::clone(&registry),
-        hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
+        hemsd::runtime::fleet::Fleet::new(&settings.fleet, &hems_service::HttpSettings::default())
+            .expect("a client"),
         Arc::clone(&plan),
         // The price stack the plan was made against, which a running box hands
         // to the loop that writes its quarter-hour registers. Not read here.
@@ -400,7 +401,8 @@ async fn a_battery_whose_charge_nobody_reports_is_left_out_of_the_plan() {
             wear_eur_per_kwh: 0.08,
         },
         registry,
-        hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
+        hemsd::runtime::fleet::Fleet::new(&settings.fleet, &hems_service::HttpSettings::default())
+            .expect("a client"),
         Arc::clone(&plan),
         Arc::new(RwLock::new(None)),
         hemsd::runtime::planner::Published {
@@ -483,7 +485,8 @@ async fn a_box_installed_this_morning_plans_from_persistence() {
             wear_eur_per_kwh: 0.08,
         },
         registry,
-        hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
+        hemsd::runtime::fleet::Fleet::new(&settings.fleet, &hems_service::HttpSettings::default())
+            .expect("a client"),
         Arc::clone(&plan),
         Arc::new(RwLock::new(None)),
         hemsd::runtime::planner::Published {
@@ -603,7 +606,8 @@ async fn plan_with(
             wear_eur_per_kwh: 0.08,
         },
         registry,
-        hemsd::runtime::fleet::Fleet::new(&settings.fleet).expect("a client"),
+        hemsd::runtime::fleet::Fleet::new(&settings.fleet, &hems_service::HttpSettings::default())
+            .expect("a client"),
         Arc::clone(&plan),
         Arc::new(RwLock::new(None)),
         hemsd::runtime::planner::Published {

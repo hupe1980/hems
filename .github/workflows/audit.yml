@@ -1,8 +1,9 @@
 name: Security audit
 
 # The push and pull-request lane already runs cargo-deny on every change. This
-# schedule exists to catch advisories filed *after* the last push — a dependency
-# that was clean on merge day and had a RUSTSEC entry raised on Wednesday.
+# schedule exists to catch what changes *without* a push — an advisory filed on
+# Wednesday against a dependency that was clean on merge day, and a dependency
+# whose own release makes this workspace's manifest wrong.
 
 on:
   schedule:
@@ -18,3 +19,29 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check advisories
+
+  # Everything resolved afresh, with the lockfile thrown away.
+  #
+  # A locked `cargo check` and `cargo deny` both ask about the versions already
+  # chosen. This asks about the versions *available* — the question a manifest
+  # can be silently wrong about, because a feature a dependency has deleted goes
+  # on resolving against the older version that still has it (D171).
+  #
+  # `continue-on-error`: an upstream release breaking a build is news rather than
+  # a fault of the commit on `main`, and a scheduled job that goes red for
+  # somebody else's release is one people stop reading.
+  latest:
+    name: Newest compatible dependencies
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve everything afresh
+        run: |
+          rm -f Cargo.lock
+          cargo generate-lockfile
+      - name: What moved
+        run: cargo tree --workspace --depth 1 --edges normal | sort -u
+      - name: Build and test against it
+        run: cargo test --workspace --all-features --no-run

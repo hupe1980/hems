@@ -92,17 +92,21 @@ impl Http {
     /// which is a deployment fault rather than a runtime one.
     pub fn new(
         endpoints: BTreeMap<Source, crate::config::Endpoint>,
+        http: &hems_service::HttpSettings,
         timeout: std::time::Duration,
     ) -> anyhow::Result<Self> {
+        for endpoint in endpoints.values() {
+            hems_service::http::confidential(&endpoint.url)?;
+        }
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                // A published API is somebody else's server, and a fleet of
-                // boxes asking it questions is a fleet that can knock it over.
-                // Naming ourselves is the minimum courtesy and the thing that
-                // gets an operator a mail rather than a block.
-                .user_agent(concat!("hems-tariffd/", env!("CARGO_PKG_VERSION")))
-                .build()?,
+            // The shared builder — which also names this daemon in its
+            // `User-Agent`, the courtesy that gets an operator a mail rather
+            // than a block. This one calls the **open web**, so the platform's
+            // own trust store is the question being asked.
+            client: hems_service::http::client(
+                hems_service::identity!(),
+                &http.clone().with_timeout_s(timeout.as_secs().max(1)),
+            )?,
             endpoints,
         })
     }

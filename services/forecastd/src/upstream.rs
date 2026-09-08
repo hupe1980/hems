@@ -57,13 +57,23 @@ impl Http {
     /// A client for `endpoint`.
     ///
     /// # Errors
-    /// When the HTTP client cannot be built at all.
-    pub fn new(endpoint: String, timeout: std::time::Duration) -> anyhow::Result<Self> {
+    /// When the HTTP client cannot be built at all, or when `endpoint` would
+    /// carry this fleet's questions across a network in the clear (D85).
+    pub fn new(
+        endpoint: String,
+        http: &hems_service::HttpSettings,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Self> {
+        hems_service::http::confidential(&endpoint)?;
         Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .user_agent(concat!("hems-forecastd/", env!("CARGO_PKG_VERSION")))
-                .build()?,
+            // The shared builder, so the trust anchors are the operator's
+            // decision rather than seven call sites' separate accidents. This
+            // one calls the **open web**, which is what `TlsRoots::Platform` is
+            // for — and the image then has to carry a trust store.
+            client: hems_service::http::client(
+                hems_service::identity!(),
+                &http.clone().with_timeout_s(timeout.as_secs().max(1)),
+            )?,
             endpoint,
         })
     }
@@ -128,6 +138,7 @@ mod tests {
     fn the_coordinates_are_appended_to_whatever_endpoint_was_configured() {
         let http = Http::new(
             crate::config::DEFAULT_ENDPOINT.into(),
+            &hems_service::HttpSettings::default(),
             std::time::Duration::from_secs(5),
         )
         .unwrap();
@@ -146,6 +157,7 @@ mod tests {
     fn a_mirror_with_no_query_string_gets_a_question_mark() {
         let http = Http::new(
             "https://weather.local/v1".into(),
+            &hems_service::HttpSettings::default(),
             std::time::Duration::from_secs(5),
         )
         .unwrap();
