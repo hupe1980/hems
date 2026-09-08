@@ -717,7 +717,21 @@ impl BuildingSim {
     /// Above [`BuildingSim::thermostat_max_c`] nothing can make it hotter. That
     /// is a safety limit rather than a control one, and it is the third way this
     /// simulator says no.
-    pub fn step(&mut self, electrical: Power, outdoor_c: f64, dt: Duration) -> Power {
+    ///
+    /// `window_w_per_m2` is the irradiance on the building's glazing over the
+    /// step. It is what the sun and the household put into the house whether or
+    /// not the compressor runs — on a clear shoulder-season noon it is the whole
+    /// of the demand — and it is here rather than folded into the caller's
+    /// `electrical` because it is **not** electrical: it neither costs anything
+    /// nor appears at the meter, and a simulator that let it do either would
+    /// invent both a bill and a § 14a quantity.
+    pub fn step(
+        &mut self,
+        electrical: Power,
+        outdoor_c: f64,
+        window_w_per_m2: f64,
+        dt: Duration,
+    ) -> Power {
         let unlimited = electrical >= self.nominal_electrical;
         // The unit's own hysteresis, kept across ticks so it does not chatter.
         if self.state.indoor_c < self.thermostat_set_c {
@@ -762,7 +776,8 @@ impl BuildingSim {
             };
         }
 
-        let heat_kw = drawn.kw() * self.cop(outdoor_c);
+        let heat_kw =
+            drawn.kw() * self.cop(outdoor_c) + self.building.free_heat_kw(window_w_per_m2);
         self.state = self.building.step(self.state, heat_kw, outdoor_c, dt);
         drawn
     }
@@ -917,12 +932,12 @@ mod tests {
         // 5 kW unit: it runs, and it holds 2 kW — which is what a single-speed
         // compressor does by short-cycling inside the quarter hour, and what the
         // planner's `min_electrical` means for a unit whose slots are scheduled.
-        let drawn = b.step(Power::from_kw(2.0), -5.0, QUARTER);
+        let drawn = b.step(Power::from_kw(2.0), -5.0, 0.0, QUARTER);
         assert_eq!(drawn, Power::from_kw(2.0));
 
         // Below the floor it cannot average lower and still be the unit that was
         // committed, so it takes the floor rather than the request.
-        let drawn = b.step(Power::from_kw(0.2), -5.0, QUARTER);
+        let drawn = b.step(Power::from_kw(0.2), -5.0, 0.0, QUARTER);
         assert_eq!(drawn, Power::from_kw(5.0) * 0.3);
     }
 
@@ -984,7 +999,7 @@ mod tests {
     fn a_house_cools_down_slowly_when_the_heating_stops() {
         let mut b = BuildingSim::new(21.0);
         for _ in 0..4 {
-            b.step(Power::ZERO, -5.0, QUARTER);
+            b.step(Power::ZERO, -5.0, 0.0, QUARTER);
         }
         assert!(b.indoor_c() < 21.0, "it should be cooling");
         assert!(b.indoor_c() > 17.0, "but not that fast: {}", b.indoor_c());
@@ -994,7 +1009,7 @@ mod tests {
     fn heating_warms_the_house_and_then_the_fabric() {
         let mut b = BuildingSim::new(18.0);
         for _ in 0..8 {
-            b.step(Power::from_kw(5.0), 0.0, QUARTER);
+            b.step(Power::from_kw(5.0), 0.0, 0.0, QUARTER);
         }
         assert!(b.indoor_c() > 18.0);
         assert!(b.mass_c() > 18.0, "the fabric follows the air");

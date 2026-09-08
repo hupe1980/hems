@@ -954,6 +954,16 @@ pub struct Problem<'a> {
     /// extended with its last value rather than refused: a forecast that runs
     /// out is a reason to plan less well, not to stop planning.
     pub outdoor_c: &'a [f64],
+    /// Irradiance on the building's glazing in each slot, W/m².
+    ///
+    /// Vertical, at the façade's azimuth — see
+    /// [`hems_core::thermal::Rc2::solar_aperture_m2`]. Read through
+    /// [`Problem::free_heat_at`], which is where it becomes kilowatts.
+    ///
+    /// Empty is allowed and means no solar term. It is **not** extended with its
+    /// last value the way [`Problem::outdoor_c`] is: a temperature persists and
+    /// an afternoon's sunshine does not.
+    pub window_w_per_m2: &'a [f64],
     /// The grid's limits.
     pub limits: PlanningLimits,
     /// What the plan is willing to pay to avoid things other than money.
@@ -1486,6 +1496,7 @@ impl<'a> Problem<'a> {
             dhw_draw: &[],
             community_share: &[],
             outdoor_c: &[],
+            window_w_per_m2: &[],
             limits: PlanningLimits::default(),
             objective: Objective::cost(),
             curtailment_penalty_eur_per_kwh: 0.01,
@@ -1534,10 +1545,24 @@ impl<'a> Problem<'a> {
     }
 
     /// Add a building and its heat pump, with the weather it faces.
+    ///
+    /// `window_w_per_m2` is the irradiance on the building's glazing, slot by
+    /// slot — [`hems_forecast::solar::window_irradiance`] computes it, and it is
+    /// what [`hems_core::thermal::Rc2::free_heat_kw`] turns into the heat the
+    /// house gets for nothing. Pass an empty slice for a site with no irradiance
+    /// forecast: the internal gains still apply and the solar term is zero,
+    /// which is the honest answer rather than the safe one (see
+    /// `Rc2::free_heat_kw` for which way it is wrong).
     #[must_use]
-    pub fn with_thermal(mut self, thermal: ThermalModel, outdoor_c: &'a [f64]) -> Self {
+    pub fn with_thermal(
+        mut self,
+        thermal: ThermalModel,
+        outdoor_c: &'a [f64],
+        window_w_per_m2: &'a [f64],
+    ) -> Self {
         self.thermal = Some(thermal);
         self.outdoor_c = outdoor_c;
+        self.window_w_per_m2 = window_w_per_m2;
         self
     }
 
@@ -1641,6 +1666,27 @@ impl<'a> Problem<'a> {
             .or_else(|| self.outdoor_c.last())
             .copied()
             .unwrap_or(10.0)
+    }
+
+    /// The heat the building gets for nothing in slot `k`, kW.
+    ///
+    /// The sun through the glazing plus the household's own waste heat. It is a
+    /// **known constant** in each slot rather than a decision, so it enters the
+    /// state equation exactly where the heat pump's kilowatts do and the
+    /// programme stays linear.
+    ///
+    /// A slot past the end of the irradiance series takes **zero sun**, not the
+    /// last value — the opposite of [`Problem::outdoor_at`], and deliberately.
+    /// Carrying the last outdoor temperature forward keeps a plan from
+    /// pre-heating for a night at absolute zero; carrying the last *irradiance*
+    /// forward would light the small hours of tomorrow morning with this
+    /// afternoon's sun.
+    #[must_use]
+    pub fn free_heat_at(&self, k: usize) -> f64 {
+        self.thermal.map_or(0.0, |t| {
+            t.building
+                .free_heat_kw(self.window_w_per_m2.get(k).copied().unwrap_or(0.0))
+        })
     }
 
     /// The futures this problem is priced against.

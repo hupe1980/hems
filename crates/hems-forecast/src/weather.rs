@@ -144,6 +144,44 @@ impl WeatherSeries {
             .collect()
     }
 
+    /// Irradiance on a building's glazing over a horizon, W/m².
+    ///
+    /// The input [`hems_core::thermal::Rc2::free_heat_kw`] wants, laid out by
+    /// slot number the way [`WeatherSeries::outdoor_c_over`] is.
+    ///
+    /// A slot the run does not cover takes **zero**, not the last value — the
+    /// opposite of the temperature, and deliberately. A forecast that stops at
+    /// teatime says nothing about tomorrow morning, and carrying an afternoon's
+    /// sunshine forward would light the small hours with it; carrying an
+    /// afternoon's *temperature* forward is merely imprecise. Zero sun is also
+    /// the answer that makes the planner heat rather than not heat, which is the
+    /// right way for a missing forecast to be wrong.
+    #[must_use]
+    pub fn window_w_per_m2_over(
+        &self,
+        horizon: Horizon,
+        location: hems_core::prelude::GeoPoint,
+        facade_azimuth_deg: f64,
+    ) -> Vec<f64> {
+        let by_slot: std::collections::BTreeMap<Slot, f64> = self
+            .slots
+            .iter()
+            .map(|(slot, point)| (*slot, point.ghi_w_per_m2))
+            .collect();
+        horizon
+            .slots()
+            .map(|slot| {
+                by_slot.get(&slot).map_or(0.0, |ghi| {
+                    crate::solar::window_irradiance(
+                        crate::solar::sun_position(location, slot),
+                        *ghi,
+                        facade_azimuth_deg,
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// The outdoor temperature in each slot, for the planner's thermal model.
     #[must_use]
     pub fn outdoor_c(&self) -> Vec<f64> {

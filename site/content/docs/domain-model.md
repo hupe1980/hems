@@ -191,6 +191,30 @@ The same `Rc2Discrete` serves the planner, the rule-based baseline it compares
 itself against, and the simulator that answers it. One model, and no way for the
 plan and the house to disagree about physics for numerical reasons.
 
+### The heat nobody paid for
+
+The model carries two more numbers: an effective **solar aperture** and a
+constant **internal gain**. Together they are the heat the house gets whether or
+not the compressor runs — the sun through the glazing, and the people, the
+cooking and everything electric that ends up warm.
+
+They are there because leaving them out is not a smaller model but a **wrongly
+signed** one. The average archetype loses `(21 − T_out) / 6` kW: 2,7 kW at 5 °C
+outdoors. A clear March noon puts about 550 W/m² on a vertical south plane, which
+through a 4,5 m² aperture is 2,5 kW, and the internal gains are another 0,45 — so
+on the days a heating plan is most worth making, the free heat *exceeds the
+demand*, and even at −2 °C in January it is about half of it. A planner that does
+not model it heats a room the sun is already warming and then pays the comfort
+slack for the overshoot. Measured on the reference days, giving the house its
+free heat took the January heat pump from 26,5 kWh to 21,7 and the sunny-May one
+from 10,4 to 2,7 — the second being the figure that says how wrong the old model
+was, because a well-insulated German house does not heat on 15 May.
+
+It costs the planner nothing. The state equation is already linear in the heat
+input and the free heat is a *known constant* in each slot rather than a
+decision, so it is an offset on the right-hand side: no new coefficient, no new
+variable, and the programme stays linear.
+
 ## Everything takes time as a parameter
 
 No function in `hems-core` reads a clock, opens a socket, spawns a task or

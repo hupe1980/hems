@@ -410,7 +410,7 @@ $ curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet | jq '{sit
 }
 ```
 
-`saving_eur` is the reference winter day's own €2,14, which is the point: the
+`saving_eur` is the reference winter day's own €1,94, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.

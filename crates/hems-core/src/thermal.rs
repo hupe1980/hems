@@ -74,6 +74,34 @@ pub struct Rc2 {
     pub r_air_out_k_per_kw: f64,
     /// Thermal resistance from the indoor air to the fabric, K/kW.
     pub r_air_mass_k_per_kw: f64,
+    /// Effective solar aperture, m² — the area of perfectly transmitting
+    /// glazing this building is equivalent to.
+    ///
+    /// Multiply by the irradiance on the building's principal glazed plane and
+    /// you have the heat the sun puts into it. It is the glazed area times the
+    /// glass's `g` value times whatever the frames, the curtains and the tree in
+    /// front take away, and it is one number rather than four because no
+    /// installer knows the other three and the fit does not need them separated.
+    ///
+    /// **The plane is vertical**, at the façade the windows are mostly in — not
+    /// the horizontal. Driving the aperture with a horizontal irradiance would
+    /// make it a different constant in December from the one it is in June, and
+    /// a house identified in one season would then be wrong in the other by the
+    /// ratio of the two, which at 52° north is about three.
+    ///
+    /// Zero is a building with no glazing modelled — the old behaviour, and what
+    /// [`Rc2::adiabatic_gains`] returns to.
+    pub solar_aperture_m2: f64,
+    /// Heat from people, cooking, and everything electric that ends up as heat,
+    /// kW.
+    ///
+    /// A constant, deliberately. The schedules in DIN V 18599-10 describe an
+    /// average dwelling over a year and say nothing about whether *this*
+    /// household is at home on a Tuesday; a box that pretended to know would be
+    /// inventing a diurnal shape to sit beside the two it has actually measured.
+    /// Three watts per square metre of the archetype's floor area, which is the
+    /// residential middle of EN ISO 13790 Annex G.
+    pub internal_gain_kw: f64,
 }
 
 /// The state of the two masses, °C.
@@ -232,6 +260,12 @@ impl BuildingClass {
                 // 41 K / 4,1 kW.
                 r_air_out_k_per_kw: 10.0,
                 r_air_mass_k_per_kw: 0.4,
+                // More glazing than the average house and worse glass for it:
+                // 30 m² at a triple-glazed g of 0,5. The two changes nearly
+                // cancel, which is why a new build is not the sunniest of the
+                // four.
+                solar_aperture_m2: 5.0,
+                internal_gain_kw: 0.45,
             },
             Self::SolidWall => Rc2 {
                 air_capacity_kwh_per_k: 0.6,
@@ -240,6 +274,9 @@ impl BuildingClass {
                 // 41 K / 16,5 kW.
                 r_air_out_k_per_kw: 2.5,
                 r_air_mass_k_per_kw: 0.4,
+                // Small windows in thick walls, and the reveal shades them.
+                solar_aperture_m2: 3.5,
+                internal_gain_kw: 0.45,
             },
             Self::Apartment => Rc2 {
                 // 80 m² rather than 150.
@@ -250,6 +287,10 @@ impl BuildingClass {
                 // floor area suggests.
                 r_air_out_k_per_kw: 15.0,
                 r_air_mass_k_per_kw: 0.4,
+                // Windows on one or two sides rather than four, over half the
+                // floor area.
+                solar_aperture_m2: 2.0,
+                internal_gain_kw: 0.25,
             },
         }
     }
@@ -273,7 +314,61 @@ impl Rc2 {
             mass_capacity_kwh_per_k: 12.0,
             r_air_out_k_per_kw: 6.0,
             r_air_mass_k_per_kw: 0.4,
+            // About 25 m² of glazing, a little under half of it facing the sun,
+            // double-glazed at g ≈ 0,6, with frames and curtains taking a third.
+            solar_aperture_m2: 4.5,
+            // 150 m² at 3 W/m².
+            internal_gain_kw: 0.45,
         }
+    }
+
+    /// The same fabric with the free heat switched off.
+    ///
+    /// For a caller that has no irradiance to drive the aperture with and would
+    /// rather plan against a house that is only ever heated deliberately than
+    /// against one whose sun it is inventing. It is the pre-D175 model, and it
+    /// is a **worse** model rather than a safer one: see the note on
+    /// [`Rc2::free_heat_kw`] for which way it is wrong.
+    #[must_use]
+    pub const fn adiabatic_gains(mut self) -> Self {
+        self.solar_aperture_m2 = 0.0;
+        self.internal_gain_kw = 0.0;
+        self
+    }
+
+    /// Heat this building gets for nothing, kW.
+    ///
+    /// `irradiance_w_per_m2` is on the **vertical** plane the glazing is mostly
+    /// in — see [`Rc2::solar_aperture_m2`]. It enters the model exactly where
+    /// the heat pump's kilowatts do, which is why the discretisation needs no
+    /// new term and the planner stays a linear program: the state equation is
+    /// linear in the heat input, and free heat is a *known constant* in each
+    /// slot rather than a decision.
+    ///
+    /// # Why a model without this is not merely less precise
+    ///
+    /// The German single-family archetype loses `(21 − T_out) / 6` kW. At 5 °C
+    /// that is 2,7 kW; a clear March noon on a vertical south plane is about
+    /// 550 W/m², which through a 4,5 m² aperture is 2,5 kW, and the internal
+    /// gains are another 0,45. **The free heat exceeds the demand.** Even at
+    /// −2 °C in January it is about half of it.
+    ///
+    /// A planner that does not model it therefore believes the house needs
+    /// heating all day on exactly the days it does not, runs the compressor into
+    /// a room the sun is already warming, and pays the comfort slack for the
+    /// overshoot at the top of the band — which is the *opposite* of the error a
+    /// conservative omission would make, so leaving it out is not the safe
+    /// choice. It is also the error that makes an identified fabric wrong: a fit
+    /// with no aperture has nowhere to put the sun but `R_air_out`, so it
+    /// reports a better-insulated house than the one it watched, and reports a
+    /// different one in June from the one it reported in December.
+    #[must_use]
+    pub fn free_heat_kw(&self, irradiance_w_per_m2: f64) -> f64 {
+        if !irradiance_w_per_m2.is_finite() {
+            return self.internal_gain_kw.max(0.0);
+        }
+        self.internal_gain_kw.max(0.0)
+            + self.solar_aperture_m2.max(0.0) * irradiance_w_per_m2.max(0.0) / 1000.0
     }
 
     /// Whether every parameter is finite and strictly positive — the condition
@@ -289,6 +384,14 @@ impl Rc2 {
         ]
         .iter()
         .all(|v| v.is_finite() && *v > 0.0)
+            // The two gain parameters are *not* in the list above: they take no
+            // part in the discretisation, so a nonsensical one cannot make the
+            // step diverge and must not cost a house its whole thermal model.
+            // Zero is a meaningful value for both, and `free_heat_kw` floors
+            // them, so this only has to refuse a NaN.
+            && [self.solar_aperture_m2, self.internal_gain_kw]
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0)
     }
 
     /// Steady-state heat input needed to hold `indoor_c` against `outdoor_c`, kW.

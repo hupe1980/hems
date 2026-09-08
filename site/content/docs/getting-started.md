@@ -66,13 +66,13 @@ Seven days, and six comparisons run against them. The days:
 
 | Day | What it shows | Saved |
 |---|---|---|
-| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €2,14 |
-| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,65 |
-| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,56 |
-| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,33 |
-| `offline` | **the planner switched off** — what the box does on its own | €7,90 |
-| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,77 |
-| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 11,78 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €1,27 |
+| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €1,94 |
+| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,84 |
+| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,57 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,37 |
+| `offline` | **the planner switched off** — what the box does on its own | €7,99 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,84 |
+| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,01 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €0,89 |
 
 What each comparison isolates, and why a reference day is built the way it is,
 are on [simulation and evaluation](@/docs/simulation.md).
@@ -165,12 +165,21 @@ multiplicative *level* per hour, so it absorbs soiling in a fortnight and a wron
 compass bearing never.
 
 **Which house it is, thermally.** `[site.building]` takes an archetype —
-`average`, `new-build`, `solid-wall`, `apartment` — or the four parameters
-directly. It is a *prior*: the box fits the real building from the household's
-own thermometer once it has watched a few excited days, and the fit wins. The
-prior matters for the weeks before that, because the fabric capacity decides
-whether pre-heating into a cheap hour pays at all and spans a factor of five
-across the classes.
+`average`, `new-build`, `solid-wall`, `apartment` — or the parameters directly:
+the four RC ones, plus `solar_aperture_m2` and `internal_gain_kw`, the heat the
+house gets for nothing. It is a *prior*: the box fits the real building from the
+household's own thermometer once it has watched a few excited days, and the fit
+wins. The prior matters for the weeks before that, because the fabric capacity
+decides whether pre-heating into a cheap hour pays at all and spans a factor of
+five across the classes.
+
+One field there is **not** a prior. `facade_azimuth_deg` — 180 by default, a
+south front — says which way the glazing looks, and it is the plane the solar
+aperture is measured against both when the box fits it and when the plan uses it.
+A vertical south plane at 52° north sees 1,6 times the horizontal irradiance at a
+December noon and half of it at a June one, so getting the façade wrong does not
+make the model noisier; it makes the aperture a different number in every
+season.
 
 **What the paperwork says.** `[site.declared.<asset>]` carries the commissioning
 date, the § 14a legacy regime and any exemption; `[site.para9]` the § 9 EEG facts
@@ -333,7 +342,7 @@ energy manager — a counterfactual only a simulator can re-run. A day from
 fleet counts those in `unmeasurable_days` rather than averaging them in as days
 that saved nothing.
 
-`saving_eur` is the reference winter day's own €2,14, which is the point: the
+`saving_eur` is the reference winter day's own €1,94, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.

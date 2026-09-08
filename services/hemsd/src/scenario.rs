@@ -95,7 +95,24 @@ const THREE_PHASE_EFFICIENCY: f64 = 0.92;
 /// same arithmetic and adds nothing a minute does not already show. The guard is
 /// told the period, because a bound on a state is only a bound on a rate once
 /// you know how long the rate is held for.
-const CONTROL_PERIOD: Duration = Duration::minutes(1);
+/// How often a simulated day re-derives.
+///
+/// A minute, against the one **second** a box on a wall runs at. That ratio is
+/// not a detail: every bound a reactive controller has scales with it, so the
+/// day's own § 9 EEG excursions are sixty times a box's, and the assertions that
+/// bound them say so rather than quoting a number that would be meaningless at
+/// the other cadence. See [`DayResult::worst_uncommanded_export_step_w`].
+pub const CONTROL_PERIOD: Duration = Duration::minutes(1);
+
+/// Which way the reference household's glazing faces, degrees clockwise from
+/// north.
+///
+/// Due south, like its roof. It is the plane the building's solar aperture is
+/// driven with (`hems_core::thermal::Rc2::solar_aperture_m2`), and it is a
+/// constant here for the same reason the roof's tilt is read from the site model
+/// rather than repeated: the simulator and the plan must not be able to disagree
+/// about which way the house is pointing.
+const FACADE_AZIMUTH_DEG: f64 = 180.0;
 
 /// How often the planner re-solves.
 ///
@@ -800,6 +817,18 @@ pub struct DayResult {
     /// reads exactly like a mechanism that ran and achieved nothing, so the
     /// report prints the line only where there is one to print.
     pub shared_kwh: f64,
+    /// The same, for the **unmanaged** household of
+    /// [`DayResult::baseline`] — a member of the same community that joined and
+    /// then did nothing about it.
+    ///
+    /// It was computed and thrown away: `baseline_cost` settled the allocation
+    /// to get its credit and kept only the euros. That made the value of
+    /// *shifting* into a community window measurable only as a difference of two
+    /// differences — two savings each the difference of two ~30 € days — where
+    /// the quantity itself is right here. On a January day the euro figure comes
+    /// out at three cents either way, which is noise; the kilowatt-hours are the
+    /// mechanism (D174).
+    pub baseline_shared_kwh: f64,
     /// Household consumption excluding the controllable devices, kWh.
     pub consumed_kwh: f64,
     /// Production thrown away because it could be neither used nor exported, kWh.
@@ -933,6 +962,26 @@ pub struct DayResult {
     pub worst_feed_in_overshoot_w: f64,
     /// For how long the connection point was above that ceiling, minutes.
     pub feed_in_over_minutes: i64,
+    /// The largest rise in *uncommanded* net export between two control
+    /// periods, watts — the roof going up plus the household's own draw going
+    /// down, neither of which the manager asked for.
+    ///
+    /// This is what bounds [`DayResult::worst_feed_in_overshoot_w`], and it is
+    /// the reason that number is not zero on a reactive limiter. A guard that
+    /// held the connection point exactly at the ceiling last tick is over it by
+    /// this much on the next one, whatever it does, because the step happened
+    /// between two decisions.
+    ///
+    /// It is reported rather than reasoned about because the dominant term is
+    /// not what it was assumed to be. The bound this replaced was written as
+    /// "the household's own uncommanded load steps" and hard-coded at a
+    /// kilowatt; measured on the `capped` day, the worst tick has 288 W of
+    /// household draw and the step is almost entirely the **roof** — a cloud
+    /// edge clearing on a 20 kWp array in sixty seconds. The load-step story
+    /// was true for the site it was written on and stopped being true when the
+    /// array grew, which is exactly what a hard-coded bound cannot tell you
+    /// (D174).
+    pub worst_uncommanded_export_step_w: f64,
     /// How long the manager held itself at its failsafe value for want of
     /// contact with an Energy Guard, minutes — the `init` and `failsafe` states
     /// of the EEBUS machine together.
@@ -1512,6 +1561,9 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     let mut failsafe_for = Duration::ZERO;
     let mut limited_for = Duration::ZERO;
     let mut feed_in_over = Duration::ZERO;
+    // The previous period's uncommanded net export, so the step between two
+    // guard decisions can be measured rather than argued about.
+    let mut previous_uncommanded_export: Option<Power> = None;
     // What the connection point saw last tick. The only thing on this loop that
     // reads it is the offline fallback for a shiftable appliance, which has to
     // decide before the current tick's balance exists.
@@ -1609,6 +1661,14 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 .slots()
                 .map(|s| weather.forecast_outdoor_at(s.start()))
                 .collect();
+            // And the sun on the windows the *forecast* expects — the mean cloud,
+            // not this day's own. The house will get whatever it gets; the plan
+            // is made against what a box could have known, which is the whole
+            // discipline of D35.
+            let horizon_window: Vec<f64> = horizon
+                .slots()
+                .map(|s| weather.forecast_window_at(site.location, s, FACADE_AZIMUTH_DEG))
+                .collect();
             let mut problem = Problem::new(horizon, &horizon_prices, &pv_forecast, &load_forecast)
                 .with_battery(BatteryModel {
                     capacity: battery.capacity,
@@ -1649,6 +1709,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                         },
                     },
                     &horizon_outdoor,
+                    &horizon_window,
                 )
                 .with_dhw(
                     DhwModel {
@@ -2066,6 +2127,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                 .copied()
                 .unwrap_or(Power::ZERO),
             outdoor_now,
+            weather.window_at(site.location, now, FACADE_AZIMUTH_DEG),
             step,
         );
         let (dhw_actual, dhw_short) = tank.step(
@@ -2187,6 +2249,17 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                     result.worst_feed_in_overshoot_w.max(over * 1000.0);
                 feed_in_over += step;
             }
+            // What the guard could not have known a period earlier: the roof
+            // rising and the household's uninstrumented draw falling. It is the
+            // bound on the line above, so it is measured beside it rather than
+            // assumed about it.
+            let uncommanded = pv_now.outflow() - load_now.inflow();
+            if let Some(previous) = previous_uncommanded_export {
+                result.worst_uncommanded_export_step_w = result
+                    .worst_uncommanded_export_step_w
+                    .max((uncommanded - previous).kw() * 1000.0);
+            }
+            previous_uncommanded_export = Some(uncommanded);
         }
         result.battery_throughput_kwh += battery_actual.abs().kw() * hours;
         if evse.mode == PhaseMode::Single && evse_actual > Power::ZERO {
@@ -2409,7 +2482,8 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         .map_or(0.0, |(v, ev)| {
             -(v.stored - ev.energy_target).max(Energy::ZERO).kwh() * mean_import
         });
-    result.baseline = baseline_cost(scenario, &weather, &array, &prices, site, site.location);
+    (result.baseline, result.baseline_shared_kwh) =
+        baseline_cost(scenario, &weather, &array, &prices, site, site.location);
 
     // ── § 42c: what the community actually allocated this member ────────────
     (result.shared_kwh, result.cost.sharing_eur) = community.settle(&prices);
@@ -2681,15 +2755,16 @@ fn unmanaged_wallbox(
 /// whole of the difference being measured — and it lives under the same § 14a
 /// direct-control ceiling the rest of the unmanaged house does.
 fn unmanaged_heat_pump(
-    scenario: &Scenario,
-    weather: &Weather,
+    house: &Reference,
     building: &mut BuildingSim,
     thermostat_on: &mut bool,
     bounded: &impl Fn(Power) -> Power,
-    now: OffsetDateTime,
+    outdoor_c: f64,
+    // The same sun the managed house gets. A baseline heated by a different
+    // physics from the plan's is not a comparison (D37).
+    window_w_per_m2: f64,
     step: Duration,
 ) -> Power {
-    let house = Reference::of(&scenario.config).expect("run() has already validated this");
     let low = house.heat_pump.comfort_min_c;
     if building.indoor_c() < low {
         *thermostat_on = true;
@@ -2702,7 +2777,8 @@ fn unmanaged_heat_pump(
         } else {
             Power::ZERO
         },
-        weather.outdoor_at(now),
+        outdoor_c,
+        window_w_per_m2,
         step,
     )
 }
@@ -2840,7 +2916,7 @@ fn baseline_cost(
     prices: &PriceStack,
     site: &Site,
     location: GeoPoint,
-) -> CostBreakdown {
+) -> (CostBreakdown, f64) {
     let house = Reference::of(&scenario.config).expect("run() has already validated this");
     let start = scenario.start();
     // The same § 9 EEG ceiling the managed house lives under. It is a property
@@ -2932,12 +3008,12 @@ fn baseline_cost(
         );
 
         let hp = unmanaged_heat_pump(
-            scenario,
-            weather,
+            &house,
             &mut building,
             &mut thermostat_on,
             &bounded,
-            now,
+            weather.outdoor_at(now),
+            weather.window_at(location, now, FACADE_AZIMUTH_DEG),
             step,
         );
 
@@ -2988,7 +3064,8 @@ fn baseline_cost(
         .sum::<f64>()
         / prices.slots.len().max(1) as f64;
     cost.stored_eur = (tank_open - tank.stored).kwh() / tank.cop.max(f64::EPSILON) * mean_import;
-    cost.sharing_eur = community.settle(prices).1;
+    let (baseline_shared_kwh, sharing_eur) = community.settle(prices);
+    cost.sharing_eur = sharing_eur;
     // A window with nowhere to put the programme costs the same on both sides.
     // Charging only the plan for a wash nobody got would be the asymmetry this
     // whole function exists to avoid, pointing the other way.
@@ -3001,7 +3078,7 @@ fn baseline_cost(
     cost.vehicle_eur = scenario.ev.map_or(0.0, |ev| {
         -(car_stored - ev.energy_target).max(Energy::ZERO).kwh() * mean_import
     });
-    cost
+    (cost, baseline_shared_kwh)
 }
 
 fn household_load(slot: Slot) -> Power {

@@ -192,8 +192,19 @@ impl Learned {
     /// arrive together or not at all — how warm it was inside, how warm outside,
     /// and how much heat went in — and a household with no indoor sensor has
     /// none of them while still having a perfectly good load profile.
-    pub fn observe_house(&mut self, slot: Slot, indoor_c: f64, outdoor_c: f64, heat_kw: f64) {
-        self.building.observe(slot, indoor_c, outdoor_c, heat_kw);
+    /// `window_w_per_m2` is the irradiance on the building's glazing over the
+    /// slot; a site with no weather series passes zero, and the identification
+    /// then leaves the aperture at the prior rather than fitting it to nothing.
+    pub fn observe_house(
+        &mut self,
+        slot: Slot,
+        indoor_c: f64,
+        outdoor_c: f64,
+        heat_kw: f64,
+        window_w_per_m2: f64,
+    ) {
+        self.building
+            .observe(slot, indoor_c, outdoor_c, heat_kw, window_w_per_m2);
     }
 }
 
@@ -203,6 +214,10 @@ pub struct Planner {
     pub household: Household,
     /// The roof, as the solar model sees it.
     pub array: ArrayModel,
+    /// Which way the building's glazing mostly faces, degrees clockwise from
+    /// north — the plane [`hems_core::thermal::Rc2::solar_aperture_m2`] is
+    /// driven with.
+    pub facade_azimuth_deg: f64,
     /// What a kilowatt-hour costs and earns.
     pub tariff: TariffSettings,
     /// Cadences and budgets.
@@ -313,6 +328,15 @@ pub struct Published {
     /// boundary would be teaching its building from one series and planning it
     /// against another.
     pub outdoor: Arc<RwLock<std::collections::BTreeMap<Slot, f64>>>,
+    /// The irradiance on the building's glazing the plan was made against, by
+    /// slot, W/m².
+    ///
+    /// The fourth series, and it travels with `outdoor` for exactly the reason
+    /// `outdoor` travels with `modelled_pv`: the aperture is **identified**
+    /// against it and **planned** against it, and a box that used one number for
+    /// the fit and another for the plan would be fitting the difference between
+    /// two forecasts.
+    pub window: Arc<RwLock<std::collections::BTreeMap<Slot, f64>>>,
 }
 
 /// Plan, publish, sleep, repeat — until the process is asked to stop.
@@ -536,7 +560,15 @@ async fn attempt(
     let building = held.building.building();
     drop(held);
 
-    publish(published, &series, &pv, &load).await;
+    publish(
+        published,
+        &series,
+        &pv,
+        &load,
+        site.location,
+        planner.facade_azimuth_deg,
+    )
+    .await;
 
     // ── The battery, if its meter is telling us where it is ─────────────────
     let battery = battery_model(
@@ -557,6 +589,11 @@ async fn attempt(
     // across a ten-second solve.
     let thermal = heat_pump_model(site, &observed, &planner.household, building);
     let outdoor: Vec<f64> = series.outdoor_c_over(horizon);
+    // The sun on the windows, which is heat the house gets whether or not the
+    // compressor runs — on a clear shoulder-season noon it is the whole of the
+    // demand (`Rc2::free_heat_kw`).
+    let window: Vec<f64> =
+        series.window_w_per_m2_over(horizon, site.location, planner.facade_azimuth_deg);
     let ev = ev_session(
         site,
         &observed,
@@ -618,7 +655,7 @@ async fn attempt(
             problem = problem.with_ev(session);
         }
         if let Some(model) = thermal {
-            problem = problem.with_thermal(model, &outdoor);
+            problem = problem.with_thermal(model, &outdoor, &window);
         }
         problem.solve_budget_s = budget;
         solve(&problem, &names, now)
@@ -635,11 +672,32 @@ async fn attempt(
 /// what was **acted on** rather than against a fresh forecast. A band nobody
 /// planned against says nothing about the plan, and a building identified from
 /// one weather series and planned against another is identified from noise.
-async fn publish(published: &Published, series: &WeatherSeries, pv: &Forecast, load: &Forecast) {
+async fn publish(
+    published: &Published,
+    series: &WeatherSeries,
+    pv: &Forecast,
+    load: &Forecast,
+    location: hems_core::prelude::GeoPoint,
+    facade_azimuth_deg: f64,
+) {
     *published.outdoor.write().await = series
         .slots
         .iter()
         .map(|(slot, point)| (*slot, point.temperature_c))
+        .collect();
+    *published.window.write().await = series
+        .slots
+        .iter()
+        .map(|(slot, point)| {
+            (
+                *slot,
+                hems_forecast::solar::window_irradiance(
+                    hems_forecast::solar::sun_position(location, *slot),
+                    point.ghi_w_per_m2,
+                    facade_azimuth_deg,
+                ),
+            )
+        })
         .collect();
     *published.bands.write().await = pv
         .slots

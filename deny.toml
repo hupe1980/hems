@@ -64,7 +64,38 @@ allow-wildcard-paths = true
 # compiled in and neither is installed as the process default, and a household
 # box discovering that at the first fleet call is not where it should be found.
 # So the choice is a build failure to change rather than a resolution to notice.
-deny = [{ name = "ring", reason = "the TLS provider is aws-lc-rs; two providers in one binary is a runtime panic" }]
+#
+# ## The rule is stated over the feature, not over the crate
+#
+# It used to be `deny = [{ name = "ring" }]`, and that is the wrong noun. `ring`
+# is a general cryptography library; it is a `rustls` **provider** only when
+# something turns on `rustls/ring`. Banning the crate bans every other use of it
+# in the graph, and the one that matters is real: `parquet` uses `ring` for
+# Parquet modular encryption, reached through `datafusion`'s default features,
+# which is how `meterstore` — the tiered metering store `histd`'s register half
+# is meant to move to — came to be refused by a rule whose stated reason
+# (a second TLS provider) was not true of it. Measured 2026-09-08 on
+# `meterstore` 0.12: `ring` v0.17 is in the tree and the only `rustls` provider
+# is `aws-lc-rs`.
+#
+# So the ban is on the feature that would actually produce the panic. It fails
+# on the state it names and on nothing else, which is the difference between a
+# rule and a proxy for one.
+#
+# The defence in depth is `hems_service::db`, which builds its `ClientConfig` on
+# an explicitly named `aws_lc_rs` provider rather than on whatever the process
+# default happens to be — so even a graph that acquired two would not panic
+# there.
+
+[[bans.features]]
+crate  = "rustls"
+deny   = ["ring"]
+reason = "the TLS provider is aws-lc-rs; two rustls providers in one binary is a runtime panic"
+
+[[bans.features]]
+crate  = "rustls-webpki"
+deny   = ["ring"]
+reason = "the certificate verifier follows the same provider as rustls itself"
 
 [advisories]
 version = 2

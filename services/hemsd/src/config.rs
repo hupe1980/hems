@@ -753,7 +753,7 @@ impl Default for SiteSettings {
 /// and the difference is not cosmetic — the fabric capacity decides whether
 /// pre-heating into a cheap hour pays at all, and it spans a factor of five
 /// across the classes.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct BuildingSettings {
     /// The archetype, from [`BuildingClass`]: `average` (the default),
@@ -772,6 +772,40 @@ pub struct BuildingSettings {
     pub r_air_out_k_per_kw: Option<f64>,
     /// Thermal resistance from the indoor air to the fabric, K/kW.
     pub r_air_mass_k_per_kw: Option<f64>,
+    /// Effective solar aperture, m² — the glazed area times what actually gets
+    /// through it. Overrides the archetype's.
+    pub solar_aperture_m2: Option<f64>,
+    /// Heat from people and appliances, kW. Overrides the archetype's.
+    pub internal_gain_kw: Option<f64>,
+    /// Which way the glazing mostly faces, degrees clockwise from north.
+    ///
+    /// 180 is a south front, and it is the default because it is the orientation
+    /// a German house is built to where the plot allows. It matters: the same
+    /// aperture facing east sees its sun before the house is cold and none of it
+    /// at four in the afternoon.
+    ///
+    /// It is the plane [`Rc2::solar_aperture_m2`] is driven with, so the value
+    /// here and the value the box **identifies** the aperture against are the
+    /// same by construction — an azimuth that is wrong makes the fitted aperture
+    /// absorb the error rather than making the model diverge.
+    pub facade_azimuth_deg: f64,
+}
+
+impl Default for BuildingSettings {
+    /// The archetype and nothing overridden — except the façade, which cannot
+    /// be `0` by default without pointing every unconfigured house north.
+    fn default() -> Self {
+        Self {
+            class: BuildingClass::default(),
+            air_capacity_kwh_per_k: None,
+            mass_capacity_kwh_per_k: None,
+            r_air_out_k_per_kw: None,
+            r_air_mass_k_per_kw: None,
+            solar_aperture_m2: None,
+            internal_gain_kw: None,
+            facade_azimuth_deg: 180.0,
+        }
+    }
 }
 
 impl BuildingSettings {
@@ -792,6 +826,8 @@ impl BuildingSettings {
                 .unwrap_or(base.mass_capacity_kwh_per_k),
             r_air_out_k_per_kw: self.r_air_out_k_per_kw.unwrap_or(base.r_air_out_k_per_kw),
             r_air_mass_k_per_kw: self.r_air_mass_k_per_kw.unwrap_or(base.r_air_mass_k_per_kw),
+            solar_aperture_m2: self.solar_aperture_m2.unwrap_or(base.solar_aperture_m2),
+            internal_gain_kw: self.internal_gain_kw.unwrap_or(base.internal_gain_kw),
         };
         if built.is_valid() {
             Ok(built)

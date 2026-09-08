@@ -64,9 +64,21 @@ pub struct ThermalSample {
     /// asking for a number nobody has.
     pub mass_c: f64,
     /// Heat delivered into the air during the step, kW.
+    ///
+    /// The heating system's own contribution, and only that. The sun and the
+    /// household are not in it: they are what [`Rc2::solar_aperture_m2`] and
+    /// [`Rc2::internal_gain_kw`] are being **fitted** for, and adding them here
+    /// with an assumed size would be handing the fit the answer.
     pub heat_kw: f64,
     /// Outdoor temperature over the step, °C.
     pub outdoor_c: f64,
+    /// Irradiance on the building's principal glazed plane over the step, W/m².
+    ///
+    /// Vertical, at the façade's own azimuth — [`crate::solar::window_irradiance`]
+    /// computes it from a global horizontal value. A record that has none may
+    /// pass zero throughout, and [`identify`] then leaves the aperture at the
+    /// prior instead of fitting a parameter nothing excites.
+    pub solar_w_per_m2: f64,
     /// Indoor air temperature at the *end* of the step, °C — the thing being
     /// predicted.
     pub next_indoor_c: f64,
@@ -127,7 +139,11 @@ fn one_step_mse(building: &Rc2, samples: &[ThermalSample], dt: Duration) -> f64 
                 indoor_c: s.indoor_c,
                 mass_c: mass,
             },
-            s.heat_kw,
+            // The heating system plus what the candidate says the house gets for
+            // nothing. The free heat is part of the *model* here, not part of
+            // the record, which is what makes the aperture and the internal gain
+            // identifiable at all.
+            s.heat_kw + building.free_heat_kw(s.solar_w_per_m2),
             s.outdoor_c,
         );
         let error = next.indoor_c - s.next_indoor_c;
@@ -139,32 +155,46 @@ fn one_step_mse(building: &Rc2, samples: &[ThermalSample], dt: Duration) -> f64 
     total / n
 }
 
-/// The four parameters as a vector, in the order the search walks them.
-fn to_vec(b: &Rc2) -> [f64; 4] {
+/// How many parameters the search walks.
+const PARAMS: usize = 6;
+
+/// The parameters as a vector, in the order the search walks them.
+fn to_vec(b: &Rc2) -> [f64; PARAMS] {
     [
         b.air_capacity_kwh_per_k,
         b.mass_capacity_kwh_per_k,
         b.r_air_out_k_per_kw,
         b.r_air_mass_k_per_kw,
+        b.solar_aperture_m2,
+        b.internal_gain_kw,
     ]
 }
 
-fn from_vec(v: [f64; 4]) -> Rc2 {
+fn from_vec(v: [f64; PARAMS]) -> Rc2 {
     Rc2 {
         air_capacity_kwh_per_k: v[0],
         mass_capacity_kwh_per_k: v[1],
         r_air_out_k_per_kw: v[2],
         r_air_mass_k_per_kw: v[3],
+        solar_aperture_m2: v[4],
+        internal_gain_kw: v[5],
     }
 }
 
 /// Physically plausible bounds for a dwelling, so a fit cannot wander into a
 /// house made of vacuum.
-const BOUNDS: [(f64, f64); 4] = [
-    (0.05, 5.0), // air capacity, kWh/K
-    (1.0, 80.0), // fabric capacity, kWh/K
-    (0.5, 60.0), // air ↔ outdoors, K/kW
-    (0.02, 5.0), // air ↔ fabric, K/kW
+///
+/// Every lower bound is strictly positive because the search is
+/// **multiplicative**: a parameter that reached exactly zero could never leave
+/// it again, and a dwelling with no glazing and nobody in it is not one of the
+/// answers worth being able to give.
+const BOUNDS: [(f64, f64); PARAMS] = [
+    (0.05, 5.0),  // air capacity, kWh/K
+    (1.0, 80.0),  // fabric capacity, kWh/K
+    (0.5, 60.0),  // air ↔ outdoors, K/kW
+    (0.02, 5.0),  // air ↔ fabric, K/kW
+    (0.05, 30.0), // solar aperture, m² — 30 is a wall of glass
+    (0.02, 3.0),  // internal gain, kW — 3 kW is a party, not a household
 ];
 
 /// The largest relative step the search starts with, and the smallest it stops
@@ -172,25 +202,29 @@ const BOUNDS: [(f64, f64); 4] = [
 const STEP_START: f64 = 0.5;
 const STEP_STOP: f64 = 0.0005;
 
-/// The directions the pattern search tries, as exponents on a step ratio.
+/// The directions the pattern search tries over `active`, as exponents on a
+/// step ratio.
 ///
-/// The four axes, then every signed pair. A pair moving two parameters the
-/// *same* way walks along the ridge described in the module note; a pair moving
-/// them opposite ways crosses it.
-fn directions() -> Vec<[f64; 4]> {
-    let mut out = Vec::with_capacity(32);
-    for i in 0..4 {
+/// Each active axis, then every signed pair of them. A pair moving two
+/// parameters the *same* way walks along the ridge described in the module note;
+/// a pair moving them opposite ways crosses it.
+///
+/// The axes are a parameter rather than all of them because an unexcited one
+/// must not be walked: see [`excited`].
+fn directions(active: &[usize]) -> Vec<[f64; PARAMS]> {
+    let mut out = Vec::with_capacity(active.len() * 2 + active.len() * active.len() * 2);
+    for &i in active {
         for sign in [1.0, -1.0] {
-            let mut d = [0.0; 4];
+            let mut d = [0.0; PARAMS];
             d[i] = sign;
             out.push(d);
         }
     }
-    for i in 0..4 {
-        for j in (i + 1)..4 {
+    for (a, &i) in active.iter().enumerate() {
+        for &j in &active[a + 1..] {
             for si in [1.0, -1.0] {
                 for sj in [1.0, -1.0] {
-                    let mut d = [0.0; 4];
+                    let mut d = [0.0; PARAMS];
                     d[i] = si;
                     d[j] = sj;
                     out.push(d);
@@ -201,18 +235,50 @@ fn directions() -> Vec<[f64; 4]> {
     out
 }
 
-/// Whether the record says anything about how the house responds to heat.
-///
-/// Without variation in the heat input the identification is fitting a free
-/// response, and the two capacities become unidentifiable from the resistances.
-fn is_excited(samples: &[ThermalSample]) -> bool {
+/// The spread of one column of the record.
+fn spread(samples: &[ThermalSample], of: impl Fn(&ThermalSample) -> f64) -> f64 {
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
     for s in samples {
-        min = min.min(s.heat_kw);
-        max = max.max(s.heat_kw);
+        let v = of(s);
+        min = min.min(v);
+        max = max.max(v);
     }
-    max - min > 0.5
+    max - min
+}
+
+/// Which parameters this record can say anything about.
+///
+/// Identification needs **excitation**, and the two halves of the model need
+/// different excitation. Without variation in the heat input the fit is watching
+/// a free response and the capacities become unidentifiable from the
+/// resistances — that is the refusal [`identify`] has always made. The solar
+/// aperture needs the same thing from the *irradiance*: a record taken through a
+/// fortnight of unbroken cloud, or one whose caller has no irradiance to give
+/// and passes zero, says nothing about how much sun this house lets in.
+///
+/// The answer there is not to refuse the whole identification — the fabric is
+/// still learnable and is the valuable half — but to leave the aperture at the
+/// prior and not walk it. A parameter the data cannot constrain, left free in a
+/// search, does not stay where it started: it absorbs whatever else the model
+/// gets wrong.
+///
+/// The internal gain is always walked. It is a constant offset in the heat
+/// input, so any record that excites the fabric at all constrains it.
+fn excited(samples: &[ThermalSample]) -> Option<Vec<usize>> {
+    // Half a kilowatt of movement in the heating, or there is no fabric to fit.
+    if spread(samples, |s| s.heat_kw) <= 0.5 {
+        return None;
+    }
+    let mut active = vec![0, 1, 2, 3, 5];
+    // A hundred watts per square metre between the darkest and the brightest
+    // step: less than the difference between an overcast noon and a dark one, so
+    // this refuses only a record with no daylight in it at all.
+    if spread(samples, |s| s.solar_w_per_m2) > 100.0 {
+        active.push(4);
+        active.sort_unstable();
+    }
+    Some(active)
 }
 
 /// Identify a building from its own record.
@@ -225,7 +291,7 @@ fn is_excited(samples: &[ThermalSample]) -> bool {
 /// moved, or when the fit does not beat the prior by [`MIN_IMPROVEMENT`].
 #[must_use]
 pub fn identify(samples: &[ThermalSample], dt: Duration, prior: Rc2) -> Option<Identified> {
-    if samples.len() < MIN_SAMPLES || !prior.is_valid() || !is_excited(samples) {
+    if samples.len() < MIN_SAMPLES || !prior.is_valid() {
         return None;
     }
     if samples.iter().any(|s| {
@@ -235,24 +301,26 @@ pub fn identify(samples: &[ThermalSample], dt: Duration, prior: Rc2) -> Option<I
             s.heat_kw,
             s.outdoor_c,
             s.next_indoor_c,
+            s.solar_w_per_m2,
         ]
         .iter()
         .all(|v| v.is_finite())
     }) {
         return None;
     }
+    let active = excited(samples)?;
 
     let prior_mse = one_step_mse(&prior, samples, dt);
     let mut best = to_vec(&prior);
     let mut best_mse = prior_mse;
     let mut step = STEP_START;
-    let directions = directions();
+    let directions = directions(&active);
 
     while step > STEP_STOP {
         let mut improved = false;
         for direction in &directions {
             let mut candidate = best;
-            for i in 0..4 {
+            for i in 0..PARAMS {
                 if direction[i] != 0.0 {
                     candidate[i] = (candidate[i] * (1.0 + step).powf(direction[i]))
                         .clamp(BOUNDS[i].0, BOUNDS[i].1);
@@ -325,6 +393,7 @@ struct Observation {
     indoor_c: f64,
     outdoor_c: f64,
     heat_kw: f64,
+    solar_w_per_m2: f64,
 }
 
 impl Default for Record {
@@ -379,8 +448,18 @@ impl Record {
     ///
     /// A slot that does not directly follow the open observation discards it and
     /// starts again; so does any non-finite reading.
-    pub fn observe(&mut self, slot: Slot, indoor_c: f64, outdoor_c: f64, heat_kw: f64) {
-        if ![indoor_c, outdoor_c, heat_kw].iter().all(|v| v.is_finite()) {
+    pub fn observe(
+        &mut self,
+        slot: Slot,
+        indoor_c: f64,
+        outdoor_c: f64,
+        heat_kw: f64,
+        solar_w_per_m2: f64,
+    ) {
+        if ![indoor_c, outdoor_c, heat_kw, solar_w_per_m2]
+            .iter()
+            .all(|v| v.is_finite())
+        {
             self.open = None;
             return;
         }
@@ -389,6 +468,7 @@ impl Record {
             indoor_c,
             outdoor_c,
             heat_kw,
+            solar_w_per_m2,
         };
         if let Some(previous) = self.open.take() {
             if previous.slot.next() == slot {
@@ -399,6 +479,7 @@ impl Record {
                     mass_c: previous.indoor_c,
                     heat_kw: previous.heat_kw,
                     outdoor_c: previous.outdoor_c,
+                    solar_w_per_m2: previous.solar_w_per_m2,
                     next_indoor_c: indoor_c,
                 });
             } else {
@@ -444,6 +525,16 @@ mod tests {
 
     /// Generate a record from a known house, with a heat input that actually
     /// moves — which is what makes the parameters identifiable.
+    /// A day's worth of daylight on a vertical south wall, W/m² — a half-sine
+    /// over the middle of the day and nothing at night.
+    fn daylight(k: usize) -> f64 {
+        let hour = (k % 96) as f64 / 4.0;
+        if !(7.0..19.0).contains(&hour) {
+            return 0.0;
+        }
+        450.0 * ((hour - 7.0) / 12.0 * std::f64::consts::PI).sin()
+    }
+
     fn record(truth: Rc2, n: usize) -> Vec<ThermalSample> {
         let d = truth.discretise(SLOT);
         let mut state = ThermalState::uniform(20.0);
@@ -455,12 +546,21 @@ mod tests {
             // content at more than one frequency.
             let heat_kw = if (k / 6) % 2 == 0 { 4.0 } else { 0.0 };
             let outdoor_c = 2.0 + 4.0 * (t / 96.0 * std::f64::consts::TAU).sin();
-            let next = d.step(state, heat_kw, outdoor_c);
+            // Not every day is clear, or the sun and the clock would be the same
+            // signal and the aperture would be unidentifiable from the daily
+            // temperature swing.
+            let solar_w_per_m2 = daylight(k) * if (k / 96) % 3 == 0 { 0.2 } else { 1.0 };
+            let next = d.step(
+                state,
+                heat_kw + truth.free_heat_kw(solar_w_per_m2),
+                outdoor_c,
+            );
             out.push(ThermalSample {
                 indoor_c: state.indoor_c,
                 mass_c: state.mass_c,
                 heat_kw,
                 outdoor_c,
+                solar_w_per_m2,
                 next_indoor_c: next.indoor_c,
             });
             state = next;
@@ -477,6 +577,8 @@ mod tests {
             mass_capacity_kwh_per_k: 25.0,
             r_air_out_k_per_kw: 3.5,
             r_air_mass_k_per_kw: 0.25,
+            solar_aperture_m2: 7.0,
+            internal_gain_kw: 0.8,
         };
         let samples = record(truth, 4 * 96);
         let fit = identify(&samples, SLOT, Rc2::house()).expect("four days of an excited house");
@@ -495,6 +597,68 @@ mod tests {
         let b = truth.discretise(SLOT);
         assert!((a.b_heat[0] - b.b_heat[0]).abs() < 0.01, "{a:?} vs {b:?}");
         assert!((a.a[0][0] - b.a[0][0]).abs() < 0.01, "{a:?} vs {b:?}");
+    }
+
+    #[test]
+    fn the_sun_a_house_lets_in_is_recovered_from_its_own_record() {
+        // The aperture is the parameter this model gained, and a parameter a fit
+        // cannot recover is a parameter that has become a place for the fit to
+        // put its other errors. A house with half again the prior's glazing.
+        let truth = Rc2 {
+            solar_aperture_m2: 7.0,
+            internal_gain_kw: 0.8,
+            ..Rc2::house()
+        };
+        let samples = record(truth, 6 * 96);
+        let fit = identify(&samples, SLOT, Rc2::house()).expect("six days of an excited house");
+        assert!(
+            (fit.building.solar_aperture_m2 - 7.0).abs() < 1.0,
+            "aperture {} m² against 7,0",
+            fit.building.solar_aperture_m2
+        );
+        assert!(
+            (fit.building.internal_gain_kw - 0.8).abs() < 0.25,
+            "internal gain {} kW against 0,8",
+            fit.building.internal_gain_kw
+        );
+    }
+
+    #[test]
+    fn a_fortnight_of_darkness_leaves_the_aperture_alone_rather_than_inventing_one() {
+        // Excitation is per parameter. A record with no daylight in it still
+        // says everything about the fabric and nothing about the glazing, and a
+        // parameter the data cannot constrain must not be walked: left free, it
+        // absorbs whatever else the model gets wrong.
+        let truth = Rc2 {
+            air_capacity_kwh_per_k: 0.35,
+            mass_capacity_kwh_per_k: 25.0,
+            r_air_out_k_per_kw: 3.5,
+            r_air_mass_k_per_kw: 0.25,
+            solar_aperture_m2: 7.0,
+            internal_gain_kw: 0.8,
+        };
+        let mut samples = record(truth, 4 * 96);
+        // The same house, re-derived with the sun switched off — polar night,
+        // or a caller with no irradiance to give.
+        let dark = truth.discretise(SLOT);
+        let mut state = ThermalState::uniform(20.0);
+        for s in &mut samples {
+            let next = dark.step(state, s.heat_kw + truth.internal_gain_kw, s.outdoor_c);
+            s.indoor_c = state.indoor_c;
+            s.mass_c = state.mass_c;
+            s.solar_w_per_m2 = 0.0;
+            s.next_indoor_c = next.indoor_c;
+            state = next;
+        }
+        let prior = Rc2::house();
+        let fit = identify(&samples, SLOT, prior).expect("the fabric is still learnable");
+        assert_eq!(
+            fit.building.solar_aperture_m2, prior.solar_aperture_m2,
+            "an unexcited parameter stays where the prior put it"
+        );
+        // …and the fabric was learned anyway, which is the reason not to refuse
+        // the whole identification.
+        assert!(fit.improvement() > 0.5, "improvement {}", fit.improvement());
     }
 
     #[test]
@@ -522,6 +686,7 @@ mod tests {
                     mass_c: state.mass_c,
                     heat_kw: 0.0,
                     outdoor_c: 5.0,
+                    solar_w_per_m2: 0.0,
                     next_indoor_c: next.indoor_c,
                 };
                 state = next;
@@ -544,6 +709,8 @@ mod tests {
             mass_capacity_kwh_per_k: 25.0,
             r_air_out_k_per_kw: 3.5,
             r_air_mass_k_per_kw: 0.25,
+            solar_aperture_m2: 7.0,
+            internal_gain_kw: 0.8,
         };
         let samples = record(truth, 3 * 96);
         let fit = identify(&samples, SLOT, Rc2::house()).expect("a fit");
@@ -565,8 +732,13 @@ mod tests {
             let t = k as f64;
             let heat_kw = if (k / 6) % 2 == 0 { 4.0 } else { 0.0 };
             let outdoor_c = 2.0 + 4.0 * (t / 96.0 * std::f64::consts::TAU).sin();
-            record.observe(slot, state.indoor_c, outdoor_c, heat_kw);
-            state = d.step(state, heat_kw, outdoor_c);
+            let solar_w_per_m2 = daylight(k) * if (k / 96) % 3 == 0 { 0.2 } else { 1.0 };
+            record.observe(slot, state.indoor_c, outdoor_c, heat_kw, solar_w_per_m2);
+            state = d.step(
+                state,
+                heat_kw + truth.free_heat_kw(solar_w_per_m2),
+                outdoor_c,
+            );
             slot = slot.next();
         }
         record
@@ -585,6 +757,8 @@ mod tests {
             mass_capacity_kwh_per_k: 25.0,
             r_air_out_k_per_kw: 3.5,
             r_air_mass_k_per_kw: 0.25,
+            solar_aperture_m2: 7.0,
+            internal_gain_kw: 0.8,
         };
         let mut record = watched(truth, 4 * 96, midnight());
         assert_eq!(
@@ -621,16 +795,16 @@ mod tests {
         // does.
         let mut record = Record::new(Rc2::house());
         let first = midnight();
-        record.observe(first, 21.0, 0.0, 4.0);
-        record.observe(first.next(), 21.1, 0.0, 4.0);
+        record.observe(first, 21.0, 0.0, 4.0, 0.0);
+        record.observe(first.next(), 21.1, 0.0, 4.0, 0.0);
         assert_eq!(record.len(), 1);
 
         // Four hours later.
         let after = (0..16).fold(first, |s, _| s.next());
-        record.observe(after, 18.0, 0.0, 0.0);
+        record.observe(after, 18.0, 0.0, 0.0, 0.0);
         assert_eq!(record.len(), 1, "the pair spanning the gap was never made");
 
-        record.observe(after.next(), 17.9, 0.0, 0.0);
+        record.observe(after.next(), 17.9, 0.0, 0.0, 0.0);
         assert_eq!(record.len(), 2, "and the record picks straight back up");
     }
 
@@ -638,9 +812,9 @@ mod tests {
     fn a_sensor_that_drops_out_breaks_the_chain_rather_than_poisoning_it() {
         let mut record = Record::new(Rc2::house());
         let s = midnight();
-        record.observe(s, 21.0, 0.0, 4.0);
-        record.observe(s.next(), f64::NAN, 0.0, 4.0);
-        record.observe(s.next().next(), 21.2, 0.0, 4.0);
+        record.observe(s, 21.0, 0.0, 4.0, 0.0);
+        record.observe(s.next(), f64::NAN, 0.0, 4.0, 0.0);
+        record.observe(s.next().next(), 21.2, 0.0, 4.0, 0.0);
         assert!(
             record.is_empty(),
             "neither pair touches a reading nobody took"
@@ -656,7 +830,7 @@ mod tests {
         let mut slot = midnight();
         for k in 0..(3 * 96) {
             let drift = 20.0 + f64::from(k) * 0.001;
-            record.observe(slot, drift, 5.0, 2.0);
+            record.observe(slot, drift, 5.0, 2.0, 0.0);
             slot = slot.next();
         }
         assert!(record.refit(SLOT).is_none());

@@ -267,13 +267,34 @@ legacy_70_percent = false
 #   apartment    a flat inside a heated block: little envelope, little mass
 [site.building]
 class = "average"
-# Any of the four parameters may be given instead, and overrides the class.
+# Which way the glazing mostly faces, degrees clockwise from north; 180 is a
+# south front. Not a prior but a fact about the plot, and the one field here that
+# nothing learns: it is the plane the solar aperture below is measured against
+# both when the box fits it and when the plan uses it. A vertical south plane at
+# 52° north sees about 1,6 times the horizontal irradiance at a December noon and
+# half of it at a June one, so a wrong façade does not make the model noisier —
+# it makes the aperture a different number in every season.
+facade_azimuth_deg = 180.0
+# Any of the six parameters may be given instead, and overrides the class.
 # `r_air_out_k_per_kw` is ΔT / Q at the design pair: a house losing 6,8 kW at
 # 21 °C indoors and −20 °C outdoors is 41 / 6,8 = 6.
 # air_capacity_kwh_per_k = 0.6
 # mass_capacity_kwh_per_k = 12.0
 # r_air_out_k_per_kw = 6.0
 # r_air_mass_k_per_kw = 0.4
+#
+# The heat the house gets for nothing. `solar_aperture_m2` is the glazed area
+# times the g value times whatever the frames, the curtains and the tree in front
+# take away — one number, because nobody knows the other three and the fit does
+# not need them separated. `internal_gain_kw` is the people and the appliances,
+# about 3 W per square metre of floor.
+#
+# They are priors like the rest and the box replaces them with a fit, but they
+# are not a refinement: the average archetype loses 2,7 kW at 5 °C outdoors, and
+# a clear March noon through a 4,5 m² south aperture is 2,5 kW of it. On the days
+# a heating plan is most worth making, the free heat exceeds the demand.
+# solar_aperture_m2 = 4.5
+# internal_gain_kw = 0.45
 
 # ── What the paperwork says, per device ──────────────────────────────────────
 #

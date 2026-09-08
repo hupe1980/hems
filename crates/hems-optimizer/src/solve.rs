@@ -2080,6 +2080,12 @@ fn building<M: SolverModel>(
         (vars.t_in[k - 1].into(), vars.t_mass[k - 1].into())
     };
 
+    // The sun through the windows and the household's own waste heat. A known
+    // constant in this slot rather than a decision, so it is an offset on the
+    // right-hand side and the row stays linear — the same place the compressor's
+    // kilowatts enter, because it is the same physics.
+    let free = problem.free_heat_at(k);
+
     // Watts in, kilowatts of heat out: `b_heat` is kelvin per kilowatt held for
     // one step, so the factor is COP / 1000.
     rows.air.push(model.add_constraint(constraint!(
@@ -2087,6 +2093,7 @@ fn building<M: SolverModel>(
             == prev_in.clone() * d.a[0][0]
                 + prev_mass.clone() * d.a[0][1]
                 + vars.hp[k] * (d.b_heat[0] * cop / 1000.0)
+                + d.b_heat[0] * free
                 + d.b_outdoor[0] * outdoor
     )));
     rows.mass.push(model.add_constraint(constraint!(
@@ -2094,6 +2101,7 @@ fn building<M: SolverModel>(
             == prev_in * d.a[1][0]
                 + prev_mass * d.a[1][1]
                 + vars.hp[k] * (d.b_heat[1] * cop / 1000.0)
+                + d.b_heat[1] * free
                 + d.b_outdoor[1] * outdoor
     )));
 
@@ -2341,9 +2349,11 @@ impl Unmanaged {
             0.0
         };
         let outdoor = problem.outdoor_at(k);
+        // The same free heat the plan is given. A baseline heated by a different
+        // physics from the plan's is not a comparison (D37).
         self.thermal_state = self.thermal_step.step(
             self.thermal_state,
-            p * t.heat_pump.cop(outdoor) / 1000.0,
+            p * t.heat_pump.cop(outdoor) / 1000.0 + problem.free_heat_at(k),
             outdoor,
         );
         p

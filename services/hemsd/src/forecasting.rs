@@ -196,6 +196,45 @@ impl Weather {
         usual * self.realisation.draw_factor(slot, self.spec.draw_amplitude)
     }
 
+    /// The irradiance that actually falls on the building's glazing, W/m².
+    ///
+    /// The realised cloud, on a vertical plane at `facade_azimuth_deg` — what
+    /// [`hems_core::thermal::Rc2::free_heat_kw`] turns into the heat the house
+    /// gets whether or not anything asked for it.
+    ///
+    /// It goes through the **global horizontal** value and is then transposed,
+    /// which is not how [`Weather::production_at`] treats the roof: that one
+    /// scales the clear-sky *power* by `1 − cloud`. The difference is not an
+    /// inconsistency about the weather — both read the same realised cloud —
+    /// but about what a cloud does to a plane, and a vertical one facing the
+    /// low winter sun cannot be got at by scaling a horizontal quantity.
+    #[must_use]
+    pub fn window_at(
+        &self,
+        location: GeoPoint,
+        at: OffsetDateTime,
+        facade_azimuth_deg: f64,
+    ) -> f64 {
+        let slot = Slot::containing(at);
+        let sun = hems_forecast::solar::sun_position(location, slot);
+        let ghi = hems_forecast::clear_sky_ghi(sun) * (1.0 - self.cloud_at(at)).max(0.0);
+        hems_forecast::solar::window_irradiance(sun, ghi, facade_azimuth_deg)
+    }
+
+    /// The same, as the *forecast* sees it — the mean cloud rather than this
+    /// day's own.
+    #[must_use]
+    pub fn forecast_window_at(
+        &self,
+        location: GeoPoint,
+        slot: Slot,
+        facade_azimuth_deg: f64,
+    ) -> f64 {
+        let sun = hems_forecast::solar::sun_position(location, slot);
+        let ghi = hems_forecast::clear_sky_ghi(sun) * (1.0 - self.mean_cloud).max(0.0);
+        hems_forecast::solar::window_irradiance(sun, ghi, facade_azimuth_deg)
+    }
+
     /// What the roof actually produces, as a positive magnitude in watts.
     ///
     /// The realised cloud, the realised temperature *and* the soiling the

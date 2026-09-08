@@ -49,7 +49,7 @@ Determinism was never the thing that had to go; being *told the answer* was.
 
 <pre class="mermaid">
 flowchart LR
-  G["solar geometry<br/>position · clear-sky · transposition<br/><i>exact, free, no service</i>"] --> M
+  G["solar geometry<br/>position · clear-sky · Erbs + HDKR<br/><i>exact, free, no service</i>"] --> M
   W["cloud cover<br/>ICON-D2 via forecastd"] --> M["clear sky × (1 − cloud)"]
   M --> C["<b>residual corrector</b><br/>multiplicative · by local hour<br/>~a fortnight, exponentially weighted"]
   H["this roof's own meter"] --> C
@@ -119,15 +119,21 @@ $ cargo run -p hemsd -- simulate --day winter --perfect-foresight
 
 | Day | Saved | Saved, knowing the future | The premium |
 |---|---|---|---|
-| January, § 14a reduction, 20 kWh of charging to place | **€2,14** | €5,28 | 59 % |
-| January evening, car arrives *as* the reduction starts | **€2,56** | €4,96 | 48 % |
-| June, more sun than the house can use | **€8,65** | €8,94 | 3 % |
-| May, § 9 EEG cap, no car | **€1,27** | €1,33 | 5 % |
+| January, § 14a reduction, 20 kWh of charging to place | **€1,94** | €4,55 | 57 % |
+| January evening, car arrives *as* the reduction starts | **€2,57** | €4,89 | 47 % |
+| June, more sun than the house can use | **€8,84** | €9,07 | 3 % |
+| May, § 9 EEG cap, no car | **€0,89** | €0,70 | **−27 %** |
 
 The shape of that table is a result rather than noise. Where the surplus lasts
 all day the plan has slack and being wrong costs nothing. Where a large charging
 session has to be placed into the cheap hours **around** a network operator's
 reduction, more than half the headline saving was knowledge nobody has.
+
+The last row is *negative*, and that is reported rather than smoothed. Nothing on
+the capped day turns on knowing the weather: it is a statutory ceiling and a
+store that either absorbs the clipping or does not, so both plans make the same
+decisions and what is left is one realisation's worth of noise, which can fall
+either way.
 
 Any energy manager quoting a saving without saying which of the two it measured
 is quoting the second one.
@@ -143,11 +149,11 @@ of them.
 
 | Module | Predicts | From |
 |---|---|---|
-| `solar` | what the roof would produce under a clear sky | geometry, and **this** roof's tilt and azimuth from the configuration, and the inverter's limit |
+| `solar` | what any plane on the house receives, and what the roof makes of it | geometry, a global horizontal irradiance — the clear-sky model or `forecastd`'s — split into beam and diffuse by **Erbs** and transposed by **HDKR**, this roof's own tilt and azimuth from the configuration, and the inverter's limit |
 | `residual` | what it *will* produce | the same roof's own history against that model |
 | `load` | the household's uncontrolled draw | its own quarter hours, by day type |
 | `session` | when the car comes home and how empty | its own charging sessions, by weekday |
-| `building` | which house this is | indoor and outdoor temperature against the heat put in, starting from the archetype the installer picked |
+| `building` | which house this is — its fabric, the sun it lets in and the heat its occupants make | indoor and outdoor temperature and the irradiance on its windows, against the heat put in, starting from the archetype the installer picked |
 | `naive` | any of them, badly, with almost nothing | one reading, on a box that has no profile yet |
 | `metrics` | nothing — it scores the rest | pinball, coverage, bias, CRPS |
 
@@ -161,6 +167,26 @@ only a prior, and `building::identify` replaces it with a fit from the house's o
 thermometer as soon as it has one — but the fabric capacity spans a factor of five
 across the archetypes and decides whether pre-heating into a cheap hour pays at
 all, so the weeks before the fit are not free.
+
+The fit has six parameters, not four. Two of them are the heat the house gets for
+**nothing**: an effective *solar aperture*, and the waste heat of the people and
+appliances inside. They are not a refinement. The average German single-family
+archetype loses about 2,7 kW at 5 °C outdoors; a clear March noon on a
+south-facing 4,5 m² aperture is 2,5 kW of it, and the internal gains another 0,45
+— so on exactly the days a heating plan is worth making, the free heat *exceeds
+the demand*. A model without it runs the compressor into a room the sun is
+already warming, and a fit without it has nowhere to put the sun but the
+insulation, so it reports a better-insulated house in June than in December.
+
+The aperture is driven by the irradiance on the **vertical** plane the windows
+are in, which is why `facade_azimuth_deg` is configuration: at 52° north a
+vertical south plane sees 1,6 times the horizontal irradiance at a December noon
+and half of it at a June one, so an aperture fitted against the horizontal would
+be a different number in every season. And the fit **will not walk a parameter
+the record cannot constrain** — a fortnight with no daylight in it still
+identifies the fabric and leaves the aperture where the prior put it, because a
+free parameter that the data says nothing about does not stay where it started:
+it absorbs whatever else the model gets wrong.
 
 Three of them are asymmetric on purpose:
 

@@ -231,7 +231,7 @@ Five lines there are not in anybody else's table, and the
   battery, a wallbox that starts on plug-in and ordinary thermostats, against the
   **same weather** and under the **same grid rules**. A saving computed any other
   way flatters itself.
-- **saved / …of it on the bill** — €2,14 against €3,44. The saving counts the
+- **saved / …of it on the bill** — €1,94 against €3,18. The saving counts the
   battery life, the comfort and the service the plan spent; the bill is the
   flattering number every other system quotes.
 - **…covered by the store** — `[A1 2.3]` in one number: kilowatt-hours the
@@ -246,8 +246,8 @@ Five lines there are not in anybody else's table, and the
 
 The three forecast lines are the evidence for the money lines: the planner is
 given only what six weeks of the box's own metering could have taught it, and
-`--perfect-foresight` shows what a saving quoted without that measures — **€5,28
-against €2,14** on this day.
+`--perfect-foresight` shows what a saving quoted without that measures — **€4,55
+against €1,94** on this day.
 
 ## 💡 What makes it different
 
@@ -303,10 +303,10 @@ the index records the retrieval URL of each.
 
 | Crate | What it is | I/O |
 |---|---|---|
-| [`hems-core`](crates/hems-core) | Domain model: one sign convention, the quarter-hour grid, assets, circuits, setpoints that must name a reason, the building as an exactly discretised RC model, the hot-water tank as a store, an appliance's programme as the shape it draws — and the types the edge and the fleet exchange, so a renamed field is a compile error rather than a dashboard reading zero | none |
+| [`hems-core`](crates/hems-core) | Domain model: one sign convention, the quarter-hour grid, assets, circuits, setpoints that must name a reason, the building as an exactly discretised RC model — with the sun through its windows and the household's own waste heat in it, which on a clear March noon is the whole of the heating demand — the hot-water tank as a store, an appliance's programme as the shape it draws — and the types the edge and the fleet exchange, so a renamed field is a compile error rather than a dashboard reading zero | none |
 | [`hems-grid`](crates/hems-grid) | § 14a EnWG, the EEBUS LPC/LPP state machine, § 9 EEG, Modul 3, MiSpeL flow bookkeeping, § 42c sharing, the two-year evidence record — all cited, and the ones `metering` owns are called rather than copied | none |
 | [`hems-tariff`](crates/hems-tariff) | The price stack; parsers for what ENTSO-E, SMARD, aWATTar, Tibber and Energy-Charts publish; an advisor that compares Modul 1/2/3 against a household's own history | none |
-| [`hems-forecast`](crates/hems-forecast) | Solar geometry and a physical photovoltaic model, an online residual corrector that learns what *this* roof delivers, load profiles by day type, charging-session statistics by weekday, RC identification of the building from its own record, naive fallbacks, and the metrics that score all of it | none |
+| [`hems-forecast`](crates/hems-forecast) | Solar geometry and a physical photovoltaic model — an Erbs decomposition of the sky into beam and diffuse, an HDKR transposition onto the roof and onto the windows — an online residual corrector that learns what *this* roof delivers, load profiles by day type, charging-session statistics by weekday, identification of the building from its own record (fabric, solar aperture and internal gain), naive fallbacks, and the metrics that score all of it | none |
 | [`hems-optimizer`](crates/hems-optimizer) | Receding-horizon MILP: cost, wear, comfort, hot water, shiftable appliances placed rather than smeared, grid limits per slot as hard constraints | none |
 | [`hems-realtime`](crates/hems-realtime) | The guard plane, fair allocation of a limited budget, the one-second arbiter | none |
 | [`hems-device`](crates/hems-device) | What a wanted power becomes on real hardware: amperes, phase counts, SG Ready contacts — and `realisable`, what a semi-continuous device will *actually* take | none |
@@ -401,7 +401,7 @@ obeys that as an instruction not to use it.
 | **Pairing a Steuerbox without a restart** | it dials a box that does not know it, is held pending, is approved mid-handshake, and gets through |
 | **The SHIP session** — TLS 1.2 with mutual authentication, the WebSocket upgrade, the handshake, a trust store and a SKI that survive a reboot, and a `_ship._tcp` announcement so a Steuerbox can find the box at all | a Steuerbox reduces a running household to 4,2 kW over a real socket, and an unapproved one completes TLS and gets no further |
 | The driver registry | `hemsd` checks the drivers against the site *before* a byte moves |
-| **The house in front of the box, described rather than assumed** | the roof's own tilt and azimuth, a thermal archetype for the building, the commissioning date and legacy regime of every asset, and what the connection agreement says beyond the fuse. Each was a constant standing in for a country, and each decides either a statutory limit or the shape of a plan — the commissioning date decides *both*, and § 9 EEG and § 14a read silence in opposite directions |
+| **The house in front of the box, described rather than assumed** | the roof's own tilt and azimuth, a thermal archetype for the building and the way its windows face, the commissioning date and legacy regime of every asset, and what the connection agreement says beyond the fuse. Each was a constant standing in for a country, and each decides either a statutory limit or the shape of a plan — the commissioning date decides *both*, and § 9 EEG and § 14a read silence in opposite directions |
 | **`hemsd run`** — a site, a tariff and a driver set from TOML, a task per socket, guard and arbiter against real measurements | reconnects with a bounded backoff, tells the driver its link went, ages out a device that stops answering, and says on `/v1/status` what it decided, what it could not hear, and what answered a setpoint without acting on it |
 | **A receding-horizon plan on a real box** | prices from `tariffd`, the sky from `forecastd`, this roof modelled locally and corrected by what it has actually delivered, the battery read off its own meter, the solve off the runtime — and what it learns kept in its own store, so a reboot does not cost a fortnight |
 | **The § 14a record and the quarter-hour registers, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
@@ -422,10 +422,10 @@ obeys that as an instruction not to use it.
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-1 095 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 107 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (468 citations across five document
-families, each resolving to a document the index carries; 126 quantities,
+clock, the whole suite, the workspace guards (492 citations across five document
+families, each resolving to a document the index carries; 130 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
 Five of those tests are worth naming because of what they guard against. One

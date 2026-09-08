@@ -20,6 +20,11 @@ use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use time::macros::datetime;
 
+/// No irradiance series: these tests are about the *plan*, and the building's
+/// own sun is a separate question with its own tests. `Rc2::internal_gain_kw`
+/// still applies — a house with nobody in it is not the neutral case.
+const NO_SUN: &[f64] = &[];
+
 const T0: OffsetDateTime = datetime!(2026-01-15 00:00:00 UTC);
 
 fn horizon(slots: usize) -> Horizon {
@@ -510,7 +515,7 @@ fn a_heat_pump_keeps_the_house_inside_its_comfort_band() {
     let outdoor = vec![-2.0; 32];
 
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -549,7 +554,7 @@ fn the_house_is_pre_heated_into_the_cheap_hours() {
     let outdoor = vec![0.0; 32];
 
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -579,7 +584,7 @@ fn a_colder_day_costs_more_heat_because_the_coefficient_of_performance_falls() {
     let heat_at = |outdoor_c: f64| -> f64 {
         let outdoor = vec![outdoor_c; 16];
         let solved = solve(
-            &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor),
+            &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor, NO_SUN),
             &names(),
             T0,
         )
@@ -608,7 +613,7 @@ fn the_paragraph_14a_ceiling_binds_the_heat_pump_too() {
 
     let solved = solve(
         &Problem::new(h, &p, &pv, &load)
-            .with_thermal(thermal(21.0, true), &outdoor)
+            .with_thermal(thermal(21.0, true), &outdoor, NO_SUN)
             .with_battery(battery(10.0, 0.5, 0.0))
             .with_limits(limits.clone()),
         &names(),
@@ -649,10 +654,18 @@ fn a_heat_pump_no_operator_may_reduce_is_not_charged_against_the_ceiling() {
 
     // No battery: a discharging one is local generation and lifts the ceiling
     // for everything behind it, which would hide the difference this is about.
-    let heat = |limits: PlanningLimits| -> f64 {
+    //
+    // Measured on the **largest slot**, not on the day's total. A ceiling is a
+    // statement about a slot, and the total is a proxy for it that can point the
+    // other way: a plan forced to spread its heating over every slot loses more
+    // through the envelope than one allowed to put it where it is worth most, so
+    // the reduced household can quite correctly end up buying *more* kilowatt-
+    // hours than the free one. It does here — 8,0 against 7,1 — and the proxy
+    // read that as the rule not working.
+    let peak = |limits: PlanningLimits| -> f64 {
         solve(
             &Problem::new(h, &p, &pv, &load)
-                .with_thermal(thermal(21.0, true), &outdoor)
+                .with_thermal(thermal(21.0, true), &outdoor, NO_SUN)
                 .with_limits(limits),
             &names(),
             T0,
@@ -661,12 +674,19 @@ fn a_heat_pump_no_operator_may_reduce_is_not_charged_against_the_ceiling() {
         .flows
         .iter()
         .map(|f| f.heat_pump.kw())
-        .sum()
+        .fold(0.0_f64, f64::max)
     };
 
+    let unreduced = peak(free);
+    let reduced = peak(ceiling);
     assert!(
-        heat(free) > heat(ceiling) + 1e-6,
-        "a heat pump outside § 14a should not be reduced by a § 14a limit"
+        reduced <= 1.0 + 1e-6,
+        "a § 14a ceiling of 1 kW binds a heat pump inside the group: peak {reduced} kW"
+    );
+    assert!(
+        unreduced > 1.0 + 1e-6,
+        "a heat pump outside § 14a should not be reduced by a § 14a limit: \
+         peak {unreduced} kW against a ceiling of 1,0 kW it is not subject to"
     );
 }
 
@@ -687,7 +707,7 @@ fn a_surplus_slot_reads_the_same_whether_a_device_is_controllable_or_not() {
     let plan = |limits: PlanningLimits| -> Vec<f64> {
         solve(
             &Problem::new(h, &p, &pv, &load)
-                .with_thermal(thermal(21.0, true), &outdoor)
+                .with_thermal(thermal(21.0, true), &outdoor, NO_SUN)
                 .with_battery(battery(10.0, 0.5, 0.0))
                 .with_limits(limits),
             &names(),
@@ -719,7 +739,7 @@ fn a_cold_snap_makes_the_house_uncomfortable_rather_than_the_problem_infeasible(
     t.building.r_air_out_k_per_kw = 1.5;
 
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -747,7 +767,7 @@ fn an_on_off_heat_pump_does_not_short_cycle() {
     t.heat_pump.min_off_slots = 4;
 
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -774,7 +794,7 @@ fn a_plan_commands_the_heat_pump_by_name() {
     let load = flat(h, 500.0);
     let outdoor = vec![0.0; 8];
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(21.0, true), &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -1909,7 +1929,7 @@ fn a_compressor_that_has_just_started_is_not_stopped_by_the_next_plan() {
             ..ThermalModel::house(22.5, hp)
         };
         solve(
-            &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+            &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
             &names(),
             T0,
         )
@@ -1998,7 +2018,7 @@ fn a_blocked_tail_still_obeys_the_minimum_runtime() {
     t.heat_pump.min_off_slots = 3;
 
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -2042,14 +2062,14 @@ fn the_fine_head_is_where_every_executed_slot_lives() {
     let t = thermal(20.5, false);
 
     let blocked = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
         &names(),
         T0,
     )
     .unwrap();
     let fine = solve(
         &Problem::new(h, &p, &pv, &load)
-            .with_thermal(t, &outdoor)
+            .with_thermal(t, &outdoor, NO_SUN)
             .with_commitment_horizon(hems_optimizer::CommitmentHorizon::fine()),
         &names(),
         T0,
@@ -2104,7 +2124,7 @@ fn a_price_that_moves_faster_than_the_block_is_what_blocking_costs() {
     let cost = |horizon: hems_optimizer::CommitmentHorizon| -> f64 {
         solve(
             &Problem::new(h, &p, &pv, &load)
-                .with_thermal(t, &outdoor)
+                .with_thermal(t, &outdoor, NO_SUN)
                 .with_commitment_horizon(horizon),
             &names(),
             T0,
@@ -2155,7 +2175,7 @@ fn blocking_never_swallows_a_committed_slot() {
     };
 
     let solved = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
         &names(),
         T0,
     )
@@ -2180,14 +2200,14 @@ fn a_modulating_unit_is_untouched_by_the_commitment_grid() {
     let t = thermal(21.0, true);
 
     let a = solve(
-        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor),
+        &Problem::new(h, &p, &pv, &load).with_thermal(t, &outdoor, NO_SUN),
         &names(),
         T0,
     )
     .unwrap();
     let b = solve(
         &Problem::new(h, &p, &pv, &load)
-            .with_thermal(t, &outdoor)
+            .with_thermal(t, &outdoor, NO_SUN)
             .with_commitment_horizon(hems_optimizer::CommitmentHorizon::fine()),
         &names(),
         T0,

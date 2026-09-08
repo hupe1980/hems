@@ -11,11 +11,65 @@
 //! difference between a house that still plans and one that only reacts.
 //!
 //! The model is the standard chain: solar position from the day of the year and
-//! the equation of time, clear-sky global irradiance after Haurwitz, an
-//! isotropic transposition onto the module plane, the usual cell-temperature
+//! the equation of time, clear-sky global irradiance after Haurwitz, a
+//! decomposition of the global value into its direct and diffuse halves, an
+//! anisotropic transposition onto the module plane, the usual cell-temperature
 //! correction, and the inverter's clipping limit.
+//!
+//! # The decomposition is the step that used to be a constant
+//!
+//! A plane of glass tilted 35° to the south does not see the horizontal
+//! irradiance a weather model publishes. It sees a *beam* component projected
+//! through the angle of incidence — which at a German winter noon is nearly
+//! three times the horizontal projection — plus the share of the sky dome it
+//! can see, plus a little off the ground. Turning one number into three is the
+//! decomposition, and the number that decides it is the **diffuse fraction**.
+//!
+//! It was a constant here, 0,25, on the argument that the global value being
+//! transposed *was* the clear-sky model, so the clearness index was one by
+//! construction and every correlation collapsed to its clear-sky end. That
+//! argument was wrong twice.
+//!
+//! It was wrong about the **call site**: [`crate::WeatherSeries::modelled_production`]
+//! — the path a real box runs, on a real sky from `forecastd` — passes the
+//! *measured* global irradiance, whose clearness index on an overcast December
+//! day is about 0,09. The true diffuse fraction there is essentially one; the
+//! constant claimed three quarters of it was beam and projected that onto the
+//! roof at a factor of three, so the modelled production came out **2,7 times**
+//! what the roof could make. That is the shape of error the residual corrector
+//! cannot absorb, because it is bucketed by hour of day and this error is a
+//! function of the *weather*: fitted across a fortnight it splits the difference
+//! and is wrong in both directions.
+//!
+//! And it was wrong about the **arithmetic**: the clearness index of the
+//! Haurwitz clear sky is not one either. It is about 0,78 at a German midsummer
+//! noon and 0,61 in December, because a clear sky at an air mass of four is
+//! genuinely hazier than one overhead. So the constant was 17 % optimistic even
+//! on the clear-sky path it was written for.
+//!
+//! It is now the **Erbs correlation** on the actual clearness index, which is
+//! the standard answer, has no fitted parameter of ours in it, and is right at
+//! both ends by construction. The transposition that follows it is **HDKR**
+//! (Hay–Davies–Klucher–Reindl) rather than isotropic: the same three terms plus
+//! a circumsolar one and a horizon band, which is what makes a tilted plane come
+//! out right under a clear sky instead of 10 % low.
+//!
+//! Neither introduces a knob. Both are in Duffie & Beckman, both are in `pvlib`,
+//! and the reason to prefer them to something newer is that a household box has
+//! to run them every quarter hour with no lookup table and no turbidity
+//! climatology. D172 has the alternatives and what the change is worth on the
+//! reference days.
 
 use hems_core::prelude::{GeoPoint, Power, Slot};
+
+/// The solar constant, W/m².
+///
+/// Duffie & Beckman's 1367, deliberately, rather than the 1361 the satellite
+/// record has since settled on. It is the value the Erbs correlation's own
+/// clearness indices were computed against, and a decomposition is only as
+/// meaningful as the normalisation it was fitted under. The 0,4 % difference
+/// moves a diffuse fraction by well under a percentage point either way.
+pub const SOLAR_CONSTANT_W_PER_M2: f64 = 1367.0;
 
 /// Where the sun is, seen from one place at one moment.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -24,6 +78,14 @@ pub struct SunPosition {
     pub elevation_deg: f64,
     /// Degrees clockwise from north; 180 is due south.
     pub azimuth_deg: f64,
+    /// Extraterrestrial irradiance on a surface normal to the beam, W/m².
+    ///
+    /// The solar constant corrected for where the earth is in its orbit — about
+    /// 3,3 % either side over a year. It is carried on the position rather than
+    /// recomputed because it is the **denominator of the clearness index**, and
+    /// a decomposition that had to be handed the day of the year separately
+    /// would be one a caller could get wrong.
+    pub dni_extra_w_per_m2: f64,
 }
 
 impl SunPosition {
@@ -38,6 +100,64 @@ impl SunPosition {
     pub fn cos_zenith(&self) -> f64 {
         self.elevation_deg.to_radians().sin().max(0.0)
     }
+
+    /// Extraterrestrial irradiance on the *horizontal*, W/m² — the denominator
+    /// of the clearness index.
+    #[must_use]
+    pub fn extraterrestrial_ghi(&self) -> f64 {
+        self.dni_extra_w_per_m2 * self.cos_zenith()
+    }
+
+    /// The clearness index: what fraction of the light at the top of the
+    /// atmosphere reached the ground.
+    ///
+    /// Zero when the sun is too low for the ratio to mean anything — see
+    /// [`MIN_DECOMPOSITION_ELEVATION_DEG`].
+    #[must_use]
+    pub fn clearness_index(&self, ghi: f64) -> f64 {
+        let extraterrestrial = self.extraterrestrial_ghi();
+        if self.elevation_deg < MIN_DECOMPOSITION_ELEVATION_DEG || extraterrestrial <= 0.0 {
+            return 0.0;
+        }
+        (ghi / extraterrestrial).clamp(0.0, 1.0)
+    }
+}
+
+/// Below this elevation the clearness index is not a number worth believing.
+///
+/// Its denominator carries a `cos z` that is heading for zero, so a few watts
+/// of measurement or model noise in the numerator swing it across its whole
+/// range — the well-known failure of every `kt`-based correlation at sunrise and
+/// sunset. Below the floor the light is taken as **entirely diffuse**, which is
+/// both the safe answer and very nearly the true one: at five degrees the air
+/// mass is above ten and there is almost no beam left to project.
+pub const MIN_DECOMPOSITION_ELEVATION_DEG: f64 = 5.0;
+
+/// The diffuse share of a global horizontal irradiance, after Erbs.
+///
+/// Erbs, Klein and Duffie (1982), as presented in Duffie & Beckman and
+/// implemented in `pvlib` as `erbs`. One input — the clearness index — no site
+/// parameter, and no state, which is what a box that has to evaluate it ninety-
+/// six times a plan needs.
+///
+/// It returns 1 for an overcast sky (all of very little light is diffuse) and
+/// 0,165 for the clearest one the correlation admits.
+///
+/// Transcribed as published, wiggle included: the quartic bottoms out at
+/// `kt = 0,792` and turns back up by 7 x 10⁻⁴ before the constant branch takes
+/// over. Smoothing that would make this something other than the correlation it
+/// cites, for a difference no roof can tell.
+#[must_use]
+pub fn erbs_diffuse_fraction(clearness_index: f64) -> f64 {
+    let kt = clearness_index.clamp(0.0, 1.0);
+    let kd = if kt <= 0.22 {
+        1.0 - 0.09 * kt
+    } else if kt <= 0.80 {
+        0.9511 - 0.1604 * kt + 4.388 * kt.powi(2) - 16.638 * kt.powi(3) + 12.336 * kt.powi(4)
+    } else {
+        0.165
+    };
+    kd.clamp(0.0, 1.0)
 }
 
 /// The sun's position over `at` at the middle of `slot`.
@@ -57,6 +177,14 @@ pub fn sun_position(at: GeoPoint, slot: Slot) -> SunPosition {
 
     // Spencer's Fourier expansion for the equation of time, minutes.
     let gamma = 2.0 * std::f64::consts::PI * (day_of_year - 1.0) / 365.0;
+    // Spencer's eccentricity correction, from the same expansion as the
+    // declination and the equation of time below — one day angle, three series,
+    // so nothing here can disagree with anything else here about what day it is.
+    let eccentricity = 1.000_110
+        + 0.034_221 * gamma.cos()
+        + 0.001_280 * gamma.sin()
+        + 0.000_719 * (2.0 * gamma).cos()
+        + 0.000_077 * (2.0 * gamma).sin();
     let eot = 229.18
         * (0.000_075 + 0.001_868 * gamma.cos()
             - 0.032_077 * gamma.sin()
@@ -91,6 +219,7 @@ pub fn sun_position(at: GeoPoint, slot: Slot) -> SunPosition {
     SunPosition {
         elevation_deg: elevation.to_degrees(),
         azimuth_deg,
+        dni_extra_w_per_m2: SOLAR_CONSTANT_W_PER_M2 * eccentricity,
     }
 }
 
@@ -107,6 +236,112 @@ pub fn clear_sky_ghi(sun: SunPosition) -> f64 {
     }
     (1098.0 * cos_z * (-0.059 / cos_z).exp()).max(0.0)
 }
+
+/// The cosine of the angle of incidence of the beam on an arbitrary plane.
+///
+/// `tilt_deg` is from horizontal, `azimuth_deg` clockwise from north. Negative
+/// where the sun is behind the plane.
+#[must_use]
+pub fn cos_incidence(sun: SunPosition, tilt_deg: f64, azimuth_deg: f64) -> f64 {
+    let tilt = tilt_deg.to_radians();
+    let sun_el = sun.elevation_deg.to_radians();
+    let delta_azimuth = (sun.azimuth_deg - azimuth_deg).to_radians();
+    sun_el.sin() * tilt.cos() + sun_el.cos() * tilt.sin() * delta_azimuth.cos()
+}
+
+/// Irradiance on any plane, W/m², from the global horizontal value.
+///
+/// `ghi` may be a clear-sky model or a weather service's forecast; the split
+/// into beam and diffuse comes from the **clearness index** of whatever it is,
+/// so both are handled by the same arithmetic and neither is assumed. See the
+/// module note for what assuming one cost.
+///
+/// The transposition is HDKR: the beam through the angle of incidence, the
+/// circumsolar part of the diffuse through the same angle, the rest of the sky
+/// dome through the plane's view factor with Klucher's horizon band, and the
+/// ground reflection.
+///
+/// It is a free function because a roof is not the only plane a household has.
+/// [`hems_core::thermal::Rc2::solar_aperture_m2`] is driven by the same
+/// transposition onto a **vertical** one — the windows — and a second
+/// implementation of it would be a second thing that could disagree about how
+/// much sun a building gets.
+#[must_use]
+pub fn plane_of_array(sun: SunPosition, ghi: f64, tilt_deg: f64, azimuth_deg: f64) -> f64 {
+    if ghi <= 0.0 || !sun.is_up() {
+        return 0.0;
+    }
+    let cos_zenith = sun.cos_zenith();
+    if cos_zenith <= 0.0 {
+        return 0.0;
+    }
+
+    // ── Decomposition ───────────────────────────────────────────────────────
+    // Below the elevation floor `clearness_index` returns zero, which Erbs maps
+    // to a diffuse fraction of one: no beam to project, which is what makes the
+    // low-sun singularity a non-event rather than a clamp.
+    let dhi = ghi * erbs_diffuse_fraction(sun.clearness_index(ghi));
+    let bhi = ghi - dhi;
+    // The beam normal to itself. Capped at the top of the atmosphere, because a
+    // horizontal beam divided by a small `cos z` is how a decomposition invents
+    // light that is not there — and the cap is a physical bound rather than a
+    // tuning constant.
+    let dni = (bhi / cos_zenith).min(sun.dni_extra_w_per_m2);
+    // Re-derived so the three components still sum to `ghi` after the cap.
+    let bhi = dni * cos_zenith;
+
+    // ── Transposition (HDKR) ────────────────────────────────────────────────
+    let tilt = tilt_deg.to_radians();
+    let cos_incidence = cos_incidence(sun, tilt_deg, azimuth_deg).max(0.0);
+    // The beam ratio: what one square metre of plane sees against one square
+    // metre of ground.
+    let beam_ratio = cos_incidence / cos_zenith;
+    // Hay's anisotropy index — how much of the diffuse light is really
+    // forward-scattered sunlight travelling with the beam. Zero under an
+    // overcast sky, which is what collapses HDKR back to isotropic exactly where
+    // isotropic is right.
+    let anisotropy = (dni / sun.dni_extra_w_per_m2).clamp(0.0, 1.0);
+    // Klucher's modulating factor for the brighter band near the horizon.
+    let horizon = (bhi / ghi).max(0.0).sqrt();
+
+    let sky_view = f64::midpoint(1.0, tilt.cos());
+    let ground_view = f64::midpoint(1.0, -tilt.cos());
+
+    let beam = dni * cos_incidence;
+    let circumsolar = dhi * anisotropy * beam_ratio;
+    let sky = dhi * (1.0 - anisotropy) * sky_view * (1.0 + horizon * (tilt / 2.0).sin().powi(3));
+    let ground = ghi * GROUND_ALBEDO * ground_view;
+
+    beam + circumsolar + sky + ground
+}
+
+/// Irradiance on the vertical plane a building's windows are mostly in, W/m².
+///
+/// The input [`hems_core::thermal::Rc2::free_heat_kw`] wants. `azimuth_deg` is
+/// the façade's own, clockwise from north; 180 is a south-facing front.
+///
+/// Vertical rather than horizontal, and that is the whole reason this exists
+/// rather than the caller passing the global value through: at 52° north a
+/// vertical south plane sees about 1,6 times the horizontal irradiance at a
+/// December noon and about half of it at a June one. An aperture fitted against
+/// the horizontal would be a different constant in every season, and a house
+/// identified in the heating months would then be wrong all summer by a factor
+/// of three.
+#[must_use]
+pub fn window_irradiance(sun: SunPosition, ghi: f64, azimuth_deg: f64) -> f64 {
+    plane_of_array(sun, ghi, 90.0, azimuth_deg)
+}
+
+/// Reflectance of the ground in front of the array.
+///
+/// Two tenths: grass, gravel, a tiled roof below — the value every transposition
+/// model uses when nobody has measured the site. It matters least of the four
+/// terms (a 35° plane sees about 9 % of the ground hemisphere) and it is a
+/// site constant, which is exactly the kind of error
+/// [`crate::residual::ResidualModel`] absorbs. Snow is the case that would
+/// justify making it a parameter, and it is not modelled anywhere else here
+/// either.
+const GROUND_ALBEDO: f64 = 0.2;
 
 /// A photovoltaic array's geometry and electrical limits.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,51 +377,21 @@ impl ArrayModel {
         }
     }
 
+    /// The cosine of the angle of incidence of the beam on this plane.
+    ///
+    /// Negative where the sun is behind the array; callers want
+    /// [`f64::max`] against zero before using it as a projection.
+    #[must_use]
+    pub fn cos_incidence(&self, sun: SunPosition) -> f64 {
+        cos_incidence(sun, self.tilt_deg, self.azimuth_deg)
+    }
+
     /// Irradiance on the module plane, W/m², from the global horizontal value.
     ///
-    /// An isotropic sky: the direct component is projected onto the plane, the
-    /// diffuse component is taken as a view factor of the sky, and a modest
-    /// ground reflection is added. Good enough that the error is dominated by
-    /// the cloud forecast rather than by this.
+    /// [`plane_of_array`] for this array's own tilt and azimuth.
     #[must_use]
     pub fn plane_of_array(&self, sun: SunPosition, ghi: f64) -> f64 {
-        if ghi <= 0.0 || !sun.is_up() {
-            return 0.0;
-        }
-        // A fixed diffuse fraction, deliberately, and it is not Erbs.
-        //
-        // Erbs and the other correlations split global into direct and diffuse
-        // through the **clearness index**, which needs an extraterrestrial
-        // reference and a measured global value. Here the global value *is* the
-        // clear-sky model, so the clearness index is one by construction and
-        // every correlation collapses to its clear-sky end. A quarter is that
-        // end for middle latitudes, and the honest thing is to write the number
-        // rather than the name of a correlation that is not being evaluated.
-        //
-        // The error this leaves is far below the cloud forecast's, and the
-        // residual corrector learns whatever of it is systematic for this roof.
-        let diffuse_fraction = 0.25;
-        let dhi = ghi * diffuse_fraction;
-        let bhi = ghi - dhi;
-
-        let tilt = self.tilt_deg.to_radians();
-        let sun_el = sun.elevation_deg.to_radians();
-        let delta_azimuth = (sun.azimuth_deg - self.azimuth_deg).to_radians();
-
-        // Angle of incidence on the tilted plane.
-        let cos_incidence =
-            sun_el.sin() * tilt.cos() + sun_el.cos() * tilt.sin() * delta_azimuth.cos();
-        let beam = if cos_incidence > 0.0 && sun_el.sin() > 1e-6 {
-            bhi * cos_incidence / sun_el.sin()
-        } else {
-            0.0
-        };
-
-        let sky_view = f64::midpoint(1.0, tilt.cos());
-        let ground_view = f64::midpoint(1.0, -tilt.cos());
-        let albedo = 0.2;
-
-        beam + dhi * sky_view + ghi * albedo * ground_view
+        plane_of_array(sun, ghi, self.tilt_deg, self.azimuth_deg)
     }
 
     /// Alternating-current power for a given plane irradiance and air
@@ -332,5 +537,143 @@ mod tests {
         let before = sun_position(BERLIN, slot(datetime!(2026-03-28 11:00:00 UTC)));
         let after = sun_position(BERLIN, slot(datetime!(2026-03-30 11:00:00 UTC)));
         assert!((before.elevation_deg - after.elevation_deg).abs() < 1.5);
+    }
+}
+
+#[cfg(test)]
+mod decomposition_tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const BERLIN: super::GeoPoint = super::GeoPoint {
+        latitude: 52.52,
+        longitude: 13.40,
+        altitude_m: 34.0,
+    };
+
+    fn slot(t: time::OffsetDateTime) -> Slot {
+        Slot::containing(t)
+    }
+
+    /// The regression this whole module was rewritten for.
+    ///
+    /// An overcast December noon: about a tenth of the light at the top of the
+    /// atmosphere reaches the ground, and essentially none of it is beam. The
+    /// constant that used to sit here called three quarters of it beam and
+    /// projected that onto a 35° plane at a factor of nearly three.
+    #[test]
+    fn an_overcast_winter_noon_does_not_out_produce_the_horizontal() {
+        let array = ArrayModel::new(Power::from_kw(10.0), Power::from_kw(10.0), 35.0, 180.0);
+        let noon = slot(datetime!(2026-12-21 11:00:00 UTC));
+        let sun = sun_position(BERLIN, noon);
+        let overcast = clear_sky_ghi(sun) * 0.15;
+        let poa = array.plane_of_array(sun, overcast);
+        assert!(
+            poa < overcast * 1.15,
+            "an overcast sky is diffuse: {poa} W/m² on the plane from {overcast} W/m² horizontal"
+        );
+    }
+
+    #[test]
+    fn a_clear_sky_still_gains_on_the_horizontal_in_winter() {
+        let array = ArrayModel::new(Power::from_kw(10.0), Power::from_kw(10.0), 35.0, 180.0);
+        let noon = slot(datetime!(2026-12-21 11:00:00 UTC));
+        let sun = sun_position(BERLIN, noon);
+        let ghi = clear_sky_ghi(sun);
+        let poa = array.plane_of_array(sun, ghi);
+        // A steeply tilted plane against a low sun is the case the tilt exists
+        // for: it should be worth more than the horizontal, and not three times
+        // more.
+        assert!(
+            poa > ghi * 1.5 && poa < ghi * 2.6,
+            "clear winter noon: {poa} W/m² on the plane from {ghi} W/m² horizontal"
+        );
+    }
+
+    #[test]
+    fn the_three_components_never_exceed_the_light_that_arrived() {
+        // Beam plus diffuse is the global value, by construction and after the
+        // cap at the top of the atmosphere. A plane lying flat sees exactly it,
+        // plus nothing from a ground it cannot see.
+        let flat = ArrayModel::new(Power::from_kw(1.0), Power::from_kw(1.0), 0.0, 180.0);
+        let start = metering::calendar::day_start_utc(time::macros::date!(2026 - 06 - 21));
+        for i in 0..96 {
+            let s = Slot::containing(start).offset(i);
+            let sun = sun_position(BERLIN, s);
+            for factor in [0.05, 0.3, 0.7, 1.0] {
+                let ghi = clear_sky_ghi(sun) * factor;
+                let poa = flat.plane_of_array(sun, ghi);
+                assert!(
+                    poa <= ghi + 1e-6,
+                    "a horizontal plane saw {poa} W/m² of {ghi} W/m² at slot {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn erbs_runs_from_overcast_to_clear() {
+        assert!((erbs_diffuse_fraction(0.0) - 1.0).abs() < 1e-12);
+        assert!((erbs_diffuse_fraction(1.0) - 0.165).abs() < 1e-12);
+        // Monotone downwards across the range, to within the published
+        // quartic's own wiggle: it bottoms out at kt = 0,792 and turns up by
+        // 7 x 10^-4 before the constant branch takes over at 0,80. That is an
+        // artefact of the fit rather than a transcription error, it is what
+        // `pvlib` evaluates too, and smoothing it here would make this
+        // something other than Erbs for a difference no roof can tell.
+        let mut previous = f64::INFINITY;
+        for i in 0..=1000 {
+            let kt = f64::from(i) / 1000.0;
+            let kd = erbs_diffuse_fraction(kt);
+            assert!(kd <= previous + 1e-3, "not monotone at kt={kt}");
+            previous = kd;
+        }
+        // And the wiggle is where the correlation puts it, not somewhere a
+        // typo would put it.
+        assert!(erbs_diffuse_fraction(0.5) > erbs_diffuse_fraction(0.7));
+        assert!(erbs_diffuse_fraction(0.22) > erbs_diffuse_fraction(0.5));
+    }
+
+    #[test]
+    fn the_clearness_index_of_a_clear_german_sky_is_not_one() {
+        // The premise the old constant rested on, measured. A clear sky at an
+        // air mass of four is genuinely hazier than one overhead, so the
+        // clear-sky end of the correlation is not its `kt = 1` end.
+        let summer = sun_position(BERLIN, slot(datetime!(2026-06-21 11:00:00 UTC)));
+        let winter = sun_position(BERLIN, slot(datetime!(2026-12-21 11:00:00 UTC)));
+        let kt_summer = summer.clearness_index(clear_sky_ghi(summer));
+        let kt_winter = winter.clearness_index(clear_sky_ghi(winter));
+        assert!(
+            (0.74..0.82).contains(&kt_summer),
+            "midsummer clearness index {kt_summer}"
+        );
+        assert!(
+            (0.56..0.66).contains(&kt_winter),
+            "midwinter clearness index {kt_winter}"
+        );
+        assert!(kt_winter < kt_summer);
+    }
+
+    #[test]
+    fn the_low_sun_singularity_produces_no_light_from_nowhere() {
+        // The failure every clearness-index correlation has at sunrise: the
+        // denominator heads for zero and the ratio swings across its range. The
+        // elevation floor is what makes it a non-event.
+        let array = ArrayModel::new(Power::from_kw(10.0), Power::from_kw(10.0), 35.0, 180.0);
+        let start = metering::calendar::day_start_utc(time::macros::date!(2026 - 06 - 21));
+        for i in 0..96 {
+            let s = Slot::containing(start).offset(i);
+            let sun = sun_position(BERLIN, s);
+            if !sun.is_up() {
+                continue;
+            }
+            let ghi = clear_sky_ghi(sun);
+            let poa = array.plane_of_array(sun, ghi);
+            assert!(
+                poa.is_finite() && poa <= sun.dni_extra_w_per_m2,
+                "slot {i}: {poa} W/m² on the plane at {} degrees",
+                sun.elevation_deg
+            );
+        }
     }
 }

@@ -808,6 +808,7 @@ pub async fn run(
                 heat_pump: running.household.heat_pump.clone(),
                 modelled_pv: published.modelled_pv.clone(),
                 outdoor: published.outdoor.clone(),
+                window: published.window.clone(),
                 bands: published.bands.clone(),
             },
             control::Live {
@@ -1046,6 +1047,10 @@ async fn start_planner(
         // loop teaches the building from the same series (D117 again, for the
         // house rather than the roof).
         outdoor: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
+        // And the sun on the windows, from the same series, for the same
+        // reason: the solar aperture is fitted against it and planned against
+        // it, and those have to be one number.
+        window: Arc::new(tokio::sync::RwLock::new(BTreeMap::new())),
     };
     // What the box remembered from before it was restarted. A fortnight of
     // observations is what makes a forecast worth having, and relearning it
@@ -1109,6 +1114,7 @@ async fn start_planner(
         planner::Planner {
             household: running.household.clone(),
             array: array_of(&running.household.site, &settings.site),
+            facade_azimuth_deg: settings.site.building.facade_azimuth_deg,
             tariff: settings.tariff.clone(),
             control: settings.control.clone(),
             wear_eur_per_kwh: settings.site.battery_wear_eur_per_kwh,

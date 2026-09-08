@@ -40,13 +40,13 @@ $ just demo-all
 
 | Day | What it shows | Saved |
 |---|---|---|
-| `winter` | a reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back 75 minutes | €2,14 |
-| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,65 |
-| `deadline` | a car that arrives *as the reduction starts* with three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,56 |
-| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,33 |
-| `offline` | **the planner switched off** — what the box does on its own | €7,90 |
-| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,77 |
-| `capped` | a clear May day on a 20 kWp roof, the § 9 EEG cap binding at 11,78 of 12,00 kW | €1,27 |
+| `winter` | a reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back 75 minutes | €1,94 |
+| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,84 |
+| `deadline` | a car that arrives *as the reduction starts* with three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,57 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,37 |
+| `offline` | **the planner switched off** — what the box does on its own | €7,99 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,84 |
+| `capped` | a clear May day on a 20 kWp roof, the § 9 EEG cap binding at 12,01 of 12,00 kW | €0,89 |
 
 `autumn` is also the only one of the seven where the seam between the arbiter and
 the wiring shows: a switching wallbox spends the afternoon being asked for power
@@ -70,7 +70,7 @@ because each costs minutes rather than seconds.
 
 | Flag | What it isolates |
 |---|---|
-| `--perfect-foresight` | the January day with the future known: €5,28 against the €2,14 an honest forecast earns |
+| `--perfect-foresight` | the January day with the future known: €4,55 against the €1,94 an honest forecast earns |
 | `--wear-eur-per-kwh 0` | a cost-only optimiser: 18,7 kWh of battery throughput instead of 15,5 |
 | `--no-phase-switching` | on the autumn day, 0,2 kWh into the car against 13,1 — and a car 4,8 kWh short |
 | `--imsys` | the § 9 EEG cap lifted: one cent to the managed household, twelve to the unmanaged one |

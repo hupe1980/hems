@@ -346,7 +346,7 @@ away real kilowatt-hours for nothing.
 `just demo capped` runs a clear **May** day on a 20 kWp roof with a small store —
 May, not June, because the cap is a fraction of *direct-current* power and how
 close a roof gets to that fraction is decided by cell temperature — and prints
-the quarter-hour feed-in peak against the ceiling. The cap binds, at 11,78 of
+the quarter-hour feed-in peak against the ceiling. The cap binds, at 12,01 of
 12,00 kW around solar noon, and the household loses **2,4 kWh** of export — of
 which 2,3 kWh is the price of the one-minute control period the simulated day
 runs at rather than the one second a box runs at. The guard lends the roof the

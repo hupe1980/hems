@@ -200,6 +200,9 @@ pub struct Managed {
     /// that fetched its own weather on the slot boundary would identify the
     /// building against one series and plan it against another.
     pub outdoor: Arc<tokio::sync::RwLock<BTreeMap<Slot, f64>>>,
+    /// The irradiance on the building's glazing the plan was made against, by
+    /// slot, W/m² — what the solar aperture is identified against.
+    pub window: Arc<tokio::sync::RwLock<BTreeMap<Slot, f64>>>,
 }
 
 /// The state this loop shares with the rest of the box.
@@ -945,10 +948,23 @@ async fn teach_the_house(
         return;
     }
     let heat_kw = carried.heat_pump_wh / covered_hours / 1000.0 * hp.cop.at(outdoor_c);
-    learned
-        .lock()
+    // The same series the plan was made against, for the same reason the outdoor
+    // temperature is: an aperture fitted against one forecast and planned
+    // against another is fitted to the difference between two forecasts.
+    let window_w_per_m2 = managed
+        .window
+        .read()
         .await
-        .observe_house(carried.delivered_slot, indoor_c, outdoor_c, heat_kw);
+        .get(&carried.delivered_slot)
+        .copied()
+        .unwrap_or(0.0);
+    learned.lock().await.observe_house(
+        carried.delivered_slot,
+        indoor_c,
+        outdoor_c,
+        heat_kw,
+        window_w_per_m2,
+    );
 }
 
 /// What one tick hands to the next.
