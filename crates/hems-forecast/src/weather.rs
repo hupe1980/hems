@@ -556,3 +556,151 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod modelled_production_tests {
+    use super::WeatherSeries;
+    use crate::weather::WeatherPoint;
+    use hems_core::prelude::{GeoPoint, Power, Slot};
+
+    const BERLIN: GeoPoint = GeoPoint {
+        latitude: 52.52,
+        longitude: 13.40,
+        altitude_m: 34.0,
+    };
+
+    fn array() -> crate::ArrayModel {
+        crate::ArrayModel::new(Power::from_kw(10.0), Power::from_kw(10.0), 35.0, 180.0)
+    }
+
+    fn series(day: time::Date, factor: f64) -> WeatherSeries {
+        let start = Slot::containing(metering::calendar::day_start_utc(day));
+        WeatherSeries {
+            slots: (0..96)
+                .map(|i| {
+                    let slot = start.offset(i);
+                    let sun = crate::solar::sun_position(BERLIN, slot);
+                    (
+                        slot,
+                        WeatherPoint {
+                            ghi_w_per_m2: crate::clear_sky_ghi(sun) * factor,
+                            temperature_c: 2.0,
+                            cloud_cover: Some(1.0 - factor),
+                        },
+                    )
+                })
+                .collect(),
+            published_minutes: 15,
+        }
+    }
+
+    /// **The path a box on a wall runs, scored rather than merely exercised.**
+    ///
+    /// This is the seam that hid a 2,7× error for months (D172).
+    /// `modelled_production` is what a real household's plan is built on — a
+    /// global horizontal irradiance from `forecastd`, transposed onto this roof
+    /// — and every reference day takes the *other* path, `clear_sky_power`
+    /// scaled by a cloud fraction. So the whole suite exercised the one call
+    /// site where the old constant's premise happened to hold, and
+    /// `planned_house.rs` runs this one with a synthetic bell whose own comment
+    /// says "the planner does not need it to be right".
+    ///
+    /// The bound is physical rather than a fitted number. Whatever the sky is
+    /// doing, a module cannot convert more than the light that reaches its
+    /// plane, and its plane cannot receive more than the beam-transposed global
+    /// value plus the sky and the ground — which, for the *overcast* case where
+    /// there is no beam to transpose, is very close to the global value itself.
+    #[test]
+    fn an_overcast_winter_day_does_not_out_produce_the_light_that_fell_on_it() {
+        let array = array();
+        // A tenth of the clear sky: a solid December overcast.
+        let series = series(time::macros::date!(2026 - 12 - 21), 0.10);
+        let modelled: f64 = series
+            .modelled_production(&array, BERLIN)
+            .iter()
+            .map(|(_, w)| w * hems_core::prelude::SLOT_HOURS)
+            .sum::<f64>()
+            / 1000.0;
+        // What the array would make if every square metre of module saw exactly
+        // the *horizontal* irradiance. Under an overcast sky a tilted plane sees
+        // slightly less than that, never three times it.
+        let horizontal: f64 = series
+            .slots
+            .iter()
+            .map(|(_, p)| {
+                array.kwp_dc.kw()
+                    * (p.ghi_w_per_m2 / 1000.0)
+                    * (1.0 - array.system_loss)
+                    * hems_core::prelude::SLOT_HOURS
+            })
+            .sum();
+        // Under a solid overcast there is almost no beam to project, so the
+        // plane is worth about what the horizontal is worth: the sky-view
+        // fraction of the diffuse (0,91 at 35°), plus a little off the ground,
+        // plus the percent or two of beam Erbs still allows at `kt = 0,1`
+        // magnified by a low winter sun. It lands within a tenth either way.
+        // The constant this replaced put it at **2,7 times**.
+        let ratio = modelled / horizontal;
+        assert!(
+            (0.85..1.10).contains(&ratio),
+            "the box modelled {modelled:.3} kWh from a sky that put {horizontal:.3} kWh \
+             on a horizontal metre — {ratio:.2}×, and an overcast sky has no beam to project"
+        );
+    }
+
+    /// The clear-sky end of the same path, where the tilt is worth something.
+    ///
+    /// The other half of the bound: a 35° plane against a low winter sun *should*
+    /// beat the horizontal, and by a factor the geometry decides rather than one
+    /// a constant does.
+    #[test]
+    fn a_clear_winter_day_beats_the_horizontal_by_the_tilt_and_not_by_three() {
+        let array = array();
+        let series = series(time::macros::date!(2026 - 12 - 21), 1.0);
+        let modelled: f64 = series
+            .modelled_production(&array, BERLIN)
+            .iter()
+            .map(|(_, w)| w * hems_core::prelude::SLOT_HOURS)
+            .sum::<f64>()
+            / 1000.0;
+        let horizontal: f64 = series
+            .slots
+            .iter()
+            .map(|(_, p)| {
+                array.kwp_dc.kw()
+                    * (p.ghi_w_per_m2 / 1000.0)
+                    * (1.0 - array.system_loss)
+                    * hems_core::prelude::SLOT_HOURS
+            })
+            .sum();
+        // Two to three times, which is the well-known midwinter tilt gain for a
+        // 30–40° south plane at 52° north, and is higher than the *noon* ratio
+        // (about 2,2) because the low-sun slots either side of it have the
+        // largest transposition of all.
+        let gain = modelled / horizontal;
+        assert!(
+            (1.8..3.2).contains(&gain),
+            "a 35° south plane in December is worth {gain:.2}× the horizontal"
+        );
+    }
+
+    /// And it agrees with the path the reference days take.
+    ///
+    /// On a clear day the irradiance a weather service reports *is* the
+    /// clear-sky model, so the two production paths are the same physics reached
+    /// two ways. Holding them to each other is what stops one of them drifting
+    /// while the suite watches only the other — the same discipline the two
+    /// § 14a state machines are held to (D167).
+    #[test]
+    fn the_two_production_paths_agree_where_they_describe_the_same_sky() {
+        let array = array();
+        let series = series(time::macros::date!(2026 - 06 - 21), 1.0);
+        for (slot, watts) in series.modelled_production(&array, BERLIN) {
+            let direct = array.clear_sky_power(BERLIN, slot, 2.0).outflow().get();
+            assert!(
+                (watts - direct).abs() < 1e-6,
+                "slot {slot}: the weather path says {watts} W and the clear-sky path {direct} W"
+            );
+        }
+    }
+}
