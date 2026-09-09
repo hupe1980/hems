@@ -41,7 +41,16 @@ uuid         = { version = "1", features = ["v4", "v7", "serde"] }
 tracing      = "0.1"
 # The advisory runtime `agentd` is built on: durable, replayable, and the
 # journal is the plan of record. `redb` is the embedded store one instance uses.
-agentplane   = { version = "0.31", default-features = false, features = ["redb", "manifest"] }
+#
+# **`manifest` is deliberately off**, and it was on for months without a caller.
+# It is the YAML-defined-agent surface, and `agentd` defines its specialists in
+# Rust: `SPECIALISTS` is a table of functions, which is what makes the review a
+# computation rather than a prompt. The feature was costing the fleet binary
+# `serde_yaml_ng`, `jsonschema` and their trees — **21 packages**, measured — to
+# parse documents that do not exist. A Cargo feature with no caller is the same
+# defect as a module with no caller and is harder to see, because nothing
+# reports it.
+agentplane   = { version = "0.32", default-features = false, features = ["redb"] }
 anyhow       = "1"
 toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 

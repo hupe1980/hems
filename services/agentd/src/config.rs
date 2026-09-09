@@ -19,6 +19,24 @@ pub struct Settings {
     /// its input, its answer and every effect, append-only and hash-chained, so
     /// "why did the queue say that in March" is a replay rather than an
     /// argument. On an ephemeral filesystem it is a log that answers nothing.
+    ///
+    /// # A journal does not always survive an upgrade of this daemon
+    ///
+    /// `agentplane` is pre-1.0 and takes hard cuts rather than compatibility
+    /// shims, and one of them lands here: 0.32 changed how an identifier is
+    /// written inside a record, so the same logical run serialises to different
+    /// bytes and **every chain digest moved**. Old records still *read* — the
+    /// deserialiser accepts both spellings, and a stored record is verified
+    /// against the bytes it was stored as — but a **strict replay** of a run
+    /// journaled by an older build re-derives the record and compares, and the
+    /// comparison now fails.
+    ///
+    /// That is the one thing this file's path is for, so it is stated rather
+    /// than discovered: across such a release, recreate the journal, or export
+    /// and restore it. The queue itself is a projection and costs a refresh —
+    /// the next review rebuilds it — but a finding from before the upgrade
+    /// stops being answerable, which is the property that made a runtime worth
+    /// having over a cron job.
     pub journal: PathBuf,
     /// Which tenant's households the specialists may read.
     ///

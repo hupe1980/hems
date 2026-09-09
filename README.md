@@ -422,7 +422,7 @@ obeys that as an instruction not to use it.
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
 
-1 111 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 112 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
 clock, the whole suite, the workspace guards (492 citations across five document
 families, each resolving to a document the index carries; 130 quantities,

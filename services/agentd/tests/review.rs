@@ -210,9 +210,10 @@ async fn a_review_reads_a_fleet_and_leaves_a_queue_an_operator_can_replay() {
     }
 
     // ── And the finding can be replayed to the summary it was drawn from ─────
-    let run = agentplane::core::RunId::parse(&triage.run).expect("a run identifier");
+    // No parse: the queue carries the identifier as a `RunId`, so the thing that
+    // makes a finding answerable months later cannot have been a typo.
     let replayed = runtime
-        .replay(run, agentplane::prelude::Mode::Strict)
+        .replay(triage.run, agentplane::prelude::Mode::Strict)
         .await
         .expect("the replay completed");
     let again: agentd::Proposal =

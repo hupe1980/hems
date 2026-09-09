@@ -14,6 +14,13 @@
 # every effect, append-only and hash-chained. "Why did the queue say that in
 # March" is a replay rather than an argument — so a path on an ephemeral
 # filesystem is a log that answers nothing.
+#
+# It does not always survive an upgrade of this daemon. `agentplane` is pre-1.0
+# and takes hard cuts: 0.32 changed how an identifier is written inside a
+# record, so every chain digest moved and a **strict replay** of a run journaled
+# by an older build now fails, even though the record still reads. Across such a
+# release, recreate this file or export and restore it. The queue rebuilds
+# itself on the next review; a finding from before the upgrade does not.
 journal = "/var/lib/agentd/journal.redb"
 
 # Which operator's households the specialists read. "*" is every household this

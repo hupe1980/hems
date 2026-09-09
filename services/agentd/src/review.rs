@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use agentplane::core::SourceId;
+use agentplane::core::{RunId, SourceId};
 use agentplane::prelude::{Runtime, Tainted};
 use hems_service::{Health, Shutdown};
 use time::OffsetDateTime;
@@ -75,7 +75,14 @@ pub struct Reviewed {
     /// Which specialist.
     pub specialist: &'static str,
     /// The run in the journal that produced it, so a finding can be replayed.
-    pub run: String,
+    ///
+    /// A [`RunId`] rather than the string it used to be. Nothing changes on the
+    /// wire — `agentplane` 0.32 made `Serialize` write the same prefixed form
+    /// `Display` already wrote (`run_01J8Z…`) — and two things change here: a
+    /// replay parses nothing, and a run identifier that is not one cannot be
+    /// constructed. This type's own test used to build `run: "r".into()`, which
+    /// is not a run and which no reader would have caught (D177).
+    pub run: RunId,
     /// When the review ran.
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
@@ -210,13 +217,13 @@ pub async fn run_specialists(
                 continue;
             }
         };
-        let run = outcome.run_id.to_string();
+        let run = outcome.run_id;
         let answer = match outcome.success() {
             Ok(answer) => answer,
             Err(failure) => {
                 tracing::error!(
                     specialist = specialist.name,
-                    run,
+                    %run,
                     %failure,
                     "a specialist failed; the queue keeps whatever it said last"
                 );
@@ -235,7 +242,7 @@ pub async fn run_specialists(
             }),
             Err(error) => tracing::error!(
                 specialist = specialist.name,
-                run,
+                %run,
                 %error,
                 "a specialist answered with something this build cannot read"
             ),
@@ -369,15 +376,57 @@ mod tests {
 
         // The run identifier is not decoration: it is what makes a finding
         // answerable months later.
-        let run = agentplane::core::RunId::parse(&triage.run).expect("a run identifier");
         let replayed = runtime
-            .replay(run, agentplane::prelude::Mode::Strict)
+            .replay(triage.run, agentplane::prelude::Mode::Strict)
             .await
             .expect("the replay completed");
         let proposal: Proposal =
             serde_json::from_value(replayed.output.expect("an answer").peek().clone())
                 .expect("the same answer");
         assert_eq!(proposal, triage.proposal, "the same answer, re-derived");
+    }
+
+    /// The identifier an operator's dashboard reads is unchanged by having
+    /// become a type.
+    ///
+    /// `Reviewed.run` was a `String` built with `RunId::to_string()`; it is now
+    /// a `RunId`. That is only safe to do silently because `agentplane` 0.32
+    /// made `Serialize` write what `Display` already wrote, and "only safe
+    /// because of an upstream release note" is exactly the kind of claim that
+    /// wants an assertion rather than a comment. A field on a served API is a
+    /// wire form, and a wire form nothing pins is one that moves.
+    #[test]
+    fn the_run_identifier_is_the_same_string_on_the_wire_as_in_a_log() {
+        let id = RunId::generate();
+        let reviewed = Reviewed {
+            specialist: "compliance-triage",
+            run: id,
+            at: time::macros::datetime!(2026-01-15 06:00 UTC),
+            source: "https://obsd.example/v1/fleet".into(),
+            days: 56,
+            sites: 4,
+            proposal: Proposal::default(),
+        };
+        let json = serde_json::to_value(&reviewed).expect("a serialisable review");
+        assert_eq!(
+            json["run"],
+            serde_json::Value::String(id.to_string()),
+            "the served field is what an operator would grep a log for"
+        );
+        // And it is the prefixed form, so the string says what kind of id it is
+        // wherever it lands.
+        assert!(
+            json["run"].as_str().is_some_and(|s| s.starts_with("run_")),
+            "an identifier should be self-describing: {}",
+            json["run"]
+        );
+        // Round-trip, because a dashboard that shows it is a dashboard that may
+        // hand it back.
+        assert_eq!(
+            json["run"].as_str().unwrap().parse::<RunId>().unwrap(),
+            id,
+            "what is served parses back to what produced it"
+        );
     }
 
     #[tokio::test]
@@ -389,7 +438,7 @@ mod tests {
         assert!(queue.is_empty().await);
         let reviewed = |name: &'static str| Reviewed {
             specialist: name,
-            run: "r".into(),
+            run: RunId::generate(),
             at: time::macros::datetime!(2026-01-15 06:00 UTC),
             source: "s".into(),
             days: 60,
