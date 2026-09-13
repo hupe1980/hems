@@ -379,7 +379,30 @@ pub fn allocate_by(
     })
 }
 
-/// Whether § 42c allocation applies on `day`.
+/// Whether a network operator must already make § 42c allocation possible on
+/// `day`.
+///
+/// # Where the refusal belongs, and where it does not
+///
+/// **Not in [`allocate_by`].** The arithmetic is defined by the community's own
+/// contract (§ 42c Abs. 3), not by the date, and a caller that wants the
+/// conservation identity checked over a day's registers is asking a question
+/// about arithmetic rather than making a claim about money. A function that
+/// refused a date would be a rule stated over the wrong noun — the same mistake
+/// as banning a crate when the invariant is about a feature.
+///
+/// **At the boundary where an allocation becomes a claim**, which is the shape
+/// this workspace already uses for the sibling rule: `histd`'s MiSpeL export
+/// refuses a period the Festlegung never reached, and the error lives at the
+/// export rather than in the quantity. What § 42c Abs. 4 Nr. 1 fixes is the day
+/// a *network operator* must make sharing possible, so before it a household
+/// may agree whatever it likes and will not be allocated anything — and a box
+/// that planned against a share, or a report that credited one, would be
+/// promising money that will not arrive.
+///
+/// It was called by nothing for as long as it existed, which is how two
+/// reference days came to settle a § 42c allocation on dates in January and May
+/// 2026 and report the credit (D179).
 #[must_use]
 pub fn applies_on(day: Date) -> bool {
     day >= SHARING_START
@@ -634,5 +657,47 @@ mod tests {
     fn sharing_starts_on_the_first_of_june() {
         assert!(!applies_on(time::macros::date!(2026 - 05 - 31)));
         assert!(applies_on(SHARING_START));
+    }
+
+    /// The predicate that says when a network operator's duty begins, and the
+    /// boundary it draws.
+    ///
+    /// It is only a predicate: [`allocate_by`] does **not** consult it, because
+    /// the arithmetic is contract-defined and a caller checking a conservation
+    /// identity over a day's registers is not claiming a household was
+    /// allocated anything. The refusal belongs where an allocation becomes a
+    /// claim, which is what D179 moved.
+    #[test]
+    fn the_duty_begins_on_the_first_of_june_and_not_before() {
+        assert!(!applies_on(time::macros::date!(2026 - 05 - 31)));
+        assert!(applies_on(SHARING_START));
+        assert!(applies_on(time::macros::date!(2028 - 06 - 01)));
+
+        // And the arithmetic answers whatever it is asked, on either side of
+        // that boundary, because it is a different question.
+        let community = Community::new(
+            "11YDE-VE-------2",
+            vec![
+                Member::new("DE0001111111111111111111111111111", Decimal::ONE),
+                Member::new("DE0002222222222222222222222222222", Decimal::ONE),
+            ],
+        );
+        for at in [
+            time::macros::datetime!(2026-05-31 12:00:00 UTC),
+            time::macros::datetime!(2026-06-01 12:00:00 UTC),
+        ] {
+            let allocation = allocate(
+                &community,
+                Slot::containing(at),
+                Decimal::from(4),
+                &[Decimal::from(2), Decimal::from(2)],
+            )
+            .expect("the identity is a question about arithmetic");
+            assert_eq!(
+                allocation.shares.iter().map(|s| s.shared).sum::<Decimal>()
+                    + allocation.unallocated,
+                Decimal::from(4)
+            );
+        }
     }
 }

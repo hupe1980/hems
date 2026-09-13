@@ -45,11 +45,21 @@ hems-service   = { workspace = true }
 eebus        = { workspace = true, features = ["runtime", "mdns", "aws-lc-rs", "conformance"] }
 if-addrs     = { workspace = true }
 hems-sim       = { workspace = true }
+# The S2 wire types, so this daemon can decode a frame into the `Message` that
+# `hems-flex` decides about. `default-features = false` keeps the crate's own
+# WebSocket transport out: it binds a port and cannot say which *resource* a
+# connection is for, which is the one thing a multi-resource household needs
+# (see `runtime::s2`).
+s2energy     = { version = "0.3", default-features = false }
 hems-tariff    = { workspace = true }
 metering       = { workspace = true }
 
 anyhow       = { workspace = true }
-axum         = { workspace = true }
+# `ws`, for the one surface that needs one. S2's recommended binding is JSON over
+# WebSockets, and the box already binds a socket for its own API — so the
+# manager's route rides on it rather than costing a household a second port and a
+# second firewall rule (see `runtime::s2`).
+axum         = { workspace = true, features = ["ws"] }
 clap         = { version = "4", features = ["derive", "env"] }
 # The box's one outbound call, on the **async** client. `main` is
 # `#[tokio::main]`, so every command runs inside a runtime, and
@@ -65,6 +75,11 @@ redb         = { workspace = true }
 chronix      = { workspace = true }
 arrow        = { workspace = true }
 rust_decimal = { workspace = true }
+# The box issues its own API token, and the operating system's entropy is the
+# only thing it may come from: a credential derived from a site name, a serial
+# number or a clock is one somebody can compute (`runtime::access`).
+getrandom    = { workspace = true }
+hex          = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 thiserror    = { workspace = true }
@@ -73,3 +88,26 @@ tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "net
 time         = { workspace = true }
 tracing      = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+# The **CEM's** half of S2, for the one test that needs a real one. The client
+# connector is the standard crate's own, so what drives the box across a socket
+# in `managed_by_a_cem.rs` is the reference implementation rather than a second
+# opinion about the wire — which is the whole reason `hems-flex` takes the
+# generated types in the first place.
+#
+# A dev-dependency, so the daemon itself never links `tokio-tungstenite`: the box
+# is the *server* and axum already binds its socket.
+s2energy = { version = "0.3", default-features = false, features = ["websockets-json"] }
+# S2's schema puts instants in `chrono`, so a test that *builds* an instruction
+# needs one. The daemon itself does not: it decodes, and `hems-flex` converts at
+# its own edge, so `time` stays the only calendar in the product.
+chrono   = { version = "0.4", default-features = false, features = ["std"] }
+# The credential rides in the ordinary `Authorization` header, so the test's CEM
+# needs a handshake request it can add one to. `IntoClientRequest` is the
+# standard crate's own — writing the `Sec-WebSocket-Key` by hand would be a
+# second implementation of a handshake in a test about something else.
+# The same version `s2energy` and `axum` already resolve to, so there is one
+# tungstenite in the build graph rather than two.
+http              = { workspace = true }
+tokio-tungstenite = { version = "0.28", default-features = false }

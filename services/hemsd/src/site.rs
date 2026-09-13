@@ -1,8 +1,8 @@
 //! Building the household the daemon manages.
 
 use hems_core::asset::{
-    AssetMeta, Battery, Capabilities, Chemistry, DhwTank, Evse, FlexibleLoad, HeatPump,
-    HeatPumpControl, LegacyStatus, LoadKind, Programme, PvArray, SteuVeExemption,
+    AssetMeta, Battery, Capabilities, DhwTank, Evse, FlexibleLoad, HeatPump, HeatPumpControl,
+    LegacyStatus, LoadKind, Programme, PvArray, SteuVeExemption,
 };
 use hems_core::prelude::*;
 use hems_optimizer::model::{PlanningLimits, SteuVeDevices, TimedLimit};
@@ -115,6 +115,27 @@ pub struct DhwConfig {
     pub litres: f64,
     /// Electrical power of the heater.
     pub heater: Power,
+    /// Thermal kilowatt-hours delivered per electrical kilowatt-hour.
+    ///
+    /// One for an immersion heater, around three for a hot-water heat pump. It
+    /// is the difference between a tank that costs a kilowatt-hour to fill and
+    /// one that costs three, so a household fitted with the first and modelled
+    /// as the second has its hot water priced at a third of what it pays.
+    pub cop: f64,
+    /// Standing loss — the reason a tank left alone is cold in the morning.
+    pub standing_loss: Power,
+    /// Lowest acceptable temperature, °C. Below it the household has a cold
+    /// shower, which the plan pays for rather than forbidding.
+    pub t_min_c: f64,
+    /// The temperature the household's **own thermostat** holds, °C.
+    ///
+    /// Not a bound on the plan — the plan works between `t_min_c` and `t_max_c`
+    /// and uses the tank as a store. This is what the household would have
+    /// without a manager, so it is what the **baseline** is held at, and
+    /// therefore what the saving is measured against (D183).
+    pub t_set_c: f64,
+    /// Highest safe temperature, °C — a scald bound, not a target.
+    pub t_max_c: f64,
 }
 
 /// The identifiers this daemon gives the household's assets.
@@ -322,6 +343,11 @@ impl Default for HouseholdConfig {
             dhw: Some(DhwConfig {
                 litres: 300.0,
                 heater: Power::from_kw(0.5),
+                cop: 3.0,
+                standing_loss: Power::new(45.0),
+                t_min_c: 45.0,
+                t_set_c: 55.0,
+                t_max_c: 60.0,
             }),
             fuse: Current::new(35.0),
             connection: ConnectionConfig::default(),
@@ -580,7 +606,6 @@ fn assets_of(
             soc_min: Soc::new(0.05)?,
             soc_max: Soc::FULL,
             reserve_soc: battery.reserve_soc,
-            chemistry: Chemistry::Lfp,
             grid_charging_allowed: true,
         }));
     }
@@ -633,11 +658,11 @@ fn assets_of(
             )?,
             volume_l: dhw.litres,
             heater: dhw.heater,
-            cop: 3.0,
-            standing_loss: Power::new(45.0),
-            t_min_c: 45.0,
-            t_set_c: 55.0,
-            t_max_c: 60.0,
+            cop: dhw.cop,
+            standing_loss: dhw.standing_loss,
+            t_min_c: dhw.t_min_c,
+            t_set_c: dhw.t_set_c,
+            t_max_c: dhw.t_max_c,
         }));
     }
     assets.push(base_load(main)?);

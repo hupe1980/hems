@@ -30,5 +30,3 @@ serde = [
   "time/serde-well-known",
 ]
 
-[dev-dependencies]
-serde_json = { workspace = true }

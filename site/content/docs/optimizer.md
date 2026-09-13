@@ -251,6 +251,17 @@ three — so the whole store is under two kilowatt-hours of electricity that can
 bought hours before it is used. It is the cheapest flexibility in most German
 houses and the one nobody plans with.
 
+All five facts are the **installation's** — volume, heater, coefficient, standing
+loss and the three temperatures — because a household with a plain immersion
+heater buys three kilowatt-hours where one with a hot-water heat pump buys one,
+and modelling the first as the second prices its hot water at a third of what it
+pays. The one that is easy to misread is the **set point**: it bounds nothing the
+plan does, which works between the lowest acceptable and the highest safe
+temperature and uses everything between them as a store. It is where this
+household's own thermostat would sit with no energy manager at all — so it is
+what the *baseline* is held at, and therefore what the saving is measured
+against.
+
 It is modelled as a **linear store**: heat above the lowest acceptable
 temperature, with a leak and a draw. Not a second RC model, because what a
 household cares about is whether there is hot water rather than the temperature
@@ -366,6 +377,13 @@ free — which makes the two-mass RC model the largest store in the plan. It is
 also the one most easily got wrong, because the air node's time constant is about
 thirteen minutes and the planner's step is fifteen.
 
+It is heated by more than the heat pump. The sun through the glazing and the
+household's own waste heat are a *known constant* per slot rather than a
+decision, so they are an offset on the right-hand side and the programme stays
+linear — and on a clear March noon they exceed the whole demand
+([the domain model](@/docs/domain-model.md#the-heat-nobody-paid-for) has the
+numbers).
+
 Stepping it with explicit Euler at that step size does two things at once. The
 fast eigenvalue comes out **negative** — `−0,16` where the exact value is `+0,31`
 — so the planned indoor temperature *rings* after every change of heat input,
@@ -389,33 +407,6 @@ what keeps the planner a linear program.
 The same discretisation serves the planner, the rule-based baseline it compares
 itself against, and the simulator that answers it. One model, and no way for the
 plan and the house to disagree about physics for numerical reasons.
-
-### The house is heated by more than the heat pump
-
-The building model also carries an effective **solar aperture** and a constant
-**internal gain** — the sun through the glazing, and the people, the cooking and
-everything electric that ends up warm. Both are identified from the household's
-own record along with the fabric.
-
-They are not a refinement. The average German archetype loses `(21 − T_out) / 6`
-kilowatts: 2,7 kW at 5 °C outdoors. A clear March noon puts about 550 W/m² on a
-vertical south plane, which through a 4,5 m² aperture is 2,5 kW, and the internal
-gains are another 0,45. **On the days a heating plan is most worth making, the
-free heat exceeds the demand**, and even at −2 °C in January it is about half of
-it. A plan made without it runs the compressor into a room the sun is already
-warming and then pays the comfort slack for the overshoot — which is the opposite
-of the way a conservative omission would be wrong, so leaving it out was never
-the safe choice.
-
-Measured on the reference days: the January heat pump falls from 26,5 kWh to
-21,7 and the bill from €21,03 to €19,88; the sunny-May one falls from 10,4 kWh to
-2,7, which is the number that says how wrong the old model was, because a
-well-insulated German house does not heat on 15 May.
-
-It costs the programme nothing. The state equation is already linear in the heat
-input and the free heat is a **known constant** in each slot rather than a
-decision, so it is an offset on the right-hand side: no new variable, no new
-coefficient, the same linear program.
 
 ### Every preference is a price, so the objective has one unit
 

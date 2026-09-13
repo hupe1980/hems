@@ -292,7 +292,7 @@ fn heat_pump_commands(hp: &HeatPump, decision: Decision) -> Vec<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hems_core::asset::{AssetMeta, Battery, Chemistry, DhwTank, PvArray, Relay};
+    use hems_core::asset::{AssetMeta, Battery, DhwTank, PvArray, Relay};
 
     fn meta(id: &str, kw: f64) -> AssetMeta {
         AssetMeta::new(
@@ -465,7 +465,6 @@ mod tests {
             soc_min: Soc::new(0.05).unwrap(),
             soc_max: Soc::FULL,
             reserve_soc: Soc::EMPTY,
-            chemistry: Chemistry::Lfp,
             grid_charging_allowed: true,
         });
         assert_eq!(

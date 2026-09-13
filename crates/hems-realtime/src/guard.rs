@@ -1536,7 +1536,7 @@ pub fn minimum_useful_power(asset: &Asset) -> Power {
 mod tests {
     use super::*;
     use hems_core::asset::{
-        AssetMeta, Battery, Capabilities, Chemistry, Evse, FlexibleLoad, LoadKind, PvArray,
+        AssetMeta, Battery, Capabilities, Evse, FlexibleLoad, LoadKind, PvArray,
     };
     use time::macros::datetime;
 
@@ -1594,7 +1594,6 @@ mod tests {
                     soc_min: Soc::new(0.05).unwrap(),
                     soc_max: Soc::FULL,
                     reserve_soc: Soc::new(0.1).unwrap(),
-                    chemistry: Chemistry::Lfp,
                     grid_charging_allowed: true,
                 }),
                 Asset::Load(FlexibleLoad {

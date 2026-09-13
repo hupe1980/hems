@@ -11,11 +11,18 @@ license.workspace      = true
 repository.workspace   = true
 rust-version.workspace = true
 
+# **Not `hems-forecast`, and not by accident.** This crate is the day that
+# *happens*; the forecaster is the day that was *expected*, and keeping them
+# apart is the whole of D35 — a simulator that can read the forecast is one that
+# can be shown the answer. `cargo xtask check-deps-used` keeps the edge out.
+#
+# **And not `hems-grid` either, since D186.** The simulated Steuerbox used to
+# emit the rule crate's own `LpcEvent`, which tied a simulator of the *operator's*
+# box to one particular household-side state machine. It emits its own `Command`
+# now, and `hemsd` translates — so this crate simulates the other side of a wire
+# rather than half of the thing on this side of it.
 [dependencies]
 hems-core     = { workspace = true }
-hems-forecast = { workspace = true }
-hems-grid     = { workspace = true }
-metering      = { workspace = true }
 serde         = { workspace = true, optional = true }
 time          = { workspace = true }
 

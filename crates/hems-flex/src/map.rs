@@ -135,7 +135,7 @@ pub fn roles_for(asset: &Asset) -> Vec<RoleType> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hems_core::asset::{AssetMeta, Battery, Chemistry, Evse, FlexibleLoad, HeatPump, PvArray};
+    use hems_core::asset::{AssetMeta, Battery, Evse, FlexibleLoad, HeatPump, PvArray};
 
     fn meta(id: &str, kw: f64) -> AssetMeta {
         AssetMeta::new(
@@ -168,7 +168,6 @@ mod tests {
             soc_min: Soc::new(0.05).unwrap(),
             soc_max: Soc::FULL,
             reserve_soc: Soc::EMPTY,
-            chemistry: Chemistry::Lfp,
             grid_charging_allowed: true,
         })
     }

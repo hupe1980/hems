@@ -104,13 +104,6 @@ const DEFAULT_EXPORT_EUR_PER_KWH: f64 = 0.08;
 /// The German grid's carbon intensity where no source provides one, g/kWh.
 const DEFAULT_CO2_G_PER_KWH: f64 = 400.0;
 
-/// Where an unmanaged hot-water thermostat holds the tank, as a fraction of its
-/// usable heat.
-///
-/// A tank on a plain thermostat sits at its set point all day, which is what
-/// makes it a *baseline*: it never uses the store as a store.
-const DHW_THERMOSTAT_SET: f64 = 0.85;
-
 /// What the objective is multiplied by before the dual pass.
 ///
 /// Large enough to bring a €/W coefficient of order 10⁻⁵ up to order 1, which is
@@ -2378,7 +2371,12 @@ impl Unmanaged {
         let draw = problem.dhw_draw_at(k) + d.standing_loss.get() * DT_HOURS;
         cost.unserved_eur += (draw - self.dhw_stored).max(0.0) * (d.shortfall_eur_per_kwh / 1000.0);
         self.dhw_stored = (self.dhw_stored - draw).max(0.0);
-        let missing = d.capacity.get() * DHW_THERMOSTAT_SET - self.dhw_stored;
+        // The household's **own** set point, not a constant standing in for
+        // one. A tank on a plain thermostat sits where the installer set it all
+        // day and never uses the store as a store, which is what makes it a
+        // baseline; a baseline that held the water hotter than the household
+        // asks for would credit the manager with the difference (D183).
+        let missing = d.thermostat_set.get().min(d.capacity.get()) - self.dhw_stored;
         let p = if missing > 0.0 {
             d.heater
                 .get()

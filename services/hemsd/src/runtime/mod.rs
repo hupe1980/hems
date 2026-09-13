@@ -31,6 +31,7 @@
 //! health surface rather than in a comment, because a box that quietly never
 //! plans looks exactly like one that plans badly.
 
+pub mod access;
 pub mod api;
 pub mod control;
 pub mod day;
@@ -38,6 +39,7 @@ pub mod fleet;
 pub mod outbox;
 pub mod overrides;
 pub mod planner;
+pub mod s2;
 pub mod ship;
 pub mod transport;
 
@@ -123,6 +125,19 @@ pub struct Running {
     /// and starved the other, and one that assumed registration order matched
     /// configuration order would depend on an ordering nothing declares.
     pub drivers: Vec<crate::drivers::DriverId>,
+    /// What a connected Customer Energy Manager is asking of this household,
+    /// shared with the S2 surface and the control loop.
+    pub cem: s2::Cem,
+    /// The credential this box's own surfaces answer to.
+    ///
+    /// Beside `ski` because it is the same kind of fact and the same
+    /// commissioning step: two credentials an installer carries away from the
+    /// visit, one for the network operator's box and one for whoever reads this
+    /// one's own screens.
+    pub access: access::LocalAccess,
+    /// The token as it should be shown at start-up, where the box issued it
+    /// itself. `None` where a deployment configured one and already has it.
+    pub api_token: Option<String>,
     /// Approving a Steuerbox on a running box, shared with the HTTP surface.
     ///
     /// `None` where this household has no EEBUS identity — a box with no § 14a
@@ -167,6 +182,11 @@ pub fn assemble(
         drivers,
         ski: None,
         overrides: overrides::Overrides::new(),
+        cem: s2::Cem::new(),
+        // Replaced in `run` from the store; `assembled` is the pure half and has
+        // no store to read one out of.
+        access: access::LocalAccess::for_testing("unconfigured", ""),
+        api_token: None,
         series: None,
         trust: None,
         household,
@@ -756,34 +776,37 @@ pub async fn run(
     running.overrides = overrides.clone();
     running.series = open_series(settings)?;
 
+    // The box's own credential, before anything is served. Resolved here rather
+    // than at the call site that builds the router, because it is the store this
+    // function owns that remembers it across a reboot.
+    let site = running.household.site.id.to_string();
+    let (access, issued) = match &store {
+        Some(store) => {
+            let held = store.lock().await;
+            access::LocalAccess::resolve(&settings.api, &site, Some(&held))?
+        }
+        None => access::LocalAccess::resolve(&settings.api, &site, None)?,
+    };
+    // The managers this household connected earlier. Kept for the same reason
+    // the EEBUS trust store is: a household that had to re-connect its
+    // aggregator after a power cut is a household whose flexibility contract
+    // depends on somebody being at home (D102, D188).
+    let access = access.remembering(store.clone());
+    match access.restore().await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(managers = n, "energy managers this household has connected"),
+        Err(error) => tracing::error!(%error, "the connected managers could not be read"),
+    }
+    running.access = access;
+    running.api_token = issued.announcement();
+
+    let cem = announce_the_s2_surface(settings);
+    running.cem = cem.clone();
+
     let (plan, prices, published, learned) =
         start_planner(settings, &running, store.clone(), health, shutdown).await?;
 
-    // The record's last leg. The box has already kept its own copy, so this is
-    // the fleet's convenience rather than the household's safety — which is why
-    // a failure here is a retry and never a reason to stop controlling a house.
-    let to_histd = outbox::Outbox::new(&settings.histd, &settings.service.http)?;
-    let to_obsd = outbox::Reporter::new(&settings.obsd, &settings.service.http)?;
-    match store.clone() {
-        Some(store) if to_histd.is_some() || to_obsd.is_some() => {
-            tokio::spawn(outbox::run(
-                to_histd,
-                to_obsd,
-                store,
-                std::time::Duration::from_secs(settings.histd.every_s.max(30)),
-                settings.histd.batch.max(1),
-                shutdown.clone(),
-            ));
-        }
-        _ => {
-            if settings.histd.is_configured() || settings.obsd.is_configured() {
-                tracing::warn!(
-                    "a fleet endpoint is configured and this box has no store, so \
-                     there is nothing to forward"
-                );
-            }
-        }
-    }
+    start_forwarding(settings, store.clone(), shutdown)?;
 
     // The one task this box cannot do its job without. A control loop that has
     // panicked leaves a process answering every request and managing nothing —
@@ -820,6 +843,7 @@ pub async fn run(
                 store,
                 series: running.series.clone(),
                 overrides: overrides.clone(),
+                cem: cem.clone(),
             },
             settings.control.clone(),
             health.clone(),
@@ -828,6 +852,88 @@ pub async fn run(
     );
 
     Ok(running)
+}
+
+/// The record's last leg: what the box has kept, on its way to the fleet.
+///
+/// The box has already kept its own copy, so this is the fleet's convenience
+/// rather than the household's safety — which is why a failure inside it is a
+/// retry and never a reason to stop controlling a house. What *is* worth saying
+/// out loud is the configuration that cannot work: a fleet endpoint on a box with
+/// no store has nothing to forward, and every screen would show a healthy box
+/// sending nothing.
+fn start_forwarding(
+    settings: &Settings,
+    store: Option<Arc<Mutex<crate::store::Store>>>,
+    shutdown: &Shutdown,
+) -> anyhow::Result<()> {
+    let to_histd = outbox::Outbox::new(&settings.histd, &settings.service.http)?;
+    let to_obsd = outbox::Reporter::new(&settings.obsd, &settings.service.http)?;
+    match store {
+        Some(store) if to_histd.is_some() || to_obsd.is_some() => {
+            tokio::spawn(outbox::run(
+                to_histd,
+                to_obsd,
+                store,
+                std::time::Duration::from_secs(settings.histd.every_s.max(30)),
+                settings.histd.batch.max(1),
+                shutdown.clone(),
+            ));
+        }
+        _ => {
+            if settings.histd.is_configured() || settings.obsd.is_configured() {
+                tracing::warn!(
+                    "a fleet endpoint is configured and this box has no store, so \
+                     there is nothing to forward"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Everything this daemon serves, assembled once.
+///
+/// **One assembly, used by `main` and by the tests**, and that is the point
+/// rather than tidiness: a test that built its own router would be checking a
+/// second arrangement of the same parts, and the arrangement is where the
+/// security property lives. The gate is a layer over the whole thing, so a route
+/// added tomorrow is covered by a decision nobody has to remember to repeat
+/// (D112, [`access::require_token`]).
+///
+/// The shell's `/livez`, `/readyz` and `/metrics` are **not** here — they are
+/// added afterwards by `hems_service::Server` and stay open, because an
+/// orchestrator that needed a household's credential to restart a crashed box is
+/// one that would be given that credential far too widely.
+pub fn surfaces(
+    local: api::Local,
+    s2: Option<s2::Surface>,
+    access: access::LocalAccess,
+) -> axum::Router {
+    let mut router = api::router(local);
+    if let Some(surface) = s2 {
+        router = router.merge(s2::router(surface));
+    }
+    router.layer(axum::middleware::from_fn_with_state(
+        access,
+        access::require_token,
+    ))
+}
+
+/// The map an S2 session writes and the arbiter reads.
+///
+/// It exists whether or not the surface is enabled — an empty one costs a hash
+/// lookup a second and means the control loop has one shape rather than two —
+/// and the *setting* is what turns the socket on.
+fn announce_the_s2_surface(settings: &Settings) -> s2::Cem {
+    if settings.s2.enabled {
+        tracing::info!(
+            "a Customer Energy Manager may drive this household over S2 at \
+             `/s2/{{asset}}`: an instruction outranks this box's own plan and is \
+             narrowed by the guard like everything else"
+        );
+    }
+    s2::Cem::new()
 }
 
 /// Give every configured driver whatever moves its bytes.

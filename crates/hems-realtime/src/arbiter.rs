@@ -125,6 +125,12 @@ pub struct Tick<'a> {
     pub plan: Option<&'a Plan>,
     /// Explicit wishes from the household.
     pub overrides: &'a BTreeMap<AssetId, UserOverride>,
+    /// What a connected Customer Energy Manager has asked of each asset, over
+    /// S2 (EN 50491-12-2).
+    ///
+    /// Empty on a box with no CEM, which is the ordinary case and carries no
+    /// cost: an absent entry is an asset the plan keeps.
+    pub cem: &'a BTreeMap<AssetId, CemRequest>,
     /// What was commanded last tick, for ramping and the deadband.
     pub previous: &'a BTreeMap<AssetId, Power>,
     /// Energy already moved by each asset **since the start of the current
@@ -151,10 +157,95 @@ pub struct Tick<'a> {
 /// small enough to stay a finite number the allocator can divide by.
 const BOOST_WEIGHT: f64 = 1_000.0;
 
+/// What an external Customer Energy Manager has asked of one asset.
+///
+/// The arbiter's view of an S2 session, and deliberately not S2's own types: a
+/// control plane that had to match on `FrbcInstruction` would be a second place
+/// the standard is decoded, and `hems-flex` is the first. What survives the
+/// translation is the only two things a real-time loop can act on — a power to
+/// aim for, and a ceiling not to exceed — and the instant after which neither
+/// may be believed.
+///
+/// # Why both, and why either may be absent
+///
+/// S2's control types do not all say the same kind of thing. `FRBC` instructs a
+/// **rate** — charge this store at four fifths of its charge mode — which is a
+/// desire. `PEBC` sends an **envelope**, which is a bound and nothing else: it
+/// says what the household may not exceed and leaves the choice underneath it
+/// where it was. Collapsing the second into the first would turn "you may take
+/// up to 5 kW" into "take 5 kW", which is the opposite instruction on a sunny
+/// afternoon.
+///
+/// So a request carries whichever of the two the manager actually sent. An
+/// envelope with no rate narrows whatever the plan or the surplus tracker was
+/// going to do; a rate with no envelope replaces it.
+///
+/// The envelope is an [`Envelope`] rather than a bare ceiling because S2's is
+/// two-sided and so is this household's: a `PEBC` element carries a lower and an
+/// upper limit in the same convention hems uses — positive draws — so an
+/// inverter's permitted production is the *floor* and no asset kind has to be
+/// special-cased on the way in. It narrows and can only narrow: the want is
+/// clamped into it before the guard runs and the guard clamps again after, so a
+/// manager cannot widen anything by sending a generous envelope.
+///
+/// # An instruction that stops arriving stops applying
+///
+/// [`CemRequest::until`] is not a nicety. A manager that goes quiet — a crashed
+/// process, a cut cable, a cloud that lost its certificate — would otherwise
+/// hold this household at whatever it last said for as long as the box runs. S2
+/// instructions carry their own validity, and the one thing an energy manager
+/// must never be is *stuck*, so the request expires and the asset falls back to
+/// the plan the box makes for itself. That is the same argument as the § 14a
+/// failsafe with the ownership reversed, and it is why this is a field rather
+/// than a comment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CemRequest {
+    /// The power the manager asked this asset to take, load convention.
+    ///
+    /// `None` where the manager sent only a bound.
+    pub power: Option<Power>,
+    /// The interval the manager will allow it to work in, load convention — an
+    /// S2 `PEBC` envelope element.
+    ///
+    /// `None` where the manager sent only a rate.
+    pub envelope: Option<Envelope>,
+    /// The instant after which neither may be believed.
+    pub until: OffsetDateTime,
+}
+
+impl CemRequest {
+    /// A request to take a power, valid until `until`.
+    #[must_use]
+    pub const fn power(power: Power, until: OffsetDateTime) -> Self {
+        Self {
+            power: Some(power),
+            envelope: None,
+            until,
+        }
+    }
+
+    /// A bound with no rate — an S2 `PEBC` envelope.
+    #[must_use]
+    pub const fn envelope(envelope: Envelope, until: OffsetDateTime) -> Self {
+        Self {
+            power: None,
+            envelope: Some(envelope),
+            until,
+        }
+    }
+
+    /// Whether this request still applies at `now`.
+    #[must_use]
+    pub fn is_live(&self, now: OffsetDateTime) -> bool {
+        now <= self.until && (self.power.is_some() || self.envelope.is_some())
+    }
+}
+
 /// Where a desire came from, before the guard had its say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Desire {
     User(UserOverride),
+    Cem,
     Plan,
     Realtime(RealtimeCause),
     Idle(FallbackCause),
@@ -427,12 +518,30 @@ impl Arbiter {
             }
             let id = asset.id().clone();
             let planned = slot_plan.and_then(|s| s.target(&id)).map(|t| t.power);
+            // What a connected manager is asking of this asset, if it is asking
+            // anything and the instruction has not expired. Read once: the rate
+            // decides the desire and the ceiling narrows whatever the desire
+            // turns out to be, and those are two different sentences about the
+            // same request.
+            let cem = tick.cem.get(&id).filter(|r| r.is_live(tick.now));
             let (want, weight, source) = match tick.overrides.get(&id) {
                 Some(UserOverride::Pause) => (Power::ZERO, 1.0, Desire::User(UserOverride::Pause)),
                 Some(UserOverride::Boost) => (
                     asset.meta().connection_power,
                     BOOST_WEIGHT,
                     Desire::User(UserOverride::Boost),
+                ),
+                // A manager the household connected outranks the planner the box
+                // runs for itself — see [`Reason::Cem`] for why that is the
+                // right way round — and is outranked by the person who pressed
+                // a button. It carries the weight of an ordinary plan target
+                // with no marginal value attached, because a scarce § 14a budget
+                // is split by how much each claimant is worth and an S2
+                // instruction does not say.
+                Some(UserOverride::Away) | None if cem.is_some_and(|r| r.power.is_some()) => (
+                    cem.and_then(|r| r.power).expect("checked"),
+                    1.0,
+                    Desire::Cem,
                 ),
                 Some(UserOverride::Away) | None => match slot_plan.and_then(|s| s.target(&id)) {
                     // A plan target means two different things and only one of
@@ -484,6 +593,30 @@ impl Arbiter {
                         None => (Power::ZERO, 1.0, Desire::Idle(idle_cause)),
                     },
                 },
+            };
+            // …and a `PEBC` envelope narrows whatever the desire turned out to
+            // be, whoever it came from. It is applied here rather than after the
+            // guard so that the guard allocates a scarce § 14a budget against
+            // what this asset may actually use — and applied *before* the guard
+            // so that the guard clamps the result again, which is what makes a
+            // generous envelope incapable of widening anything.
+            //
+            // A person's override is the exception, and deliberately: `Boost` is
+            // a household saying it wants the car charged now, and a manager's
+            // standing bound is not the thing that should silently refuse it.
+            // The guard still does.
+            //
+            // And where it *moved* the value, it becomes the reason: a setpoint
+            // held by a manager's envelope and labelled with the plan that asked
+            // for more is a household told the wrong thing about who is driving
+            // its house (P7).
+            let (want, source) = match cem.and_then(|r| r.envelope) {
+                Some(bound) if !matches!(source, Desire::User(_)) => {
+                    let bounded = bound.clamp(want);
+                    let moved = (bounded - want).abs() > Power::new(f64::EPSILON);
+                    (bounded, if moved { Desire::Cem } else { source })
+                }
+                _ => (want, source),
             };
             wants.insert(id.clone(), (want, weight));
             // Under a plan the steady view is the slot's own target; otherwise
@@ -554,6 +687,7 @@ impl Arbiter {
             // deadband, and the household should be told which.
             (None, _) if correction.is_some() => Reason::Realtime(correction.expect("checked")),
             (None, Some(Desire::User(o))) => Reason::User(*o),
+            (None, Some(Desire::Cem)) => Reason::Cem,
             (None, Some(Desire::Plan)) => Reason::Plan {
                 plan: desires.plan.map_or_else(PlanId::new, |p| p.id),
                 slot: Slot::containing(tick.now),
@@ -881,7 +1015,7 @@ const REFERENCE_EUR_PER_KWH: f64 = 0.30;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hems_core::asset::{AssetMeta, Battery, Chemistry, Evse, FlexibleLoad, LoadKind, PvArray};
+    use hems_core::asset::{AssetMeta, Battery, Evse, FlexibleLoad, LoadKind, PvArray};
     use hems_grid::para14a::minimum_power;
     use time::macros::datetime;
 
@@ -941,7 +1075,6 @@ mod tests {
                     soc_min: Soc::new(0.05).unwrap(),
                     soc_max: Soc::FULL,
                     reserve_soc: Soc::new(0.1).unwrap(),
-                    chemistry: Chemistry::Lfp,
                     grid_charging_allowed: true,
                 }),
                 Asset::Load(FlexibleLoad {
@@ -964,6 +1097,7 @@ mod tests {
         state: SiteState,
         limits: GridLimits,
         overrides: BTreeMap<AssetId, UserOverride>,
+        cem: BTreeMap<AssetId, CemRequest>,
         previous: BTreeMap<AssetId, Power>,
         delivered: BTreeMap<AssetId, Energy>,
         phases: BTreeMap<AssetId, PhaseState>,
@@ -976,6 +1110,7 @@ mod tests {
                 state: SiteState::default(),
                 limits: GridLimits::default(),
                 overrides: BTreeMap::new(),
+                cem: BTreeMap::new(),
                 previous: BTreeMap::new(),
                 delivered: BTreeMap::new(),
                 phases: BTreeMap::new(),
@@ -1020,6 +1155,7 @@ mod tests {
                 state: &self.state,
                 limits: &self.limits,
                 plan,
+                cem: &self.cem,
                 overrides: &self.overrides,
                 previous: &self.previous,
                 delivered: &self.delivered,
@@ -1305,6 +1441,196 @@ mod tests {
                 .iter()
                 .any(|s| matches!(s.reason, Reason::Fallback(FallbackCause::PlanStale))),
             "the charge point has nothing to fall back to and should say why"
+        );
+    }
+
+    // ── The Customer Energy Manager, as a voice among voices ──────────────
+    //
+    // hems can be driven by an external CEM over S2 (EN 50491-12-2), and where
+    // it lands in the order of authority is the whole of what these say. The
+    // socket is `hemsd`'s (`runtime::s2`); what a decoded instruction *counts
+    // for* is decided here and nowhere else.
+
+    /// A plan for one asset, so a CEM has something to outrank.
+    fn wants(asset: &str, kw: f64) -> Plan {
+        let horizon = Horizon::new(NOW, 2);
+        Plan {
+            slots: horizon
+                .slots()
+                .map(|slot| SlotPlan {
+                    flexibility_eur_per_kwh: None,
+                    slot,
+                    targets: vec![AssetTarget::fixed(
+                        AssetId::new(asset).unwrap(),
+                        Power::from_kw(kw),
+                    )],
+                    marginal_eur_per_kwh: Some(0.4),
+                })
+                .collect(),
+            ..Plan::empty(horizon, NOW)
+        }
+    }
+
+    #[test]
+    fn a_connected_manager_outranks_the_box_s_own_plan() {
+        // The half of S2 that makes connecting one mean anything. A household
+        // that has delegated its optimising to a manager and then finds the box
+        // quietly following its own plan instead has a manager in name only.
+        let mut f = Fixture::new().with_the_cap_lifted().grid(0.5);
+        f.cem.insert(
+            AssetId::new("battery").unwrap(),
+            CemRequest::power(Power::from_kw(3.0), NOW + Duration::minutes(15)),
+        );
+        let plan = wants("battery", 5.0);
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), Some(&plan));
+
+        assert!(
+            (commanded(&d, "battery") - Power::from_kw(3.0)).abs() < Power::new(1.0),
+            "the manager asked for 3 kW and the plan for 5: got {}",
+            commanded(&d, "battery")
+        );
+        let sp = d
+            .setpoints
+            .iter()
+            .find(|s| s.asset.as_str() == "battery")
+            .expect("the battery was commanded");
+        assert_eq!(sp.reason, Reason::Cem, "and it says who decided");
+        assert_eq!(sp.authority(), Authority::Cem);
+    }
+
+    #[test]
+    fn a_person_outranks_a_manager_in_a_data_centre() {
+        // The other end of the same order. `Pause` is somebody standing in the
+        // kitchen; a CEM is a process somewhere else, and it does not get to
+        // overrule the person paying for the electricity.
+        let mut f = Fixture::new().with_the_cap_lifted().grid(0.5);
+        f.cem.insert(
+            AssetId::new("battery").unwrap(),
+            CemRequest::power(Power::from_kw(5.0), NOW + Duration::minutes(15)),
+        );
+        f.overrides
+            .insert(AssetId::new("battery").unwrap(), UserOverride::Pause);
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
+
+        assert_eq!(commanded(&d, "battery"), Power::ZERO);
+        let sp = d
+            .setpoints
+            .iter()
+            .find(|s| s.asset.as_str() == "battery")
+            .expect("the battery was commanded");
+        assert_eq!(sp.reason, Reason::User(UserOverride::Pause));
+    }
+
+    #[test]
+    fn a_manager_cannot_ask_its_way_past_a_grid_limit() {
+        // `[BK6-22-300 A1 4.6 S. 3]`: grid control has precedence over
+        // market-driven control, and a CEM is market-driven control. This is the
+        // single assertion that makes an S2 surface safe to expose at all — what
+        // a manager writes is a *desire*, and the guard runs after every desire
+        // in the system.
+        let mut f = Fixture::new().grid(0.5).measure("haushalt", 0.5);
+        f.limits = GridLimits {
+            steuve_ceiling: Some(Power::from_kw(2.0)),
+            steuve_since: Some(NOW - Duration::minutes(3)),
+            ..GridLimits::default()
+        };
+        f.cem.insert(
+            AssetId::new("battery").unwrap(),
+            CemRequest::power(Power::from_kw(9.0), NOW + Duration::minutes(15)),
+        );
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), None);
+
+        assert!(
+            commanded(&d, "battery") <= Power::from_kw(2.0),
+            "a § 14a ceiling of 2 kW and the manager got {}",
+            commanded(&d, "battery")
+        );
+        let sp = d
+            .setpoints
+            .iter()
+            .find(|s| s.asset.as_str() == "battery")
+            .expect("the battery was commanded");
+        assert_eq!(sp.authority(), Authority::Guard, "and the guard says so");
+    }
+
+    #[test]
+    fn a_manager_that_stops_talking_stops_deciding() {
+        // The failure this expiry exists to prevent: a crashed manager, a cut
+        // cable or a certificate that lapsed would otherwise hold this household
+        // at whatever it last said for as long as the box runs. On expiry the
+        // asset goes back to the box's own plan with nothing cancelled.
+        let mut f = Fixture::new().with_the_cap_lifted().grid(0.5);
+        f.cem.insert(
+            AssetId::new("battery").unwrap(),
+            CemRequest::power(Power::from_kw(3.0), NOW - Duration::seconds(1)),
+        );
+        // Inside the battery's own rating, so that what is being asserted is
+        // which *authority* decided rather than which hardware limit bound.
+        let plan = wants("battery", 2.0);
+        let d = f.tick(&Arbiter::new(ArbiterConfig::default()), Some(&plan));
+
+        let sp = d
+            .setpoints
+            .iter()
+            .find(|s| s.asset.as_str() == "battery")
+            .expect("the battery was commanded");
+        assert!(
+            matches!(sp.reason, Reason::Plan { .. }),
+            "an expired instruction should leave the plan in charge: {:?}",
+            sp.reason
+        );
+    }
+
+    #[test]
+    fn an_envelope_narrows_the_plan_and_does_not_replace_it() {
+        // S2's two control types do not say the same kind of thing, and
+        // collapsing one into the other is the mistake this pins. `PEBC` sends a
+        // *bound*: "you may take up to 1 kW" leaves the choice underneath it
+        // where it was, and turning it into "take 1 kW" would be the opposite
+        // instruction on a sunny afternoon.
+        let mut f = Fixture::new().with_the_cap_lifted().grid(0.5);
+        f.cem.insert(
+            AssetId::new("battery").unwrap(),
+            CemRequest::envelope(
+                Envelope::at_most(Power::from_kw(1.0)),
+                NOW + Duration::minutes(15),
+            ),
+        );
+
+        // Under a plan that wants more, the envelope binds and says so.
+        let d = f.tick(
+            &Arbiter::new(ArbiterConfig::default()),
+            Some(&wants("battery", 5.0)),
+        );
+        assert!(commanded(&d, "battery") <= Power::from_kw(1.0) + Power::new(1.0));
+        assert_eq!(
+            d.setpoints
+                .iter()
+                .find(|s| s.asset.as_str() == "battery")
+                .map(|s| s.reason),
+            Some(Reason::Cem),
+            "the envelope is what is holding the value, so it is what is named"
+        );
+
+        // Under a plan that wants less, it does not: a bound is not a target.
+        let d = f.tick(
+            &Arbiter::new(ArbiterConfig::default()),
+            Some(&wants("battery", 0.4)),
+        );
+        assert!(
+            commanded(&d, "battery") <= Power::from_kw(0.5),
+            "a ceiling of 1 kW must not pull a 0,4 kW plan up to it: got {}",
+            commanded(&d, "battery")
+        );
+        assert!(
+            matches!(
+                d.setpoints
+                    .iter()
+                    .find(|s| s.asset.as_str() == "battery")
+                    .map(|s| s.reason),
+                Some(Reason::Plan { .. }) | None
+            ),
+            "and the plan is still what decided it"
         );
     }
 
@@ -1603,6 +1929,42 @@ mod tests {
                 overrides.insert(AssetId::new("wallbox").unwrap(), UserOverride::Boost);
             }
 
+            // …and a Customer Energy Manager asking for whatever it likes,
+            // including an envelope wider than the household's own wiring. It is
+            // in the *property* rather than only in a unit test because that is
+            // the whole claim: a third voice was added to the desire hierarchy
+            // and `[A1 4.6 S. 3]` has to survive it for the same reason it
+            // survives a boost — the guard runs after every desire in the
+            // system and an intersection cannot be widened from below.
+            let mut cem = BTreeMap::new();
+            match next(6) {
+                0 => {
+                    cem.insert(
+                        AssetId::new("wallbox").unwrap(),
+                        CemRequest::power(Power::from_kw(22.0), NOW + Duration::hours(1)),
+                    );
+                }
+                1 => {
+                    cem.insert(
+                        AssetId::new("battery").unwrap(),
+                        CemRequest::envelope(
+                            Envelope::new(Power::from_kw(-50.0), Power::from_kw(50.0)),
+                            NOW + Duration::hours(1),
+                        ),
+                    );
+                }
+                2 => {
+                    // An instruction that has already expired must change
+                    // nothing at all — the failure mode that would make a
+                    // crashed manager the household's permanent controller.
+                    cem.insert(
+                        AssetId::new("wallbox").unwrap(),
+                        CemRequest::power(Power::from_kw(22.0), NOW - Duration::seconds(1)),
+                    );
+                }
+                _ => {}
+            }
+
             let d = arbiter.tick(Tick {
                 now: NOW,
                 site: &site,
@@ -1610,6 +1972,7 @@ mod tests {
                 limits: &limits,
                 plan: Some(&plan),
                 overrides: &overrides,
+                cem: &cem,
                 previous: &BTreeMap::new(),
                 delivered: &BTreeMap::new(),
                 phases: &BTreeMap::new(),

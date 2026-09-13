@@ -201,9 +201,9 @@ pub struct CostBreakdown {
     ///
     /// # Why it is not [`CostBreakdown::stored_eur`]
     ///
-    /// `stored_eur` is deliberately one-sided: the baseline has no battery and no
-    /// managed tank, so it can never earn the credit and taking it would be a
-    /// saving flattering itself. **Both households have the same car.** A
+    /// `stored_eur` is deliberately one-sided: the credit for ending fuller than
+    /// you started is refused on **both** sides, so neither household can earn
+    /// it and a saving cannot flatter itself with it. **Both households have the same car.** A
     /// kilowatt-hour a controller pushed into it past the target is a
     /// kilowatt-hour nobody buys later, and refusing to credit it measures a
     /// manager that absorbed a sunny afternoon into the car against one that

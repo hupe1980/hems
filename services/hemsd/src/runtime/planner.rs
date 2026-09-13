@@ -547,14 +547,12 @@ async fn attempt(
     // cell with a *certain zero*. It no longer does — an empty cell borrows the
     // same quarter hour from the day types the household has been seen on — and
     // the gate now asks the question the profile can actually answer.
-    let load = if held.load.is_empty() {
-        let recent = crate::drivers::household_load(&observed).ok_or(Reason::NoHistory)?;
-        // Doubling by this time tomorrow, which is about what a single reading
-        // is worth twenty-four hours out.
-        hems_forecast::naive::persistence(recent, horizon, 0.9)
-    } else {
-        held.load.forecast(horizon)
-    };
+    let load = crate::forecasting::load_forecast(
+        &held.load,
+        horizon,
+        crate::drivers::household_load(&observed),
+    )
+    .ok_or(Reason::NoHistory)?;
     // Read while the lock is already held: the alternative is taking it a second
     // time forty lines further down for one `Copy` value.
     let building = held.building.building();
@@ -787,6 +785,10 @@ fn dhw_model(
         heater: tank.heater,
         cop: tank.cop,
         standing_loss: tank.standing_loss,
+        // The installation's own set point, through the same arithmetic the
+        // fill level is read with — so the tank the baseline holds is the tank
+        // this household asked for (D183).
+        thermostat_set: tank.stored_heat(tank.t_set_c),
         ..DhwModel::tank(tank.usable_heat(), tank.heater)
     })
 }

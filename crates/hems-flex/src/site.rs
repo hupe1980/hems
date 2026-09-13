@@ -360,8 +360,8 @@ fn heat_pump_envelope(
 mod tests {
     use super::*;
     use hems_core::asset::{
-        AssetMeta, Battery, Chemistry, DhwTank, Evse, FlexibleLoad, HeatPump, HeatPumpControl,
-        LoadKind, Programme, PvArray,
+        AssetMeta, Battery, DhwTank, Evse, FlexibleLoad, HeatPump, HeatPumpControl, LoadKind,
+        Programme, PvArray,
     };
     use time::macros::datetime;
 
@@ -410,7 +410,6 @@ mod tests {
                     soc_min: Soc::new(0.05).unwrap(),
                     soc_max: Soc::FULL,
                     reserve_soc: Soc::EMPTY,
-                    chemistry: Chemistry::Lfp,
                     grid_charging_allowed: true,
                 }),
                 Asset::Evse(Evse {

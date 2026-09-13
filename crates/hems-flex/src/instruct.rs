@@ -206,6 +206,40 @@ pub fn envelope_now(
     ))
 }
 
+/// The interval a PEBC instruction leaves `asset` to work in, load convention.
+///
+/// S2's envelope is **two-sided** and so is hems's [`Envelope`]: a
+/// `PowerEnvelopeElement` carries a lower and an upper limit in watts with
+/// consumption positive, which is this workspace's convention exactly. So an
+/// inverter's permitted production is the floor and a wallbox's permitted draw
+/// is the ceiling, and neither needs the asset kind named on the way in.
+///
+/// This rather than [`envelope_command`] is what a **control plane** wants. A
+/// command has to pick one end — that is what a command is — and picking one
+/// throws away the other, which is the half a real-time loop needs in order to
+/// narrow a desire instead of replacing it. Both start here, so a session and an
+/// arbiter cannot come to different conclusions about what one envelope said.
+///
+/// The phase mode decides which commodity quantity is read, because a charge
+/// point on one conductor is bounded in `ElectricPower.L1` and the same charge
+/// point on three is bounded symmetrically.
+///
+/// # Errors
+/// [`InstructError`] when the instruction carries nothing for this asset's
+/// commodity quantity, or carries an empty envelope.
+pub fn envelope_interval(
+    instruction: &pebc::Instruction,
+    asset: &Asset,
+    mode: PhaseMode,
+) -> Result<Envelope, InstructError> {
+    let quantity = match asset.meta().phases.clamp_mode(mode) {
+        PhaseMode::Single => s2energy::common::CommodityQuantity::ElectricPowerL1,
+        PhaseMode::Three => s2energy::common::CommodityQuantity::ElectricPower3PhaseSymmetric,
+    };
+    let (lower, upper) = envelope_now(instruction, quantity)?;
+    Ok(Envelope::new(lower, upper))
+}
+
 /// The command that carries out a PEBC instruction on `asset`.
 ///
 /// A producer is bounded from below (curtailment), a consumer from above. Which
@@ -219,15 +253,12 @@ pub fn envelope_command(
     asset: &Asset,
     mode: PhaseMode,
 ) -> Result<Command, InstructError> {
-    let quantity = match asset.meta().phases.clamp_mode(mode) {
-        PhaseMode::Single => s2energy::common::CommodityQuantity::ElectricPowerL1,
-        PhaseMode::Three => s2energy::common::CommodityQuantity::ElectricPower3PhaseSymmetric,
-    };
-    let (lower, upper) = envelope_now(instruction, quantity)?;
-
+    let envelope = envelope_interval(instruction, asset, mode)?;
     Ok(match asset {
-        Asset::Pv(_) => Command::ProductionCeiling(Power::new(-lower.get()).max(Power::ZERO)),
-        _ => Command::ConsumptionCeiling(upper.max(Power::ZERO)),
+        Asset::Pv(_) => {
+            Command::ProductionCeiling(Power::new(-envelope.floor.get()).max(Power::ZERO))
+        }
+        _ => Command::ConsumptionCeiling(envelope.ceiling.max(Power::ZERO)),
     })
 }
 
@@ -238,7 +269,7 @@ mod tests {
         HeatPumpDescription, describe_battery, describe_dhw, describe_evse, describe_heat_pump,
         describe_pv,
     };
-    use hems_core::asset::{AssetMeta, Chemistry, DhwTank, Evse, HeatPump, PvArray};
+    use hems_core::asset::{AssetMeta, DhwTank, Evse, HeatPump, PvArray};
     use s2energy::common::{Duration, Id};
     use time::OffsetDateTime;
     use time::macros::datetime;
@@ -265,7 +296,6 @@ mod tests {
             soc_min: Soc::new(0.1).unwrap(),
             soc_max: Soc::FULL,
             reserve_soc: Soc::EMPTY,
-            chemistry: Chemistry::Lfp,
             grid_charging_allowed: true,
         }
     }

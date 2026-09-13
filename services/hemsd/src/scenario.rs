@@ -15,7 +15,6 @@ use std::collections::BTreeMap;
 use hems_core::prelude::*;
 use hems_forecast::{ArrayModel, Band, Calibration};
 use hems_grid::evidence::{EvidenceRecorder, Observation};
-use hems_grid::lpc::{LpcConfig, LpcMachine};
 use hems_grid::mispel::QuarterHour as MispelQuarterHour;
 use hems_grid::para14a::ControlMode;
 use hems_optimizer::model::{BatteryModel, DhwModel, HeatPumpModel, Problem, ThermalModel};
@@ -214,6 +213,20 @@ pub struct Scenario {
     ///
     /// [`EvSession::tightness`]: hems_optimizer::EvSession::tightness
     pub adaptive_risk: bool,
+    /// How many days of metering the box has behind it when the day opens.
+    ///
+    /// [`crate::forecasting::WARM_UP_DAYS`] on every ordinary reference day: six
+    /// weeks, which is what it takes before a Sunday cell of the load profile has
+    /// enough observations to be worth planning against.
+    ///
+    /// **Zero is a box on its first evening**, and it is a different question
+    /// from the saving rather than a smaller answer to it. Hour one of every
+    /// real installation runs this code and nothing exercised it: no load
+    /// profile, no correction the roof has earned, no charging session predicted
+    /// from previous weeks. What a cold box owes a household is not a good plan —
+    /// it cannot have one — but a *lawful* one, a delivered one, and an honest
+    /// account of how little it knows (D187).
+    pub warm_up_days: usize,
     /// Whether the planner prices each asset separately.
     ///
     /// `false` gives every device the slot's marginal value instead, so the
@@ -392,6 +405,7 @@ impl Scenario {
             risk: hems_optimizer::Risk::default(),
             community: None,
             adaptive_risk: false,
+            warm_up_days: crate::forecasting::WARM_UP_DAYS,
             dishwasher: Some(evening_wash()),
             ev: Some(EvPlan::overnight(
                 Energy::from_kwh(18.0),
@@ -423,6 +437,7 @@ impl Scenario {
             risk: hems_optimizer::Risk::default(),
             community: None,
             adaptive_risk: false,
+            warm_up_days: crate::forecasting::WARM_UP_DAYS,
             dishwasher: None,
             ..Self::summer_surplus(config)
         }
@@ -461,6 +476,7 @@ impl Scenario {
             risk: hems_optimizer::Risk::default(),
             community: None,
             adaptive_risk: false,
+            warm_up_days: crate::forecasting::WARM_UP_DAYS,
             dishwasher: None,
             date: time::macros::date!(2026 - 09 - 20),
             outdoor_c: 14.0,
@@ -508,6 +524,7 @@ impl Scenario {
             risk: hems_optimizer::Risk::default(),
             community: None,
             adaptive_risk: false,
+            warm_up_days: crate::forecasting::WARM_UP_DAYS,
             dishwasher: Some(evening_wash()),
             ev: Some(EvPlan {
                 energy_now: Energy::from_kwh(26.0),
@@ -596,6 +613,7 @@ impl Scenario {
             risk: hems_optimizer::Risk::default(),
             community: None,
             adaptive_risk: false,
+            warm_up_days: crate::forecasting::WARM_UP_DAYS,
             dishwasher: Some(evening_wash()),
             ev: Some(EvPlan::overnight(
                 Energy::from_kwh(20.0),
@@ -625,6 +643,7 @@ impl Scenario {
             risk: hems_optimizer::Risk::default(),
             community: None,
             adaptive_risk: false,
+            warm_up_days: crate::forecasting::WARM_UP_DAYS,
             dishwasher: Some(evening_wash()),
             ev: None,
             // **May, not June.** The cap is a fraction of installed
@@ -685,6 +704,59 @@ impl Scenario {
     #[must_use]
     pub fn start(&self) -> OffsetDateTime {
         metering::calendar::day_start_utc(self.date)
+    }
+
+    /// The same day, moved forward in whole weeks until § 42c allocation is a
+    /// duty a network operator already has.
+    ///
+    /// **Whole weeks**, so the weekday survives: the load profile is kept by day
+    /// type (workday / Saturday / Sunday-and-holiday), and a January Thursday
+    /// moved to a January Friday would be a different household's day wearing
+    /// the same name. Fifty-two weeks is 364 days, which also leaves the solar
+    /// declination within half a degree of where it was — the comparison stays
+    /// the *same* day in every sense that decides a number.
+    ///
+    /// It exists because a § 42c demonstration on a date the rule does not reach
+    /// demonstrates nothing: § 42c Abs. 4 Nr. 1 obliges a network operator to
+    /// make sharing possible from 1 June 2026, and before that a household may
+    /// agree whatever it likes and will not be allocated a kilowatt-hour. Two
+    /// reference days settled one anyway, in January and May 2026, and reported
+    /// the credit (D179).
+    #[must_use]
+    pub fn on_a_day_sharing_reaches(mut self) -> Self {
+        while !hems_grid::sharing::applies_on(self.date) {
+            self.date += time::Duration::weeks(52);
+        }
+        self
+    }
+}
+
+/// One command from a simulated Steuerbox, applied to the machine.
+///
+/// The whole of what the simulator owes the state machine, and the reason the
+/// two can be separate crates at all: `hems-sim` simulates the *operator's* box
+/// and says what it put on the wire; what a Controllable System makes of a write
+/// is the Controllable System's business. `hems-drv`'s own
+/// `steuerbox_against_the_machine.rs` makes the same translation, because it
+/// drives the same pair (D186).
+fn apply_to_the_machine(
+    lpc: &mut hems_drv::eebus::Lpc,
+    command: hems_sim::Command,
+    now: OffsetDateTime,
+) {
+    use hems_drv::eebus::LimitWrite;
+    match command {
+        hems_sim::Command::Heartbeat => lpc.on_heartbeat(now),
+        hems_sim::Command::Limit { value, duration } => {
+            let write = match duration.and_then(|d| std::time::Duration::try_from(d).ok()) {
+                Some(d) => LimitWrite::active_for(value.get(), d),
+                None => LimitWrite::active(value.get()),
+            };
+            lpc.on_limit(&write, now);
+        }
+        hems_sim::Command::Release => {
+            lpc.on_limit(&LimitWrite::deactivated(), now);
+        }
     }
 }
 
@@ -840,6 +912,46 @@ pub struct DayResult {
     /// What the same day would have cost with no storage and no shifting,
     /// priced with the same terms.
     pub baseline: CostBreakdown,
+    /// The day's electricity bill computed the way most published comparisons
+    /// compute it: **netted within each quarter hour** before it is priced.
+    ///
+    /// Not a cost term, and deliberately not in [`CostBreakdown`] — that type
+    /// holds what the day *spent*, one entry per term of the objective. This is
+    /// the same spending measured a second way, and the gap between the two is a
+    /// property of the **measurement** rather than of the household.
+    ///
+    /// # Why it is worth a line on the report
+    ///
+    /// A two-register meter does not net. It integrates the instantaneous flow
+    /// into the import register or the export register as the sign falls, so a
+    /// quarter hour in which the house draws 1 kW for seven minutes and feeds
+    /// back 1 kW for seven minutes registers both — and is billed for both, at
+    /// two different prices. Netting that quarter hour to zero makes it free.
+    ///
+    /// An evaluation that nets at its own scheduling step therefore charges a
+    /// controller less than the meter will, and it does so **unevenly**: a
+    /// controller whose output fluctuates inside the interval is forgiven more
+    /// than one whose output is smooth. arXiv:2510.25373 measures what that is
+    /// worth on residential battery scheduling and puts it at 37 % of the
+    /// reported advantage at a quarter-hour step and 69 % at an hourly one.
+    ///
+    /// `hemsd` never nets: [`DayResult::cost`] is accumulated tick by tick from
+    /// the two directions priced apart. This field is what that decision is
+    /// worth on this day, so the claim is a number rather than an assertion —
+    /// and so that the day it stops being true, the number moves (R20).
+    pub energy_eur_netted: f64,
+    /// The **unmanaged** household's bill under the same netting, so the
+    /// artefact can be read where it matters: on the *saving*.
+    ///
+    /// A saving is a difference, and netting does not forgive both households
+    /// equally. It forgives whichever one crosses zero more often inside a
+    /// quarter hour — and that is the one the paper's own mechanism names: a
+    /// thermostat and a plug-in wallbox reverse the connection point far more
+    /// than a plan that smooths it. So a comparison evaluated at its scheduling
+    /// step credits the *baseline* with reversals the meter would charge it for,
+    /// and the managed household's advantage shrinks. Reporting both is what
+    /// turns that from an argument into a figure this day can print.
+    pub baseline_energy_eur_netted: f64,
     /// The share of consumption covered without importing.
     pub self_sufficiency: f64,
     /// Energy moved through the battery, kWh.
@@ -1344,7 +1456,8 @@ impl ReferenceIds {
 ///
 /// # Errors
 /// When the household described by the scenario is not a valid site — a
-/// duplicate asset name, or an asset on a circuit that does not exist.
+/// duplicate asset name, or an asset on a circuit that does not exist — or when
+/// it belongs to a § 42c community on a day the rule does not reach.
 ///
 /// # Panics
 /// When a scenario declares a charging session but the simulated charge point
@@ -1352,6 +1465,26 @@ impl ReferenceIds {
 /// programming error rather than a runtime condition.
 #[allow(clippy::too_many_lines)]
 pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
+    // The boundary where a § 42c allocation becomes a **claim about money**, and
+    // therefore where the date is checked — not inside `allocate_by`, whose
+    // arithmetic is defined by the community's own contract and which the capped
+    // day asks a pure conservation question of. It is the shape `histd`'s MiSpeL
+    // export already uses for the sibling rule.
+    //
+    // A day dated before a network operator's duty begins would settle an
+    // allocation nobody would perform and credit the household for it. Two of
+    // these days did, and reported it, because `sharing::applies_on` existed and
+    // was called by nothing (D179).
+    if scenario.community.is_some() && !hems_grid::sharing::applies_on(scenario.date) {
+        anyhow::bail!(
+            "this household is in a § 42c community on {}, and a network operator's \
+             duty to allocate begins on {} — `Scenario::on_a_day_sharing_reaches` \
+             moves the day forward in whole weeks, so the weekday and the season \
+             survive",
+            scenario.date,
+            hems_grid::sharing::SHARING_START,
+        );
+    }
     let household = Household::build(&scenario.config)?;
     let house = Reference::of(&scenario.config)?;
     let ids = ReferenceIds::of(&household)?;
@@ -1442,11 +1575,17 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         hems_grid::para14a::ControlMode::Ems,
     )
     .max(hems_grid::para14a::MINDESTLEISTUNG);
-    let mut lpc = LpcMachine::new(
-        LpcConfig {
-            failsafe_limit,
-            ..LpcConfig::default()
-        },
+    // **The machine a real box runs**, driven directly rather than through a
+    // socket. It was `hems_grid::lpc::LpcMachine` — a second implementation of
+    // the same certifiable state machine — so every § 14a figure the reference
+    // days produced came from a machine no household has (D186).
+    let mut lpc = hems_drv::eebus::Lpc::new(
+        household.grid_meter.clone(),
+        hems_drv::eebus::Use::Lpc,
+        failsafe_limit,
+        // The Failsafe Duration Minimum `[LPC-022]` allows, from the crate that
+        // enforces the range rather than from a constant restated here.
+        *hems_drv::eebus::FAILSAFE_DURATION_RANGE.start(),
         start,
     );
 
@@ -1483,12 +1622,12 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     // forecast unable to be wrong, and every saving a perfect-foresight one.
     let weather = Weather::new(scenario.weather, scenario.cloudiness, scenario.outdoor_c);
     let learned = crate::forecasting::warm_up(
+        scenario.warm_up_days,
         &weather,
         &array,
         site.location,
         start,
         household_load,
-        hems_forecast::hotwater::draw,
         scenario
             .ev
             .map(|e| (e.arrival, e.departure, e.energy_target - e.energy_now)),
@@ -1502,7 +1641,16 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     let full = Horizon::new(start, 96 * 2);
     let pv_forecast =
         crate::forecasting::pv_forecast(&learned, &weather, &array, site.location, full);
-    let load_forecast = crate::forecasting::load_forecast(&learned, full);
+    // A cold box plans from its own meter, exactly as `runtime::planner` does —
+    // one function, so the simulated first evening is the one a household
+    // actually gets (D187). The reading is the household's own underlying load
+    // at midnight, which is what a box with a connection-point meter sees.
+    let load_forecast = crate::forecasting::load_forecast(
+        &learned.load,
+        full,
+        Some(household_load(Slot::containing(start))),
+    )
+    .ok_or_else(|| anyhow::anyhow!("a box with no history and no meter cannot plan"))?;
 
     // What the forecasts turn out to have been worth, scored against what
     // happened. A day whose scores are zero is a day with perfect foresight, and
@@ -1590,15 +1738,11 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
 
     while now < start + Duration::days(1) {
         // The Steuerbox speaks.
-        for event in steuerbox.poll(now) {
-            let _ = lpc.handle(event, now);
+        for command in steuerbox.poll(now) {
+            apply_to_the_machine(&mut lpc, command, now);
         }
-        while let Some(deadline) = lpc.next_deadline() {
-            if deadline > now || lpc.tick(now).is_none() {
-                break;
-            }
-        }
-        let ceiling = lpc.effective_limit();
+        lpc.on_timeout(now);
+        let ceiling = lpc.ceiling();
         if ceiling != previous_ceiling {
             ceiling_since = ceiling.map(|_| now);
             previous_ceiling = ceiling;
@@ -1618,7 +1762,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         let limits = GridLimits {
             steuve_ceiling: ceiling,
             steuve_since: ceiling_since,
-            in_failsafe: !lpc.state().is_controlled(),
+            in_failsafe: !lpc.is_controlled(),
             // What an *operator* has asked for, which in this scenario is
             // nothing. The statute is the guard's own business.
             feed_in_ceiling: None,
@@ -1718,6 +1862,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                         heater: tank_asset.heater,
                         cop: tank_asset.cop,
                         standing_loss: tank_asset.standing_loss,
+                        thermostat_set: tank_asset.stored_heat(tank_asset.t_set_c),
                         shortfall_eur_per_kwh: HOT_WATER_SHORTFALL_EUR_PER_KWH,
                     },
                     &horizon_draw,
@@ -2081,6 +2226,12 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             limits: &limits,
             plan: plan.as_ref(),
             overrides: &overrides,
+            // A simulated day has no Customer Energy Manager on it: the reference
+            // days measure *this* box's planner against a household, and a second
+            // optimiser in the loop would be measuring two things at once. The
+            // arbiter's S2 voice is tested where it is decided, in
+            // `hems-realtime`, and end to end in `tests/managed_by_a_cem.rs`.
+            cem: &BTreeMap::new(),
             previous: &previous,
             delivered: &delivered,
             phases: &phase_state,
@@ -2482,8 +2633,11 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         .map_or(0.0, |(v, ev)| {
             -(v.stored - ev.energy_target).max(Energy::ZERO).kwh() * mean_import
         });
-    (result.baseline, result.baseline_shared_kwh) =
-        baseline_cost(scenario, &weather, &array, &prices, site, site.location);
+    (
+        result.baseline,
+        result.baseline_shared_kwh,
+        result.baseline_energy_eur_netted,
+    ) = baseline_cost(scenario, &weather, &array, &prices, site, site.location);
 
     // ── § 42c: what the community actually allocated this member ────────────
     (result.shared_kwh, result.cost.sharing_eur) = community.settle(&prices);
@@ -2496,6 +2650,29 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     result.feed_in_over_minutes = feed_in_over.whole_minutes();
 
     result.quarter_hours = registers.into_values().collect();
+
+    // The same bill, netted per quarter hour before it is priced — what a
+    // published comparison that evaluates at its own scheduling step reports.
+    // Computed from the registers rather than from a second pass over the day,
+    // because the registers already hold each direction accumulated apart: their
+    // *difference* is the net the coarser method would price, and their sum is
+    // what the meter actually bills.
+    result.energy_eur_netted = result
+        .quarter_hours
+        .iter()
+        .filter_map(|q| {
+            let price = prices.at(q.slot)?;
+            let draw = q.grid_draw.to_f64()?;
+            let fed_in = q.grid_feed_in.to_f64()?;
+            let net = draw - fed_in;
+            Some(if net >= 0.0 {
+                net * price.import_f64()
+            } else {
+                net * price.export_f64()
+            })
+        })
+        .sum();
+
     // The § 9 EEG quantity, at the resolution § 9 EEG measures it: the largest
     // quarter-hour average that left the connection point, straight off the
     // registers the settlement would be built from.
@@ -2916,8 +3093,14 @@ fn baseline_cost(
     prices: &PriceStack,
     site: &Site,
     location: GeoPoint,
-) -> (CostBreakdown, f64) {
+) -> (CostBreakdown, f64, f64) {
     let house = Reference::of(&scenario.config).expect("run() has already validated this");
+    // The unmanaged household's own quarter-hour registers, kept only so the
+    // same day can be priced the netted way for *both* sides. A saving is a
+    // difference, so a measurement artefact that forgives one household more
+    // than the other moves the saving even when it barely moves either bill.
+    let mut netted: std::collections::BTreeMap<Slot, (f64, f64)> =
+        std::collections::BTreeMap::new();
     let start = scenario.start();
     // The same § 9 EEG ceiling the managed house lives under. It is a property
     // of the installation, not of who is controlling it.
@@ -2953,10 +3136,37 @@ fn baseline_cost(
     };
     let mut thermostat_on = false;
     let mut cost = CostBreakdown::default();
-    let mut tank = TankSim::new(
-        Energy::from_kwh(house.dhw.litres * hems_core::asset::WATER_KWH_PER_LITRE_KELVIN * 15.0),
-        house.dhw.heater,
-    );
+    // **The same tank the managed household has**, read off the same asset.
+    //
+    // It was a tank of its own: `litres × c × 15 K`, on `TankSim::new`'s default
+    // coefficient of 3,0 and default standing loss of 45 W. For the reference
+    // household every one of those happens to equal the configured value — the
+    // span really is 60 − 45 — which is what kept it invisible: when the literal
+    // equals the configuration, no test can tell one from the other. For any
+    // *other* household it is a different appliance, and the difference between
+    // two tanks was being reported as a saving (D183, R25).
+    let (mut tank, thermostat_set) = match site.assets.iter().find_map(|a| match a {
+        Asset::Dhw(tank) => Some(tank),
+        _ => None,
+    }) {
+        Some(asset) => (
+            TankSim {
+                cop: asset.cop,
+                standing_loss: asset.standing_loss,
+                ..TankSim::new(asset.usable_heat(), asset.heater)
+            },
+            asset.stored_heat(asset.t_set_c),
+        ),
+        _ => (
+            TankSim::new(
+                Energy::from_kwh(
+                    house.dhw.litres * hems_core::asset::WATER_KWH_PER_LITRE_KELVIN * 15.0,
+                ),
+                house.dhw.heater,
+            ),
+            Energy::ZERO,
+        ),
+    };
     let tank_open = tank.stored;
     // The unmanaged household presses start when it loads the machine, which is
     // the first moment its own window allows. That is the whole of the
@@ -3017,12 +3227,24 @@ fn baseline_cost(
             step,
         );
 
-        // An unmanaged tank reheats whenever it is not full and stops when it
-        // is. It never uses the store as a store, which is the whole of the
-        // difference being measured — and it is not immune to a cold shower
-        // either: it starts each morning where the evening left it.
+        // An unmanaged tank reheats whenever it is below **its own set point**
+        // and stops there. It never uses the store as a store, which is the whole
+        // of the difference being measured — and it is not immune to a cold
+        // shower either: it starts each morning where the evening left it.
+        //
+        // The set point rather than the brim, and the distinction is the
+        // household's money: `t_max_c` is the highest *safe* temperature, a
+        // safety bound the installer sets so nobody is scalded, and heating to it
+        // all day is not what an unmanaged household does. This commanded the
+        // heater unconditionally, so the baseline held its water at 60 °C where
+        // the household asks for 55 — and every kilowatt-hour of the difference
+        // was credited to the manager (D183).
         let (dhw, dhw_short) = tank.step(
-            house.dhw.heater,
+            if tank.stored < thermostat_set {
+                house.dhw.heater
+            } else {
+                Power::ZERO
+            },
             weather.draw_in(slot, hems_forecast::hotwater::draw(slot)) * (step / SLOT),
             step,
         );
@@ -3042,6 +3264,11 @@ fn baseline_cost(
         if let Some(price) = prices.at(slot) {
             cost.energy_eur += grid.inflow().kw() * hours * price.import_f64()
                 - grid.outflow().kw() * hours * price.export_f64();
+        }
+        {
+            let register = netted.entry(slot).or_insert((0.0, 0.0));
+            register.0 += grid.inflow().kw() * hours;
+            register.1 += grid.outflow().kw() * hours;
         }
         community.observe(weather, location, now, hours, slot, grid.inflow());
         // A thermostat is not free of discomfort: it starts reheating only once
@@ -3063,7 +3290,19 @@ fn baseline_cost(
         .map(hems_tariff::SlotPrice::import_f64)
         .sum::<f64>()
         / prices.slots.len().max(1) as f64;
-    cost.stored_eur = (tank_open - tank.stored).kwh() / tank.cop.max(f64::EPSILON) * mean_import;
+    // **The same rule the managed household is charged by**, `.max(0.0)` and
+    // all: ending with a fuller tank than it started with is a real credit and
+    // neither side takes it, because a credit one side can earn and the other
+    // cannot is a comparison between two households rather than between two
+    // decisions.
+    //
+    // Unclamped it would be an arbitrage rather than an accounting entry: the
+    // heat is bought in whatever hours a thermostat demands it and credited back
+    // at the day's *mean* import price, so a baseline that held its water hotter
+    // would come out cheaper for having bought more electricity — R29's car
+    // entry, in the tank (D183).
+    cost.stored_eur =
+        ((tank_open - tank.stored).kwh() / tank.cop.max(f64::EPSILON) * mean_import).max(0.0);
     let (baseline_shared_kwh, sharing_eur) = community.settle(prices);
     cost.sharing_eur = sharing_eur;
     // A window with nowhere to put the programme costs the same on both sides.
@@ -3078,7 +3317,19 @@ fn baseline_cost(
     cost.vehicle_eur = scenario.ev.map_or(0.0, |ev| {
         -(car_stored - ev.energy_target).max(Energy::ZERO).kwh() * mean_import
     });
-    (cost, baseline_shared_kwh)
+    let energy_eur_netted = netted
+        .iter()
+        .filter_map(|(slot, (draw, fed_in))| {
+            let price = prices.at(*slot)?;
+            let net = draw - fed_in;
+            Some(if net >= 0.0 {
+                net * price.import_f64()
+            } else {
+                net * price.export_f64()
+            })
+        })
+        .sum();
+    (cost, baseline_shared_kwh, energy_eur_netted)
 }
 
 fn household_load(slot: Slot) -> Power {

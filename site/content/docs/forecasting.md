@@ -98,14 +98,13 @@ Every day prints what its forecasts were worth:
 **CRPS** is the continuous ranked probability score — the number the forecasting
 literature compares models on, in the unit of the quantity, and here a score to
 compare with **itself**: across days, across households, across two candidate
-models on the same band. It is deliberately *not* claimed comparable with a
-published figure. A published CRPS is analytic or computed over a dense grid of
-quantile levels; this band has three, and three equally weighted nodes are a
-coarse quadrature that under-states the integral — measured against the analytic
-CRPS of a calibrated normal it comes out about 11 % low. The weighting that would
-correct that is a constant fitted to a normal, and a roof's residual is not
-normal, so correcting it would put back the distributional assumption the band
-itself no longer makes. The percentage is how often
+models on the same band, and deliberately *not* with a published figure. A
+published CRPS is analytic or taken over a dense grid of quantile levels; this
+band has three, and three equally weighted nodes under-state the integral by
+about 11 % against the analytic CRPS of a calibrated normal. Correcting that
+needs a weighting fitted to a normal — and a roof's residual is not one, so the
+bias is named rather than traded for an assumption the band itself does not make.
+The percentage is how often
 the outcome landed inside the 10–90 band, which should be near 80 — and `of 32
 lit` is how many quarter hours it is a percentage *of*. A production score is
 about the part of the day the sun was up; the other sixty-four slots of a January
@@ -127,10 +126,10 @@ $ cargo run -p hemsd -- simulate --day winter --perfect-foresight
 
 | Day | Saved | Saved, knowing the future | The premium |
 |---|---|---|---|
-| January, § 14a reduction, 20 kWh of charging to place | **€1,94** | €4,55 | 57 % |
-| January evening, car arrives *as* the reduction starts | **€2,57** | €4,89 | 47 % |
-| June, more sun than the house can use | **€8,84** | €9,07 | 3 % |
-| May, § 9 EEG cap, no car | **€0,89** | €0,70 | **−27 %** |
+| January, § 14a reduction, 20 kWh of charging to place | **€2,18** | €4,78 | 54 % |
+| January evening, car arrives *as* the reduction starts | **€2,81** | €5,12 | 45 % |
+| June, more sun than the house can use | **€8,98** | €9,21 | 2 % |
+| May, § 9 EEG cap, no car | **€1,04** | €0,85 | **−22 %** |
 
 The shape of that table is a result rather than noise. Where the surplus lasts
 all day the plan has slack and being wrong costs nothing. Where a large charging
@@ -176,15 +175,12 @@ thermometer as soon as it has one — but the fabric capacity spans a factor of 
 across the archetypes and decides whether pre-heating into a cheap hour pays at
 all, so the weeks before the fit are not free.
 
-The fit has six parameters, not four. Two of them are the heat the house gets for
-**nothing**: an effective *solar aperture*, and the waste heat of the people and
-appliances inside. They are not a refinement. The average German single-family
-archetype loses about 2,7 kW at 5 °C outdoors; a clear March noon on a
-south-facing 4,5 m² aperture is 2,5 kW of it, and the internal gains another 0,45
-— so on exactly the days a heating plan is worth making, the free heat *exceeds
-the demand*. A model without it runs the compressor into a room the sun is
-already warming, and a fit without it has nowhere to put the sun but the
-insulation, so it reports a better-insulated house in June than in December.
+The fit has **six** parameters. Four are the fabric; the other two are the heat
+the house gets for nothing — a solar aperture and the household's own waste heat
+([the domain model](@/docs/domain-model.md#the-heat-nobody-paid-for) has the
+physics). Fitting them is not tidiness: a fit without an aperture has nowhere to
+put the sun but the insulation, so it reports a better-insulated house in June
+than in December.
 
 The aperture is driven by the irradiance on the **vertical** plane the windows
 are in, which is why `facade_azimuth_deg` is configuration: at 52° north a
@@ -193,8 +189,8 @@ and half of it at a June one, so an aperture fitted against the horizontal would
 be a different number in every season. And the fit **will not walk a parameter
 the record cannot constrain** — a fortnight with no daylight in it still
 identifies the fabric and leaves the aperture where the prior put it, because a
-free parameter that the data says nothing about does not stay where it started:
-it absorbs whatever else the model gets wrong.
+free parameter the data says nothing about does not stay where it started: it
+absorbs whatever else the model gets wrong.
 
 Three of them are asymmetric on purpose:
 

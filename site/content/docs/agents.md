@@ -134,23 +134,20 @@ append-only hash-chained log, and a replay re-executes the logic while reading
 each effect back. *"Why did the queue say that in March"* becomes a replay
 rather than an argument — and for a pure function the replay is exact.
 
-The run identifier a finding carries is that replay's handle, so it is a typed
-one rather than a string, and it is served in the self-describing form
-`run_01J8Z…` — the same text an operator would grep a log for, which a test
-pins. The runtime is taken with its embedded-store feature and nothing else:
-`agentd` defines its specialists as a table of Rust functions, so the
-YAML-defined-agent surface was compiling twenty-one packages into the fleet
-binary to parse documents that do not exist.
+The run identifier a finding carries is that replay's handle, so it is typed
+rather than a string and is served in the self-describing form `run_01J8Z…` — the
+same text an operator would grep a log for. The runtime is taken with its
+embedded-store feature and nothing else: `agentd` defines its specialists as a
+table of Rust functions, so the YAML-defined-agent surface would be twenty-one
+packages in the fleet binary for documents that do not exist.
 
 **A journal does not always survive an upgrade of this daemon.** The runtime is
-pre-1.0 and takes hard cuts rather than compatibility shims, and one of them
-changed how an identifier is written *inside* a record — so every chain digest
-moved. An old record still reads, and a strict replay of a run journaled by an
-older build does not. Across such a release the journal is recreated, or
-exported and restored; the queue rebuilds itself on the next review, and a
-finding from before the upgrade stops being answerable. That is the cost of the
-property, and it is written on the setting rather than left to be found in a
-failed audit.
+pre-1.0 and takes hard cuts rather than compatibility shims, and a change to how
+an identifier is written *inside* a record moves every chain digest: an old
+record still reads, a strict replay of it does not. Across such a release the
+journal is recreated, or exported and restored. The queue rebuilds itself on the
+next review; a finding from before the upgrade stops being answerable, which is
+why the cost is written on the setting rather than left to a failed audit.
 
 ### How a review runs
 

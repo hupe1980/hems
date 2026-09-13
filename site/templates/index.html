@@ -200,35 +200,34 @@ flowchart TB
         </div>
 <pre><code>  2026-01-15 — with a § 14a reduction
 
-  produced                             8.4 kWh
+  produced                             7.7 kWh
   household consumption               11.0 kWh
   charged into the car                21.7 kWh
-  heat pump                           26.1 kWh
+  heat pump                           21.7 kWh
   hot water                            3.1 kWh
   dishwasher                    1.1 kWh, 75 min later
-  battery throughput                  15.5 kWh
-  imported                            55.6 kWh
+  battery throughput                  16.1 kWh
+  imported                            52.6 kWh
   exported                             0.3 kWh
   curtailed                            0.0 kWh
   peak feed-in, per quarter hour  0.12 of 5.88 kW
-  self-sufficiency                        13 %
+  self-sufficiency                        12 %
 
-  indoor temperature            19.9 – 23.1 °C
-  outside the comfort band            0.12 K·h
-  hot-water tank, emptiest           24 % full
+  indoor temperature            19.9 – 23.0 °C
+  outside the comfort band            0.15 K·h
+  hot-water tank, emptiest           30 % full
 
   roof, as the box learned it   90 % of the model
-  production forecast, CRPS     192 W (81 % of 32 lit)
+  production forecast, CRPS     169 W (84 % of 32 lit)
   load forecast, CRPS           18 W (85 % covered)
 
-  electricity bill                     21.03 €
-  battery life spent                    0.62 €
-  comfort given up                      0.19 €
-  borrowed from the stores              0.14 €
-  cost of the day                      21.97 €
-  without optimisation                 24.12 €
-  saved                                 2.14 €
-  …of it on the bill                    3.44 €
+  electricity bill                     19.88 €
+  battery life spent                    0.65 €
+  comfort given up                      0.22 €
+  cost of the day                      20.75 €
+  without optimisation                 22.92 €
+  saved                                 2.18 €
+  …of it on the bill                    2.99 €
 
   § 14a limit in force                  90 min
   …against a minimum of                10.5 kW
@@ -254,7 +253,7 @@ flowchart TB
         </li>
         <li>
           <h3>saved, against …of it on the bill</h3>
-          <p>€2,14 against €3,44. The saving counts the battery life, the comfort
+          <p>€2,18 against €2,99. The saving counts the battery life, the comfort
           and the service the plan actually spent. The bill alone is the
           flattering number every other system quotes.</p>
         </li>
@@ -275,8 +274,8 @@ flowchart TB
           <h3>The three forecast lines are the evidence for the money lines</h3>
           <p>The planner is given only what six weeks of the box’s own metering
           could have taught it. <code>--perfect-foresight</code> shows what a
-          saving quoted without that measures: <strong>€5,28 against
-          €2,14</strong> on this day.</p>
+          saving quoted without that measures: <strong>€4,78 against
+          €2,18</strong> on this day.</p>
         </li>
       </ul>
     </div>

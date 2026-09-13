@@ -46,6 +46,9 @@ pub struct Local {
     /// `None` where this household has no EEBUS identity at all, which is a box
     /// with no § 14a driver and nothing to pair.
     trust: Option<crate::runtime::ship::Trust>,
+    /// The credentials this box answers to, so a household can see which energy
+    /// managers it has connected and withdraw one.
+    access: crate::runtime::access::LocalAccess,
     /// The box's own measurement series, where it keeps one.
     ///
     /// Read-only here. The Data Act gives a user the data their product
@@ -63,6 +66,7 @@ impl Local {
         ski: Option<String>,
         overrides: crate::runtime::overrides::Overrides,
         trust: Option<crate::runtime::ship::Trust>,
+        access: crate::runtime::access::LocalAccess,
         series: Option<Arc<crate::series::Series>>,
     ) -> Self {
         Self {
@@ -71,6 +75,7 @@ impl Local {
             ski,
             overrides,
             trust,
+            access,
             series,
         }
     }
@@ -100,6 +105,13 @@ pub struct StatusBody {
     /// *could* produce is one whose curtailment lifts on an assumption, and a
     /// household is entitled to know which of its devices are in that position.
     pub assumed_available: Vec<String>,
+    /// Controllable devices whose **consumption** the guard had to assume.
+    ///
+    /// The consumption side of the same honesty: a silent controllable device is
+    /// taken to be drawing its nameplate power, which is the safe answer and an
+    /// expensive one — every watt of it is § 14a budget spent on a device that
+    /// may be doing nothing. `assumed_available` is the generation side (R20).
+    pub assumed_nominal: Vec<String>,
     /// Devices that answered their last setpoint and did not act on it, with
     /// what they said about it.
     ///
@@ -145,6 +157,22 @@ pub struct StatusBody {
     /// How exposed this connection is to § 14a control — `null` until the box
     /// has any record to draw on.
     pub exposure: Option<ExposureBody>,
+    /// Which rule is holding each asset's setpoint, where one is.
+    ///
+    /// The answer to *why is my car charging slowly*, which is the commonest
+    /// question a household has and the one a screen of watts cannot answer. It
+    /// is the same reason chain a setpoint carries (P7), summarised per asset so
+    /// a page does not have to reconstruct it.
+    pub overriding: std::collections::BTreeMap<String, String>,
+    /// What an external Customer Energy Manager is doing over S2, where one is
+    /// connected.
+    ///
+    /// A household that has delegated its optimising to somebody else is
+    /// entitled to see that it has, and to see which of its devices that manager
+    /// is actually driving — an S2 session that connected, chose a control type
+    /// and then instructed nothing looks from every other screen exactly like
+    /// one that is working.
+    pub cem: crate::runtime::s2::CemStatus,
 }
 
 /// How often the operator reduces *this* household, and when.
@@ -180,6 +208,11 @@ pub fn router(local: Local) -> axum::Router {
         .route("/v1/pairing/{ski}/refuse", axum::routing::post(refuse_peer))
         .route("/v1/overrides", get(list_overrides).delete(clear_overrides))
         .route("/v1/series/{point}", get(series))
+        .route("/v1/managers", get(list_managers))
+        .route(
+            "/v1/managers/{name}",
+            put(connect_manager).delete(forget_manager),
+        )
         .route(
             "/v1/overrides/{asset}",
             put(set_override).delete(clear_override),
@@ -187,9 +220,80 @@ pub fn router(local: Local) -> axum::Router {
         .with_state(local)
 }
 
+/// The energy managers this household has connected.
+///
+/// The § 14a side has had this since D102: a Steuerbox is trusted by SKI, shown
+/// on a screen and forgotten from one. A Customer Energy Manager drives the same
+/// house through `/s2/{asset}` and, until now, held the household's *own*
+/// credential — so a household could see that something was driving its battery
+/// and not what, and could withdraw one only by rotating the token every other
+/// surface uses (D188).
+async fn list_managers(
+    State(local): State<Local>,
+) -> Result<Json<Vec<crate::runtime::access::Manager>>, StatusCode> {
+    local.access.managers().await.map(Json).map_err(|error| {
+        tracing::error!(%error, "the manager list could not be read");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })
+}
+
+/// Connect one, and hand back the credential it presents.
+///
+/// **The only time the token is shown.** It is not stored in a form this API can
+/// give back, for the same reason the EEBUS private key is not: a credential an
+/// endpoint can be asked for is a credential an endpoint can leak. Naming the
+/// same manager again issues a new one, which is how a household rotates it.
+async fn connect_manager(
+    State(local): State<Local>,
+    Path(name): Path<String>,
+) -> Result<Json<Connected>, (StatusCode, String)> {
+    if name.trim().is_empty() || name.len() > 64 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "a manager needs a name a household would recognise, of at most 64 characters".into(),
+        ));
+    }
+    let token = local
+        .access
+        .connect_manager(&name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(Connected { name, token }))
+}
+
+/// Withdraw one. The credential stops working on the next request.
+async fn forget_manager(
+    State(local): State<Local>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let existed = local
+        .access
+        .forget_manager(&name)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(if existed {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    })
+}
+
+/// A manager that has just been connected, and the credential it presents.
+#[derive(Debug, Serialize)]
+pub struct Connected {
+    /// What the household called it.
+    pub name: String,
+    /// The bearer token it presents. Shown once and never again.
+    pub token: String,
+}
+
 /// The window a series is asked for.
+///
+/// Named for the asking, not the answer: what comes back is a
+/// [`crate::series::Window`], which carries the resolution the box could answer
+/// at as well as the readings.
 #[derive(Debug, serde::Deserialize)]
-pub struct Window {
+pub struct Asked {
     /// The first instant, RFC 3339. Absent means an hour ago, which is what a
     /// screen wants and what stops an unbounded default returning a week.
     #[serde(default, with = "time::serde::rfc3339::option")]
@@ -201,15 +305,20 @@ pub struct Window {
 
 /// One point of measurement over a window — `grid`, `netzwirksam`, or an asset.
 ///
-/// The household's own one-second history, from the box that took it. A box with
-/// no series configured answers `404` rather than an empty list: *nothing was
-/// kept* and *nothing happened* are different answers, and an empty array would
-/// say the second.
+/// The household's own history, from the box that took it. A box with no series
+/// configured answers `404` rather than an empty list: *nothing was kept* and
+/// *nothing happened* are different answers, and an empty array would say the
+/// second.
+///
+/// The answer carries its own `resolution`, because the box keeps days of
+/// seconds and years of quarter hours and a long window is answered from the
+/// second tier. A client that ignored it would draw a year of quarter-hourly
+/// means and label it one-second data.
 async fn series(
     State(local): State<Local>,
     Path(point): Path<String>,
-    Query(window): Query<Window>,
-) -> Result<axum::Json<Vec<crate::series::Reading>>, StatusCode> {
+    Query(window): Query<Asked>,
+) -> Result<axum::Json<crate::series::Window>, StatusCode> {
     let Some(series) = local.series.as_ref() else {
         return Err(StatusCode::NOT_FOUND);
     };
@@ -220,7 +329,7 @@ async fn series(
         return Err(StatusCode::BAD_REQUEST);
     }
     series
-        .between(&point, from, to)
+        .window(&point, from, to)
         .map(axum::Json)
         .map_err(|error| {
             tracing::warn!(%error, %point, "the measurement series could not be read");
@@ -344,6 +453,11 @@ async fn status(State(local): State<Local>) -> Json<StatusBody> {
             .iter()
             .map(ToString::to_string)
             .collect(),
+        assumed_nominal: held
+            .assumed_nominal
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         disobedient: held
             .disobedient
             .iter()
@@ -363,6 +477,12 @@ async fn status(State(local): State<Local>) -> Json<StatusBody> {
         plan_expected_eur: held.plan_expected_eur,
         plan_baseline_eur: held.plan_baseline_eur,
         overruns: held.overruns,
+        cem: held.cem.clone(),
+        overriding: held
+            .overriding
+            .iter()
+            .map(|(id, rule)| (id.to_string(), rule.clone()))
+            .collect(),
         exposure: held.exposure.as_ref().map(|e| ExposureBody {
             days_of_record: e.days_of_record,
             hours_reduced: e.hours_reduced,
@@ -411,6 +531,7 @@ mod exposure_tests {
             None,
             crate::runtime::overrides::Overrides::default(),
             None,
+            crate::runtime::access::LocalAccess::for_testing("haus", "t"),
             None,
         );
 
@@ -438,6 +559,7 @@ mod exposure_tests {
             None,
             crate::runtime::overrides::Overrides::default(),
             None,
+            crate::runtime::access::LocalAccess::for_testing("haus", "t"),
             None,
         );
 
@@ -569,12 +691,13 @@ mod series_tests {
             None,
             crate::runtime::overrides::Overrides::default(),
             None,
+            crate::runtime::access::LocalAccess::for_testing("haus", "t"),
             None,
         );
         let outcome = series(
             State(local),
             Path("grid".to_owned()),
-            Query(Window {
+            Query(Asked {
                 from: None,
                 to: None,
             }),
@@ -604,22 +727,28 @@ mod series_tests {
             None,
             crate::runtime::overrides::Overrides::default(),
             None,
+            crate::runtime::access::LocalAccess::for_testing("haus", "t"),
             Some(Arc::new(store)),
         );
         // No window: the default hour back is what a screen asks for, and it has
         // to be wide enough to contain a reading five minutes old.
-        let Json(readings) = series(
+        let Json(window) = series(
             State(local),
             Path(crate::series::GRID.to_owned()),
-            Query(Window {
+            Query(Asked {
                 from: None,
                 to: None,
             }),
         )
         .await
         .expect("a box with a series answers");
-        assert_eq!(readings.len(), 1, "{readings:?}");
-        assert!((readings[0].watts - 2_500.0).abs() < 1e-6);
+        assert_eq!(
+            window.resolution,
+            crate::series::Resolution::Seconds,
+            "an hour back is the box's own trace, not a rollup of it"
+        );
+        assert_eq!(window.readings.len(), 1, "{window:?}");
+        assert!((window.readings[0].watts - 2_500.0).abs() < 1e-6);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -584,6 +584,24 @@ pub struct DhwModel {
     pub cop: f64,
     /// Standing loss.
     pub standing_loss: Power,
+    /// Where this household's **own thermostat** holds the tank, in the same
+    /// kilowatt-hours of heat above the lowest acceptable temperature as
+    /// [`DhwModel::capacity`].
+    ///
+    /// Read by the **baseline** rather than by the plan, and that is the whole
+    /// of what it is for. A managed tank is a store the optimiser moves between
+    /// its bounds; an unmanaged one sits at its set point all day and never uses
+    /// the store as a store, which is what makes it a baseline worth comparing
+    /// against.
+    ///
+    /// It is a field because it is a fact about the *installation* —
+    /// `DhwTank::t_set_c`, which an installer sets and the household feels in
+    /// the shower. It was a constant of 0,85 of capacity for as long as it
+    /// existed, and the reference tank's own set point is two thirds: 45 °C
+    /// lowest acceptable, 55 °C set, 60 °C highest safe. So the household the
+    /// saving was measured against held its water hotter than the household
+    /// actually asks for, and the difference was credited to the manager (D183).
+    pub thermostat_set: Energy,
     /// What a kilowatt-hour of hot water the household asked for and did not get
     /// is worth avoiding, €/kWh.
     ///
@@ -597,6 +615,13 @@ pub struct DhwModel {
 
 impl DhwModel {
     /// A three-hundred-litre tank on a hot-water heat pump, half charged.
+    ///
+    /// A convenience for callers that have no [`hems_core::asset::DhwTank`] to
+    /// read — which in this workspace means the optimiser's own tests. A caller
+    /// that *has* one owes [`DhwModel::thermostat_set`] the tank's real set
+    /// point: `tank.stored_heat(tank.t_set_c)`, which is the same arithmetic the
+    /// fill level is read with, so the two cannot disagree about what a degree
+    /// is worth.
     #[must_use]
     pub fn tank(capacity: Energy, heater: Power) -> Self {
         Self {
@@ -605,6 +630,10 @@ impl DhwModel {
             heater,
             cop: 3.0,
             standing_loss: Power::new(45.0),
+            // Deliberately *not* the reference household's two thirds: a
+            // stand-in that happened to equal the real value is one no test
+            // could tell apart from a configuration that had been read (D183).
+            thermostat_set: capacity * 0.85,
             shortfall_eur_per_kwh: 3.0,
         }
     }

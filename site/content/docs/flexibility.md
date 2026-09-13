@@ -227,6 +227,67 @@ single control type for it, so a household is several sessions rather than one
 multiplexed connection. `sessions_for` builds them from the site, pairing each
 description with the ratings its statuses are a fraction of.
 
+## And it runs on a socket
+
+The session is sans-I/O; `hemsd` is where one is allowed to exist. Turning on
+`[s2] enabled` puts the surface on the listener the box already binds:
+
+```text
+ws://<box>/s2/<asset>
+```
+
+One connection per resource, and **the path is what names it**. No S2 message
+carries a resource identifier — that is the direct consequence of one RM per
+connection — so something outside the protocol has to say which resource a socket
+is about. A listening port per resource is the same information expressed as a
+firewall rule, and it changes whenever a household buys a battery; the asset
+identifier is the one already in the household's own configuration.
+
+What crosses the seam is still a desire. An instruction becomes a request the
+arbiter ranks [above the box's own plan and below the
+household](@/docs/architecture.md), and the guard narrows it afterwards like
+everything else — so a manager cannot ask its way past a § 14a ceiling.
+
+**A manager that stops talking stops deciding.** Every request expires after one
+market interval, so a crashed process, a cut cable or a lapsed certificate cannot
+hold a household at whatever it last said — the § 14a failsafe's own failure with
+the ownership reversed.
+
+**And the second answer arrives late, on purpose.** An instruction is answered
+twice, and the interesting one is the second: a network operator's reduction
+arrives *after* the `ACCEPTED` has gone out, so the box sends an
+`InstructionStatusUpdate` of `ABORTED` when the guard takes an instruction back,
+once per instruction. It is the answer an aggregator settles on, and the same
+fact reaches the household in the sentence that explains a bill: *your manager
+asked for this and your network operator would not allow it.*
+
+**A manager presents a credential of its own, and the surface is off until you
+turn it on.** This route sits behind the same gate as every other one the box
+adds. What a manager presents is not the household's own token but one issued to
+it by name —
+
+```console
+$ curl -sX PUT -H "Authorization: Bearer $HEMS_TOKEN" \
+    localhost:8080/v1/managers/aggregator-nord
+{"name":"aggregator-nord","token":"…"}
+```
+
+— listed at `GET /v1/managers` and withdrawn at `DELETE`, which stops it working
+on the next request. It is the shape a Steuerbox has on the § 14a side, for the
+same reason: a household that can see *that* something is driving its battery but
+not *what* cannot revoke it. The token is shown once; naming the same manager
+again is how it is rotated.
+
+What bounds the worst case is the ranking: everything a connected manager does
+goes through the guard, so the § 14a, § 9 EEG, fuse and device-rating properties
+hold whoever is on the socket, and a person who presses *pause* still wins. What
+is left is money, spent badly, by somebody the household gave a credential to.
+
+Two control types are acknowledged and not yet carried out — an `OMBC` SG Ready
+mode and a `PPBC` programme start — because the arbiter decides a *power* per
+asset and those are decided elsewhere. They are counted rather than dropped
+quietly, which is how a gap says out loud that somebody wants it.
+
 ## Standing on the authors' work
 
 The wire types come from [`s2energy`](https://crates.io/crates/s2energy),

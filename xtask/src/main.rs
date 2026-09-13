@@ -15,11 +15,13 @@ fn main() -> Result<()> {
         Some("check-citations") => check_citations(&root),
         Some("check-events") => check_events(&root),
         Some("check-manifests") => check_manifests(&root),
-        Some("check-wire") => check_wire(&root),
+        Some("check-wire") => check_wire(&root).map(drop),
         Some("check-vital") => check_vital(&root),
         Some("check-examples") => check_examples(&root),
         Some("check-stats") => check_stats(&root),
+        Some("check-notes") => check_notes(&root),
         Some("check-deps") => check_deps(&root),
+        Some("check-deps-used") => check_deps_used(&root).map(drop),
         Some("check-all") => {
             check_citations(&root)?;
             check_events(&root)?;
@@ -28,6 +30,8 @@ fn main() -> Result<()> {
             check_vital(&root)?;
             check_examples(&root)?;
             check_deps(&root)?;
+            check_deps_used(&root)?;
+            check_notes(&root)?;
             check_stats(&root)
         }
         Some("help" | "--help" | "-h") | None => {
@@ -60,10 +64,15 @@ cargo xtask <task>
   check-examples    every daemon ships an annotated example configuration, a
                     test parses it so it cannot drift from the struct, and every
                     endpoint it sets is one the daemon will accept
-  check-stats       the landing page's citation and crate counts are the ones
-                    the build actually produces
+  check-stats       the landing page's and README's citation, test and crate
+                    counts are the ones the build actually produces
+  check-notes       every decision, risk and milestone label the code cites
+                    resolves to an entry in the architecture notes, and no label
+                    is defined twice
   check-deps        the sibling-crate versions the architecture notes state are
                     the ones the workspace manifest resolves
+  check-deps-used   every dependency a crate declares is one its source reaches,
+                    so a published manifest does not promise what it never uses
   check-all         all of the above
 "
     );
@@ -265,6 +274,358 @@ fn check_citations(root: &Path) -> Result<()> {
 /// producing it means running the suite, and a guard that had to do that would
 /// be the slowest thing in `just ci` for a number on a web page. It is checked
 /// by hand against `cargo test`, and `just ci` runs both.
+/// Every `D107`, `R32` and `M5c` the source cites resolves to an entry, and no
+/// label is defined twice.
+///
+/// The workspace's doc comments cite decisions, risks and milestones by label —
+/// three hundred places — and the registers they resolve to are **internal
+/// notes** that are not published with the crates. A label is therefore the only
+/// thing a reader outside this repository gets, which makes a dangling one worse
+/// than an ordinary broken link: there is nothing else to go on. The registers
+/// promise stable labels, and a promise nothing checks is a convention.
+///
+/// A withdrawn decision stays in the log **as withdrawn** rather than being
+/// deleted, which is what this enforces from the other end: the code that cites
+/// one is usually the code that replaced it, and that is the citation most worth
+/// resolving. D107 was deleted and three tests went on pointing at it.
+///
+/// Absent notes are not a failure. `concepts/` is internal, so a clone without
+/// it must still pass CI — the guard says it found nothing to resolve.
+fn check_notes(root: &Path) -> Result<()> {
+    let notes = root.join("concepts");
+    let mut known: BTreeSet<String> = BTreeSet::new();
+    let mut wrong: Vec<String> = Vec::new();
+    let mut registers: Vec<(char, &str)> = Vec::new();
+
+    for (letter, file) in [
+        ('D', "DECISIONS.md"),
+        ('R', "RISKS.md"),
+        ('M', "ROADMAP.md"),
+    ] {
+        let path = notes.join(file);
+        if !path.exists() {
+            continue;
+        }
+        registers.push((letter, file));
+        for line in std::fs::read_to_string(&path)?.lines() {
+            // The register's own row shape: `| D42 | …`. A label inside a row's
+            // prose is a cross-reference, not a definition.
+            let Some(rest) = line.strip_prefix("| ") else {
+                continue;
+            };
+            let Some(label) = label_at(rest, letter) else {
+                continue;
+            };
+            if !known.insert(label.clone()) {
+                wrong.push(format!("  {file}: {label} is defined twice"));
+            }
+        }
+    }
+    if registers.is_empty() {
+        println!("check-notes: no architecture notes in this checkout, nothing to resolve");
+        return Ok(());
+    }
+
+    let mut cited = 0usize;
+    for file in rust_sources(root)? {
+        let text = std::fs::read_to_string(&file)?;
+        let relative = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        for (line_no, line) in text.lines().enumerate() {
+            for (letter, register) in &registers {
+                for label in cites(line, *letter) {
+                    cited += 1;
+                    if !known.contains(&label) {
+                        wrong.push(format!(
+                            "  {relative}:{}: {label} resolves to nothing in {register}",
+                            line_no + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let named = stale_names(root, &mut wrong)?;
+    let linked = internal_links(root, &mut wrong)?;
+
+    if wrong.is_empty() {
+        println!(
+            "check-notes: {cited} citations of {} decisions, risks and milestones, {named} names \
+             a current-state note gives and {linked} links between notes, all resolving",
+            known.len()
+        );
+        return Ok(());
+    }
+    eprintln!("check-notes: the notes and the code disagree:");
+    for line in &wrong {
+        eprintln!("{line}");
+    }
+    bail!("a label or a name in the architecture notes resolves to nothing")
+}
+
+/// Identifiers the **current-state** notes name that the workspace does not
+/// define.
+///
+/// A note that describes what exists is a map, and a map naming a road that was
+/// renamed is worse than one that leaves it out. Three of these were found by
+/// hand in one pass: an `ARCHITECTURE.md` row marked ✅ that named a
+/// `TariffId` catalogue which does not exist and is still an open question in
+/// `ROADMAP.md`; `GRID_RULES.md` describing the § 14a evidence flag as a variant
+/// when it is a predicate; and `HEMSD.md` carrying an `obsd` summary field under
+/// a name the decision log had already recorded as renamed.
+///
+/// The corpus is `crates/` and `services/` — **not** `xtask/`. Including this
+/// file made the guard blind to any defect its own doc comment described: the
+/// first version quoted the renamed field by name, so the corpus contained it
+/// and the reintroduced defect passed.
+///
+/// **Snake-case only**, and that is the whole of the precision. A field or a
+/// function is almost always this workspace's own and is exactly what gets
+/// renamed; a `CamelCase` name in these notes is as often a type in an upstream
+/// crate or one that is designed and not written. The registers that legitimately
+/// name what does *not* exist — the decision log's rejected alternatives, the
+/// risks, the roadmap, the market comparison — are skipped wholesale rather than
+/// annotated, because naming the unbuilt is their job.
+fn stale_names(root: &Path, wrong: &mut Vec<String>) -> Result<usize> {
+    /// Named in a current-state note and deliberately not ours.
+    const FOREIGN: [(&str, &str); 3] = [
+        (
+            "dlms_cosem",
+            "the DLMS/COSEM protocol family, not a crate here",
+        ),
+        (
+            "max_power_kw",
+            "a field of the § 41e dispatch event `flexd` will emit",
+        ),
+        (
+            "g_shared",
+            "the shared-limit term in the planner's own notation",
+        ),
+    ];
+    // These four are *about* what does not exist: rejected alternatives, open
+    // risks, unbuilt work, other people's products.
+    const REGISTERS: [&str; 4] = [
+        "DECISIONS.md",
+        "RISKS.md",
+        "ROADMAP.md",
+        "MARKET_LANDSCAPE.md",
+    ];
+
+    let notes = root.join("concepts");
+    if !notes.exists() {
+        return Ok(0);
+    }
+    let mut corpus = String::new();
+    for file in rust_sources(root)? {
+        if file.starts_with(root.join("xtask")) {
+            continue;
+        }
+        corpus.push_str(&std::fs::read_to_string(&file)?);
+    }
+    for manifest in ["Cargo.toml", "justfile", "deny.toml"] {
+        if let Ok(text) = std::fs::read_to_string(root.join(manifest)) {
+            corpus.push_str(&text);
+        }
+    }
+
+    let mut checked = 0usize;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&notes)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    files.sort();
+    for path in files {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        if REGISTERS.contains(&name.as_str()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        for identifier in backticked_snake_case(&text) {
+            if FOREIGN.iter().any(|(allowed, _)| *allowed == identifier) {
+                continue;
+            }
+            checked += 1;
+            if !corpus.contains(&identifier) {
+                wrong.push(format!(
+                    "  concepts/{name}: `{identifier}` is named as if it exists and the \
+                     workspace does not define it"
+                ));
+            }
+        }
+    }
+    Ok(checked)
+}
+
+/// Every `` `snake_case_name` `` in a document: backticked, lower-case, and
+/// carrying at least one underscore, with nothing path-like or file-like in it.
+///
+/// Fenced blocks are removed first. Splitting the whole document on the backtick
+/// and taking alternate spans is the obvious reading and it is wrong: a ``` fence
+/// is three of them, so one code block inverts the parity and every inline span
+/// after it is read as prose. The first draft checked whatever happened to fall
+/// on the right side of the first fence — it passed on a document where the
+/// defect this guard exists for had been put back by hand.
+fn backticked_snake_case(text: &str) -> Vec<String> {
+    let mut prose = String::with_capacity(text.len());
+    let mut fenced = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            continue;
+        }
+        if !fenced {
+            prose.push_str(line);
+            prose.push('\n');
+        }
+    }
+
+    let mut found = Vec::new();
+    for span in prose.split('`').skip(1).step_by(2) {
+        if span.len() < 3 || span.len() > 60 {
+            continue;
+        }
+        if !span.contains('_') {
+            continue;
+        }
+        if !span
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        {
+            continue;
+        }
+        if span.starts_with('_') || span.ends_with('_') {
+            continue;
+        }
+        found.push(span.to_owned());
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Every relative link from one note to another resolves to a file that is there.
+///
+/// Cheap, and the moment it earns its keep is a **split**: a note that grows to
+/// cover four topics gets divided, and every inbound link that pointed at the
+/// half that moved is now wrong. There is no build step over these documents and
+/// nothing else would say so.
+fn internal_links(root: &Path, wrong: &mut Vec<String>) -> Result<usize> {
+    let notes = root.join("concepts");
+    if !notes.exists() {
+        return Ok(0);
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(&notes)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "md"))
+        .collect();
+    files.sort();
+
+    let mut checked = 0usize;
+    for path in &files {
+        let from = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        for target in markdown_links(&std::fs::read_to_string(path)?) {
+            checked += 1;
+            // The anchor is not checked: a heading is prose and renaming one is
+            // not the defect this exists for.
+            let file = target.split('#').next().unwrap_or_default();
+            if file.is_empty() {
+                continue;
+            }
+            if !notes.join(file).exists() {
+                wrong.push(format!(
+                    "  concepts/{from}: links to {file}, which is not there"
+                ));
+            }
+        }
+    }
+    Ok(checked)
+}
+
+/// The targets of every `[text](target.md)` in a document.
+fn markdown_links(text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    let bytes = text.as_bytes();
+    for (i, _) in text.match_indices("](") {
+        let start = i + 2;
+        let Some(end) = text[start..].find(')').map(|n| start + n) else {
+            continue;
+        };
+        let target = &text[start..end];
+        // Only sibling notes: an absolute URL, a path with a directory in it and
+        // an image are all somebody else's to resolve.
+        if target.contains("://") || target.contains('/') || !target.contains(".md") {
+            continue;
+        }
+        if i > 0 && bytes[i - 1] == b'!' {
+            continue;
+        }
+        found.push(target.to_owned());
+    }
+    found
+}
+
+/// A label at the very start of `text`: the letter, at least one digit, and any
+/// lower-case suffix (`M5c`).
+fn label_at(text: &str, letter: char) -> Option<String> {
+    let rest = text.strip_prefix(letter)?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let suffix: String = rest[digits.len()..]
+        .chars()
+        .take_while(char::is_ascii_lowercase)
+        .collect();
+    Some(format!("{letter}{digits}{suffix}"))
+}
+
+/// Every citation of one register's letter on one line.
+///
+/// Bounded by a non-identifier character on both sides, so a hexadecimal
+/// literal, an identifier like `R2D2` and — the one that actually fired —
+/// `SOLAR_CONSTANT_W_PER_M2` are not read as labels. The underscore counts as
+/// part of the identifier; leaving it out found two milestones inside a constant
+/// naming a unit.
+fn cites(line: &str, letter: char) -> Vec<String> {
+    let identifier = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = line.as_bytes();
+    let mut found = Vec::new();
+    for (i, c) in line.char_indices() {
+        if c != letter || (i > 0 && identifier(bytes[i - 1])) {
+            continue;
+        }
+        let Some(label) = label_at(&line[i..], letter) else {
+            continue;
+        };
+        // Three digits is the widest register; more is a version or a part
+        // number that happens to start with the same letter.
+        if label.len() > 5 {
+            continue;
+        }
+        if line[i + label.len()..]
+            .bytes()
+            .next()
+            .is_some_and(identifier)
+        {
+            continue;
+        }
+        found.push(label);
+    }
+    found
+}
+
 fn check_stats(root: &Path) -> Result<()> {
     let config = root.join("site/config.toml");
     if !config.exists() {
@@ -289,19 +650,126 @@ fn check_stats(root: &Path) -> Result<()> {
         None => wrong.push(format!("  {key}: the site does not state it")),
     };
 
-    check("stat_rules", count_citations(root)?);
-    check("stat_tests", count_tests(root)?);
+    let citations = count_citations(root)?;
+    let tests = count_tests(root)?;
+    check("stat_rules", citations);
+    check("stat_tests", tests);
     check("stat_crates", pure_crates(root)?);
+    wrong.extend(readme_figures(
+        root,
+        citations,
+        tests,
+        wire_fields(root)?,
+        declared_dependencies(root)?,
+    )?);
 
     if wrong.is_empty() {
-        println!("check-stats: the landing page's counted figures match the build");
+        println!(
+            "check-stats: every counted figure the site, the README and the notes state matches the build"
+        );
         return Ok(());
     }
-    eprintln!("check-stats: site/config.toml states a figure the build does not produce:");
+    eprintln!("check-stats: a stated figure is not one the build produces:");
     for line in &wrong {
         eprintln!("{line}");
     }
-    bail!("the landing page's numbers have drifted")
+    bail!("the stated numbers have drifted")
+}
+
+/// Every count `README.md` states in prose.
+///
+/// The README argues that a figure nothing compares is wrong within a fortnight,
+/// and states five of its own. It also stated the citation count **twice**, and
+/// the two copies had drifted apart from each other as well as from the build —
+/// which is why this checks every occurrence of an anchor rather than the first:
+/// two statements of one number are two chances to be wrong.
+///
+/// A missing pattern is a failure rather than a skip. Otherwise rewording the
+/// sentence silently removes the check, which is how a guard stops guarding
+/// without anybody deciding to.
+fn readme_figures(
+    root: &Path,
+    citations: usize,
+    tests: usize,
+    wire: usize,
+    dependencies: usize,
+) -> Result<Vec<String>> {
+    // Written with a space between the thousands, as everything in German
+    // convention here is, so the comparison is on the digits.
+    let digits = |s: &str| s.chars().filter(char::is_ascii_digit).collect::<String>();
+    // The number immediately before `marker`: the trailing run of digits and the
+    // spaces between them, scanned backwards and put back the right way round.
+    let before = |text: &str, marker: &str| -> String {
+        let head = text.split_once(marker).map(|(head, _)| head).unwrap_or("");
+        head.chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == ' ')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect()
+    };
+
+    let mut wrong = Vec::new();
+    for (document, what, marker, actual) in [
+        ("README.md", "tests", " tests. `just ci` runs", tests),
+        ("README.md", "citations", " citations across", citations),
+        (
+            "README.md",
+            "citations",
+            " of them against an index of primary sources",
+            citations,
+        ),
+        (
+            "README.md",
+            "quantities",
+            " quantities and instants, each of which",
+            wire,
+        ),
+        (
+            "README.md",
+            "dependencies",
+            " declared dependencies,",
+            dependencies,
+        ),
+        // The architecture notes state the test count too. They are internal, so
+        // a checkout without them is not a failure — but a checkout *with* them
+        // must not carry a figure the build contradicts.
+        ("concepts/OVERVIEW.md", "tests", " tests, `just ci`", tests),
+    ] {
+        let path = root.join(document);
+        let internal = document.starts_with("concepts/");
+        if internal && !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+
+        // Every occurrence, not the first: the same figure is stated more than
+        // once and the copies have drifted apart from each other before.
+        let mut rest = text.as_str();
+        let mut found = 0usize;
+        while let Some(at) = rest.find(marker) {
+            found += 1;
+            match digits(&before(rest, marker)).parse::<usize>() {
+                Ok(claimed) if claimed == actual => {}
+                Ok(claimed) => wrong.push(format!(
+                    "  {document} {what}: it says {claimed}, the build counts {actual}"
+                )),
+                Err(_) => wrong.push(format!(
+                    "  {document} {what}: no number before \"{}\"",
+                    marker.trim()
+                )),
+            }
+            rest = &rest[at + marker.len()..];
+        }
+        if found == 0 {
+            wrong.push(format!(
+                "  {document} {what}: the sentence this guard reads is gone, \
+                 so the figure is unchecked"
+            ));
+        }
+    }
+    Ok(wrong)
 }
 
 /// The crates `just purity` holds to "no clock, no socket".
@@ -658,7 +1126,15 @@ fn string_literals(text: &str) -> Vec<String> {
 ///
 /// Which is why this is a guard rather than a convention. One forgotten
 /// attribute is silent.
-fn check_wire(root: &Path) -> Result<()> {
+fn check_wire(root: &Path) -> Result<usize> {
+    let checked = wire_fields(root)?;
+    println!("check-wire: {checked} quantities and instants, all naming their wire form");
+    Ok(checked)
+}
+
+/// The count, without the line saying so — `check-stats` holds the README to this
+/// number and must not reprint a guard that has already run in `check-all`.
+fn wire_fields(root: &Path) -> Result<usize> {
     let mut bare = Vec::new();
     let mut checked = 0usize;
 
@@ -725,8 +1201,7 @@ fn check_wire(root: &Path) -> Result<()> {
     }
 
     if bare.is_empty() {
-        println!("check-wire: {checked} quantities and instants, all naming their wire form");
-        Ok(())
+        Ok(checked)
     } else {
         eprintln!(
             "check-wire: a quantity or an instant must say how it travels — \
@@ -818,6 +1293,162 @@ fn decimal_field(trimmed: &str) -> Option<&str> {
 ///
 /// `concepts/` is internal and absent from a clone, so a missing file is not a
 /// failure — the same rule [`check_stats`] follows for a missing site.
+/// Every dependency a crate declares is one its source actually reaches.
+///
+/// # Why a guard rather than a tidy-up
+///
+/// A declared dependency nobody uses is not free and it is not visible. It costs
+/// a **downstream** consumer a resolution and a compile — every crate here is
+/// published — and it costs this workspace nothing measurable, which is exactly
+/// why eight of them accumulated without anybody noticing. No test can fail for
+/// one, `cargo build` is silent, and `cargo tree` only answers if asked.
+///
+/// One of the eight was a **layering** defect rather than weight: `hems-sim`
+/// declared `hems-forecast`. Nothing used it, but the edge said the simulator —
+/// "the day that happens" — may read the forecaster — "the day that was
+/// expected" — and keeping those apart is the whole of D35. An unused edge is
+/// how a used one arrives.
+///
+/// # How it decides
+///
+/// Textually, and deliberately so: it is a build-graph question answered from
+/// the source, needing no nightly toolchain and no network. A dependency counts
+/// as reached when its identifier appears as a path root (`foo::`), in a `use`,
+/// in an attribute, or as an `extern crate` — anywhere in the crate's `src` and
+/// `tests`. That over-accepts (a mention inside a string literal counts) and
+/// never under-accepts, which is the right direction for a guard whose failure
+/// mode would otherwise be a false alarm on somebody's Friday afternoon.
+///
+/// A dependency that is genuinely needed without being named — a feature-only
+/// edge, a linked system library — says so with `# xtask: unreferenced` on its
+/// own line above the entry, and the reason belongs beside it.
+fn check_deps_used(root: &Path) -> Result<usize> {
+    let checked = declared_dependencies(root)?;
+    println!("check-deps-used: {checked} declared dependencies, every one reached");
+    Ok(checked)
+}
+
+/// The count, without the line saying so. See [`wire_fields`].
+fn declared_dependencies(root: &Path) -> Result<usize> {
+    let mut checked = 0usize;
+    let mut unused = Vec::new();
+
+    for member in workspace_members(root)? {
+        let dir = root.join(&member);
+        let manifest_path = dir.join("Cargo.toml");
+        let Ok(manifest) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let mut source = String::new();
+        for sub in ["src", "tests", "benches", "examples"] {
+            collect_rust(&dir.join(sub), &mut source);
+        }
+
+        let mut section = "";
+        let mut exempt_next = false;
+        for line in manifest.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                section = trimmed;
+                continue;
+            }
+            // The section first. An exemption comment is about the entry below
+            // it, so one written anywhere else — in `[package]`, in a profile —
+            // must not survive to exempt the first dependency that follows it,
+            // which is a guard quietly not guarding.
+            if !matches!(
+                section,
+                "[dependencies]" | "[dev-dependencies]" | "[build-dependencies]"
+            ) {
+                exempt_next = false;
+                continue;
+            }
+            if trimmed.contains("# xtask: unreferenced") {
+                exempt_next = true;
+                continue;
+            }
+            let Some(name) = trimmed.split('=').next().map(str::trim) else {
+                continue;
+            };
+            if name.is_empty() || trimmed.starts_with('#') || !trimmed.contains('=') {
+                continue;
+            }
+            if std::mem::take(&mut exempt_next) {
+                continue;
+            }
+            checked += 1;
+            let ident = name.replace('-', "_");
+            if !reaches(&source, &ident) {
+                unused.push(format!(
+                    "  {member}: `{name}` is declared and never reached"
+                ));
+            }
+        }
+    }
+
+    if unused.is_empty() {
+        return Ok(checked);
+    }
+    eprintln!("check-deps-used: a manifest promises what its source does not use:");
+    for line in &unused {
+        eprintln!("{line}");
+    }
+    bail!("remove it, or mark it `# xtask: unreferenced` with the reason")
+}
+
+/// Whether `source` reaches the crate named by `ident`.
+///
+/// Four shapes, and the last two are what make an attribute-only dependency —
+/// `#[derive(Foo)]`, `#[serde(…)]` — count as reached.
+fn reaches(source: &str, ident: &str) -> bool {
+    let hit = |needle: String| source.contains(&needle);
+    hit(format!("{ident}::"))
+        || hit(format!("use {ident}"))
+        || hit(format!("extern crate {ident}"))
+        || hit(format!("[{ident}"))
+        || hit(format!("({ident}"))
+}
+
+/// Concatenate every `.rs` file under `dir` into `out`.
+fn collect_rust(dir: &Path, out: &mut String) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs")
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            out.push_str(&text);
+            out.push('\n');
+        }
+    }
+}
+
+/// The workspace's member directories, in the order the root manifest lists them.
+fn workspace_members(root: &Path) -> Result<Vec<String>> {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml"))?;
+    let Some(start) = manifest.find("members = [") else {
+        bail!("the workspace manifest has no member list")
+    };
+    let rest = &manifest[start..];
+    let Some(end) = rest.find(']') else {
+        bail!("the workspace manifest's member list is unterminated")
+    };
+    Ok(rest[..end]
+        .split(',')
+        .filter_map(|token| {
+            let token = token.trim();
+            token
+                .strip_prefix('"')
+                .and_then(|t| t.strip_suffix('"'))
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
 fn check_deps(root: &Path) -> Result<()> {
     let notes = root.join("concepts/ARCHITECTURE.md");
     if !notes.exists() {

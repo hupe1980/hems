@@ -68,7 +68,7 @@ pub mod wire;
 /// Everything a consumer normally wants, in one `use`.
 pub mod prelude {
     pub use crate::asset::{
-        Asset, AssetMeta, Battery, CapRelief, Capabilities, Chemistry, DhwTank, Evse, Fallgruppe,
+        Asset, AssetMeta, Battery, CapRelief, Capabilities, DhwTank, Evse, Fallgruppe,
         FlexibleLoad, HeatPump, HeatPumpControl, LegacyStatus, LoadKind, Meter, MeterRole,
         Para9Status, Programme, PvArray, Relay, SteuVeExemption,
     };

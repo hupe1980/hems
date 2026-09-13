@@ -706,6 +706,13 @@ fn the_days_own_generation_is_shared_over_a_forty_two_c_community() {
         ],
     );
 
+    // This asks the allocation a question about **arithmetic** — does
+    // `Σ shared + residual` equal the generation, under either contract — rather
+    // than claiming this household was allocated anything on 15 May 2026. That
+    // is why `allocate_by` does not check the date and `Scenario::run` does: the
+    // conservation identity is defined by the community's own contract, and the
+    // day a network operator must make sharing possible is a different fact
+    // about a different party (D179).
     let mut shared = Decimal::ZERO;
     let mut generated = Decimal::ZERO;
     let mut stranded_static = Decimal::ZERO;
@@ -1429,12 +1436,36 @@ fn a_forty_two_c_community_moves_the_day_and_the_baseline_is_in_it_too() {
     // box would never once move a kilowatt-hour to catch the neighbours' roof.
     //
     // Three things have to hold at once, and only running the day can show them.
-    let plain = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
-    let mut with_community = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    // **Both days move**, and that is the whole of why the comparison is still a
+    // comparison. § 42c Abs. 4 Nr. 1 obliges a network operator to make sharing
+    // possible from 1 June 2026, and every reference day is dated before it — so
+    // a community on the January day would settle an allocation nobody would
+    // perform, which is what this test used to do and report (D179). The shift
+    // is whole weeks, so the weekday and therefore the load profile's day type
+    // survive it, and the member outside a community is measured on the same
+    // Thursday as the member inside one.
+    let lawful =
+        Scenario::winter_with_grid_event(HouseholdConfig::default()).on_a_day_sharing_reaches();
+    assert!(
+        hems_grid::sharing::applies_on(lawful.date),
+        "the day a § 42c comparison runs on has to be one § 42c reaches"
+    );
+    let plain = run(&lawful).unwrap();
+    let mut with_community = lawful.clone();
     with_community.community = Some(hemsd::CommunityMembership::mehrfamilienhaus(
         with_community.config.pv.map_or(Power::ZERO, |pv| pv.kwp) * 3.0,
     ));
     let shared = run(&with_community).unwrap();
+
+    // And a community on a day the rule does not reach is refused rather than
+    // settled quietly — the assertion that would have caught this.
+    let mut too_early = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    too_early.community = with_community.community;
+    assert!(
+        run(&too_early).is_err(),
+        "a § 42c allocation on {} is one no network operator would perform",
+        too_early.date
+    );
 
     // 1. The module is *reached*. A structural zero here is the failure mode
     //    this workspace keeps finding in itself — a rule implemented, cited,
@@ -1482,7 +1513,7 @@ fn a_forty_two_c_community_moves_the_day_and_the_baseline_is_in_it_too() {
     //    two differences — each of them two ~30 € winter days — and on a January
     //    day it came out at three cents. Three cents between two thirty-euro
     //    numbers is not a mechanism check, it is noise with a sign; the same
-    //    day states the mechanism as 13,1 kWh against 4,6.
+    //    day states the mechanism as 12,9 kWh against 3,9.
     assert!(
         shared.shared_kwh > shared.baseline_shared_kwh * 1.5,
         "the planner catches more of the community's roof than the member who did \
@@ -1892,5 +1923,299 @@ fn the_day_counts_the_hours_ss_51_eeg_took_the_remuneration_in() {
         "a winter import bill is a winter carbon bill: {:.2} kg against {:.2}",
         winter.imported_co2_kg,
         summer.imported_co2_kg
+    );
+}
+
+/// The landing page prints the winter day's report. It has to be **that** report.
+///
+/// A terminal transcript on a marketing page is a number printed where nobody
+/// compares it: it is copied once, and every change to the physics, the tariff or
+/// the planner moves it silently. This session's own irradiance and free-heat
+/// work moved every line of it and nothing failed.
+///
+/// So the page's block is parsed and held to the day it claims to be. `hemsd` is
+/// `publish = false`, which is what makes reaching outside the crate for the
+/// template legitimate — a published crate could not package it.
+///
+/// A line the report does not have, or has differently, fails here rather than on
+/// somebody's screenshot.
+#[test]
+fn the_landing_page_prints_the_day_it_says_it_does() {
+    const PAGE: &str = include_str!("../../../site/templates/index.html");
+    const OPENING: &str = "2026-01-15 — with a § 14a reduction";
+
+    let Some(start) = PAGE.find(OPENING) else {
+        panic!("the landing page no longer shows a winter day, or shows another one");
+    };
+    let block = &PAGE[start..start + PAGE[start..].find("</code></pre>").expect("a closed block")];
+
+    let scenario = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    let day = run(&scenario).unwrap();
+    let report = hemsd::render::day(&scenario, &day);
+
+    // Every non-blank line of the page's block, against the same label in the
+    // report the binary would print.
+    let mut checked = 0usize;
+    for line in block.lines().skip(1) {
+        let line = line.trim_end();
+        if line.trim().is_empty() {
+            continue;
+        }
+        let (label, value) = split_report_line(line);
+        let Some(actual) = report
+            .lines()
+            .map(str::trim_end)
+            .find_map(|l| (split_report_line(l).0 == label).then(|| split_report_line(l).1))
+        else {
+            panic!("the landing page shows `{label}`, which this day no longer reports");
+        };
+        assert_eq!(
+            value, actual,
+            "the landing page says `{label}` is `{value}`; the day says `{actual}`"
+        );
+        checked += 1;
+    }
+    assert!(
+        checked >= 20,
+        "only {checked} lines were compared — the block on the page has changed shape"
+    );
+}
+
+/// A report line is a label and a value with two or more spaces between them.
+fn split_report_line(line: &str) -> (&str, &str) {
+    match line.trim().split_once("  ") {
+        Some((label, value)) => (label.trim(), value.trim()),
+        None => (line.trim(), ""),
+    }
+}
+
+/// The unmanaged household's tank is **the tank this household has**, held where
+/// **this household's thermostat** would hold it.
+///
+/// Two defects in one place, and both were invisible for the same reason: the
+/// reference household's configured values happened to equal the constants
+/// standing in for them. The baseline built a tank of its own — `litres × c ×
+/// 15 K`, on `TankSim::new`'s default coefficient of 3,0 and its default 45 W
+/// standing loss — and the reference span really is 60 − 45, the coefficient
+/// really is 3,0 and the loss really is 45 W. When the literal equals the
+/// configuration, no test can tell one from the other. And it commanded the
+/// heater unconditionally, so it reheated to `t_max_c` — the highest **safe**
+/// temperature, a scald bound an installer sets so nobody is burnt — where the
+/// household asks for `t_set_c` (D183).
+///
+/// So this asserts by **moving the configuration**, which is the only thing a
+/// constant cannot follow.
+#[test]
+fn the_baseline_household_heats_its_water_the_way_this_household_asked() {
+    let tank_of = |cop: f64, t_set_c: f64| {
+        let mut config = HouseholdConfig::default();
+        let dhw = config
+            .dhw
+            .as_mut()
+            .expect("the reference household has a tank");
+        dhw.cop = cop;
+        dhw.t_set_c = t_set_c;
+        run(&Scenario::winter_with_grid_event(config)).unwrap()
+    };
+
+    // 1. The **set point** reaches the baseline. A household that keeps its water
+    //    at 50 °C is cheaper to be than one that keeps it at 58 °C, and a
+    //    baseline that ignored the setting would price the two identically — so
+    //    the manager would be credited with the difference between two
+    //    households rather than with a decision.
+    let cool = tank_of(3.0, 50.0);
+    let warm = tank_of(3.0, 58.0);
+    assert!(
+        warm.baseline.total() > cool.baseline.total() + 0.01,
+        "a baseline held at 58 °C should cost more than one held at 50 °C: \
+         {:.2} € against {:.2} €",
+        warm.baseline.total(),
+        cool.baseline.total()
+    );
+
+    // 2. …and so does the **coefficient of performance**. An immersion heater
+    //    buys three kilowatt-hours where a hot-water heat pump buys one, and a
+    //    baseline hard-coded to 3,0 would tell a household with the first that
+    //    its hot water costs a third of what it pays.
+    let immersion = tank_of(1.0, 55.0);
+    let heat_pump = tank_of(3.0, 55.0);
+    assert!(
+        immersion.baseline.total() > heat_pump.baseline.total() + 0.05,
+        "an immersion heater's baseline should cost more than a hot-water heat \
+         pump's: {:.2} € against {:.2} €",
+        immersion.baseline.total(),
+        heat_pump.baseline.total()
+    );
+
+    // 3. And the *managed* side moves with it too, which is what says both
+    //    households are the same appliance. A saving is a difference between two
+    //    runs of one house; if only one side followed the configuration, the
+    //    difference would be measuring the configuration instead.
+    assert!(
+        immersion.cost.total() > heat_pump.cost.total() + 0.05,
+        "the plan has to pay the same physics: {:.2} € against {:.2} €",
+        immersion.cost.total(),
+        heat_pump.cost.total()
+    );
+}
+
+/// A box on its **first evening** — hour one of every real installation.
+///
+/// Every other day here warms up with six weeks of metering, so nothing
+/// exercised the code that runs when a box knows nothing: no load profile, no
+/// correction its roof has earned, no session history. That is not an edge case,
+/// it is what every household gets on the day the installer leaves, and it lasts
+/// until the profile fills (D187).
+///
+/// What a cold box owes a household is **not a good plan** — it cannot have one
+/// — but a lawful one, a delivered one, and an honest account of how little it
+/// knows. Those are the assertions; the euro figure is the *finding*, and it is
+/// recorded in R31 rather than asserted, because it is currently negative.
+#[test]
+fn a_box_on_its_first_evening_is_lawful_and_honest_about_what_it_knows() {
+    let warm = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    let mut cold = warm.clone();
+    cold.warm_up_days = 0;
+
+    let warm_day = run(&warm).unwrap();
+    let day = run(&cold).unwrap();
+
+    // 1. It plans at all. A box that refused until it had history would leave a
+    //    household on the fallback arbiter for its first six weeks, which is
+    //    worse than a plan made from one meter reading.
+    assert_eq!(
+        day.minutes_without_a_plan, 0,
+        "a cold box has to plan from its first reading, not from its first month"
+    );
+
+    // 2. It is lawful. None of this depends on learning: the guard derives the
+    //    § 14a ceiling and the § 9 EEG cap from the site and the session, and a
+    //    box that knows nothing about its household still knows the law.
+    assert!(
+        day.grid_event_respected,
+        "a cold box respected no § 14a reduction"
+    );
+    assert!(
+        day.peak_feed_in_kw <= day.feed_in_ceiling_kw.unwrap_or(f64::INFINITY) + 1e-6,
+        "a cold box fed in {:.2} kW over a ceiling of {:?}",
+        day.peak_feed_in_kw,
+        day.feed_in_ceiling_kw
+    );
+
+    // 3. It delivers the service. The car reaches its target and nobody has a
+    //    cold shower — the two soft terms a bad forecast is most likely to spend.
+    assert!(
+        day.cost.unserved_eur < 0.01,
+        "a cold box left {:.2} € of service undelivered",
+        day.cost.unserved_eur
+    );
+    assert!(
+        (day.ev_charged_kwh - warm_day.ev_charged_kwh).abs() < 0.5,
+        "the car has to be charged whatever the box knows: {:.1} kWh cold against \
+         {:.1} kWh warm",
+        day.ev_charged_kwh,
+        warm_day.ev_charged_kwh
+    );
+
+    // 4. And it is **honest about knowing nothing**. This is the one that would
+    //    otherwise rot: a cold box whose roof correction read like a learned one,
+    //    or whose forecast scored as well as a warm box's, would be a box
+    //    reporting confidence it has not earned — R28's shape, one layer up.
+    assert!(
+        (day.roof_correction - 1.0).abs() < 1e-9,
+        "a roof nobody has metered cannot have earned a correction: {:.3}",
+        day.roof_correction
+    );
+    assert!(
+        day.pv_forecast.crps > warm_day.pv_forecast.crps,
+        "a box that has never seen this roof forecast it as well as one that has: \
+         {:.0} W cold against {:.0} W warm",
+        day.pv_forecast.crps,
+        warm_day.pv_forecast.crps
+    );
+
+    // 5. What six weeks of metering is worth, which is the number this day
+    //    exists to produce. It is large, and it is currently a *loss* — see R31.
+    assert!(
+        warm_day.saving_eur() > day.saving_eur() + 1.0,
+        "six weeks of learning should be worth more than a euro a day on this \
+         household: {:.2} € warm against {:.2} € cold",
+        warm_day.saving_eur(),
+        day.saving_eur()
+    );
+}
+
+/// The R31 figure the notes quote, printed rather than asserted.
+///
+/// `cargo test -p hemsd --test simulated_days -- --ignored --nocapture`. It is
+/// not an assertion because the useful properties of a cold box are in
+/// `a_box_on_its_first_evening_is_lawful_and_honest_about_what_it_knows`; this
+/// exists so the number in the notes has somewhere to come from.
+#[test]
+#[ignore = "prints the R31 figure the notes quote; not an assertion"]
+fn the_cold_box_figure_the_notes_quote() {
+    let mut cold = Scenario::winter_with_grid_event(HouseholdConfig::default());
+    cold.warm_up_days = 0;
+    let d = run(&cold).unwrap();
+    println!(
+        "COLD saved {:.2} € (cost {:.2}, baseline {:.2})",
+        d.saving_eur(),
+        d.cost.total(),
+        d.baseline.total()
+    );
+}
+
+/// The day's bill is what a **two-register meter** would bill, not what netting
+/// the quarter hour would.
+///
+/// A bidirectional meter integrates the instantaneous flow into the import
+/// register or the export register as the sign falls. A quarter hour in which a
+/// house draws for seven minutes and feeds back for seven registers *both*, and
+/// is billed for both at two different prices. Netting it first makes that
+/// quarter hour free.
+///
+/// `hemsd` accumulates tick by tick with the two directions priced apart, on
+/// **both** sides of the comparison — and the reason to test it rather than
+/// assert it in a comment is that netting does not forgive the two households
+/// equally. It forgives whichever one crosses zero more often inside a quarter
+/// hour, and on a January day that is the *unmanaged* one: a thermostat heat
+/// pump cycles on and off under a roof that is still producing, where a plan
+/// modulates. arXiv:2510.25373 measures the same mechanism on residential
+/// battery scheduling and finds 37 % of the reported advantage at a quarter-hour
+/// evaluation step.
+///
+/// So the shortcut is not neutral here, and it does not run the flattering way:
+/// it would take about a third off this day's bill saving. This test fails if
+/// anybody ever prices a register instead of a tick — the two figures would
+/// collapse onto each other.
+#[test]
+fn the_bill_is_what_a_two_register_meter_would_bill() {
+    let r = run(&Scenario::winter_with_grid_event(HouseholdConfig::default())).unwrap();
+
+    let bill_saving = r.baseline.energy_eur - r.cost.energy_eur;
+    let netted_saving = r.baseline_energy_eur_netted - r.energy_eur_netted;
+    let forgiven = bill_saving - netted_saving;
+
+    assert!(
+        forgiven > 0.25,
+        "netting a quarter hour changes this day's bill saving by only {forgiven:.2} € \
+         (bill saving {bill_saving:.2} €, netted {netted_saving:.2} €) — either the \
+         household stopped reversing inside a quarter hour, or something is now \
+         pricing a register instead of a tick"
+    );
+    // Netting can only ever forgive: it cancels opposing flows that were bought
+    // at the import price and sold at the lower export one. A negative here on
+    // either household would mean the arithmetic has a sign error.
+    assert!(
+        r.cost.energy_eur >= r.energy_eur_netted - 1e-9,
+        "netting made the managed household's bill larger: {:.4} € against {:.4} €",
+        r.cost.energy_eur,
+        r.energy_eur_netted
+    );
+    assert!(
+        r.baseline.energy_eur >= r.baseline_energy_eur_netted - 1e-9,
+        "netting made the unmanaged household's bill larger: {:.4} € against {:.4} €",
+        r.baseline.energy_eur,
+        r.baseline_energy_eur_netted
     );
 }

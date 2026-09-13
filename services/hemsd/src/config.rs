@@ -69,6 +69,14 @@ pub struct Settings {
     pub obsd: crate::runtime::outbox::ObsdSettings,
     /// How the box presents itself on the EEBUS network, and whom it trusts.
     pub ship: crate::runtime::ship::ShipSettings,
+    /// Whether an external Customer Energy Manager may drive this household
+    /// over S2, and on what terms.
+    #[serde(default)]
+    pub s2: crate::runtime::s2::S2Settings,
+    /// How this box's own surfaces are reached — the bearer token that opens
+    /// `/v1/*` and `/s2/*`.
+    #[serde(default)]
+    pub api: crate::runtime::access::ApiSettings,
     /// How fast the control planes run.
     pub control: ControlSettings,
     /// What speaks to the hardware. One entry per device.
@@ -119,6 +127,37 @@ pub struct SeriesSettings {
 
 const fn default_series_days() -> u16 {
     7
+}
+
+/// The standard German fitting: a three-hundred-litre tank on a hot-water heat
+/// pump, 45 °C lowest acceptable, 55 °C set, 60 °C highest safe.
+///
+/// Defaults rather than required fields, because a household that has not been
+/// surveyed still has a tank and refusing to model one would be worse than
+/// modelling the common case. Every one of them is a fact an installer can
+/// read off the appliance, and each is on the example configuration.
+const fn default_dhw_cop() -> f64 {
+    3.0
+}
+
+/// See [`default_dhw_cop`].
+const fn default_dhw_standing_loss_w() -> f64 {
+    45.0
+}
+
+/// See [`default_dhw_cop`].
+const fn default_dhw_t_min_c() -> f64 {
+    45.0
+}
+
+/// See [`default_dhw_cop`].
+const fn default_dhw_t_set_c() -> f64 {
+    55.0
+}
+
+/// See [`default_dhw_cop`].
+const fn default_dhw_t_max_c() -> f64 {
+    60.0
 }
 
 impl AsMut<hems_service::Settings> for Settings {
@@ -653,6 +692,33 @@ pub struct SiteSettings {
     pub dhw_litres: f64,
     /// Electrical power of the hot-water heater, kW.
     pub dhw_heater_kw: f64,
+    /// Thermal kilowatt-hours the tank gains per electrical kilowatt-hour.
+    ///
+    /// **One** for a plain immersion heater, around **three** for a hot-water
+    /// heat pump. A household fitted with the first and planned as the second
+    /// has its hot water priced at a third of what it actually pays, so this is
+    /// a fact about the appliance rather than a tuning figure.
+    #[serde(default = "default_dhw_cop")]
+    pub dhw_cop: f64,
+    /// Standing loss of the tank, watts — the reason it is cold in the morning.
+    #[serde(default = "default_dhw_standing_loss_w")]
+    pub dhw_standing_loss_w: f64,
+    /// Lowest acceptable water temperature, °C. Below it somebody has a cold
+    /// shower, which the plan pays for rather than forbidding.
+    #[serde(default = "default_dhw_t_min_c")]
+    pub dhw_t_min_c: f64,
+    /// Where the household's **own thermostat** holds the tank, °C.
+    ///
+    /// Not a bound on the plan, which works between the two temperatures above
+    /// and below and uses the tank as a store. It is what this household would
+    /// have with no energy manager at all, so it is what the **baseline** is
+    /// held at — and therefore what the saving on the report is measured
+    /// against (D183).
+    #[serde(default = "default_dhw_t_set_c")]
+    pub dhw_t_set_c: f64,
+    /// Highest safe water temperature, °C — a scald bound, not a target.
+    #[serde(default = "default_dhw_t_max_c")]
+    pub dhw_t_max_c: f64,
     /// The charge point's largest current per conductor, amperes. Zero means
     /// the household has no charge point — see [`SiteSettings::pv_kwp`].
     ///
@@ -728,6 +794,11 @@ impl Default for SiteSettings {
             comfort_max_c: heat_pump.comfort_max_c,
             dhw_litres: dhw.litres,
             dhw_heater_kw: dhw.heater.kw(),
+            dhw_cop: dhw.cop,
+            dhw_standing_loss_w: dhw.standing_loss.get(),
+            dhw_t_min_c: dhw.t_min_c,
+            dhw_t_set_c: dhw.t_set_c,
+            dhw_t_max_c: dhw.t_max_c,
             evse_max_a: evse.max_current.get(),
             evse_switchable: evse.switchable,
             ev_charge_limit: evse.charge_limit.map(Soc::fraction),
@@ -1188,6 +1259,11 @@ impl SiteSettings {
                 crate::site::DhwConfig {
                     litres: self.dhw_litres,
                     heater: Power::from_kw(self.dhw_heater_kw),
+                    cop: self.dhw_cop,
+                    standing_loss: Power::new(self.dhw_standing_loss_w),
+                    t_min_c: self.dhw_t_min_c,
+                    t_set_c: self.dhw_t_set_c,
+                    t_max_c: self.dhw_t_max_c,
                 }
             }),
             fuse: Current::new(self.fuse_a),

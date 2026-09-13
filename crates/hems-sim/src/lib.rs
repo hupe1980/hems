@@ -31,5 +31,5 @@ pub use device::{
     ApplianceSim, BatterySim, BuildingSim, CompressorSim, EvseSim, PHASE_SWITCH_DEAD_TIME, PvSim,
     TankSim, VehicleSim,
 };
-pub use steuerbox::{Instruction, SteuerboxSim};
+pub use steuerbox::{Command, DEFAULT_HEARTBEAT, Instruction, SteuerboxSim};
 pub use weather::Realisation;

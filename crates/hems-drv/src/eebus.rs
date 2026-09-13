@@ -59,6 +59,17 @@ use eebus::usecases::monitoring::{
 };
 use eebus::usecases::{descriptor, limitation, lpc, lpp, mgcp};
 
+/// The timings `[LPC-031]`, `[LPC-906]` and `[LPC-022]` fix, re-exported from
+/// the crate that implements them.
+///
+/// Re-exported rather than restated. They were stated a second time in
+/// `hems-grid::lpc`, and a second statement of a number a certification
+/// laboratory checks is the defect D186 removed: whichever copy is wrong, it is
+/// the one the laboratory is not looking at. A caller that needs the heartbeat
+/// cadence — a simulated Steuerbox, a test — takes it from here.
+pub use eebus::usecases::limitation::{
+    FAILSAFE_DURATION_RANGE, HEARTBEAT_PERIOD, HEARTBEAT_TIMEOUT, WRITE_WINDOW,
+};
 /// What the Energy Guard wrote, and what a Controllable System answers.
 ///
 /// Re-exported from [`eebus`] rather than mirrored: a caller has to be able to
@@ -159,6 +170,20 @@ pub struct Lpc {
     /// every tick — the guard is edge-driven and a repeated event is noise in an
     /// evidence record.
     last_reported: Option<EffectiveLimit>,
+    /// When the state the machine is in now began, and what it was.
+    ///
+    /// Not a second state machine: it is one observation of `eebus`'s own, taken
+    /// where every event already passes. It exists because [`Lpc::limit_ends_at`]
+    /// has to answer *when does this end* for `Init` and `Failsafe`, where the
+    /// answer is `[LPC-922]`'s Failsafe Duration Minimum counted from the moment
+    /// the state was entered — and the crate publishes the state and the
+    /// duration but not the instant between them.
+    state_since: (LpcState, OffsetDateTime),
+    /// When an active limit with a duration of its own lapses, `[LPC-909]`.
+    ///
+    /// `None` for a limit with no duration, which runs until it is deactivated
+    /// or the operator goes quiet.
+    limit_expires_at: Option<OffsetDateTime>,
     /// The Monitoring Appliance side of the box: MGCP scenario 1, the § 9 EEG
     /// feed-in limitation factor `[MGCP-011]`.
     ///
@@ -249,6 +274,11 @@ impl Lpc {
             monitoring: false,
             started_at,
             last_reported: None,
+            // `ControllableSystem::new` starts in `Init`, and `[LPC-922]` counts
+            // the Failsafe Duration Minimum from the moment a state is entered —
+            // so a box that has just started is already inside it.
+            state_since: (LpcState::Init, started_at),
+            limit_expires_at: None,
             events: Vec::new(),
         })
     }
@@ -317,6 +347,20 @@ impl Lpc {
             .actor
             .system_mut()
             .on_limit_write(write, LocalDecision::Apply, elapsed);
+        // `[LPC-909]`: a limit may carry a duration of its own, after which it
+        // lapses. Recorded only where the machine took the write, so a refused
+        // one cannot move an expiry the household is still under.
+        if outcome.is_accepted() {
+            self.limit_expires_at = write
+                .is_active
+                .then(|| {
+                    write
+                        .duration
+                        .and_then(|d| time::Duration::try_from(d).ok())
+                })
+                .flatten()
+                .map(|d| now + d);
+        }
         // What the state machine now holds is also what the Energy Guard reads
         // back, so the published value follows the decision. Left out, a
         // Steuerbox that subscribed to `LoadControlLimitListData` would be told
@@ -350,6 +394,32 @@ impl Lpc {
         self.watch_failsafe(decided.as_ref(), elapsed);
         self.consume_engine_events(elapsed);
         self.drain(now);
+    }
+
+    /// When the ceiling in force now stops applying, if it is going to.
+    ///
+    /// What the **planner** needs and the guard does not: a reduction that lapses
+    /// at 18:30 is a different plan from one that does not, and a receding
+    /// horizon that could not see the end of it would shift load out of hours the
+    /// household is free in.
+    ///
+    /// Three cases, and the middle one is the one that is easy to miss.
+    /// `Limited` ends when an `[LPC-909]` duration runs out — or never, for a
+    /// limit written without one. `Init` and `Failsafe` are the household holding
+    /// *itself* down for want of an Energy Guard, and it knows exactly when it
+    /// will stop: `[LPC-922]` releases the device once the Failsafe Duration
+    /// Minimum has run from the moment the state was entered. Under either
+    /// unlimited state nothing is ending because nothing is in force.
+    #[must_use]
+    pub fn limit_ends_at(&self) -> Option<OffsetDateTime> {
+        match self.state() {
+            LpcState::Limited => self.limit_expires_at,
+            LpcState::Init | LpcState::Failsafe => {
+                let minimum = self.actor.system().config().failsafe_duration;
+                Some(self.state_since.1 + time::Duration::try_from(minimum).ok()?)
+            }
+            LpcState::UnlimitedControlled | LpcState::UnlimitedAutonomous => None,
+        }
     }
 
     /// When [`Lpc::on_timeout`] should next be called.
@@ -525,6 +595,18 @@ impl Lpc {
 
     /// Emit an event where the effective limit has actually moved.
     fn drain(&mut self, now: OffsetDateTime) {
+        // Where every path already passes, so the instant a state was entered is
+        // observed rather than recomputed. `[LPC-922]` counts from here.
+        let state = self.state();
+        if self.state_since.0 != state {
+            self.state_since = (state, now);
+            // A limitation that has ended takes its expiry with it: a stale
+            // instant would tell the planner a reduction lapses at a time
+            // nothing is going to happen.
+            if state != LpcState::Limited {
+                self.limit_expires_at = None;
+            }
+        }
         let current = self.actor.system().effective_limit();
         if self.last_reported == Some(current) {
             return;

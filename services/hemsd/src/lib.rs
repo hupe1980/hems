@@ -24,6 +24,7 @@ pub mod backtest;
 pub mod config;
 pub mod drivers;
 pub mod forecasting;
+pub mod render;
 pub mod report;
 pub mod runtime;
 pub mod scenario;

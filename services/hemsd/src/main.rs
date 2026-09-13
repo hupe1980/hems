@@ -291,17 +291,34 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
         // trust this box, and it is the step field reports say goes wrong most
         // often. Deriving it here also *creates* it on a first run, so the
         // number does not change when the daemon starts for real.
+        // The store is opened once for both credentials. Deriving them here
+        // *creates* them on a first run, which is the point: an installer doing
+        // a dry run carries away the same two numbers the daemon will serve
+        // with, rather than two that change when it starts for real.
+        let store = match &settings.store_path {
+            Some(path) => Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+                hemsd::store::Store::open(path)?,
+            ))),
+            None => None,
+        };
         if settings.ship.listen.is_some() {
-            let store = match &settings.store_path {
-                Some(path) => Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                    hemsd::store::Store::open(path)?,
-                ))),
-                None => None,
-            };
             let (_, ski, _key) =
                 hemsd::runtime::ship::identity(&settings.ship, store.as_ref(), now).await?;
             println!("🔑 SKI  {}", ski.to_display_string());
             println!("   give this to the metering point operator, so the Steuerbox trusts it");
+        }
+        // The other credential, and the one without which every surface below
+        // answers `401`.
+        let site = running.household.site.id.to_string();
+        let issued = match &store {
+            Some(store) => {
+                let held = store.lock().await;
+                hemsd::runtime::access::LocalAccess::resolve(&settings.api, &site, Some(&held))?.1
+            }
+            None => hemsd::runtime::access::LocalAccess::resolve(&settings.api, &site, None)?.1,
+        };
+        if let Some(announcement) = issued.announcement() {
+            println!("{announcement}");
         }
         let now = time::OffsetDateTime::now_utc();
         let modes = std::collections::BTreeMap::new();
@@ -353,19 +370,44 @@ async fn manage(config: Option<&std::path::Path>, check: bool) -> anyhow::Result
 
     let running = hemsd::runtime::run(&settings, &health, &signal).await?;
     let site = running.household.site.id.to_string();
+    // The second credential a commissioning visit carries away. The SKI goes to
+    // the metering point operator so a Steuerbox trusts this box; this one goes
+    // to whoever reads the box's own screens, and without it every surface below
+    // answers `401`.
+    if let Some(announcement) = &running.api_token {
+        println!("{announcement}");
+    }
 
-    hems_service::Server::new(
-        hems_service::identity!(),
-        settings.service.clone(),
-        health,
-        hemsd::runtime::api::router(hemsd::runtime::api::Local::new(
+    // The household's own surface, and — where the household has connected an
+    // energy manager — the one that manager drives it over. Both on the socket
+    // the shell already binds: one port to configure, one to firewall, and a
+    // metrics label that is the route rather than every asset's name.
+    let router = hemsd::runtime::surfaces(
+        hemsd::runtime::api::Local::new(
             running.status,
             site,
             running.ski,
             running.overrides,
             running.trust,
+            running.access.clone(),
             running.series,
-        )),
+        ),
+        settings.s2.enabled.then(|| {
+            hemsd::runtime::s2::Surface::new(
+                std::sync::Arc::new(running.household.site.clone()),
+                std::sync::Arc::clone(&running.registry),
+                running.cem.clone(),
+                settings.s2.clone(),
+            )
+        }),
+        running.access.clone(),
+    );
+
+    hems_service::Server::new(
+        hems_service::identity!(),
+        settings.service.clone(),
+        health,
+        router,
     )
     .run_until(signal)
     .await?;
@@ -447,6 +489,21 @@ async fn main() -> anyhow::Result<()> {
                         .map_or(hems_core::prelude::Power::ZERO, |pv| pv.kwp)
                         * 3.0,
                 ));
+                // And on a day the rule reaches. § 42c Abs. 4 Nr. 1 obliges a
+                // network operator to make sharing possible from 1 June 2026,
+                // and every reference day is dated before that — so the same
+                // day moves forward in whole weeks, keeping its weekday and its
+                // season, rather than demonstrating an allocation nobody would
+                // perform (D179).
+                let before = scenario.date;
+                scenario = scenario.on_a_day_sharing_reaches();
+                if scenario.date != before {
+                    println!(
+                        "  § 42c reaches this household from {}, so the same day runs on {}",
+                        hems_grid::sharing::SHARING_START,
+                        scenario.date
+                    );
+                }
             }
             scenario.risk = risk.model();
             scenario.adaptive_risk = risk.adaptive();
@@ -455,7 +512,7 @@ async fn main() -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                print_report(&scenario, &result);
+                print!("{}", hemsd::render::day(&scenario, &result));
             }
             // Written **before** the report goes out. The order is the whole
             // point: the household's own record must not depend on a fleet
@@ -795,354 +852,4 @@ fn print_risk(scenario: &Scenario, rows: &[(&str, hemsd::Spread)]) {
          higher worst — and if it has a lower mean and nothing else, it is not\n  \
          worth having, which is a result rather than a failure.\n"
     );
-}
-
-fn print_report(scenario: &Scenario, r: &hemsd::DayResult) {
-    println!(
-        "\n  {} — {}\n",
-        scenario.date,
-        if scenario.grid_event.is_some() {
-            "with a § 14a reduction"
-        } else {
-            "no grid event"
-        }
-    );
-    // A day the planner could not be surprised by is not a measurement of a
-    // controller, and its saving is an upper bound rather than a result. Saying
-    // so here is the whole of this project's argument applied to its own output:
-    // the same winter day saves €2,09 honestly and €5,25 with the answer in
-    // hand, and until this line existed both printed identically.
-    if r.foresight_is_perfect {
-        println!("  ⚠ the planner was shown the weather in advance — every figure");
-        println!("    below is an upper bound, not a result\n");
-    }
-    let row = |label: &str, value: String| println!("  {label:<34} {value:>14}");
-    row("produced", format!("{:.1} kWh", r.produced_kwh));
-    row(
-        "household consumption",
-        format!("{:.1} kWh", r.consumed_kwh),
-    );
-    row(
-        "charged into the car",
-        format!("{:.1} kWh", r.ev_charged_kwh),
-    );
-    row("heat pump", format!("{:.1} kWh", r.heat_pump_kwh));
-    row("hot water", format!("{:.1} kWh", r.dhw_kwh));
-    if r.appliance_ran() {
-        row(
-            "dishwasher",
-            format!(
-                "{:.1} kWh, {} min later",
-                r.appliance_kwh, r.appliance_shift_minutes
-            ),
-        );
-    }
-    row(
-        "battery throughput",
-        format!("{:.1} kWh", r.battery_throughput_kwh),
-    );
-    row("imported", format!("{:.1} kWh", r.imported_kwh));
-    row("exported", format!("{:.1} kWh", r.exported_kwh));
-    row("curtailed", format!("{:.1} kWh", r.curtailed_kwh));
-    row(
-        "peak feed-in, per quarter hour",
-        match r.feed_in_ceiling_kw {
-            Some(cap) => format!("{:.2} of {cap:.2} kW", r.peak_feed_in_kw),
-            None => format!("{:.2} kW, uncapped", r.peak_feed_in_kw),
-        },
-    );
-    row(
-        "self-sufficiency",
-        format!("{:.0} %", r.self_sufficiency * 100.0),
-    );
-    row(
-        "wallbox on one conductor",
-        format!(
-            "{} min ({} switches)",
-            r.single_phase_minutes, r.phase_switches
-        ),
-    );
-    println!();
-    row(
-        "indoor temperature",
-        format!("{:.1} – {:.1} °C", r.indoor_min_c, r.indoor_max_c),
-    );
-    row(
-        "outside the comfort band",
-        format!("{:.2} K·h", r.discomfort_kelvin_hours),
-    );
-    row(
-        "hot-water tank, emptiest",
-        format!("{:.0} % full", r.tank_min_fill * 100.0),
-    );
-    // Only where there is a compressor to cycle. A modulating unit has nothing
-    // to start, and a structural zero printed every day is how a number stops
-    // being read.
-    if r.compressor_starts > 0 || r.compressor_held_minutes > 0 {
-        row(
-            "compressor starts",
-            if r.compressor_held_minutes == 0 {
-                format!("{}", r.compressor_starts)
-            } else {
-                // Time the unit's own minimum runtime overrode a command to
-                // stop — the part of a plan the hardware does not carry out.
-                format!(
-                    "{} ({} min held against a command)",
-                    r.compressor_starts, r.compressor_held_minutes
-                )
-            },
-        );
-    }
-    if r.cold_water_kwh > 0.01 {
-        row(
-            "hot water not delivered",
-            format!("{:.1} kWh", r.cold_water_kwh),
-        );
-    }
-    // § 42c: only where there is a community, because a structural zero printed
-    // every day is how a number stops being read.
-    if scenario.community.is_some() {
-        row(
-            "allocated by the community",
-            format!("{:.1} kWh", r.shared_kwh),
-        );
-    }
-    if r.pv_forecast.samples > 0 {
-        println!();
-        row(
-            "roof, as the box learned it",
-            format!("{:.0} % of the model", r.roof_correction * 100.0),
-        );
-        // The slot count is on the line on purpose. A production score is over
-        // the *lit* part of the day — a band of nothing against an outcome of
-        // nothing is midnight, not a forecast that came true — and a reader who
-        // cannot see how much of the day was scored cannot tell a good January
-        // figure from an arithmetic about how long the night is.
-        row(
-            "production forecast, CRPS",
-            format!(
-                "{:.0} W ({:.0} % of {} lit)",
-                r.pv_forecast.crps,
-                r.pv_forecast.coverage * 100.0,
-                r.pv_forecast.samples
-            ),
-        );
-        row(
-            "load forecast, CRPS",
-            format!(
-                "{:.0} W ({:.0} % covered)",
-                r.load_forecast.crps,
-                r.load_forecast.coverage * 100.0
-            ),
-        );
-    }
-    println!();
-    row("electricity bill", format!("{:.2} €", r.cost.energy_eur));
-    if r.cost.sharing_eur.abs() > 0.005 {
-        row(
-            "…less the community's own",
-            format!("{:.2} €", r.cost.sharing_eur),
-        );
-    }
-    row("battery life spent", format!("{:.2} €", r.cost.wear_eur));
-    row(
-        "comfort given up",
-        format!("{:.2} €", r.cost.discomfort_eur),
-    );
-    if r.cost.curtailment_eur > 0.005 {
-        row(
-            "production thrown away",
-            format!("{:.2} €", r.cost.curtailment_eur),
-        );
-    }
-    if r.cost.unserved_eur > 0.005 {
-        row(
-            "service not delivered",
-            format!("{:.2} €", r.cost.unserved_eur),
-        );
-    }
-    if r.cost.stored_eur > 0.005 {
-        row(
-            "borrowed from the stores",
-            format!("{:.2} €", r.cost.stored_eur),
-        );
-    }
-    // Signed, and shown against the baseline's own entry: both households own
-    // the same car, so the comparison is only fair once both are credited for
-    // what is in it at midnight.
-    let car = r.cost.vehicle_eur - r.baseline.vehicle_eur;
-    if car.abs() > 0.005 {
-        row("left in the car", format!("{car:+.2} €"));
-    }
-    row("cost of the day", format!("{:.2} €", r.cost.total()));
-    row(
-        "without optimisation",
-        format!("{:.2} €", r.baseline.total()),
-    );
-    row("saved", format!("{:.2} €", r.saving_eur()));
-    row(
-        "…of it on the bill",
-        format!("{:.2} €", r.bill_saving_eur()),
-    );
-    println!();
-    row("§ 14a limit in force", format!("{} min", r.limited_minutes));
-    if r.limited_minutes > 0 {
-        row(
-            "…against a minimum of",
-            format!("{:.1} kW", r.minimum_power_kw),
-        );
-    }
-    if r.commanded_below_minimum {
-        row(
-            "commanded below that minimum",
-            "YES — unlawful, and recorded".to_string(),
-        );
-    }
-    if r.failsafe_below_minimum {
-        row(
-            "own failsafe below that minimum",
-            "YES — a configuration fault".to_string(),
-        );
-    }
-    if r.lent_kwh > 0.005 {
-        row("…covered by the store", format!("{:.1} kWh", r.lent_kwh));
-    }
-    row(
-        "control events recorded",
-        format!("{} ({} samples)", r.control_events, r.evidence_samples),
-    );
-    row("self-restraint records", format!("{}", r.failsafe_events));
-    row(
-        "slowest reaction",
-        match r.acted_by_command {
-            Some(true) => format!("{:.0} s, commanded", r.worst_latency_s),
-            Some(false) => "0 s, already below".to_string(),
-            None => format!("{:.0} s", r.worst_latency_s),
-        },
-    );
-    row(
-        "minutes without a plan",
-        format!("{}", r.minutes_without_a_plan),
-    );
-    // The other seam between the arbiter and the world: how often a device could
-    // not hold the command it was given. A charge point is off or above 6 A with
-    // nothing in between, so this is never structurally zero — and a day where it
-    // is large is a day the planner was modelling a device that does not exist.
-    row(
-        "commands the hardware clipped",
-        format!("{} ticks ({:.2} kWh)", r.clipped_ticks, r.clipped_kwh),
-    );
-    // The § 51 EEG hours the day contained, and the carbon behind what the
-    // household drew. Both are numbers the objective's own terms owe a day
-    // (R20): § 51 is applied per slot inside the price stack and no day used to
-    // say whether it had bound, and the carbon term could be priced with
-    // nothing reporting its effect. The intensity is the *import-weighted* one
-    // rather than the grid's average, because moving load from the evening ramp
-    // into the middle of the day changes the first and leaves the second alone.
-    row(
-        "quarter hours § 51 EEG zeroed",
-        format!("{}", r.para51_hours),
-    );
-    if r.imported_co2_kg > 0.0 {
-        row(
-            "carbon behind the imports",
-            format!(
-                "{:.1} kg ({:.0} g/kWh)",
-                r.imported_co2_kg,
-                r.imported_co2_kg / r.imported_kwh.max(1e-9) * 1000.0
-            ),
-        );
-    }
-    // What the plan that opened the day thought the day would cost, against what
-    // it did. The seam between a forecast and a meter, in the currency everything
-    // else in this report is in — and structurally zero for as long as the
-    // planner was shown the answer, which is why it is worth printing.
-    if let Some(expected) = r.opening_plan_bill_eur {
-        row(
-            "the opening plan expected",
-            format!(
-                "{expected:.2} €, off by {:+.2}",
-                r.cost.billed_eur() - expected
-            ),
-        );
-    }
-    if r.unmet_charge_kwh > 0.01 {
-        row(
-            "car left short by",
-            format!("{:.1} kWh", r.unmet_charge_kwh),
-        );
-    } else if r.planned_charge_shortfall_kwh > 0.01 {
-        row(
-            "a plan feared falling short by",
-            format!("{:.1} kWh, and did not", r.planned_charge_shortfall_kwh),
-        );
-    }
-    row(
-        "without an Energy Guard",
-        format!("{} min", r.failsafe_minutes),
-    );
-    row(
-        "§ 14a limit respected",
-        if r.grid_event_respected {
-            "yes".to_string()
-        } else {
-            format!("NO, by {:.0} W", r.worst_overshoot_w)
-        },
-    );
-    // § 9 EEG is the other statutory limit on this connection point and it used
-    // to have no line of its own: the peak feed-in was printed beside its
-    // ceiling and left for the reader to compare, and it sat above it while the
-    // § 14a line said the day had been compliant throughout. Two rules, two
-    // answers.
-    if r.feed_in_ceiling_kw.is_some() {
-        row(
-            "§ 9 EEG ceiling respected",
-            if r.worst_feed_in_overshoot_w <= 0.0 {
-                "yes".to_string()
-            } else {
-                // Named for what it is: the connection point crossed the
-                // ceiling between two runs of the guard, which is the control
-                // period rather than a decision. A real box ticks once a
-                // second; this day ticks once a minute.
-                format!(
-                    "{:.0} W for {} min, one control period behind a load step",
-                    r.worst_feed_in_overshoot_w, r.feed_in_over_minutes
-                )
-            },
-        );
-    }
-    println!();
-    if r.risk_re_solves > 0 {
-        row(
-            "re-solved against three futures",
-            format!("{}×, because a service was at risk", r.risk_re_solves),
-        );
-    }
-    row(
-        "described in S2",
-        match r.s2_undescribed {
-            0 => format!("{} resources", r.s2_resources),
-            n => format!("{} resources, {n} it cannot express", r.s2_resources),
-        },
-    );
-    if r.widest_asset_value_ratio > 1.0 {
-        row(
-            "dearest asset vs cheapest",
-            format!("{:.0}×", r.widest_asset_value_ratio),
-        );
-    }
-    if r.relief_eur_per_kwh > 0.0 {
-        row(
-            "relief from § 14a was worth",
-            format!("{:.2} €/kWh", r.relief_eur_per_kwh),
-        );
-    }
-    if let Some(break_even) = r.modul2_break_even_kwh_per_year {
-        row("Modul 2 pays above", format!("{break_even:.0} kWh/a"));
-        row(
-            "…on this day it would have",
-            format!("{:+.2} € on the energy", r.modul2_delta_today_eur),
-        );
-    }
-    println!();
 }

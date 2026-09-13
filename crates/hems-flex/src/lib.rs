@@ -54,7 +54,7 @@ pub use describe::{
 };
 pub use instruct::{
     Direction, InstructError, actuator_factor, battery_power, dhw_power, envelope_command,
-    envelope_now, heat_pump_state, programme_start,
+    envelope_interval, envelope_now, heat_pump_state, programme_start,
 };
 pub use map::{ControlType, control_type_for, roles_for};
 pub use session::{

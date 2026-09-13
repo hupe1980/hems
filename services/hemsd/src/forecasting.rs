@@ -295,26 +295,35 @@ pub const WARM_UP_DAYS: usize = 42;
 /// simulator's own weather generator produces those days, so the history is
 /// consistent with the day that follows without being *the same as* it.
 ///
-/// `usual_load` and `usual_draw` are the household's underlying profiles — the
-/// thing the realisation perturbs, and the thing the box cannot see directly.
+/// `usual_load` is the household's underlying profile — the thing the realisation
+/// perturbs, and the thing the box cannot see directly.
+///
+/// There is deliberately **no hot-water draw here**. The tank's usual draw is a
+/// fixed prior shared by the box and the days (`hems_forecast::hotwater::draw`),
+/// so a warm-up has nothing about it to learn. The day it becomes something the
+/// box learns, it belongs on `Learned` rather than in a closure passed through
+/// here.
+///
+/// `days` is how long it watched. **Zero is a box on its first evening** — no
+/// profile, no correction, no session history — which is hour one of every real
+/// installation and is a case worth running rather than assuming (D187).
 pub fn warm_up(
+    days: usize,
     weather: &Weather,
     array: &ArrayModel,
     location: GeoPoint,
     start: OffsetDateTime,
     usual_load: impl Fn(Slot) -> Power,
-    usual_draw: impl Fn(Slot) -> Energy,
     session: Option<(Duration, Duration, Energy)>,
 ) -> Learned {
     let mut learned = Learned {
         load: LoadProfile::default(),
         roof: ResidualModel::default(),
         sessions: SessionHistory::new(),
-        days: WARM_UP_DAYS,
+        days,
     };
-    let _ = usual_draw;
 
-    for day in 1..=WARM_UP_DAYS {
+    for day in 1..=days {
         let past = weather.earlier(day as u64);
         let midnight = start - Duration::days(i64::try_from(day).unwrap_or(0));
         for k in 0..96 {
@@ -367,10 +376,39 @@ pub fn pv_forecast(
     }
 }
 
-/// The load forecast for a horizon, from the household's own history.
+/// The load forecast a box plans against — warm or **cold**.
+///
+/// One function because there are two callers and they disagreed. The running
+/// box gated on `LoadProfile::is_empty` and fell back to persistence from its
+/// own meter; the reference days called `forecast` unconditionally. A profile
+/// with no history at all answers `p10 = p50 = p90 = 0` — *the house will use
+/// nothing, and I am sure* — so a simulated cold box planned against a household
+/// that does not exist, deferred every flexible kilowatt-hour into hours it
+/// believed were free, and came out **worse than having no energy manager**.
+/// That was a property of the harness rather than of the product, which is the
+/// worst kind of difference to have: it measures a path production does not run
+/// (D187).
+///
+/// It takes the **profile** rather than either of this daemon's two `Learned`
+/// types, because the decision is about the profile: a caller that has one can
+/// ask, whichever bundle it keeps it in.
+///
+/// `measured_now` is what the household's own meter says at the start of the
+/// horizon. `None` where nothing is measuring it, and then there is no forecast
+/// to be had: a box that cannot read its own connection point has no load to
+/// persist and inventing one would plan a house nobody is watching.
 #[must_use]
-pub fn load_forecast(learned: &Learned, horizon: Horizon) -> Forecast {
-    learned.load.forecast(horizon)
+pub fn load_forecast(
+    profile: &LoadProfile,
+    horizon: Horizon,
+    measured_now: Option<Power>,
+) -> Option<Forecast> {
+    if !profile.is_empty() {
+        return Some(profile.forecast(horizon));
+    }
+    // Doubling by this time tomorrow, which is about what a single reading is
+    // worth twenty-four hours out.
+    measured_now.map(|recent| hems_forecast::naive::persistence(recent, horizon, 0.9))
 }
 
 /// The charging session the planner should be given at `now`.

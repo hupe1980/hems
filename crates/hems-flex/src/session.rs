@@ -851,9 +851,7 @@ mod tests {
     use super::*;
     use crate::describe::{describe_battery, describe_heat_pump};
     use crate::resource_manager_details;
-    use hems_core::asset::{
-        Asset, AssetMeta, Battery, Capabilities, Chemistry, HeatPump, HeatPumpControl,
-    };
+    use hems_core::asset::{Asset, AssetMeta, Battery, Capabilities, HeatPump, HeatPumpControl};
     use hems_core::prelude::{CircuitId, Energy, PhaseConnection, PhaseMode, Soc};
     use s2energy::common::{HandshakeResponse, SelectControlType};
     use time::macros::datetime;
@@ -877,7 +875,6 @@ mod tests {
             soc_min: Soc::new(0.05).unwrap(),
             soc_max: Soc::FULL,
             reserve_soc: Soc::new(0.1).unwrap(),
-            chemistry: Chemistry::Lfp,
             grid_charging_allowed: true,
         }
     }

@@ -36,10 +36,10 @@ Some devices are **semi-continuous**: off, or somewhere between a minimum and a
 maximum, with nothing in between. Asking a three-phase charge point for 3,7 kW is
 asking for 5,3 A, and it answers by charging nothing at all.
 
-Every layer above has to know that, and until `realisable` existed none of them
-did: the arbiter commanded the value, the energy tracker counted it as delivered,
-the plan fell behind by exactly that much and compensated in the next slot, and
-the only place the truth appeared was the meter.
+Every layer above has to know that, which is what `realisable` is for. Without
+it the arbiter commands the value, the energy tracker counts it as delivered, the
+plan falls behind by exactly that much and compensates in the next slot — and the
+only place the truth appears is the meter.
 
 A request below the minimum resolves to **zero**, not up to the minimum. Rounding
 *up* is the tempting choice — a semi-continuous device can deliver a fractional
@@ -380,16 +380,16 @@ wrongly. Most German heat pumps are not that. A Stiebel, Vaillant, Viessmann or
 Bosch unit answers Modbus all day and publishes no model list at all: the
 register numbers are in a PDF, and every unit's are different.
 
-`modbus::registers` is the driver for that, and it was written for **one
+`modbus::registers` is the driver for that, and what it is mainly for is **one
 measurement**. The planner models the building, learns which house it is from the
 household's own record, and can start the compressor — and all of it is gated on
-an *indoor temperature*, which no EEBUS use case carried at the time and which a
-heat pump had been publishing in a register the whole time.
+an *indoor temperature*, which most installed heat pumps publish in a register
+and nowhere else.
 
-EEBUS caught up: `hvac::mrt` carries a room temperature, so a unit that speaks it
-needs no register map. This remains the path for everything that does not, which
-is most of the installed base — and it is the **alternative** rather than a
-companion, because both measure and one asset gets one meter.
+`hvac::mrt` carries a room temperature, so a unit that speaks EEBUS needs no
+register map. Registers are the path for everything that does not, which is most
+of the installed base — and the **alternative** rather than a companion, because
+both measure and one asset gets one meter.
 
 A point declares five things and guesses none of them:
 

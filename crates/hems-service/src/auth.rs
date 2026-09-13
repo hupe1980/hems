@@ -411,6 +411,15 @@ pub const EVERY_TENANT: &str = "*";
 pub struct Credentials {
     sites: Vec<(String, String)>,
     operators: Vec<(SiteScope, String)>,
+    /// Credentials whose authority is given outright rather than derived from a
+    /// site or a tenant.
+    ///
+    /// The general form the two above are conveniences for. It exists because a
+    /// household's box issues credentials of its own to the energy managers it
+    /// has connected, and *which* manager presented one has to survive into the
+    /// [`Authority`] — otherwise a household can see that something is driving
+    /// its battery and not what.
+    named: Vec<(Authority, String)>,
 }
 
 impl Credentials {
@@ -455,6 +464,9 @@ impl Credentials {
                     Ok((scope, credential.token.resolve_from_process()?))
                 })
                 .collect::<Result<_, crate::ConfigError>>()?,
+            // A fleet service names its principals in configuration; the named
+            // form is the box's, where they are issued at run time.
+            named: Vec::new(),
         })
     }
 
@@ -482,10 +494,24 @@ impl Credentials {
         self
     }
 
+    /// A credential whose authority is stated outright.
+    ///
+    /// The general case [`Credentials::with_site`] and
+    /// [`Credentials::with_operator`] are shorthands for. Its purpose is a
+    /// **named** principal: a box issues one credential per energy manager it
+    /// has been connected to, and the subject is what lets a household see which
+    /// of them is driving its house and withdraw one without disturbing the
+    /// others.
+    #[must_use]
+    pub fn with_authority(mut self, authority: Authority, token: impl Into<String>) -> Self {
+        self.named.push((authority, token.into()));
+        self
+    }
+
     /// Whether anything at all is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.sites.is_empty() && self.operators.is_empty()
+        self.sites.is_empty() && self.operators.is_empty() && self.named.is_empty()
     }
 
     /// What `token` is allowed to do, if anything.
@@ -503,6 +529,11 @@ impl Credentials {
         for (scope, secret) in &self.operators {
             if constant_time_eq(token.as_bytes(), secret.as_bytes()) {
                 found = found.or_else(|| Some(Authority::operator(scope.clone())));
+            }
+        }
+        for (authority, secret) in &self.named {
+            if constant_time_eq(token.as_bytes(), secret.as_bytes()) {
+                found = found.or_else(|| Some(authority.clone()));
             }
         }
         found

@@ -797,17 +797,6 @@ pub fn household_load(observed: &Observed) -> Option<Power> {
     Some((grid - assets).max(Power::ZERO))
 }
 
-/// The per-asset powers a caller can read straight out of an [`Observed`].
-#[must_use]
-pub fn powers(observed: &Observed) -> BTreeMap<AssetId, Power> {
-    observed
-        .state
-        .assets
-        .iter()
-        .filter_map(|(id, m)| m.power.map(|p| (id.clone(), p)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

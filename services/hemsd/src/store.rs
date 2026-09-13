@@ -114,6 +114,20 @@ const LEARNED: TableDefinition<&str, &[u8]> = TableDefinition::new("learned");
 /// The box's EEBUS identity and trust store. One row, under `"self"`.
 const IDENTITY: TableDefinition<&str, &[u8]> = TableDefinition::new("identity");
 
+/// The energy managers this household has connected, by name.
+///
+/// A table of its own rather than a key in [`IDENTITY`], because there are many
+/// of them and they are added and withdrawn one at a time — which is the whole
+/// point of naming them.
+const MANAGERS: TableDefinition<&str, &[u8]> = TableDefinition::new("managers");
+
+/// The key the box's own API token sits under in [`IDENTITY`].
+///
+/// A named constant rather than a literal at two call sites: a reader and a
+/// writer that disagreed about the spelling would produce a box that issues a
+/// fresh token on every boot and never says why.
+const API_TOKEN: &str = "api-token";
+
 /// The failsafe a network operator wrote, per direction.
 const FAILSAFE: TableDefinition<&str, &[u8]> = TableDefinition::new("failsafe");
 
@@ -414,6 +428,7 @@ impl Store {
             sql!(write.open_table(OUTBOUND))?;
             sql!(write.open_table(OUTBOUND_OWED))?;
             sql!(write.open_table(OUTBOUND_BY_EVENT))?;
+            sql!(write.open_table(MANAGERS))?;
 
             let mut meta = sql!(write.open_table(META))?;
             let found = sql!(meta.get("schema"))?.map(|v| v.value());
@@ -472,6 +487,82 @@ impl Store {
             sql!(table.insert("self", bytes.as_slice()))?;
         }
         sql!(write.commit())
+    }
+
+    /// The bearer token this box answers its own surfaces with, if it has
+    /// issued one.
+    ///
+    /// In the identity table beside the EEBUS key and under its own name,
+    /// because it is the same kind of fact: a credential an installer reads off
+    /// a screen once, which has to survive a reboot or the reading has to be
+    /// done again (`runtime::access`).
+    ///
+    /// # Errors
+    /// [`StoreError`] where the read fails.
+    pub fn api_token(&self) -> Result<Option<String>, StoreError> {
+        let read = sql!(self.db.begin_read())?;
+        let table = sql!(read.open_table(IDENTITY))?;
+        match sql!(table.get(API_TOKEN))? {
+            Some(bytes) => Ok(Some(decode(0, bytes.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Keep the token this box issued itself.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the write fails.
+    pub fn put_api_token(&self, token: &str) -> Result<(), StoreError> {
+        let bytes = encode(&token.to_owned())?;
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut table = sql!(write.open_table(IDENTITY))?;
+            sql!(table.insert(API_TOKEN, bytes.as_slice()))?;
+        }
+        sql!(write.commit())
+    }
+
+    /// Every energy manager this household has connected, by name.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the read fails.
+    pub fn managers(&self) -> Result<Vec<(String, String)>, StoreError> {
+        let read = sql!(self.db.begin_read())?;
+        let table = sql!(read.open_table(MANAGERS))?;
+        let mut out = Vec::new();
+        for row in sql!(table.iter())? {
+            let (name, token) = sql!(row)?;
+            out.push((name.value().to_owned(), decode(0, token.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Connect one, or replace the credential of one already connected.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the write fails.
+    pub fn put_manager(&self, name: &str, token: &str) -> Result<(), StoreError> {
+        let bytes = encode(&token.to_owned())?;
+        let write = sql!(self.db.begin_write())?;
+        {
+            let mut table = sql!(write.open_table(MANAGERS))?;
+            sql!(table.insert(name, bytes.as_slice()))?;
+        }
+        sql!(write.commit())
+    }
+
+    /// Withdraw one. Returns whether it was connected.
+    ///
+    /// # Errors
+    /// [`StoreError`] where the write fails.
+    pub fn forget_manager(&self, name: &str) -> Result<bool, StoreError> {
+        let write = sql!(self.db.begin_write())?;
+        let existed = {
+            let mut table = sql!(write.open_table(MANAGERS))?;
+            sql!(table.remove(name))?.is_some()
+        };
+        sql!(write.commit())?;
+        Ok(existed)
     }
 
     /// The failsafe a network operator last wrote, for `direction`.
@@ -1084,6 +1175,12 @@ impl Store {
             sql!(sql!(write.open_table(OUTBOUND))?.retain(|_, _| false))?;
             sql!(sql!(write.open_table(OUTBOUND_OWED))?.retain(|_, ()| false))?;
             sql!(sql!(write.open_table(OUTBOUND_BY_EVENT))?.retain(|_, _| false))?;
+            // The energy managers with it. A box that changed hands carrying
+            // these would let the previous household's aggregator go on driving
+            // the new one's battery — the same fault as keeping the EEBUS
+            // identity, which is what RED/EN 18031 asks a factory reset to
+            // prevent (D188).
+            sql!(sql!(write.open_table(MANAGERS))?.retain(|_, _| false))?;
             // The counters go with it — a reset box hands out identifiers from
             // one again, like the box it now is — and the schema row stays, so
             // the next open runs no migration.
@@ -1331,6 +1428,10 @@ mod tests {
                 NOW,
             )
             .unwrap();
+        store.put_api_token("a-token-somebody-was-given").unwrap();
+        store
+            .put_manager("aggregator-nord", "its-own-credential")
+            .unwrap();
         store.put_quarter_hour(&quarter(NOW), NOW).unwrap();
         store.put_control_event(&event(NOW)).unwrap();
         // Everything the fleet is owed, taken — a reset refuses otherwise.
@@ -1351,6 +1452,11 @@ mod tests {
         store.factory_reset().expect("a drained box resets");
 
         assert_eq!(store.eebus_failsafe("consumption").unwrap(), None);
+        // The credentials go too. A box that changed hands carrying these would
+        // let whoever held them read the new household's electricity, and let
+        // the previous household's aggregator go on driving its battery (D188).
+        assert_eq!(store.api_token().unwrap(), None);
+        assert!(store.managers().unwrap().is_empty());
         assert_eq!(store.eebus_identity().unwrap(), None);
         assert!(store.control_events().unwrap().is_empty());
         assert!(store.quarter_hours().unwrap().is_empty());

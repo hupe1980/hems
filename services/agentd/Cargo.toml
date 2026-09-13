@@ -34,7 +34,6 @@ time         = { workspace = true }
 tokio-util   = { workspace = true }
 tokio        = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing      = { workspace = true }
-tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 # **The fleet view this daemon reads, in the end-to-end test only.**

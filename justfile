@@ -103,8 +103,9 @@ test-crate crate:
     cargo test -p {{ crate }} --all-features
 
 # 🛡️ Workspace guards: citations, the event catalogue, publishable manifests,
-# the wire forms, that a daemon's background loops can fail its liveness, and
-# that every daemon ships an example configuration a test parses
+# the wire forms, that a daemon's background loops can fail its liveness, that
+# every daemon ships an example configuration a test parses, and that no manifest
+# declares a dependency its source never reaches
 guards:
     cargo xtask check-all
 

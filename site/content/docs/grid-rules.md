@@ -129,8 +129,8 @@ lends it to the inverter, minus the part it could not call back before its next
 tick: a draw it is commanding away this second, a draw it only guessed from a
 nameplate, and the share of a thermostat's draw that `lend_window` says is longer
 than one control period away. A heat pump answering its own safety limit drops a
-kilowatt nobody asked it to, and until this rule existed that kilowatt was
-already spent on the roof.
+kilowatt nobody asked it to; without the deduction that kilowatt is already spent
+on the roof.
 
 Two further readings go the conservative way, and both are places where the
 tempting default is the unsafe one:
@@ -269,14 +269,13 @@ now counts only within sixty seconds of a heartbeat — the implementation
 guide's own window, and the same gate the `eebus` crate's certifiable machine
 runs.
 
-A second exploration runs **both** machines — the one the reference days drive
-and the certifiable one a real box runs — through the same alphabet in lockstep,
-and asserts they agree on the ceiling, on whether an operator is in control and
-on the state itself after every edge. The time grains land *on* each constant the
-specification names as well as either side of it, because a boundary the alphabet
-steps over is one no test can see: "no heartbeat for 120 s" means the release
-happens on the stroke of 120, and that second is where a certification laboratory
-measures.
+It explores the machine a box actually runs, and so do the reference days: two
+implementations of a certifiable state machine disagree, and the one that is
+wrong is whichever the laboratory is not looking at. The time grains land *on*
+each constant the specification names as well as either side of it, because a
+boundary the alphabet steps over is one no test can see — "no heartbeat for
+120 s" means the release happens on the stroke of 120, and that second is where a
+certification laboratory measures.
 
 `init` and `failsafe` are also not § 14a events. The limit in force there is the
 device's own preconfigured value, applied because nothing is talking to it — the
@@ -719,11 +718,20 @@ neighbours" suggests. Network charges, the Stromsteuer, the Konzessionsabgabe an
 `hemsd simulate --day winter --sharing` runs the comparison, and the **baseline
 is in the same community**: a household joins one and then does nothing about it,
 and the key allocates it anyway. Leaving the baseline outside would report the
-value of the *membership* as though the planner had produced it. On the reference
-winter day membership alone is worth **€0,88** to a household that does nothing,
-and the planner's shifting adds **€0,19** on top; the day settles **14,5 kWh**
-through the community, from its own quarter-hour registers and through the same
-allocation a Nachweis would use.
+value of the *membership* as though the planner had produced it. The day settles
+**12,9 kWh** through the community against the **3,9 kWh** the same key allocates
+a member who does nothing — from its own quarter-hour registers, through the same
+allocation a Nachweis would use, and **€2,00** of credit against **€0,60**. It is
+measured on the allocation rather than on a difference of two savings: on a
+January day that difference is three cents, which is noise with a sign.
+
+**It runs a year on from the winter day's own date**, because § 42c Abs. 4 Nr. 1
+obliges a network operator to make sharing possible only from **1 June 2026** and
+every reference day is dated before that. Both sides move together, by whole
+weeks, so the weekday and the load profile's day type survive and the household
+inside a community is measured against the same Thursday as the one outside it. A
+household in a community on a day the rule does not reach is refused rather than
+settled: an allocation before the duty is one no operator would perform.
 
 Whether a delivery point may take part at all is a metering question
 (Zählerstandsgangmessung *or* quarter-hourly registrierende Leistungsmessung,

@@ -31,6 +31,9 @@ store_path = "/var/lib/hemsd/hemsd.redb"
 # at half past two" has an answer. Served at `/v1/series/{point}`, where a point
 # is `grid`, `netzwirksam` or an asset id.
 #
+# Two tiers: seconds for `keep_days`, and quarter-hour means for three years. The
+# answer says which of the two it is.
+#
 # A **separate** store from `store_path`, holding no settlement quantity: a
 # series field is an `f64` and a MiSpeL register is an exact decimal.
 #
@@ -38,8 +41,9 @@ store_path = "/var/lib/hemsd/hemsd.redb"
 # than an empty list — nothing kept and nothing happened are different answers.
 [series]
 path = "/var/lib/hemsd/series"
-# A diagnostic window, not the statutory one: `[A1 7.3]`'s two years are the
-# events and registers above.
+# How long the *second-by-second* tier is kept. A diagnostic window, not the
+# statutory one: `[A1 7.3]`'s two years are the events and registers above, and
+# the household's own three years are the quarter-hour tier.
 keep_days = 7
 
 # ── The shell ────────────────────────────────────────────────────────────────
@@ -204,6 +208,29 @@ comfort_max_c = 23.0
 
 dhw_litres = 300.0
 dhw_heater_kw = 0.5
+# Thermal kilowatt-hours per electrical one: **1,0 for a plain immersion heater**,
+# around 3,0 for a hot-water heat pump. It is the difference between a tank that
+# costs a kilowatt-hour to fill and one that costs three, so a household fitted
+# with the first and planned as the second has its hot water priced at a third of
+# what it pays.
+dhw_cop = 3.0
+# Standing loss, watts — the reason the tank is cold in the morning.
+dhw_standing_loss_w = 45.0
+# The three temperatures, °C. `t_min` is the lowest acceptable: below it somebody
+# has a cold shower, which the plan *pays for* rather than forbidding, because a
+# hard constraint makes an ordinary morning infeasible whenever the tank started
+# the day cold. `t_max` is the highest **safe** temperature — a scald bound, not a
+# target. The plan uses everything between them as a store.
+#
+# `t_set` is the one that is easy to misread: it is **not** a bound on the plan.
+# It is where this household's own thermostat would sit with no energy manager at
+# all, so it is what the *baseline* is held at — and therefore what the saving on
+# the day report is measured against. Setting it to `t_max` says the household
+# would otherwise keep its water at the scald bound all day, which will make the
+# manager look better than it is.
+dhw_t_min_c = 45.0
+dhw_t_set_c = 55.0
+dhw_t_max_c = 60.0
 
 # The charge point's largest current per conductor. 16 A three-phase is the
 # ordinary "11 kW" wallbox, 32 A the "22 kW" one; zero says the household has
@@ -496,6 +523,56 @@ trust = []
 # second one that found this box would be refused. Turn it off on a segmented
 # network, or where something else announces on this box's behalf.
 announce = true
+
+# ── Who may ask this box anything ────────────────────────────────────────────
+#
+# `/v1/*` and `/s2/*` need a bearer token; `/livez`, `/readyz` and `/metrics` do
+# not, because they carry no household data and an orchestrator should not hold a
+# household's credential to restart a crashed box.
+#
+# **Leave this out and the box issues its own**, keeps it in its store beside the
+# EEBUS key, and prints it at start-up next to the SKI — the two credentials a
+# commissioning visit carries away. Set it only where something else already
+# provisions credentials; `env:` and `file:` work, and a token written literally
+# into this file is a token in a backup.
+#
+# An **energy manager** gets a credential of its own, connected by name while the
+# box runs rather than configured here:
+#
+#   curl -sX PUT -H "Authorization: Bearer $TOKEN" \
+#       http://localhost:8080/v1/managers/aggregator-nord
+#
+# `GET /v1/managers` lists them, `DELETE` withdraws one. The token is shown once.
+[api]
+# token = "env:HEMS_API_TOKEN"
+
+# ── Being managed by somebody else's energy manager ──────────────────────────
+#
+# S2 (EN 50491-12-2) is the European interface between a Customer Energy Manager
+# and the Resource Managers in a building. Everywhere else in this file the box
+# is the manager; here it is the *managed* — turn it on where the household has
+# delegated its optimising to an aggregator or a flexibility service.
+#
+# A manager opens one WebSocket per resource at `ws://<this box>/s2/<asset>`,
+# because no S2 message carries a resource identifier. It rides on the same
+# socket as `[service] listen`.
+#
+# **An instruction outranks this box's own plan and is narrowed by the guard like
+# everything else**: a manager cannot ask its way past a § 14a ceiling, and a
+# person pressing *boost* in the kitchen outranks it. `[A1 4.6 S. 3]`.
+[s2]
+enabled = false
+# How long an instruction is believed. One market interval: a manager that has
+# gone quiet — a crashed process, a cut cable, a certificate that lapsed — must
+# not hold this household at whatever it last said for as long as the box runs,
+# and on expiry the asset goes back to the box's own plan with nothing having to
+# be cancelled.
+instruction_for_secs = 900
+# How often the household's own measurements go back to a connected manager. S2
+# owes a manager a status while the connection is up, and a manager planning
+# against a fill level it last saw a minute ago is planning against a different
+# house.
+report_every_secs = 5
 
 # ── What speaks to the hardware ──────────────────────────────────────────────
 #

@@ -459,20 +459,6 @@ pub struct PvArray {
     pub para9: Para9Status,
 }
 
-/// Battery chemistry, because degradation behaves differently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
-pub enum Chemistry {
-    /// Lithium iron phosphate — cheap cycles, the home-storage default.
-    #[default]
-    Lfp,
-    /// Nickel manganese cobalt — denser, markedly more cycle-sensitive.
-    Nmc,
-    /// Anything else; the optimiser uses conservative defaults.
-    Other,
-}
-
 /// A stationary battery.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -497,9 +483,6 @@ pub struct Battery {
     /// below it; only an islanded system may use it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub reserve_soc: Soc,
-    /// Cell chemistry.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub chemistry: Chemistry,
     /// Whether the system can charge from the grid at all. A storage system that
     /// cannot is outside MiSpeL entirely and always "green".
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1158,7 +1141,6 @@ mod tests {
             soc_min: Soc::new(0.05).unwrap(),
             soc_max: Soc::new(0.95).unwrap(),
             reserve_soc: Soc::new(0.30).unwrap(),
-            chemistry: Chemistry::Lfp,
             grid_charging_allowed: true,
         };
         assert_eq!(b.discharge_floor(), Soc::new(0.30).unwrap());

@@ -278,8 +278,23 @@ planned anyway has made S2's argument and declined the consequence.
 
 hems is a CEM in its ordinary deployment, so this is the case where a household
 has deliberately handed an asset to somebody else's manager — an aggregator, a
-landlord's building manager. The session is built and tested; the wiring is not,
-which is why `hems_flex::session` emits an *event* rather than a setpoint. See
+landlord's building manager.
+
+It is **built**, and the ordering above is machine-checkable rather than a
+paragraph: an instruction becomes a `CemRequest` the arbiter reads before it
+reads the plan, a setpoint a manager decided carries its own reason, and the
+property test that says *no input can make the arbiter exceed a grid limit* draws
+a CEM instruction among its inputs. The socket is one WebSocket per resource at
+`/s2/{asset}` — the path names the resource because no S2 message does — and it
+is off until a household turns it on.
+
+Two details are load-bearing. A request **expires**, because a manager that stops
+talking would otherwise hold a household at whatever it last said for as long as
+the box runs; on expiry the asset returns to the box's own plan with nothing
+cancelled. And when the guard takes an instruction back, the manager is **told** —
+an `ABORTED` on the wire, once per instruction. By the time a network operator's
+reduction arrives the instruction has long since been answered `ACCEPTED`, and an
+aggregator that is never told has sold flexibility the grid already took. See
 [flexibility](@/docs/flexibility.md).
 
 ## Why everything is sans-I/O
@@ -350,14 +365,10 @@ control plane:
   and a handshake — and no protocol logic at all, so the daemon holds no copy of
   the machine.
 
-  The **simulator** does hold one, and saying otherwise would be the comfortable
-  version: the reference days need to drive a whole § 14a day in virtual time, so
-  hems keeps its own sans-I/O limitation machine for them. Two implementations is
-  a liability whoever holds them, so the two are driven through one event
-  alphabet in lockstep, breadth-first over every reachable state, and the
-  effective limit, the controlled flag and the state name are asserted after
-  every edge. Collapsing to one is on the backlog; what is not optional is
-  something that fails the moment they disagree.
+  Nor does anything else: the **reference days drive that same machine**, so
+  every § 14a compliance figure the product quotes comes from the one a household
+  has. Two implementations of a certifiable state machine disagree, and the one
+  that is wrong is whichever the laboratory is not looking at — so there is one.
 
 ## The box's two outbound questions
 

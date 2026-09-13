@@ -70,7 +70,7 @@ a set of capabilities. The interesting ones are not the obvious ones.
 | `Battery` | asymmetric charge and discharge ratings, a **backup reserve** that is a promise, and round-trip efficiency that belongs in the *fill rate* rather than in the power |
 | `Evse` | a charge point is off, or at **at least 6 A per conductor** (IEC 61851). There is nothing in between, and a plan that trickles 500 W into it delivers nothing |
 | `HeatPump` | how it is controlled — a ceiling, or one of the four SG Ready contact states — is a different fact from what it draws |
-| `DhwTank` | a store, not a second thermal model: three hundred litres between 45 and 60 °C are five kilowatt-hours of heat that can be bought hours before they are used |
+| `DhwTank` | a store, not a second thermal model: three hundred litres between 45 and 60 °C are five kilowatt-hours of heat that can be bought hours before they are used. All five facts are the **installation's** — volume, heater, coefficient (1,0 for an immersion heater, 3,0 for a hot-water heat pump), standing loss, and the three temperatures. `t_set_c` is the one that is easy to misread: it bounds nothing the plan does, and it is where the household's own thermostat would sit with no manager at all — so it is what the *baseline* is held at, and therefore what the saving is measured against |
 | `PvArray` | its § 9 EEG status is a **declaration** about the installation, not an inference from its nameplate |
 | `FlexibleLoad` | `LoadKind::Shiftable` **carries** the `Programme` it will run, quarter hour by quarter hour |
 
@@ -194,26 +194,22 @@ plan and the house to disagree about physics for numerical reasons.
 ### The heat nobody paid for
 
 The model carries two more numbers: an effective **solar aperture** and a
-constant **internal gain**. Together they are the heat the house gets whether or
-not the compressor runs — the sun through the glazing, and the people, the
-cooking and everything electric that ends up warm.
+constant **internal gain** — the sun through the glazing, and the people, the
+cooking and everything electric that ends up warm. Both are identified from the
+household's own record along with the fabric.
 
-They are there because leaving them out is not a smaller model but a **wrongly
-signed** one. The average archetype loses `(21 − T_out) / 6` kW: 2,7 kW at 5 °C
-outdoors. A clear March noon puts about 550 W/m² on a vertical south plane, which
-through a 4,5 m² aperture is 2,5 kW, and the internal gains are another 0,45 — so
-on the days a heating plan is most worth making, the free heat *exceeds the
-demand*, and even at −2 °C in January it is about half of it. A planner that does
-not model it heats a room the sun is already warming and then pays the comfort
-slack for the overshoot. Measured on the reference days, giving the house its
-free heat took the January heat pump from 26,5 kWh to 21,7 and the sunny-May one
-from 10,4 to 2,7 — the second being the figure that says how wrong the old model
-was, because a well-insulated German house does not heat on 15 May.
+They are first-order, not a refinement. The average archetype loses
+`(21 − T_out) / 6` kW, which is 2,7 kW at 5 °C outdoors; a clear March noon puts
+about 550 W/m² on a vertical south plane, and 4,5 m² of aperture turns that into
+2,5 kW, with the internal gains another 0,45. **On the days a heating plan is
+most worth making, the free heat exceeds the demand**, and in January it is about
+half of it. A plan without it heats a room the sun is already warming and pays
+the comfort slack for the overshoot — the opposite of the way a conservative
+omission would be wrong.
 
-It costs the planner nothing. The state equation is already linear in the heat
-input and the free heat is a *known constant* in each slot rather than a
-decision, so it is an offset on the right-hand side: no new coefficient, no new
-variable, and the programme stays linear.
+It costs the programme nothing: the state equation is already linear in the heat
+input, and free heat is a *known constant* per slot rather than a decision, so it
+is an offset on the right-hand side.
 
 ## Everything takes time as a parameter
 

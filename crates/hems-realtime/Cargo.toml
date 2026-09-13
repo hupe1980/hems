@@ -16,7 +16,6 @@ hems-core   = { workspace = true }
 hems-device = { workspace = true }
 hems-grid   = { workspace = true }
 serde     = { workspace = true, optional = true }
-thiserror = { workspace = true }
 time      = { workspace = true }
 
 [features]

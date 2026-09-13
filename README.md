@@ -231,9 +231,17 @@ Five lines there are not in anybody else's table, and the
   battery, a wallbox that starts on plug-in and ordinary thermostats, against the
   **same weather** and under the **same grid rules**. A saving computed any other
   way flatters itself.
-- **saved / …of it on the bill** — €1,94 against €3,18. The saving counts the
+- **saved / …of it on the bill** — €2,18 against €2,99. The saving counts the
   battery life, the comfort and the service the plan spent; the bill is the
   flattering number every other system quotes.
+- **…if the quarter hour were netted** — how the bill is *accumulated* moves the
+  saving, and nobody publishes their convention. A two-register meter does not
+  net: a quarter hour with seven minutes of import and seven of export registers
+  both, and is billed for both at two different prices. hems accumulates tick by
+  tick with the directions priced apart, on both sides of the comparison. The
+  line says what the shortcut would be worth — here **−€0,93 of a €2,99 bill
+  saving**, running *against* this product, because the unmanaged household is
+  the one whose heat pump cycles under a roof that is still producing.
 - **…covered by the store** — `[A1 2.3]` in one number: kilowatt-hours the
   battery lent the controllable devices during the reduction, which never crossed
   the connection point.
@@ -246,8 +254,8 @@ Five lines there are not in anybody else's table, and the
 
 The three forecast lines are the evidence for the money lines: the planner is
 given only what six weeks of the box's own metering could have taught it, and
-`--perfect-foresight` shows what a saving quoted without that measures — **€4,55
-against €1,94** on this day.
+`--perfect-foresight` shows what a saving quoted without that measures — **€4,78
+against €2,18** on this day.
 
 ## 💡 What makes it different
 
@@ -290,14 +298,36 @@ Seven claims, each argued on the site rather than here.
 
 Every regulatory number carries the document and clause it comes from —
 `[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
-all 450 of them against an index of primary sources, **failing the build** if one
+all 458 of them against an index of primary sources, **failing the build** if one
 names a document the index does not carry. `cargo xtask check-wire` does the same
-for the 124 quantities and instants, each of which has to say how it travels, and
-`cargo xtask check-vital` for a daemon's background loops: one spawned outside
-`Health::vital` has a liveness probe that cannot fail, which is worse than none.
+for the 130 quantities and instants, each of which has to say how it travels;
+`cargo xtask check-vital` for a daemon's background loops, since one spawned
+outside `Health::vital` has a liveness probe that cannot fail, which is worse
+than none; `cargo xtask check-deps-used` for the 259 declared dependencies,
+because every crate here is published and an edge nobody uses is a resolution and
+a compile a downstream consumer pays for — and an edge from the simulator to the
+forecaster would be a path by which the day that happens could read the day that
+was expected; and `cargo xtask check-notes` for the `D`, `R` and `M` labels
+below, since a doc comment citing a decision that has been withdrawn leaves a
+reader with a code and nothing to resolve it against.
 
 The documents are third-party copyrighted publications and are not redistributed;
-the index records the retrieval URL of each.
+the index that records each retrieval URL is a working file and is not part of
+the published crates. The citation is the lookup key — `[BK6-22-300 A1 4.5.2]`
+names a Beschluss of the Bundesnetzagentur and a clause in its Anlage 1, which is
+what a network operator or a certification laboratory would ask for too.
+
+Doc comments also carry **`D`, `R` and `M` labels** — `(D168)`, `(R32)`, `(M8)`.
+They point into the architecture notes: the decision log, with the alternative
+each decision rejected; the risk register; and the milestones. Those are working
+files rather than published documentation, for the same reason a laboratory
+notebook is not a manual — they are written to be argued with, and they change
+faster than a release. The argument a label refers to is always made in the doc
+comment as well, so the label is provenance rather than a dependency: it says
+*this was decided, not assumed*, and which sibling decisions it has to stay
+consistent with. `cargo xtask check-notes` fails the build where a label resolves
+to nothing, which is how a decision withdrawn from the log stops silently
+orphaning the code that replaced it.
 
 ## 📦 Crates
 
@@ -390,8 +420,9 @@ obeys that as an instruction not to use it.
 | The guard, the allocator and the one-second arbiter | with the § 14a precedence as a property test over a thousand randomised households |
 | The receding-horizon MILP | wear, comfort, hot water, placed appliances, per-slot grid limits, a shadow price per asset, and planning against three futures |
 | Forecasting, and being scored on it | solar geometry, a residual corrector that learns *this* roof, CRPS and calibration beside the money |
-| Seven reference days end to end | plus multi-day back-test and risk sweeps |
+| Seven reference days end to end | plus a cold one — a box on its first evening, with no profile and no roof correction — and multi-day back-test and risk sweeps |
 | S2 / EN 50491-12-2 as the internal flexibility model **and as a Resource Manager** | every message a whole site would send, a count of what it cannot express, and the handshake-to-instruction session a Customer Energy Manager drives — sans-I/O, so a whole negotiation is a unit test |
+| **A Customer Energy Manager can drive this household** — the half of S2 nobody else in the field implements | one WebSocket per resource at `/s2/{asset}`, off by default. An instruction outranks the box's own plan, is outranked by whoever pressed *boost*, and is narrowed by the guard like everything else, so a manager cannot ask its way past a § 14a ceiling. It expires if the manager stops talking, and a guard override is reported back as `ABORTED` — an aggregator holding an `ACCEPTED` it was never told about has sold flexibility the grid took |
 | The driver contract, SunSpec over Modbus TCP, and the EEBUS LPC Controllable System | sans-I/O; a whole § 14a day in virtual time, and an Energy Guard writing a limit over SPINE datagrams |
 | **The hot-water tank over EEBUS MDT** — the one number that kept the optimiser's hot-water store out of every real plan | a circuit reports 52,5 °C over SPINE and the planner gets a store; a flagged sensor reaches it as an absent tank rather than a number to heat against |
 | **The heat pump over EEBUS** — the lever an energy manager never had | OHPCF starts and stops the compressor's process, which is the one use case that can ask an appliance to consume *more*; MRT reports the air temperature of each room it watches and MOT the weather at this building, which are two of the three signals a thermal model is identified from. Three use cases on one session, because SHIP grants one per peer |
@@ -407,7 +438,10 @@ obeys that as an instruction not to use it.
 | **The § 14a record and the quarter-hour registers, kept and forwarded** | the control loop writes each event as it closes, `[A1 7.3]`'s two years live on the box and are swept when they run out, and what `histd` acknowledges leaves the outbox — what it refuses stays, because a Nachweis that depends on the WAN is not one |
 | **A box reports what it metered** | `hemsd run` closes each Berlin calendar day from the rows it already wrote — so a restart at 23:50 still reports the whole day — and carries the energies, the § 14a record, the seam numbers and the scores of its own forecast bands. No cost and no baseline: a baseline is a counterfactual only a simulator can re-run, and five of the six cost terms are modelled. The fleet counts those days apart rather than averaging them in as days that saved nothing |
 | **The day report, queued before it is sent** | a signed CloudEvent to `obsd` is a row in the box's own store until the fleet takes it, signed **at each attempt** — Standard Webhooks covers the timestamp, so one made when the row was written is stale by the time a box back from an outage sends it. A `5xx` or a refused connection keeps the day; a `4xx` that is not a rate limit is `obsd` having read it and refused it, and asking again changes nothing |
+| **The household's own history, on the box that took it** | every meter reading the guard acts on: seconds for a week, quarter-hour means for three years, served at `/v1/series/{point}` as the Data Act's local API. The answer says which of the two tiers it is, because a year of quarter-hourly means labelled as one-second data is wrong about the one thing a diagnostic trace is for |
 | **The household's own say** | `boost`, `pause` and `away` per asset, expiring on their own — the one write on the local API, and safe because an override is a *desire* the guard still narrows |
+| **An energy manager gets a credential of its own** | connected by name, listed and withdrawn — it stops working on the next request, and it carries the household's capabilities *less the Data Act export*, because an aggregator drives devices and the one-second series says when somebody showered. The token is shown once, and both credentials go with a factory reset |
+| **The box authenticates its own callers** | every route it adds behind one bearer token, in one layer over the whole assembly rather than a check per handler. The box **issues the token itself** and keeps it beside the EEBUS key, so it survives a reboot and is printed at start-up next to the SKI. There is no insecure mode to configure. `/livez`, `/readyz` and `/metrics` stay open — an orchestrator should not need a household's credential to restart a crashed box |
 | The fleet daemons | prices and weather fetched, the two years stored, enrolment, signed configuration and releases, a fleet view that will not take an unsigned day |
 | **`/livez`, `/readyz` and `/metrics` on every daemon** | live and ready are different questions and an orchestrator does opposite things with the answers; `/metrics` is the third, because a pool-backed service fails by saturating its pool and a saturated pool serves `503`s while both probes stay green. The request label is the **matched route**, never the path — a hems site is called `reference-household`, so a path label would put every household into an endpoint that is scraped and kept for months |
 | **A read-only agent surface on every fleet daemon** | mounted on the port it already binds, over the state its REST routes already read, so the two cannot disagree — and each call is authorised as *its own caller* against the same credentials, so a household's token reads its own site over MCP exactly as it would over REST |
@@ -418,27 +452,33 @@ obeys that as an instruction not to use it.
 | Not yet | |
 |---|---|
 | EEBUS certification | the **device-level** half is done — all seven `ATC_*` procedures driven against the box's own store, driver and SPINE session, judged by `eebus`'s harness, six answered and the seventh skipped with its reason on the report. What is left is the protocol-level suite over a real network, interop against another implementation, and the laboratory's own stopwatch on a physical box. mDNS/DNS-SD and a pairing flow a person can drive are done |
+| **Contact with an implementation that is not ours** | both protocol surfaces are tested against the library they are built on. For EEBUS that is a known blind spot with a known fix — `eebus-go`'s controlbox in a CI job. For S2 it is the same shape and was less obvious: the CEM on the far end of `managed_by_a_cem.rs` is `s2energy`, and so is the surface it dials, so the wire types are the standard's (generated from its JSON Schema) and the **session** is hand-written on both ends. `s2-analyzer` validates a live connection against those schemas and `s2-python` is a second stack; both are a CI job away. Until then "it can be driven by somebody else's energy manager" is a claim about one library's reading of EN 50491-12-2 |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
-| Controlling devices rather than only being controlled | the EEBUS CEM role, an S2 adapter, V2H/V2G, Matter DEM |
+| Controlling devices rather than only being controlled | the EEBUS CEM role, V2H/V2G, Matter DEM. The S2 side is the other direction and is built |
+| A wallbox a manager can schedule rather than only cap | over S2 it is offered as an envelope, because describing it as a *store* means answering how many kilowatt-hours the car is holding — and the pack size reaches the box as the planner's input rather than as a fact about the site |
 
-1 112 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 127 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (492 citations across five document
+clock, the whole suite, the workspace guards (458 citations across five document
 families, each resolving to a document the index carries; 130 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
-Five of those tests are worth naming because of what they guard against. One
+Six of those tests are worth naming because of what they guard against. One
 asserts the reference day's forecasts were **wrong**, since a day the planner
 cannot be surprised by measures a planner that was shown the answer. One runs the
 day's own quarter-hour registers through the § 42c allocation. One checks that
-every asset the arbiter commands can be described in S2. One hangs a socket
+every asset the arbiter commands can be described in S2, and another lets the
+standard's **own** client drive the box across a real WebSocket — because a test
+that spoke to itself through two copies of our code would agree with itself about
+the wire format, which is the one thing a standard exists to prevent. One hangs a socket
 up in the middle of a device discovery and insists the reading that comes back
 afterwards is still the right number. And one explores **every reachable state**
-of the § 14a limitation machine — breadth-first, deduplicated on the timing
-differences the machine actually compares — and checks four invariants in each;
-its first run found a write-window defect two thousand random steps had sampled
-past for the life of the project. A rule module can be implemented, cited,
+of the § 14a limitation machine a real box runs — breadth-first, deduplicated on
+the timing differences the machine actually compares, about two hundred thousand
+edges — and checks four invariants and a liveness bound in each; its first run
+found a write-window defect two thousand random steps had sampled past for the
+life of the project. A rule module can be implemented, cited,
 tested and reached by nothing at all, and no property test catches that — a
 property is a statement about code that runs.
 
@@ -468,8 +508,9 @@ downtime, and a settlement quantity should be a `NUMERIC` the database can add u
 rather than a decimal written into a `TEXT` column.
 
 The box also keeps a **`chronix`** store beside the `redb` one for its own
-one-second series — every meter reading the guard acts on, kept seven days and
-served at `/v1/series/{point}`. `meterstore` — PostgreSQL for the recent window,
+series — every meter reading the guard acts on, seven days of seconds and three
+years of quarter-hour means, served at `/v1/series/{point}`, which says which of
+the two answered. `meterstore` — PostgreSQL for the recent window,
 Apache Iceberg for history — is the fleet's equivalent and is not a dependency
 yet.
 

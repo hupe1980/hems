@@ -66,13 +66,13 @@ Seven days, and six comparisons run against them. The days:
 
 | Day | What it shows | Saved |
 |---|---|---|
-| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €1,94 |
-| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,84 |
-| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,57 |
-| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,37 |
-| `offline` | **the planner switched off** — what the box does on its own | €7,99 |
-| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,84 |
-| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,01 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €0,89 |
+| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €2,18 |
+| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,98 |
+| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,81 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,61 |
+| `offline` | **the planner switched off** — what the box does on its own | €8,12 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,97 |
+| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,01 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €1,04 |
 
 What each comparison isolates, and why a reference day is built the way it is,
 are on [simulation and evaluation](@/docs/simulation.md).
@@ -227,22 +227,33 @@ short of two hours is a tariff nobody may sell; a Niedertarif band written as a
 single wrapping window leaves the cheap level **unreachable** while every other
 rule passes, and the household pays for a module it can never be in.
 
-It also prints the box's **SKI**:
+It also prints the two credentials a commissioning visit carries away:
 
 ```console
 🔑 SKI  1621 7EDA 71A2 12FD 004A 1864 CFE4 F4CE 3689 D5AD
    give this to the metering point operator, so the Steuerbox trusts it
+🔑 API  0d4430ef578c7df7cf614134f4677c1700d6ce8e90f9e8b199dd339ee61c8993
+   the bearer token for this box's own surfaces, kept in its store
 ```
 
-That is the number the whole § 14a link hangs on, and field reports make handing
-it over the single most common commissioning failure there is. It follows the
-box's key, which lives in the box's own store — so it is the same number after a
-reboot, and the pairing is done once.
+The **SKI** is the number the whole § 14a link hangs on, and field reports make
+handing it over the single most common commissioning failure there is. It follows
+the box's key, which lives in the box's own store — so it is the same number
+after a reboot, and the pairing is done once.
 
-Once it is running, the box says what it is doing:
+The **token** is what opens `/v1/*` and `/s2/*`. The box issues it itself from
+the operating system's entropy and keeps it beside the key, for the same reason:
+so it survives a reboot and is read off a screen once. There is no insecure mode
+to configure — a setting with a default is a published credential — and a
+deployment that provisions its own sets `[api] token` instead. `/livez`,
+`/readyz` and `/metrics` need no credential, because an orchestrator should not
+have to hold a household's in order to restart a crashed box.
+
+Once it is running, the box says what it is doing — with the token:
 
 ```console
-$ curl -s localhost:8080/v1/status | jq '{silent, undriven, disobedient, steuve_budget_kw, minutes_without_a_plan, plan_expected_eur}'
+$ curl -s -H "Authorization: Bearer $HEMS_TOKEN" localhost:8080/v1/status \
+    | jq '{silent, undriven, disobedient, steuve_budget_kw, minutes_without_a_plan, plan_expected_eur}'
 ```
 
 `silent` is the devices it cannot hear from and `undriven` the controllable ones
@@ -254,7 +265,7 @@ device rather than trusting the acknowledgement. `minutes_without_a_plan` is
 `null` until the box has published one, and the readiness probe says why:
 
 ```console
-$ curl -s localhost:8080/readyz | jq '.probes.planner'
+$ curl -s localhost:8080/readyz | jq '.probes.planner'   # no credential needed
 { "ready": false, "detail": "no day-ahead prices", "last_good": null }
 ```
 
@@ -265,10 +276,12 @@ the fuse on:
 
 ```console
 $ curl -sX PUT localhost:8080/v1/overrides/wallbox \
+    -H "Authorization: Bearer $HEMS_TOKEN" \
     -H 'content-type: application/json' -d '{"what":"boost","minutes":90}'
 {"asset":"wallbox","what":"boost","until":"2026-09-02T06:16:30Z"}
 
-$ curl -sX DELETE localhost:8080/v1/overrides      # back to normal
+$ curl -sX DELETE -H "Authorization: Bearer $HEMS_TOKEN" \
+    localhost:8080/v1/overrides                    # back to normal
 ```
 
 `boost`, `pause` and `away`, per asset. This is the **only write** on the local
@@ -342,7 +355,7 @@ energy manager — a counterfactual only a simulator can re-run. A day from
 fleet counts those in `unmeasurable_days` rather than averaging them in as days
 that saved nothing.
 
-`saving_eur` is the reference winter day's own €1,94, which is the point: the
+`saving_eur` is the reference winter day's own €2,18, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.

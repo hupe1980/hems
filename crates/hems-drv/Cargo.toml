@@ -13,7 +13,6 @@ rust-version.workspace = true
 
 [dependencies]
 hems-core = { workspace = true }
-metering  = { workspace = true }
 serde     = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time      = { workspace = true }
@@ -42,3 +41,8 @@ modbus = ["dep:sunspec"]
 # seam `hemsd` owns. It needs the encoder unconditionally, where the library
 # needs it only with `eebus`.
 serde_json = { workspace = true }
+# The simulated Steuerbox, so the ways an operator's box goes wrong are driven
+# against the machine a real box runs rather than against a second one written
+# to be driven by it (D186). A dev-dependency and acyclic: `hems-sim` knows
+# nothing about drivers, which is what lets it simulate the other side.
+hems-sim   = { workspace = true }

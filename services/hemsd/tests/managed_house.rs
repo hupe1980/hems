@@ -658,6 +658,7 @@ async fn a_boost_reaches_the_arbiter_and_still_loses_to_the_grid() {
         limits: &limits,
         plan: None,
         overrides: &wanted,
+        cem: &std::collections::BTreeMap::new(),
         previous: &previous,
         delivered: &delivered,
         phases: &phases,

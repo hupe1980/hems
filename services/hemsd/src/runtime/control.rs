@@ -83,6 +83,20 @@ pub struct Status {
     pub silent: Vec<AssetId>,
     /// Devices whose available power is a nameplate rather than a reading.
     pub assumed_available: Vec<AssetId>,
+    /// Controllable devices whose **consumption** the guard had to assume,
+    /// because nothing measured them.
+    ///
+    /// P5's other half. The guard cannot refuse: a missing measurement still has
+    /// to produce a number, so a silent controllable device is taken to be
+    /// drawing its nameplate power — the safe answer and an expensive one. Every
+    /// watt assumed here is § 14a budget spent on a device that may be doing
+    /// nothing, and the household's car charges more slowly for it.
+    ///
+    /// Distinct from `assumed_available`, which is the *generation* side and
+    /// comes from the drivers — an inverter that cannot say what it could
+    /// produce. Two faults with two remedies, so reporting one of them is
+    /// reporting neither (R20, D182).
+    pub assumed_nominal: Vec<AssetId>,
     /// Devices that answered their last setpoint and did not act on it, with
     /// what they said about it.
     ///
@@ -137,6 +151,17 @@ pub struct Status {
     /// peak — which is exactly where a dynamic tariff has already told the plan
     /// not to be (D129).
     pub exposure: Option<Exposure>,
+    /// What a connected Customer Energy Manager is doing, where one is
+    /// connected. Empty on a box with no S2 surface.
+    pub cem: crate::runtime::s2::CemStatus,
+    /// Assets whose setpoint the **guard** is holding, named by the rule doing
+    /// it.
+    ///
+    /// Every asset, not only the managed ones: it is the answer to *why is my
+    /// car charging slowly*, which is the commonest question a household has and
+    /// the one a screen of watts cannot answer. `runtime::s2` reads it to tell a
+    /// Customer Energy Manager that its instruction was overridden.
+    pub overriding: BTreeMap<AssetId, String>,
     /// What the plan in force expects the horizon to cost, euros.
     ///
     /// The plan's own arithmetic, and every term of the objective is a term of
@@ -239,6 +264,13 @@ pub struct Live {
     pub series: Option<Arc<crate::series::Series>>,
     /// What the household itself has asked for, shared with the HTTP surface.
     pub overrides: crate::runtime::overrides::Overrides,
+    /// What a connected Customer Energy Manager has asked for, shared with the
+    /// S2 surface.
+    ///
+    /// Empty and inert on a box with no manager, which is the default: the
+    /// arbiter reads an empty map and every asset keeps the plan the box made
+    /// for itself.
+    pub cem: crate::runtime::s2::Cem,
 }
 
 /// Run the guard and the arbiter until the process is asked to stop.
@@ -258,6 +290,7 @@ pub async fn run(
         store,
         series,
         overrides,
+        cem,
     } = shared;
     let arbiter = Arbiter::new(ArbiterConfig {
         guard: GuardConfig {
@@ -281,7 +314,73 @@ pub async fn run(
 
     let started = OffsetDateTime::now_utc();
 
-    let mut carried = Carried {
+    let mut carried = carried_from(started);
+
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.clone().wait() => {
+                tracing::info!("the control loop is stopping");
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+        let now = OffsetDateTime::now_utc();
+        let began = std::time::Instant::now();
+
+        // Read afresh each tick, and expired entries drop out on the way past:
+        // an override is a *desire* the arbiter narrows, so it costs nothing to
+        // ask and a household that boosted its car this morning is not still
+        // boosting it tonight.
+        let wanted = overrides.active(now).await;
+        // The same rule, one voice down: an instruction a manager has stopped
+        // renewing drops out here rather than being cancelled, and the asset
+        // goes back to the box's own plan. See `runtime::s2`.
+        let instructed = cem.active(now).await;
+        let managed_assets: Vec<AssetId> = instructed.keys().cloned().collect();
+        let held = plan.read().await;
+        let (screen, silent) = tick(
+            &arbiter,
+            &managed,
+            &registry,
+            &wanted,
+            &instructed,
+            cem.status(now).await,
+            held.as_ref(),
+            &learned,
+            &prices,
+            store.as_ref(),
+            series.as_deref(),
+            &mut carried,
+            period,
+            now,
+        )
+        .await;
+        drop(held);
+
+        let elapsed = began.elapsed();
+        if elapsed > period {
+            carried.overruns += 1;
+            tracing::warn!(
+                took_ms = elapsed.as_millis(),
+                period_ms = period.as_millis(),
+                "a control tick took longer than its period"
+            );
+        }
+        tell_the_manager(&cem, managed_assets, &screen).await;
+        report_health(&health, &screen, silent, now);
+        *status.lock().await = screen;
+    }
+}
+
+/// What the loop carries between ticks, on the tick it starts.
+///
+/// A constructor rather than an initialiser in the middle of `run`: it is
+/// thirty lines of zeroes with two facts in it — the slot and the local day
+/// the box woke up in — and burying them in the loop that uses them is how the
+/// two get out of step with the boundary that resets the rest.
+fn carried_from(started: OffsetDateTime) -> Carried {
+    Carried {
         exposure: None,
         exposure_at: None,
         previous: BTreeMap::new(),
@@ -315,55 +414,90 @@ pub async fn run(
         storage_samples: 0,
         failsafe: None,
         evidence: hems_grid::evidence::EvidenceRecorder::new(),
-    };
-
-    loop {
-        tokio::select! {
-            biased;
-            () = shutdown.clone().wait() => {
-                tracing::info!("the control loop is stopping");
-                return;
-            }
-            _ = ticker.tick() => {}
-        }
-        let now = OffsetDateTime::now_utc();
-        let began = std::time::Instant::now();
-
-        // Read afresh each tick, and expired entries drop out on the way past:
-        // an override is a *desire* the arbiter narrows, so it costs nothing to
-        // ask and a household that boosted its car this morning is not still
-        // boosting it tonight.
-        let wanted = overrides.active(now).await;
-        let held = plan.read().await;
-        let (screen, silent) = tick(
-            &arbiter,
-            &managed,
-            &registry,
-            &wanted,
-            held.as_ref(),
-            &learned,
-            &prices,
-            store.as_ref(),
-            series.as_deref(),
-            &mut carried,
-            period,
-            now,
-        )
-        .await;
-        drop(held);
-
-        let elapsed = began.elapsed();
-        if elapsed > period {
-            carried.overruns += 1;
-            tracing::warn!(
-                took_ms = elapsed.as_millis(),
-                period_ms = period.as_millis(),
-                "a control tick took longer than its period"
-            );
-        }
-        report_health(&health, &screen, silent, now);
-        *status.lock().await = screen;
     }
+}
+/// The quarter hour is over: teach the forecasts, write the registers, close the
+/// day if it ended, and reset every tally that is per slot.
+///
+/// One function because it is one event. The tallies below are reset *together*
+/// or not at all — a forecast taught from a slot whose meters have already been
+/// cleared is a forecast taught from nothing — and a list of assignments in the
+/// middle of the control loop is a list somebody will add a field to and forget.
+#[allow(clippy::too_many_arguments)]
+async fn close_the_quarter_hour(
+    managed: &Managed,
+    learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
+    prices: &Arc<tokio::sync::RwLock<Option<hems_tariff::PriceStack>>>,
+    store: Option<&Arc<Mutex<crate::store::Store>>>,
+    carried: &mut Carried,
+    period: std::time::Duration,
+    slot: Slot,
+    now: OffsetDateTime,
+) {
+    teach(managed, learned, carried, period).await;
+    register(managed, carried, prices, store).await;
+    // After the register, because the day being closed is built from the rows
+    // this loop has written — including the one that was just written.
+    close_the_day(managed, carried, store, now).await;
+    carried.delivered.clear();
+    carried.samples = 0;
+    carried.pv_wh = 0.0;
+    carried.pv_samples = 0;
+    carried.load_wh = 0.0;
+    carried.indoor_c_sum = 0.0;
+    carried.indoor_samples = 0;
+    carried.outdoor_c_sum = 0.0;
+    carried.outdoor_samples = 0;
+    carried.heat_pump_wh = 0.0;
+    carried.grid_draw_wh = 0.0;
+    carried.grid_feed_wh = 0.0;
+    carried.device_draw_wh = 0.0;
+    carried.device_feed_wh = 0.0;
+    carried.storage_draw_wh = 0.0;
+    carried.storage_feed_wh = 0.0;
+    carried.storage_samples = 0;
+    carried.delivered_slot = slot;
+}
+
+/// Which rule is holding each commanded value, where one is.
+///
+/// The same reason chain a setpoint carries (P7), summarised per asset: the
+/// answer to *why is my car charging slowly*, which is the commonest question a
+/// household has and the one a screen of watts cannot answer.
+fn binding_rules(decision: &hems_realtime::Decision) -> BTreeMap<AssetId, String> {
+    decision
+        .commanded
+        .iter()
+        .filter_map(|(asset, value)| {
+            Some((
+                asset.clone(),
+                decision.verdict.binding_at(asset, *value)?.to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// What the guard took back from a connected Customer Energy Manager, so the S2
+/// session can tell it.
+///
+/// Computed from the decision this tick actually made rather than from the
+/// request, because an instruction the guard happens to agree with is not
+/// overridden — and a manager told its instruction was refused on every
+/// § 14a-quiet afternoon would learn to ignore the message.
+async fn tell_the_manager(cem: &crate::runtime::s2::Cem, managed: Vec<AssetId>, screen: &Status) {
+    if managed.is_empty() {
+        return;
+    }
+    cem.note_overrides(
+        managed
+            .into_iter()
+            .filter_map(|asset| {
+                let rule = screen.overriding.get(&asset)?;
+                Some((asset, rule.clone()))
+            })
+            .collect(),
+    )
+    .await;
 }
 
 /// Say whether the box is managing the house, in the two ways it can fail to.
@@ -1205,6 +1339,8 @@ async fn tick(
     managed: &Managed,
     registry: &Shared,
     overrides: &BTreeMap<AssetId, UserOverride>,
+    cem: &BTreeMap<AssetId, hems_realtime::CemRequest>,
+    cem_status: crate::runtime::s2::CemStatus,
     plan: Option<&hems_core::prelude::Plan>,
     learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
     prices: &Arc<tokio::sync::RwLock<Option<hems_tariff::PriceStack>>>,
@@ -1220,29 +1356,7 @@ async fn tick(
     // which is what makes it the right place to teach the forecasts.
     let slot = Slot::containing(now);
     if slot != carried.delivered_slot {
-        teach(managed, learned, carried, period).await;
-        register(managed, carried, prices, store).await;
-        // After the register, because the day being closed is built from the
-        // rows this loop has written — including the one that was just written.
-        close_the_day(managed, carried, store, now).await;
-        carried.delivered.clear();
-        carried.samples = 0;
-        carried.pv_wh = 0.0;
-        carried.pv_samples = 0;
-        carried.load_wh = 0.0;
-        carried.indoor_c_sum = 0.0;
-        carried.indoor_samples = 0;
-        carried.outdoor_c_sum = 0.0;
-        carried.outdoor_samples = 0;
-        carried.heat_pump_wh = 0.0;
-        carried.grid_draw_wh = 0.0;
-        carried.grid_feed_wh = 0.0;
-        carried.device_draw_wh = 0.0;
-        carried.device_feed_wh = 0.0;
-        carried.storage_draw_wh = 0.0;
-        carried.storage_feed_wh = 0.0;
-        carried.storage_samples = 0;
-        carried.delivered_slot = slot;
+        close_the_quarter_hour(managed, learned, prices, store, carried, period, slot, now).await;
     }
 
     // Counted here rather than derived from the plan's age on the screen: the
@@ -1288,6 +1402,7 @@ async fn tick(
         // reported rather than assumed.
         plan,
         overrides,
+        cem,
         previous: &carried.previous,
         delivered: &carried.delivered,
         phases: &carried.phases,
@@ -1352,6 +1467,7 @@ async fn tick(
     carried.phases.clone_from(&decision.phases);
 
     let silent = observed.silent.len();
+    let overriding = binding_rules(&decision);
     (
         Status {
             at: Some(now),
@@ -1362,6 +1478,9 @@ async fn tick(
             commanded: decision.commanded,
             silent: observed.silent.iter().cloned().collect(),
             assumed_available: observed.assumed_available.iter().cloned().collect(),
+            assumed_nominal: decision.verdict.assumed_nominal.clone(),
+            cem: cem_status,
+            overriding,
             disobedient: observed.disobedient.clone(),
             undriven: managed.undriven.clone(),
             steuve_ceiling: observed.limits.steuve_ceiling,

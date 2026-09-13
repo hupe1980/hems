@@ -239,6 +239,17 @@ pub enum Reason {
         )]
         marginal_eur_per_kwh: Option<f64>,
     },
+    /// An external Customer Energy Manager, over S2 (EN 50491-12-2).
+    ///
+    /// Above the plan and below the household, and both halves of that are
+    /// deliberate. A household that has connected a CEM has **delegated** the
+    /// optimising to it: running the box's own planner against it and letting
+    /// the planner win would make the connection ornamental, which is the
+    /// failure mode S2 exists to prevent. But a person standing in the kitchen
+    /// outranks a manager in a data centre, and both are narrowed by the guard —
+    /// a CEM is market-driven control and `[BK6-22-300 A1 4.6 S. 3]` puts a
+    /// network operator's reduction over all of it.
+    Cem,
     /// A correction inside the slot the plan could not anticipate.
     Realtime(RealtimeCause),
     /// No plan was available.
@@ -254,10 +265,12 @@ pub enum Authority {
     Realtime = 1,
     /// The optimiser's plan.
     Plan = 2,
+    /// An external Customer Energy Manager the household has connected.
+    Cem = 3,
     /// A person's explicit wish.
-    User = 3,
+    User = 4,
     /// A grid or safety rule. Nothing overrides it.
-    Guard = 4,
+    Guard = 5,
 }
 
 impl Reason {
@@ -268,6 +281,7 @@ impl Reason {
             Reason::Guard { .. } => Authority::Guard,
             Reason::User(_) => Authority::User,
             Reason::Plan { .. } => Authority::Plan,
+            Reason::Cem => Authority::Cem,
             Reason::Realtime(_) => Authority::Realtime,
             Reason::Fallback(_) => Authority::Fallback,
         }
@@ -306,6 +320,7 @@ impl fmt::Display for Reason {
                 write!(f, "plan for {slot} ({m:.4} €/kWh)")
             }
             Reason::Plan { slot, .. } => write!(f, "plan for {slot}"),
+            Reason::Cem => write!(f, "S2: a connected energy manager"),
             Reason::Realtime(c) => write!(f, "realtime: {c:?}"),
             Reason::Fallback(c) => write!(f, "fallback: {c:?}"),
         }
@@ -408,6 +423,44 @@ mod tests {
             Reason::Fallback(FallbackCause::NoPlan).authority(),
         ] {
             assert!(guard > other, "guard must outrank {other:?}");
+        }
+    }
+
+    /// Every reason survives a round trip through JSON, with its whole value.
+    ///
+    /// `Reason` is an **internally tagged** enum with newtype variants, and that
+    /// combination is one serde restricts: a tagged newtype wrapping something
+    /// that is not a map cannot be serialised at all, and it fails at *runtime*
+    /// rather than at compile time. So the type that explains every setpoint the
+    /// product issues — the one thing a household reads when it asks why its car
+    /// is charging slowly — could stop crossing the wire on a variant nobody
+    /// exercised, and nothing would say so until a box tried to report a day.
+    ///
+    /// Every variant, not a representative one, and the value compared rather
+    /// than the tag: a round-trip test that fills the fields it cares about and
+    /// asserts the ones it filled is how two settlement registers once went
+    /// missing from both stores at once (D165).
+    #[test]
+    fn every_reason_variant_survives_a_round_trip() {
+        let slot = Slot::containing(datetime!(2026-01-15 12:00:00 UTC));
+        for reason in [
+            Reason::guard(GuardRule::Lpc),
+            Reason::guard_since(GuardRule::Failsafe, datetime!(2026-01-15 17:00:00 UTC)),
+            Reason::User(UserOverride::Boost),
+            Reason::Cem,
+            Reason::Plan {
+                plan: PlanId::new(),
+                slot,
+                marginal_eur_per_kwh: Some(0.3),
+            },
+            Reason::Realtime(RealtimeCause::RampLimit),
+            Reason::Fallback(FallbackCause::NoPlan),
+        ] {
+            let json = serde_json::to_string(&reason)
+                .unwrap_or_else(|e| panic!("{reason:?} could not be serialised: {e}"));
+            let back: Reason = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{json} could not be read back: {e}"));
+            assert_eq!(back, reason, "through {json}");
         }
     }
 

@@ -42,14 +42,11 @@ tracing      = "0.1"
 # The advisory runtime `agentd` is built on: durable, replayable, and the
 # journal is the plan of record. `redb` is the embedded store one instance uses.
 #
-# **`manifest` is deliberately off**, and it was on for months without a caller.
-# It is the YAML-defined-agent surface, and `agentd` defines its specialists in
-# Rust: `SPECIALISTS` is a table of functions, which is what makes the review a
-# computation rather than a prompt. The feature was costing the fleet binary
-# `serde_yaml_ng`, `jsonschema` and their trees — **21 packages**, measured — to
-# parse documents that do not exist. A Cargo feature with no caller is the same
-# defect as a module with no caller and is harder to see, because nothing
-# reports it.
+# **`manifest` is off**: it is the YAML-defined-agent surface, and `agentd`
+# defines its specialists in Rust — `SPECIALISTS` is a table of functions, which
+# is what makes a review a computation rather than a prompt. Enabling it costs
+# the fleet binary `serde_yaml_ng`, `jsonschema` and their trees, 21 packages,
+# for documents that do not exist (D177).
 agentplane   = { version = "0.32", default-features = false, features = ["redb"] }
 anyhow       = "1"
 toml         = { version = "0.9", default-features = false, features = ["parse", "serde"] }
@@ -172,7 +169,7 @@ redb         = { version = "4" }
 # `default-features = false` drops the SQL surface and with it DataFusion: 52 MiB
 # of object code for a query API this box does not have. It is on by default, so
 # this is a choice rather than an inheritance.
-chronix      = { version = "0.3", default-features = false }
+chronix      = { version = "0.5", default-features = false }
 # The `arrow` major `chronix` returns query results in, named so the two cannot
 # drift. Needed to read the time column as the `Int64` it is: through an `f64`
 # every instant rounds to the nearest 256 ns, because nanoseconds since the

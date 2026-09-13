@@ -128,6 +128,46 @@ missing:
   everything rather than everyone: the deployment where somebody forgot the
   credentials is exactly the one nobody would notice.
 
+## The box authenticates its own callers too
+
+It holds the household's own electricity: `/v1/status` says what every device is
+doing right now, `/v1/series` is the Data Act's local API over the measured
+history, `/v1/overrides` decides what the arbiter wants, and `/s2/{asset}` lets
+an external energy manager drive the house.
+
+Every route it adds is behind one bearer token resolving to the same `Site(id)`
+authority a fleet service would issue — the same model, not a second one written
+for the edge. It is **one layer over the whole assembly** rather than a check in
+each handler, which is the shape rather than the convenience: the alternative is
+four call sites each spelling the test themselves, and one spelling it wrong.
+
+**The box issues the token itself**, from the operating system's entropy, and
+keeps it in its own store beside the EEBUS key. It is printed at start-up next to
+the SKI — the two credentials a commissioning visit carries away — and
+`hemsd run --check` issues both, so a dry run carries away the numbers the daemon
+will serve with. Both alternatives fail in the field: a setting with a default is
+a published credential, and a box that refuses to start is one an installer works
+around by inventing a weak one. Secure-by-default here means *no insecure mode to
+configure*, which is what the CRA asks of a product and EN 18031 of a
+radio-equipped one. A deployment with its own credentials sets `[api] token`.
+
+**An energy manager gets a credential of its own**, connected by name, listed and
+withdrawn — the shape a Steuerbox already has through the SHIP trust store, and
+for the same reason: a household that can see *that* something is driving its
+battery but not *what* cannot revoke it. The token is shown once, the subject
+carries the name so an audit line says which manager it was, and both credentials
+are cleared by the factory reset.
+
+It carries the household's capabilities **less the Data Act export**. An
+aggregator drives devices; Article 4 is a right of the user, and the one-second
+series says when they showered, cooked and went away. The gate enforces that,
+because a capability granted and never checked is not a boundary.
+
+`/livez`, `/readyz` and `/metrics` stay open, for the reason the next section
+gives about the two open services: they carry no household data, and an
+orchestrator that needed a household's credential to restart a crashed box would
+be given it far too widely.
+
 ## Two services are open, and that is written down
 
 `tariffd` serves published day-ahead auction results and `forecastd` serves

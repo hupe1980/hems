@@ -29,7 +29,7 @@ pub mod guard;
 pub mod phases;
 
 pub use allocate::{Claim, Grant, allocate, allocate_indivisible};
-pub use arbiter::{Arbiter, ArbiterConfig, Decision, Tick};
+pub use arbiter::{Arbiter, ArbiterConfig, CemRequest, Decision, Tick};
 pub use guard::{
     Binding, GridLimits, Guard, GuardConfig, GuardVerdict, SiteState, is_controllable,
     minimum_useful_power, physical_headroom, self_regulating,

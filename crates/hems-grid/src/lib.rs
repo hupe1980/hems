@@ -2,9 +2,16 @@
 //!
 //! Every rule here names the document it comes from, in the form
 //! `[A1 4.5.2]` (Anlage 1 zum Beschluss BK6-22-300) or `[LPC-031]` (the EEBUS
-//! use-case technical specification). The documents themselves are indexed in
-//! `specs/README.md` with their retrieval URLs. A rule without a citation is a
-//! bug.
+//! use-case technical specification). A rule without a citation is a bug, and
+//! the build fails where a citation names a document the workspace's index does
+//! not carry.
+//!
+//! The documents are third-party copyrighted publications and are **not
+//! redistributed**, so the index that records their retrieval URLs is a working
+//! file rather than part of this crate — the citation is the lookup key, and it
+//! is the one a network operator or a laboratory uses too. The project README
+//! explains the conventions, including the `D`/`R` labels that appear in these
+//! doc comments.
 //!
 //! | Module | Rule |
 //! |---|---|
@@ -70,7 +77,7 @@ pub mod sharing;
 pub mod stress;
 
 pub use evidence::{Action, ComplianceSample, ControlEvent, EvidenceRecorder, Observation};
-pub use lpc::{Direction, LimitWrite, LpcConfig, LpcEvent, LpcMachine, LpcState, Nack, Outcome};
+pub use lpc::LpcState;
 pub use mispel::{Abgrenzung, Basisfall, Pauschal, PauschalFall, abgrenzung_month, pauschal_year};
 pub use modul3::{
     Modul3Calendar, Modul3Conformance, Modul3Context, Modul3Eligibility, Modul3Finding, Preisstufe,

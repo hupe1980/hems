@@ -22,7 +22,7 @@ readiness probe rather than looking like a box that is planning badly.
 <pre class="mermaid">
 flowchart TB
   subgraph box["the household"]
-    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of evidence<br/>its own one-second history<br/>what its roof has learned<br/>+ an outbox"]
+    H["<b>hemsd</b><br/>guard · arbiter · planner<br/>its own two years of evidence<br/>its own history, seconds and quarter hours<br/>what its roof has learned<br/>+ an outbox"]
   end
   subgraph fleet["the fleet"]
     T["<b>tariffd</b><br/>five day-ahead sources"]
@@ -197,11 +197,11 @@ and a fleet token is not a household.
 
 ### The MiSpeL settlement
 
-The third, and until recently the arithmetic had no caller at all: the box wrote
-the registers, this service kept them for two years, and **nothing ever settled
-them** — the whole formula set of Anlage 1's (1)–(33) and Anlage 2's (P1)–(P15)
-was reachable only from a unit test, so it could have been wrong in every
-release without a single day noticing. From 01.10.2026 that document is what a
+The third, and the one where arithmetic most easily goes unreached: a box writes
+the registers and this service keeps them for two years, so the whole formula set
+of Anlage 1's (1)–(33) and Anlage 2's (P1)–(P15) could sit behind a unit test and
+be wrong in every release without a single day noticing. It is **served**, which
+is what stops that. From 01.10.2026 the document it produces is what a
 household's levy privileges (§ 21 EnFG) and its EEG support depend on.
 
 Three things about it are the design rather than the plumbing:
@@ -410,7 +410,7 @@ $ curl -s -H "Authorization: Bearer tok-demo" localhost:8080/v1/fleet | jq '{sit
 }
 ```
 
-`saving_eur` is the reference winter day's own €1,94, which is the point: the
+`saving_eur` is the reference winter day's own €2,18, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.
