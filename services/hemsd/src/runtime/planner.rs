@@ -69,6 +69,14 @@ pub struct Learned {
     pub pv: ResidualModel,
     /// This household's own load, by day type and quarter hour.
     pub load: LoadProfile,
+    /// Whether the roof is still the roof it was.
+    ///
+    /// Fed the **same** observations as `pv` and deliberately kept apart from
+    /// it: the corrector's job is to follow the array so the plan stays good,
+    /// and this one's is to notice it moving so the household finds out. A
+    /// fortnight after a string fails, `pv` has learned the lower output and
+    /// nothing anywhere says the roof got worse (D199).
+    pub health: hems_forecast::PlantHealth,
     /// Which house this is: the thermal record, and the building fitted from it.
     ///
     /// The one of the three that changes the *shape* of a plan rather than its
@@ -91,6 +99,8 @@ pub const PV_MODEL: &str = "pv-residual";
 pub const LOAD_MODEL: &str = "load-profile";
 /// The house's own thermal record and the building fitted from it.
 pub const BUILDING_MODEL: &str = "building";
+/// The roof's own performance record, against which a fault is noticed.
+pub const HEALTH_MODEL: &str = "roof-health";
 
 impl Learned {
     /// A box that has just been switched on and knows nothing but what it was
@@ -105,6 +115,7 @@ impl Learned {
     pub fn new(land: metering::Bundesland, building: hems_core::prelude::Rc2) -> Self {
         Self {
             pv: ResidualModel::new(hems_forecast::residual::DEFAULT_ALPHA),
+            health: hems_forecast::PlantHealth::new(),
             load: LoadProfile::new(land),
             building: hems_forecast::building::Record::new(building),
         }
@@ -143,6 +154,11 @@ impl Learned {
             Ok(None) => {}
             Err(error) => tracing::warn!(%error, "the household's own profile could not be read"),
         }
+        match store.learned::<hems_forecast::PlantHealth>(HEALTH_MODEL) {
+            Ok(Some(health)) => learned.health = health,
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "the roof's own health record could not be read"),
+        }
         match store.learned::<hems_forecast::building::Record>(BUILDING_MODEL) {
             Ok(Some(building)) => learned.building = building,
             Ok(None) => {}
@@ -158,6 +174,10 @@ impl Learned {
         for (name, written) in [
             (PV_MODEL, store.put_learned(PV_MODEL, &self.pv, now)),
             (LOAD_MODEL, store.put_learned(LOAD_MODEL, &self.load, now)),
+            (
+                HEALTH_MODEL,
+                store.put_learned(HEALTH_MODEL, &self.health, now),
+            ),
             (
                 BUILDING_MODEL,
                 store.put_learned(BUILDING_MODEL, &self.building, now),
@@ -182,8 +202,24 @@ impl Learned {
     pub fn observe(&mut self, slot: Slot, modelled_pv: Option<f64>, pv: f64, load: Power) {
         if let Some(modelled) = modelled_pv {
             self.pv.observe(slot, modelled, pv);
+            // The **same** two numbers, to the monitor that is watching for the
+            // array to move rather than following it. Both are powers averaged
+            // over the slot, so a quarter hour of each is energy.
+            self.health.observe_slot(
+                modelled * hems_core::prelude::SLOT_HOURS / 1000.0,
+                pv * hems_core::prelude::SLOT_HOURS / 1000.0,
+            );
         }
         self.load.observe(slot, load);
+    }
+
+    /// Close the roof's day and say what it looks like.
+    ///
+    /// Called from the control loop on the **local-day** boundary, beside the
+    /// day report, because a performance ratio is a daily figure and a Berlin
+    /// day is what the rest of this box settles on.
+    pub fn close_roof_day(&mut self) -> hems_forecast::Health {
+        self.health.close_day()
     }
 
     /// One completed quarter hour of the *house*, where the box can see one.
@@ -843,6 +879,13 @@ fn heat_pump_model(
         HeatPumpModel::on_off(hp.electrical_nominal)
     };
     unit.cop = hp.cop;
+    // The unit's own cooling rating, where it has one. Read off the asset rather
+    // than assumed, for the reason `heat_pump_cooling_kw` gives: a box that
+    // guessed would either leave a household hot with the hardware to fix it or
+    // command a mode the compressor does not have (D202).
+    unit.max_cooling = hp
+        .cooling_electrical
+        .unwrap_or(hems_core::prelude::Power::ZERO);
     if let Some(offer) = observed.flexibility.get(id) {
         if let Some(min_run) = offer.min_run {
             unit.min_on_slots = slots_of(min_run);

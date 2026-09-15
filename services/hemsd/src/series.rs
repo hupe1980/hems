@@ -177,6 +177,11 @@ impl Series {
     /// is enforced by the store's own maintenance thread, so there is no sweep
     /// for this daemon to schedule and forget.
     ///
+    /// What the preset does **not** bound is a thread pool. Reading a bucket of
+    /// four segments or more takes `rayon`'s global pool, sized to the core
+    /// count, inside the process that owes the sixty-second § 14a heartbeat —
+    /// and it is the store's global rather than this daemon's to set (R33).
+    ///
     /// # Errors
     /// [`SeriesError::Store`] where the directory cannot be opened or locked —
     /// which is what a second `hemsd` on the same box looks like.
@@ -380,7 +385,7 @@ impl Series {
             .db
             .execute(&plan)
             .map_err(|e| SeriesError::Store(e.to_string()))?;
-        Ok(readings(&batch, WATTS, None))
+        Ok(readings(&batch, WATTS))
     }
 
     /// The quarter-hour tier, through the store's **rollup view** rather than a
@@ -394,8 +399,19 @@ impl Series {
     /// watermark on, computed from the raw data in the same pass with the same
     /// accumulator, so the recent half and the stored half cannot disagree.
     ///
-    /// It answers for every point at once, which is why the tag is filtered
-    /// here.
+    /// The filter goes to the **store**, not to this loop.
+    ///
+    /// It used to answer for every point at once and the tag was matched here,
+    /// which was bounded — a house has a handful of points of measurement — and
+    /// was still the whole tag-group set materialised to read one series. 0.6's
+    /// `rollup_where` takes the filter, and it is worth taking for a reason
+    /// beyond the copying: it is refused by name if the key is not one of the
+    /// rollup's `group_by_tags`. A filter on any other key would narrow the live
+    /// half — read from the source, which still carries every tag — and match
+    /// nothing in the materialised half, so the answer would be short on one
+    /// side of the watermark and whole on the other. That is a defect this
+    /// daemon could not have detected in its own filtering, because both halves
+    /// arrive as one batch by the time it sees them. D198.
     fn quarter_hours(
         &self,
         point: &str,
@@ -404,9 +420,14 @@ impl Series {
     ) -> Result<Vec<Reading>, SeriesError> {
         let batch = self
             .db
-            .rollup(ROLLUP, nanos(from), nanos(to).saturating_sub(1))
+            .rollup_where(
+                ROLLUP,
+                nanos(from),
+                nanos(to).saturating_sub(1),
+                &[(POINT, point)],
+            )
             .map_err(|e| SeriesError::Store(e.to_string()))?;
-        Ok(readings(&batch, WATTS_MEAN, Some(point)))
+        Ok(readings(&batch, WATTS_MEAN))
     }
 
     /// Flush and release the directory lock.
@@ -450,8 +471,8 @@ fn same(declared: &chronix::RollupConfig, wanted: &chronix::RollupConfig) -> boo
 /// the nearest 256 ns. Nothing in this workspace would notice at a one-second
 /// cadence, which is exactly why it is worth saying: the *value* column is a
 /// genuine `f64` and goes through the helper, and the time column never can.
-fn readings(batch: &RecordBatch, field: &str, only: Option<&str>) -> Vec<Reading> {
-    use arrow::array::{Array as _, Int64Array, StringArray};
+fn readings(batch: &RecordBatch, field: &str) -> Vec<Reading> {
+    use arrow::array::{Array as _, Int64Array};
     let Some(times) = batch
         .column_by_name("_time")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
@@ -461,18 +482,13 @@ fn readings(batch: &RecordBatch, field: &str, only: Option<&str>) -> Vec<Reading
     let Some(watts) = batch.column_by_name(field) else {
         return Vec::new();
     };
-    // The rollup view answers for every point of measurement at once, so the tag
-    // is filtered here. A batch that carries no such column is a query that
-    // already filtered, and everything in it belongs to the caller.
-    let points = batch
-        .column_by_name(POINT)
-        .and_then(|c| c.as_any().downcast_ref::<StringArray>());
+    // Everything in the batch belongs to the caller. **Both** paths now filter
+    // in the store — the seconds tier through the query's own `.tag(…)` and the
+    // quarter-hour tier through `rollup_where` (D198) — so this took an
+    // `Option<&str>` that every call site passed `None`. A parameter nothing
+    // supplies is a filter nothing applies, and leaving it in would have left a
+    // reader believing the tag was still being checked here.
     (0..batch.num_rows())
-        .filter(|&row| match (only, points) {
-            (Some(want), Some(column)) => column.value(row) == want,
-            (Some(_), None) => false,
-            (None, _) => true,
-        })
         .filter_map(|row| {
             let value = chronix_query::extract_f64(watts.as_ref(), row)?;
             let at =
@@ -700,18 +716,21 @@ mod tests {
 
         let start = now - time::Duration::hours(30);
         // Two readings in each quarter hour, 1 kW apart, so the mean is a figure
-        // neither of them is.
+        // neither of them is — and the roof carries the **negative** of the
+        // connection point's, so the two series are told apart by value and not
+        // only by how many came back. Writing both the same made a filter that
+        // returned the wrong point indistinguishable from one that worked.
         for quarter in 0..120_i64 {
             let at = start + time::Duration::minutes(quarter * 15);
             let low = Power::from_kw(quarter as f64);
             let high = Power::from_kw(quarter as f64 + 1.0);
             series
-                .record(at, &[(GRID, low), ("dach", low)])
+                .record(at, &[(GRID, low), ("dach", -low)])
                 .expect("a tick");
             series
                 .record(
                     at + time::Duration::minutes(7),
-                    &[(GRID, high), ("dach", high)],
+                    &[(GRID, high), ("dach", -high)],
                 )
                 .expect("a tick");
         }
@@ -745,13 +764,25 @@ mod tests {
             "the most recent bucket, still being written: {last:?}"
         );
 
-        // And the tag survives the coarsening: the rollup view answers for every
-        // point at once, so a filter that did nothing would return both houses'
-        // worth and double every figure drawn from it.
+        // And the tag survives the coarsening. The filter is the **store's**
+        // since 0.6 (`rollup_where`), which is the reason to check it by value
+        // here rather than trust it: a filter that did nothing would return both
+        // points and double the count, and one that returned the wrong point
+        // would keep the count and flip the sign.
         let roof = series
             .window("dach", start, now + time::Duration::minutes(1))
             .expect("a window");
         assert_eq!(roof.readings.len(), 120);
+        assert!(
+            (roof.readings[0].watts + 500.0).abs() < 1e-6,
+            "the roof's own mean, not the connection point's: {:?}",
+            roof.readings[0]
+        );
+        assert!(
+            (roof.readings[119].watts + 119_500.0).abs() < 1e-6,
+            "…above the watermark too: {:?}",
+            roof.readings[119]
+        );
         assert!(
             series
                 .window("nothing", start, now + time::Duration::minutes(1))

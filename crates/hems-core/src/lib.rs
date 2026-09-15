@@ -77,7 +77,7 @@ pub mod prelude {
     pub use crate::error::{IdError, SetpointError, SiteError, UnitError};
     pub use crate::ids::{AssetId, CircuitId, MaloId, MeloId, PlanId, SiteId};
     pub use crate::measurement::{Freshness, Measurement};
-    pub use crate::plan::{AssetTarget, CostBreakdown, Plan, SlotPlan};
+    pub use crate::plan::{AssetTarget, CostBreakdown, Plan, SlotPlan, ThermalMode};
     pub use crate::report::DayKpis;
     pub use crate::setpoint::{
         Authority, Command, FallbackCause, GuardRule, RealtimeCause, Reason, Setpoint, UserOverride,

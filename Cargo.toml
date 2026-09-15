@@ -3,11 +3,12 @@ resolver = "3"
 members = ["crates/hems-core", "crates/hems-device", "crates/hems-drv", "crates/hems-flex", "crates/hems-grid", "crates/hems-realtime", "crates/hems-tariff", "crates/hems-forecast", "crates/hems-optimizer", "crates/hems-events", "crates/hems-service", "crates/hems-sim", "services/agentd", "services/fleetd", "services/forecastd", "services/hemsd", "services/histd", "services/obsd", "services/tariffd", "xtask"]
 
 [workspace.package]
-version      = "0.1.0"
+version      = "0.2.0"
 authors      = ["hupe1980"]
 edition      = "2024"
 license      = "MIT OR Apache-2.0"
 repository   = "https://github.com/hupe1980/hems"
+homepage     = "https://hupe1980.github.io/hems"
 rust-version = "1.94"
 
 [workspace.dependencies]
@@ -71,6 +72,21 @@ metering     = { version = "0.23", features = ["serde"] }
 # = false` so the domain side gets the sans-I/O cores and nothing else — no
 # tokio, no TLS, no mDNS. `hemsd` is where a socket is allowed to exist.
 eebus        = { version = "0.9", default-features = false, features = ["std"] }
+
+# S2 / EN 50491-12-2: the JSON data model, the rule-numbered semantic validator,
+# and the sans-I/O Resource Manager and Customer Energy Manager session engines.
+#
+# `default-features = false` twice over. It keeps the transport out of the domain
+# side, the same line `eebus` is taken on — but it is also **load-bearing for the
+# build**: the default set includes `tls-ring`, and `deny.toml` bans `ring`
+# because two `rustls` providers in one binary is a runtime panic. A careless
+# `s2-kit = "0.3"` is a `cargo deny` failure rather than a silent second
+# provider, which is the way round this workspace wants it.
+#
+# `time` rather than `chrono`: the crate carries its own `Timestamp` and
+# `Duration` and converts to whichever calendar a consumer already has, so `time`
+# stays the one calendar in the product (D201).
+s2-kit       = { version = "0.3", default-features = false, features = ["std", "time", "uuid"] }
 # Already in the tree under `mdns-sd`; a direct edge so the daemon can name the
 # interfaces it announces itself on rather than guessing.
 if-addrs     = { version = "0.15" }
@@ -90,18 +106,18 @@ sunspec      = { version = "0.9", default-features = false, features = [
 good_lp      = { version = "1.15", default-features = false }
 
 # ── Internal (path + version so the domain crates can be published) ─────────
-hems-core      = { path = "crates/hems-core",      version = "0.1" }
-hems-device    = { path = "crates/hems-device",    version = "0.1" }
-hems-drv       = { path = "crates/hems-drv",       version = "0.1" }
-hems-flex      = { path = "crates/hems-flex",      version = "0.1" }
-hems-grid      = { path = "crates/hems-grid",      version = "0.1" }
-hems-tariff    = { path = "crates/hems-tariff",    version = "0.1" }
-hems-forecast  = { path = "crates/hems-forecast",  version = "0.1" }
-hems-optimizer = { path = "crates/hems-optimizer", version = "0.1" }
-hems-realtime  = { path = "crates/hems-realtime",  version = "0.1" }
-hems-events    = { path = "crates/hems-events",    version = "0.1" }
-hems-service   = { path = "crates/hems-service",   version = "0.1" }
-hems-sim       = { path = "crates/hems-sim",       version = "0.1" }
+hems-core      = { path = "crates/hems-core",      version = "0.2" }
+hems-device    = { path = "crates/hems-device",    version = "0.2" }
+hems-drv       = { path = "crates/hems-drv",       version = "0.2" }
+hems-flex      = { path = "crates/hems-flex",      version = "0.2" }
+hems-grid      = { path = "crates/hems-grid",      version = "0.2" }
+hems-tariff    = { path = "crates/hems-tariff",    version = "0.2" }
+hems-forecast  = { path = "crates/hems-forecast",  version = "0.2" }
+hems-optimizer = { path = "crates/hems-optimizer", version = "0.2" }
+hems-realtime  = { path = "crates/hems-realtime",  version = "0.2" }
+hems-events    = { path = "crates/hems-events",    version = "0.2" }
+hems-service   = { path = "crates/hems-service",   version = "0.2" }
+hems-sim       = { path = "crates/hems-sim",       version = "0.2" }
 
 # ── The fleet's own dependencies ────────────────────────────────────────────
 #
@@ -166,10 +182,18 @@ redb         = { version = "4" }
 # outbox marker saying the fleet still owes it are one write, and two stores have
 # no shared transaction (D168).
 #
-# `default-features = false` drops the SQL surface and with it DataFusion: 52 MiB
-# of object code for a query API this box does not have. It is on by default, so
-# this is a choice rather than an inheritance.
-chronix      = { version = "0.5", default-features = false }
+# `default-features = false` drops all three defaults, and each is a choice
+# rather than an inheritance: `sql` and with it DataFusion (52 MiB of object code
+# for a query API this box does not have), `field-encryption`, and `analytics`
+# (32 310 lines this workspace does not call, because `hems-forecast` owns the
+# forecasting). Measured: 178 packages against 290.
+#
+# What it does **not** drop is `rayon`, as `chronix`'s own release notes say: the
+# facade reads segments in parallel past four per bucket, so a thread pool sized
+# to the core count spins up inside the process that owes a sixty-second § 14a
+# heartbeat. Unavoidable for any consumer today, and the reason is not this gate
+# (R33).
+chronix      = { version = "0.7", default-features = false }
 # The `arrow` major `chronix` returns query results in, named so the two cannot
 # drift. Needed to read the time column as the `Int64` it is: through an `f64`
 # every instant rounds to the nearest 256 ns, because nanoseconds since the

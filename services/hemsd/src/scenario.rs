@@ -159,7 +159,7 @@ pub struct Scenario {
     pub cloudiness: f64,
     /// How far the day that happens strays from the day that was forecast.
     ///
-    /// [`WeatherSpec::PERFECT`] hands the planner the exact series the
+    /// [`WeatherSpec::with_perfect_forecast`] hands the planner the exact series the
     /// simulator is about to run, and the difference between the two is what
     /// forecast error costs. `hemsd simulate --perfect-foresight` is that
     /// comparison, and having to ask for it by name is deliberate.
@@ -1194,6 +1194,13 @@ pub struct DayResult {
     pub roof_correction: f64,
     /// How many days of metering the forecasts rest on.
     pub history_days: usize,
+    /// What the monitor makes of the roof after the warm-up.
+    ///
+    /// A verdict rather than a ratio, because that is what a household is shown
+    /// and what would have to move if the monitor stopped working: a cold box
+    /// answers `Learning { days: 0 }` and a warmed one `Healthy`, so the figure
+    /// is not structurally constant across the reference days (R20, D199).
+    pub roof_health: hems_forecast::Health,
     /// The largest **quarter-hour average** power that left the connection
     /// point, kW.
     ///
@@ -1506,6 +1513,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
     );
     let mut building = BuildingSim {
         nominal_electrical: house.heat_pump.power,
+        cooling_electrical: house.heat_pump.cooling_electrical.unwrap_or(Power::ZERO),
         // The same floor the planner is given, so the plan and the house agree
         // about what "on" is worth for a unit whose slots are scheduled.
         min_electrical: house.heat_pump.power * 0.3,
@@ -1849,6 +1857,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
                                 .as_ref()
                                 .map(hems_sim::CompressorSim::state)
                                 .unwrap_or_default(),
+                            max_cooling: house.heat_pump.cooling_electrical.unwrap_or(Power::ZERO),
                             ..HeatPumpModel::modulating(house.heat_pump.power)
                         },
                     },
@@ -2271,16 +2280,33 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
             },
             step,
         );
-        let hp_actual = building.step(
-            decision
-                .commanded
-                .get(&ids.heat_pump)
-                .copied()
-                .unwrap_or(Power::ZERO),
-            outdoor_now,
-            weather.window_at(site.location, now, FACADE_AZIMUTH_DEG),
-            step,
-        );
+        // Which way the unit is running comes from the **plan**, because it is
+        // the only layer that knows: the arbiter narrows a power and the meter
+        // cannot tell heat from cold afterwards. A household whose unit cannot
+        // cool never sees `Cool`, because the planner's cooling variable is
+        // bounded at zero (D202).
+        let commanded_hp = decision
+            .commanded
+            .get(&ids.heat_pump)
+            .copied()
+            .unwrap_or(Power::ZERO);
+        let window_now = weather.window_at(site.location, now, FACADE_AZIMUTH_DEG);
+        // The **arbiter's** direction, not the plan's. They are the same number
+        // until they are not: the arbiter drops a plan older than
+        // `max_plan_age` and falls back, and a simulator reading the plan
+        // directly would go on cooling a house the box had stopped commanding —
+        // a harness modelling a path production does not run (D187).
+        let cooling = decision
+            .thermal
+            .get(&ids.heat_pump)
+            .copied()
+            .unwrap_or_default()
+            == hems_core::prelude::ThermalMode::Cool;
+        let hp_actual = if cooling {
+            building.step_cooling(commanded_hp, outdoor_now, window_now, step)
+        } else {
+            building.step(commanded_hp, outdoor_now, window_now, step)
+        };
         let (dhw_actual, dhw_short) = tank.step(
             decision
                 .commanded
@@ -2716,6 +2742,7 @@ pub fn run(scenario: &Scenario) -> anyhow::Result<DayResult> {
         .roof
         .ratio_at(Slot::containing(start + Duration::hours(12)));
     result.history_days = learned.days;
+    result.roof_health = learned.health.verdict();
 
     // ── Is the household on the right network-charge module? ────────────────
     //
@@ -2943,6 +2970,25 @@ fn unmanaged_heat_pump(
     step: Duration,
 ) -> Power {
     let low = house.heat_pump.comfort_min_c;
+    let high = house.heat_pump.comfort_max_c;
+
+    // **The same hardware, on its own thermostat.** A household that has bought a
+    // reversible unit does not sit in a hot house all July because nobody
+    // optimised for it — it sets a cooling set point and the unit runs. Leaving
+    // that out would credit the planner with the *cooling function* rather than
+    // with deciding when to use it, which is D195's mistake exactly: the
+    // comparison household must own what this one owns.
+    //
+    // The set point is the top of the band, with the same half-kelvin hysteresis
+    // the heating side uses, and no anticipation of anything: a thermostat cools
+    // when the room is already too warm, where a plan cools into the hours the
+    // roof is paying for. That difference is the whole of what is being measured.
+    if let Some(cooling) = house.heat_pump.cooling_electrical
+        && building.indoor_c() > high
+    {
+        return building.step_cooling(bounded(cooling), outdoor_c, window_w_per_m2, step);
+    }
+
     if building.indoor_c() < low {
         *thermostat_on = true;
     } else if building.indoor_c() > low + 0.5 {
@@ -3123,6 +3169,7 @@ fn baseline_cost(
     let mut car_stored = scenario.ev.map_or(Energy::ZERO, |e| e.energy_now);
     let mut building = BuildingSim {
         nominal_electrical: house.heat_pump.power,
+        cooling_electrical: house.heat_pump.cooling_electrical.unwrap_or(Power::ZERO),
         // The same floor the planner is given, so the plan and the house agree
         // about what "on" is worth for a unit whose slots are scheduled.
         min_electrical: house.heat_pump.power * 0.3,
@@ -3184,6 +3231,27 @@ fn baseline_cost(
     // same asymmetry as measuring a saving against a household that ignored the
     // network operator.
     let mut community = CommunityMeter::for_scenario(scenario);
+    // **The same pack the managed household has, on the controller it shipped
+    // with.** Built from the same figures and started at the same charge, so the
+    // only difference between the two households is who decides when it moves.
+    //
+    // It had no battery at all until D195, and that made every saving this
+    // project quoted the value of *owning* a store rather than of managing one.
+    // Nobody removes a battery to go back to an unmanaged house, so the
+    // counterfactual that answers a household's actual question is the factory
+    // controller — and maximising self-consumption is what every hybrid inverter
+    // in this market does out of the box. It is also the baseline the MPC
+    // literature reports against, so a figure measured this way is comparable
+    // with a published one and a figure measured against an idle store is not.
+    let mut baseline_battery = BatterySim::new(house.battery.kwh, house.battery.power);
+    baseline_battery.stored = house.battery.kwh * house.battery.reserve_soc.fraction().max(0.30);
+    let baseline_battery_open = baseline_battery.stored;
+    let baseline_battery_floor = house.battery.kwh
+        * house
+            .battery
+            .reserve_soc
+            .fraction()
+            .max(baseline_battery.soc_min.fraction());
     let mut now = start;
 
     while now < start + Duration::days(1) {
@@ -3252,10 +3320,42 @@ fn baseline_cost(
 
         let appliance = unmanaged_appliance(scenario, dishwasher.as_mut(), now, step);
 
+        // The battery, deciding for itself. A factory controller looks at the
+        // house's net position and does the obvious thing with it: a surplus
+        // goes into the store rather than out of the door, a deficit comes out
+        // of the store rather than off the grid. It never buys to charge and
+        // never sells to discharge — that is the whole of what it knows, and the
+        // whole of the difference the plan is being measured for.
+        let demand = load + appliance + ev + hp + dhw + pv;
+        let wanted = if demand < Power::ZERO {
+            // A surplus: soak it up.
+            demand.outflow().min(baseline_battery.max_charge)
+        } else {
+            // A deficit: cover it, but never below the household's own backup
+            // reserve.
+            //
+            // **No § 14a ceiling here, and that is the rule rather than an
+            // omission.** What a reduction bounds is the *netzwirksamer
+            // Leistungsbezug* — what the household draws through the connection
+            // point — and a discharging battery draws nothing; it is the thing
+            // that makes the draw smaller. Capping it would have handicapped the
+            // baseline in exactly the hour the comparison is about, which is the
+            // flattering direction. The charging side needs no ceiling either,
+            // for a reason particular to this controller: it only ever charges
+            // from surplus, so it never draws through the connection point at
+            // all.
+            let spare = (baseline_battery.stored - baseline_battery_floor).max(Energy::ZERO);
+            let by_charge =
+                Power::new(spare.get() / hours.max(1e-9) * baseline_battery.efficiency_discharge);
+            -demand.min(baseline_battery.max_discharge).min(by_charge)
+        };
+        let battery_actual = baseline_battery.step(wanted, step);
+        cost.wear_eur += battery_actual.abs().kw() * hours * (house.battery.wear_eur_per_kwh / 2.0);
+
         // § 9 EEG bounds what leaves the connection point whether or not there
         // is an energy manager behind it, so what the baseline cannot export it
         // throws away — at the same price the plan pays for doing so.
-        let mut grid = load + appliance + ev + hp + dhw + pv;
+        let mut grid = demand + battery_actual;
         if let Some(ceiling) = feed_in_ceiling {
             let curtailed = (grid.outflow() - ceiling).max(Power::ZERO);
             grid += curtailed;
@@ -3281,9 +3381,18 @@ fn baseline_cost(
         now += step;
     }
     // The same ledger the optimised day closes, so both sides are measured in
-    // the same way. A thermostat ends the day about where it started, so this is
-    // usually near zero — which is exactly why it has to be computed rather than
-    // assumed.
+    // the same way.
+    //
+    // It is **not** near zero, and the reason is worth naming: both households'
+    // tanks open at half their usable heat whatever the thermostat is set to, so
+    // a household whose set point sits below that mark drains toward it over the
+    // day and is charged for the difference. On the reference winter day that is
+    // €1,19 for a 50 °C household against €0,73 for a 58 °C one — more than the
+    // €0,36 of electricity the set point itself costs. The comparison stays
+    // **fair**, because both sides open in the same state and it cancels in a
+    // saving; what it is not is an instrument for anything about the *tank*,
+    // which is why `the_baseline_household_heats_its_water_the_way_this_household_asked`
+    // asserts on the meter instead.
     let mean_import = prices
         .slots
         .iter()
@@ -3301,8 +3410,26 @@ fn baseline_cost(
     // at the day's *mean* import price, so a baseline that held its water hotter
     // would come out cheaper for having bought more electricity — R29's car
     // entry, in the tank (D183).
-    cost.stored_eur =
-        ((tank_open - tank.stored).kwh() / tank.cop.max(f64::EPSILON) * mean_import).max(0.0);
+    //
+    // The **battery** is in this entry now for the same reason the tank is: a
+    // household whose factory controller ended the day emptier than it started
+    // has not saved what its meter says it saved, and before D195 the baseline
+    // had no store to borrow from so the term could only ever be charged to the
+    // managed side.
+    //
+    // Computed exactly as `stored_at_start` computes it for the managed
+    // household — electrical energy in the battery plus the electricity it would
+    // take to put the tank's heat back, **one** quantity with **one** clamp, at
+    // the plain mean import price. Writing it as two separately clamped terms,
+    // or discounting the battery's half by the round-trip efficiency, would both
+    // have been defensible in isolation and neither is what the other household
+    // is charged — and a ledger that prices the same kilowatt-hour differently
+    // depending on which household is holding it is the asymmetry this whole
+    // function exists to avoid.
+    let stores_open = baseline_battery_open.kwh() + tank_open.kwh() / tank.cop.max(f64::EPSILON);
+    let stores_close =
+        baseline_battery.stored.kwh() + tank.stored.kwh() / tank.cop.max(f64::EPSILON);
+    cost.stored_eur = ((stores_open - stores_close) * mean_import).max(0.0);
     let (baseline_shared_kwh, sharing_eur) = community.settle(prices);
     cost.sharing_eur = sharing_eur;
     // A window with nowhere to put the programme costs the same on both sides.

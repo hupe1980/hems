@@ -240,6 +240,13 @@ evse_max_a = 16.0
 # conductor, and it decides whether 2 kW of surplus charges a car or is
 # exported: three-phase charging cannot start below 4,14 kW.
 evse_switchable = true
+# Whether the wallbox can discharge the car into the house. A fact about the
+# hardware on the wall: what the wallbox and the car negotiate between them is
+# ISO 15118, which this box never sees. What it changes here is what a Customer
+# Energy Manager is told the wallbox can do — a producer role and a discharge
+# mode — and therefore what the planner may ask for. Still a special order in
+# Germany, so the default is false.
+evse_bidirectional = false
 ev_charge_limit = 0.75
 
 
@@ -699,6 +706,17 @@ listens_only = true
 # points = [
 #   { space = "input", register = 507, word = "s16", scale = 0.1, field = "temperature_c" },
 #   { register = 2240, word = "u32", field = "power" },
+# ]
+# # The registers a command may write. Omit `writes` and the driver is read-only.
+# # A write enumerates the raw values it may take, so nothing is computed from a
+# # scale; always one holding register, sixteen bits. Take the values from the
+# # unit's own documentation.
+# #
+# # `thermal_mode` is the one command no protocol here can carry — EEBUS has no
+# # cooling process — so a reversible heat pump needs this register or
+# # `run --check` refuses the household.
+# writes = [
+#   { command = "thermal_mode", register = 1501, heat = 1, cool = 2 },
 # ]
 
 # The heat pump, over EEBUS. Three use cases on one session, because they are

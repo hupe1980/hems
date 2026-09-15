@@ -470,7 +470,7 @@ async fn main() -> anyhow::Result<()> {
             }
             let mut scenario = scenario_for(day, config);
             if perfect_foresight {
-                scenario.weather = hemsd::WeatherSpec::PERFECT;
+                scenario.weather = scenario.weather.with_perfect_forecast();
             }
             scenario.per_asset_weights = !uniform_weights;
             if let Some(price) = co2_eur_per_kg {

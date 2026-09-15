@@ -351,11 +351,13 @@ fn check_notes(root: &Path) -> Result<()> {
 
     let named = stale_names(root, &mut wrong)?;
     let linked = internal_links(root, &mut wrong)?;
+    let filed = feedback_files(root, &mut wrong)?;
 
     if wrong.is_empty() {
         println!(
             "check-notes: {cited} citations of {} decisions, risks and milestones, {named} names \
-             a current-state note gives and {linked} links between notes, all resolving",
+             a current-state note gives, {linked} links between notes and {filed} sibling-crate \
+             feedback files, all resolving",
             known.len()
         );
         return Ok(());
@@ -546,6 +548,46 @@ fn internal_links(root: &Path, wrong: &mut Vec<String>) -> Result<usize> {
             if !notes.join(file).exists() {
                 wrong.push(format!(
                     "  concepts/{from}: links to {file}, which is not there"
+                ));
+            }
+        }
+    }
+    Ok(checked)
+}
+
+/// Sibling-crate feedback files the notes name but the repository does not have.
+///
+/// `<CRATE>_FEEDBACK.md` in the root is where a bug or a feature request for a
+/// sibling crate is written down, and the notes cite them by name. A citation
+/// that resolves to nothing is worse here than an ordinary broken link, because
+/// what it claims is that a request has been *filed* with another team: the
+/// roadmap said "the one request of `METERING_FEEDBACK.md` that 0.23 has not
+/// answered" while no such file existed, so the item read as waiting on somebody
+/// who had never been asked.
+///
+/// **Only the notes that describe current state and open work.** The decision
+/// log legitimately names files that are gone — a feedback file is deleted when
+/// its last item is resolved upstream, and the decision recording that closure
+/// is exactly where the name survives.
+fn feedback_files(root: &Path, wrong: &mut Vec<String>) -> Result<usize> {
+    const CURRENT: [&str; 2] = ["ROADMAP.md", "RISKS.md"];
+    let notes = root.join("concepts");
+    let mut checked = 0usize;
+    for name in CURRENT {
+        let path = notes.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        for (i, _) in text.match_indices("_FEEDBACK.md") {
+            let start = text[..i]
+                .rfind(|c: char| !c.is_ascii_uppercase() && c != '_')
+                .map_or(0, |b| b + 1);
+            let file = &text[start..i + "_FEEDBACK.md".len()];
+            checked += 1;
+            if !root.join(file).exists() {
+                wrong.push(format!(
+                    "  concepts/{name}: names {file}, which is not in the repository —                      a request nobody has filed"
                 ));
             }
         }

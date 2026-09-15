@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     // The series a probe cannot answer: a saturated pool serves `503`s while
     // `/livez` and `/readyz` both stay green, because the process is alive and
     // the database is reachable and there is simply no connection to be had.
-    hems_service::metrics::publish_pool(store.db(), hems_service::identity!().name);
+    hems_service::metrics::publish_pool(store.db());
 
     // **Vital**: a retention sweep that has died lets the fleet's days grow
     // without bound, and the only symptom is a disk filling up months later

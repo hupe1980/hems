@@ -36,6 +36,14 @@ pub struct Decision {
     /// on, which may differ from the one the contactor is in — the command that
     /// closes the gap is the first one emitted.
     pub mode: PhaseMode,
+    /// Which way a reversible thermal device is to run.
+    ///
+    /// The plan's [`hems_core::prelude::AssetTarget::mode`], carried through the
+    /// arbiter rather than re-derived: the planner is the only layer that knows
+    /// which direction it meant, because it chose it against the comfort band
+    /// and the weather, and a unit pre-cooling into a cheap hour is asking for
+    /// something its own thermostat would not.
+    pub thermal: ThermalMode,
 }
 
 impl Decision {
@@ -46,7 +54,15 @@ impl Decision {
             power,
             guard_limited: false,
             mode: PhaseMode::Three,
+            thermal: ThermalMode::Heat,
         }
+    }
+
+    /// Say which way a reversible thermal device should run.
+    #[must_use]
+    pub const fn in_thermal_mode(mut self, thermal: ThermalMode) -> Self {
+        self.thermal = thermal;
+        self
     }
 
     /// Say whether a guard rule is what produced the value.
@@ -248,6 +264,25 @@ fn evse_commands(evse: &Evse, decision: Decision) -> Vec<Command> {
 }
 
 fn heat_pump_commands(hp: &HeatPump, decision: Decision) -> Vec<Command> {
+    // The direction first, and only where the unit has one to choose.
+    //
+    // A heating-only unit gets nothing — there is no second direction to name
+    // and a command it cannot obey is one a driver has to decide what to do
+    // with. A reversible one gets it **before** the power, the same ordering
+    // and for the same reason a charge point's phase count precedes its
+    // current: the tick that changes direction would otherwise command a draw
+    // against the old one.
+    let mut out = if hp.is_reversible() {
+        vec![Command::ThermalMode(decision.thermal)]
+    } else {
+        Vec::new()
+    };
+    out.extend(heat_pump_power(hp, decision));
+    out
+}
+
+/// What the unit is told to *draw*, once it knows which way it is running.
+fn heat_pump_power(hp: &HeatPump, decision: Decision) -> Vec<Command> {
     match hp.control {
         HeatPumpControl::SgReady => {
             let state = if decision.guard_limited {
@@ -324,6 +359,7 @@ mod tests {
             meta: meta("wp", 9.0),
             electrical_nominal: Power::from_kw(5.0),
             heating_rod: None,
+            cooling_electrical: None,
             control,
             modulating: true,
             comfort_min_c: 20.0,

@@ -17,16 +17,18 @@ use hems_core::asset::{Battery, DhwTank, Evse, FlexibleLoad, HeatPump, Programme
 use hems_core::prelude::*;
 use time::OffsetDateTime;
 
-/// S2's generated types carry `chrono` timestamps; the rest of hems uses
-/// `time`. Converting in one place beats letting two clocks into the domain.
-fn utc(at: OffsetDateTime) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp_nanos(
-        i64::try_from(at.unix_timestamp_nanos()).unwrap_or(i64::MAX),
-    )
+/// An instant, in the shape S2 wants it.
+///
+/// `s2-kit` carries its own `Timestamp` and a `From<time::OffsetDateTime>` behind
+/// the `time` feature, so the conversion is the library's and `time` stays the
+/// only calendar in the product (D201).
+fn utc(at: OffsetDateTime) -> s2_kit::types::Timestamp {
+    at.into()
 }
 use hems_device::SgReadyState;
-use s2energy::common::{Commodity, CommodityQuantity, Duration, Id, NumberRange, PowerRange, Role};
-use s2energy::{frbc, ombc, pebc, ppbc};
+use s2_kit::types::common::{Commodity, CommodityQuantity, NumberRange, PowerRange, Role};
+use s2_kit::types::{Duration, Id};
+use s2_kit::types::{frbc, ombc, pebc, ppbc};
 
 use crate::map::{control_type_for, roles_for};
 
@@ -44,7 +46,7 @@ const HEMS_NAMESPACE: uuid::Uuid = uuid::uuid!("6f9c1f0e-4b3a-5d2e-9a71-2c8e5b4d
 /// Deriving them from the asset's own identity means a restart changes nothing,
 /// which is the behaviour a manager is entitled to assume.
 pub(crate) fn stable_id(asset: &AssetId, part: &str) -> Id {
-    Id(uuid::Uuid::new_v5(
+    Id::from_uuid(uuid::Uuid::new_v5(
         &HEMS_NAMESPACE,
         format!("{asset}/{part}").as_bytes(),
     ))
@@ -58,7 +60,7 @@ pub const KWH_PER_S_PER_W: f64 = 1.0 / 3_600_000.0;
 ///
 /// One control tick. Claiming less would invite a manager to plan on a
 /// responsiveness the arbiter does not have.
-const PROCESSING_DELAY: Duration = Duration(1_000);
+const PROCESSING_DELAY: Duration = Duration::from_millis(1_000);
 
 /// Which commodity a device's power is measured in, given the mode it is in.
 ///
@@ -80,7 +82,7 @@ pub fn resource_manager_details(
     asset: &Asset,
     mode: PhaseMode,
     has_deadline: bool,
-) -> s2energy::common::ResourceManagerDetails {
+) -> s2_kit::types::common::ResourceManagerDetails {
     let roles = roles_for(asset)
         .into_iter()
         .map(|role| Role {
@@ -89,7 +91,7 @@ pub fn resource_manager_details(
         })
         .collect();
 
-    s2energy::common::ResourceManagerDetails::builder()
+    s2_kit::types::common::ResourceManagerDetails::builder()
         .message_id(Id::generate())
         .resource_id(stable_id(asset.id(), "resource"))
         .name(asset.id().to_string())
@@ -142,11 +144,11 @@ pub fn describe_battery(battery: &Battery, valid_from: OffsetDateTime) -> Batter
 
     let mode = |id: &Id, label: &str, rate_end: f64, power_end: f64| {
         frbc::OperationMode::builder()
-            .id(id.clone())
+            .id(*id)
             .diagnostic_label(label)
             .abnormal_condition_only(false)
             .elements(vec![frbc::OperationModeElement {
-                fill_level_range: usable.clone(),
+                fill_level_range: usable,
                 fill_rate: NumberRange {
                     start_of_range: 0.0,
                     end_of_range: rate_end,
@@ -166,7 +168,7 @@ pub fn describe_battery(battery: &Battery, valid_from: OffsetDateTime) -> Batter
         .valid_from(utc(valid_from))
         .actuators(vec![
             frbc::ActuatorDescription::builder()
-                .id(actuator.clone())
+                .id(actuator)
                 .diagnostic_label("inverter")
                 .supported_commodities(vec![Commodity::Electricity])
                 .operation_modes(vec![
@@ -188,7 +190,7 @@ pub fn describe_battery(battery: &Battery, valid_from: OffsetDateTime) -> Batter
             frbc::StorageDescription::builder()
                 .diagnostic_label("battery")
                 .fill_level_label("kWh")
-                .fill_level_range(usable.clone())
+                .fill_level_range(usable)
                 .provides_leakage_behaviour(false)
                 .provides_fill_level_target_profile(false)
                 .provides_usage_forecast(false)
@@ -249,16 +251,16 @@ pub fn describe_dhw(tank: &DhwTank, valid_from: OffsetDateTime) -> DhwDescriptio
         .valid_from(utc(valid_from))
         .actuators(vec![
             frbc::ActuatorDescription::builder()
-                .id(actuator.clone())
+                .id(actuator)
                 .diagnostic_label("water heater")
                 .supported_commodities(vec![Commodity::Electricity])
                 .operation_modes(vec![
                     frbc::OperationMode::builder()
-                        .id(heat.clone())
+                        .id(heat)
                         .diagnostic_label("heat")
                         .abnormal_condition_only(false)
                         .elements(vec![frbc::OperationModeElement {
-                            fill_level_range: usable.clone(),
+                            fill_level_range: usable,
                             fill_rate: NumberRange {
                                 start_of_range: 0.0,
                                 end_of_range: tank.heater.get()
@@ -342,10 +344,10 @@ pub fn describe_programme(
         .steps
         .iter()
         .map(|step| ppbc::PowerSequenceElement {
-            duration: Duration(
+            duration: Duration::from_millis(
                 u64::try_from(hems_core::prelude::SLOT.whole_milliseconds()).unwrap_or(u64::MAX),
             ),
-            power_values: vec![s2energy::common::PowerForecastValue {
+            power_values: vec![s2_kit::types::common::PowerForecastValue {
                 commodity_quantity: q,
                 value_expected: step.get(),
                 value_lower_68ppr: None,
@@ -363,12 +365,12 @@ pub fn describe_programme(
         .id(stable_id(&load.meta.id, "load/profile"))
         .start_time(utc(valid_from))
         .end_time(utc(deadline))
-        .power_sequences_containers(vec![
+        .power_sequence_containers(vec![
             ppbc::PowerSequenceContainer::builder()
-                .id(container.clone())
+                .id(container)
                 .power_sequences(vec![
                     ppbc::PowerSequence::builder()
-                        .id(sequence.clone())
+                        .id(sequence)
                         .abnormal_condition_only(false)
                         // Started, never paused: see the note above.
                         .is_interruptible(false)
@@ -461,11 +463,11 @@ pub fn describe_ev(
 
     let mode_of = |id: &Id, label: &str, rate: f64, from: f64, to: f64| {
         frbc::OperationMode::builder()
-            .id(id.clone())
+            .id(*id)
             .diagnostic_label(label)
             .abnormal_condition_only(false)
             .elements(vec![frbc::OperationModeElement {
-                fill_level_range: usable.clone(),
+                fill_level_range: usable,
                 fill_rate: NumberRange {
                     start_of_range: 0.0,
                     end_of_range: rate,
@@ -502,7 +504,7 @@ pub fn describe_ev(
         .valid_from(utc(valid_from))
         .actuators(vec![
             frbc::ActuatorDescription::builder()
-                .id(actuator.clone())
+                .id(actuator)
                 .diagnostic_label("charge point")
                 .supported_commodities(vec![Commodity::Electricity])
                 .operation_modes(modes)
@@ -674,7 +676,7 @@ pub fn describe_heat_pump(
                 .iter()
                 .map(|(id, state, expected)| {
                     ombc::OperationMode::builder()
-                        .id(id.clone())
+                        .id(*id)
                         .diagnostic_label(format!("SG Ready {}", state.number()))
                         .abnormal_condition_only(false)
                         .power_ranges(vec![PowerRange {

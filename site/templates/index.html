@@ -200,45 +200,60 @@ flowchart TB
         </div>
 <pre><code>  2026-01-15 — with a § 14a reduction
 
-  produced                             7.7 kWh
+  produced                             7.4 kWh
   household consumption               11.0 kWh
   charged into the car                21.7 kWh
-  heat pump                           21.7 kWh
+  heat pump                           22.1 kWh
   hot water                            3.1 kWh
-  dishwasher                    1.1 kWh, 75 min later
-  battery throughput                  16.1 kWh
-  imported                            52.6 kWh
+  dishwasher             1.1 kWh, 75 min later
+  battery throughput                  15.6 kWh
+  imported                            52.9 kWh
   exported                             0.3 kWh
   curtailed                            0.0 kWh
   peak feed-in, per quarter hour  0.12 of 5.88 kW
   self-sufficiency                        12 %
+  wallbox on one conductor  0 min (0 switches)
 
   indoor temperature            19.9 – 23.0 °C
   outside the comfort band            0.15 K·h
-  hot-water tank, emptiest           30 % full
+  hot-water tank, emptiest           25 % full
 
-  roof, as the box learned it   90 % of the model
-  production forecast, CRPS     169 W (84 % of 32 lit)
-  load forecast, CRPS           18 W (85 % covered)
+  roof, as the box learned it  90 % of the model
+  roof, is it still the roof it was  yes, 91 % of 89 %
+  production forecast, CRPS  173 W (83 % of 30 lit)
+  load forecast, CRPS      18 W (85 % covered)
 
-  electricity bill                     19.88 €
-  battery life spent                    0.65 €
+  electricity bill                     19.97 €
+  …if the quarter hour were netted  +0.01 € on the bill saving, which a two-register meter does not forgive
+  battery life spent                    0.63 €
   comfort given up                      0.22 €
-  cost of the day                      20.75 €
-  without optimisation                 22.92 €
-  saved                                 2.18 €
-  …of it on the bill                    2.99 €
+  borrowed from the stores              0.08 €
+  cost of the day                      20.90 €
+  without optimisation                 21.96 €
+  saved                                 1.07 €
+  …of it on the bill                    0.63 €
 
   § 14a limit in force                  90 min
   …against a minimum of                10.5 kW
   …covered by the store                1.4 kWh
+  control events recorded       1 (92 samples)
+  self-restraint records                     1
   slowest reaction              0 s, commanded
   minutes without a plan                     0
+  commands the hardware clipped  0 ticks (0.00 kWh)
+  quarter hours § 51 EEG zeroed              0
+  carbon behind the imports  17.3 kg (327 g/kWh)
+  the opening plan expected  19.06 €, off by +0.91
+  without an Energy Guard                2 min
   § 14a limit respected                    yes
   § 9 EEG ceiling respected                yes
 
   described in S2                  6 resources
+  dearest asset vs cheapest                 1×
   relief from § 14a was worth       0.00 €/kWh
+  Modul 2 pays above                2417 kWh/a
+  …on this day it would have  -3.77 € on the energy
+
 </code></pre>
       </div>
 
@@ -246,16 +261,25 @@ flowchart TB
         <li>
           <h3>without optimisation</h3>
           <p>The same day delivering the <strong>same service</strong> — car
-          charged, house warm, shower hot — with no battery, a wallbox that
-          starts on plug-in and ordinary thermostats, against the <strong>same
-          weather</strong> down to the cloud at 12:19, and under the <strong>same
-          grid rules</strong>. A saving computed any other way flatters itself.</p>
+          charged, house warm, shower hot — with the <strong>same
+          equipment</strong>: the same battery, run the way every hybrid inverter
+          runs one out of the box, a wallbox that starts on plug-in and ordinary
+          thermostats, against the <strong>same weather</strong> down to the
+          cloud at 12:19, and under the <strong>same grid rules</strong>.</p>
+          <p>The battery is the one that matters most: a store earns the
+          import/export spread on everything it cycles whether or not anybody
+          optimises. A saving measured against an <em>idle</em> one is the value
+          of owning a battery rather than of managing one, and is comparable with
+          nothing in the literature, which measures against rule-based
+          self-consumption.</p>
         </li>
         <li>
           <h3>saved, against …of it on the bill</h3>
-          <p>€2,18 against €2,99. The saving counts the battery life, the comfort
-          and the service the plan actually spent. The bill alone is the
-          flattering number every other system quotes.</p>
+          <p>€1,08 against €0,74. The saving counts the battery life, the
+          comfort and the service the plan actually spent. The bill alone is the
+          flattering number every other system quotes — and here it is the
+          <em>smaller</em> of the two, because the factory controller cycles the
+          pack harder and lets the house drift further than the plan does.</p>
         </li>
         <li>
           <h3>…covered by the store</h3>
@@ -273,9 +297,15 @@ flowchart TB
         <li>
           <h3>The three forecast lines are the evidence for the money lines</h3>
           <p>The planner is given only what six weeks of the box’s own metering
-          could have taught it. <code>--perfect-foresight</code> shows what a
-          saving quoted without that measures: <strong>€4,78 against
-          €2,18</strong> on this day.</p>
+          could have taught it. <code>--perfect-foresight</code> runs
+          <strong>the same day</strong> with the planner shown the weather it
+          will actually get — the unmanaged household comes out identical to the
+          cent, which is what makes the difference attributable to foresight at
+          all — and on this January day that is worth <strong>€0,28 of a €0,57
+          bill saving</strong>.</p>
+          <p>So a saving published from a perfect-foresight run overstates itself
+          by percent rather than by half — the small claim, and the measured
+          one.</p>
         </li>
       </ul>
     </div>

@@ -30,9 +30,14 @@ pub fn day(scenario: &Scenario, r: &DayResult) -> String {
     );
     // A day the planner could not be surprised by is not a measurement of a
     // controller, and its saving is an upper bound rather than a result. Saying
-    // so here is the whole of this project's argument applied to its own output:
-    // the same winter day saves €2,09 honestly and €5,25 with the answer in
-    // hand, and until this line existed both printed identically.
+    // so here is the whole of this project's argument applied to its own output,
+    // and until this line existed the two printed identically.
+    //
+    // The bound is a good deal tighter than it used to look. With the flag
+    // fixed to change the forecast rather than the day (D197), the January
+    // premium is €0,13 of a €0,74 bill saving rather than the €2,60 a
+    // different-day comparison reported — so the warning is about the *kind* of
+    // number this is rather than about its size.
     if r.foresight_is_perfect {
         let _ = writeln!(
             out,
@@ -153,6 +158,40 @@ pub fn day(scenario: &Scenario, r: &DayResult) -> String {
             "roof, as the box learned it",
             format!("{:.0} % of the model", r.roof_correction * 100.0),
         );
+        // …and the other question the same numbers answer. The correction above
+        // is what the *planner* uses and it is accurate whatever the roof does —
+        // that is its job. This is the one a household has money riding on, and
+        // until it was rendered here it existed only as a `tracing::warn!`,
+        // which is not a way to tell anybody anything (D199).
+        row(
+            &mut out,
+            "roof, is it still the roof it was",
+            match r.roof_health {
+                hems_forecast::Health::Learning { days } => {
+                    format!("learning, {days}/{}", hems_forecast::health::SETTLED_DAYS)
+                }
+                hems_forecast::Health::Healthy { recent, baseline } => {
+                    format!("yes, {:.0} % of {:.0} %", recent * 100.0, baseline * 100.0)
+                }
+                hems_forecast::Health::Degraded {
+                    recent,
+                    baseline,
+                    days,
+                } => format!(
+                    "DOWN {:.0} %, {days} days",
+                    (1.0 - recent / baseline.max(f64::EPSILON)) * 100.0
+                ),
+            },
+        );
+        // A verdict of `Degraded` is the one line on this page asking somebody
+        // to do something, so it says what rather than leaving a household to
+        // work out what a performance ratio is.
+        if r.roof_health.is_degraded() {
+            let _ = writeln!(
+                out,
+                "    \u{21b3} snow, soiling, a new shadow or a failed string — worth a look"
+            );
+        }
         // The slot count is on the line on purpose. A production score is over
         // the *lit* part of the day — a band of nothing against an outcome of
         // nothing is midnight, not a forecast that came true — and a reader who

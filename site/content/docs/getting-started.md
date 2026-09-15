@@ -66,13 +66,13 @@ Seven days, and six comparisons run against them. The days:
 
 | Day | What it shows | Saved |
 |---|---|---|
-| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €2,18 |
-| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €8,98 |
-| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €2,81 |
-| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €1,61 |
-| `offline` | **the planner switched off** — what the box does on its own | €8,12 |
-| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €2,97 |
-| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,01 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €1,04 |
+| `winter` | a network operator reduction from 17:00 to 18:30, a car that must be full by seven, and a dishwasher the plan holds back half an hour | €1,08 |
+| `summer` | more production than the house can use, and **twelve** quarter hours of negative prices — three whole hours of § 51 EEG | €4,36 |
+| `deadline` | a car that arrives *as the reduction starts* and has three hours to take 13 kWh under the household's own 10,5 kW minimum, shared with a heat pump | €0,93 |
+| `shared` | the same evening on a household with **no store**, owed 7,56 kW rather than 10,5, and a reduction that arrives at 17:07 rather than on the re-planning grid | €0,91 |
+| `offline` | **the planner switched off** — what the box does on its own | €5,78 |
+| `autumn` | a September day, planner off, the surplus in the band only one conductor can use | €0,22 |
+| `capped` | a clear May day on a 20 kWp roof, with the § 9 EEG 60 % cap binding at 12,01 of 12,00 kW, and the report saying in its own line whether the ceiling was respected | €0,57 |
 
 What each comparison isolates, and why a reference day is built the way it is,
 are on [simulation and evaluation](@/docs/simulation.md).
@@ -355,7 +355,7 @@ energy manager — a counterfactual only a simulator can re-run. A day from
 fleet counts those in `unmeasurable_days` rather than averaging them in as days
 that saved nothing.
 
-`saving_eur` is the reference winter day's own €2,18, which is the point: the
+`saving_eur` is the reference winter day's own €1,08, which is the point: the
 fleet view is fed by the same number the day prints, through a type both sides
 share, so a renamed field is a compile error rather than a dashboard reading zero
 for six weeks.

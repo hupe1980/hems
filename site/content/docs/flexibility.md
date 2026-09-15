@@ -288,12 +288,51 @@ mode and a `PPBC` programme start — because the arbiter decides a *power* per
 asset and those are decided elsewhere. They are counted rather than dropped
 quietly, which is how a gap says out loud that somebody wants it.
 
-## Standing on the authors' work
+## Standing on a library, and being checked by it
 
-The wire types come from [`s2energy`](https://crates.io/crates/s2energy),
-generated from the official JSON schema by TNO and Flexiblepower — the people who
-wrote S2. Writing our own would be a second opinion about a wire format, which is
-the one thing a standard exists to prevent.
+The data model comes from [`s2-kit`](https://crates.io/crates/s2-kit), which
+proves its 36 messages and 41 component types against the standard's own JSON
+schemas in its own CI. Writing our own would be a second opinion about a wire
+format, which is the one thing a standard exists to prevent.
+
+What it adds over generated types alone is a **rule-numbered semantic
+validator** — everything JSON Schema cannot say, with the clause behind each rule
+quoted. The interop test drives a real Customer Energy Manager session with that
+validator on, so every message this box sends is checked against the catalogue
+and a violation names the rule it broke.
+
+That is worth more than it sounds. A hand-written test peer only ever proves the
+far end did not crash; a peer that tracks session state refuses things the
+standard forbids — a control-type message arriving before the acknowledgement
+that accepted the selection, say (`S2-STATE-001`), which is the kind of ordering
+error nothing else in a test suite can see.
+
+### What a validator cannot check
+
+A rule catalogue checks **messages**. It cannot check a *session* — the order
+things happen in, what is owed when, what a resource does with an instruction
+after answering it — and a session is where both ends are hand-written.
+
+Three session rules this surface keeps, none of which is visible in any single
+message:
+
+- **An instruction is a schedule.** `execution_time` means "when to start; in
+  the past means as soon as possible", so one for later waits, in time order.
+  The box answers `Accepted` on receipt and `Started` when it begins. The queue
+  is bounded at two days of quarter hours, a refusal past that is told to the
+  manager rather than dropped, and a closed session clears it.
+- **`RevokeObject` withdraws one that has not run.** One already carried out is
+  not revocable; the honest answer for that is the `Aborted` the guard's own
+  override path sends.
+- **`NO_SELECTION` is a manager letting go** — a state rather than a capability,
+  and how an aggregator finishes a dispatch window. The hold is released at
+  once, because a manager's instruction ranks above the box's own plan. The
+  connection stays up: a manager that is not driving may still want the
+  measurements, and may select again without reconnecting.
+
+None of the three can be proved from inside. That is R32's whole argument, and
+it is why what this surface needs next is not a feature but a stranger on the
+far end of the socket.
 
 Every message this crate produces is round-tripped through JSON in its own tests
 — **by value**, not by message type — which checks the whole of it against the

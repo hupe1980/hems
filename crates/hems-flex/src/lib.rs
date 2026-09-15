@@ -19,7 +19,7 @@
 //! belongs to, the description a Customer Energy Manager would be sent, and the
 //! translation of an instruction back into something [`hems_device`] can issue.
 //!
-//! The wire types are [`s2energy`], generated from the official schema by the
+//! The wire types are [`s2_kit`], generated from the official schema by the
 //! standard's own authors. Writing our own would be a second opinion about a
 //! wire format, which is the one thing a standard exists to prevent.
 //!

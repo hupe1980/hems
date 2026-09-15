@@ -7,6 +7,7 @@ authors.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+homepage.workspace     = true
 rust-version.workspace = true
 
 [[bin]]
@@ -45,12 +46,13 @@ hems-service   = { workspace = true }
 eebus        = { workspace = true, features = ["runtime", "mdns", "aws-lc-rs", "conformance"] }
 if-addrs     = { workspace = true }
 hems-sim       = { workspace = true }
-# The S2 wire types, so this daemon can decode a frame into the `Message` that
+# The S2 data model, so this daemon can decode a frame into the `Message` that
 # `hems-flex` decides about. `default-features = false` keeps the crate's own
-# WebSocket transport out: it binds a port and cannot say which *resource* a
-# connection is for, which is the one thing a multi-resource household needs
-# (see `runtime::s2`).
-s2energy     = { version = "0.3", default-features = false }
+# transport out: the box is the *server*, axum already binds its socket, and
+# `s2-kit`'s own driver dials a connection rather than accepting one — it cannot
+# say which *resource* an inbound connection is for, which is the one thing a
+# multi-resource household needs (see `runtime::s2`).
+s2-kit       = { workspace = true }
 hems-tariff    = { workspace = true }
 metering       = { workspace = true }
 
@@ -96,18 +98,15 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # opinion about the wire — which is the whole reason `hems-flex` takes the
 # generated types in the first place.
 #
-# A dev-dependency, so the daemon itself never links `tokio-tungstenite`: the box
-# is the *server* and axum already binds its socket.
-s2energy = { version = "0.3", default-features = false, features = ["websockets-json"] }
-# S2's schema puts instants in `chrono`, so a test that *builds* an instruction
-# needs one. The daemon itself does not: it decodes, and `hems-flex` converts at
-# its own edge, so `time` stays the only calendar in the product.
-chrono   = { version = "0.4", default-features = false, features = ["std"] }
-# The credential rides in the ordinary `Authorization` header, so the test's CEM
-# needs a handshake request it can add one to. `IntoClientRequest` is the
-# standard crate's own — writing the `Sec-WebSocket-Key` by hand would be a
-# second implementation of a handshake in a test about something else.
-# The same version `s2energy` and `axum` already resolve to, so there is one
-# tungstenite in the build graph rather than two.
-http              = { workspace = true }
-tokio-tungstenite = { version = "0.28", default-features = false }
+# The **`tokio` feature** here and nowhere else: it carries `io::Driver` and
+# `io::WebSocket`, so the test's CEM is a real session driving a real socket. A
+# dev-dependency, so the daemon itself never links a WebSocket client — the box
+# is the *server* and axum already binds its socket. No TLS feature: the test
+# dials `ws://` on loopback, and asking for one would drag a second `rustls`
+# provider past `deny.toml`.
+#
+# No `tokio-tungstenite` edge either: the socket type has a name of its own,
+# `s2_kit::io::Dialled`. Spelling `MaybeTlsStream<TcpStream>` here instead would
+# tie this manifest to whatever version `s2-kit` resolves, and a drift shows up
+# as two distinct `MaybeTlsStream`s with an identical-looking type error.
+s2-kit   = { workspace = true, features = ["tokio"] }

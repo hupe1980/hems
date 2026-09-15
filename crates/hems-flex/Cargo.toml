@@ -9,16 +9,17 @@ authors.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+homepage.workspace     = true
 rust-version.workspace = true
 
 [dependencies]
 hems-core = { workspace = true }
-# The reference S2 types, generated from the official schema by the standard's
-# own authors (TNO / Flexiblepower). Writing our own would be a second opinion
-# about a wire format, which is the one thing a standard exists to prevent.
-s2energy  = { version = "0.3", default-features = false }
+# S2's data model and its rule-numbered semantic validator, proven against the
+# standard's own JSON schemas in the crate's own CI. Writing our own would be a
+# second opinion about a wire format, which is the one thing a standard exists to
+# prevent.
+s2-kit    = { workspace = true }
 hems-device = { workspace = true }
-chrono      = { version = "0.4", default-features = false, features = ["std"] }
 time        = { workspace = true }
 uuid        = { version = "1", default-features = false, features = ["v5"] }
 thiserror   = { workspace = true }

@@ -171,77 +171,86 @@ $ cargo run -p hemsd -- simulate --day winter
 
   2026-01-15 — with a § 14a reduction
 
-  produced                                  8.5 kWh
+  produced                                  7.4 kWh
   household consumption                    11.0 kWh
   charged into the car                     21.7 kWh
-  heat pump                                26.1 kWh
+  heat pump                                22.1 kWh
   hot water                                 3.1 kWh
-  dishwasher                         1.1 kWh, 75 min later
-  battery throughput                       15.5 kWh
-  imported                                 55.6 kWh
+  dishwasher                  1.1 kWh, 75 min later
+  battery throughput                       15.6 kWh
+  imported                                 52.9 kWh
   exported                                  0.3 kWh
   curtailed                                 0.0 kWh
-  peak feed-in, per quarter hour     0.12 of 5.88 kW
-  self-sufficiency                             13 %
-  wallbox on one conductor           0 min (0 switches)
+  peak feed-in, per quarter hour    0.12 of 5.88 kW
+  self-sufficiency                             12 %
+  wallbox on one conductor       0 min (0 switches)
 
-  indoor temperature                 19.9 – 23.1 °C
-  outside the comfort band                 0.12 K·h
-  hot-water tank, emptiest                24 % full
+  indoor temperature                 19.9 – 23.0 °C
+  outside the comfort band                 0.15 K·h
+  hot-water tank, emptiest                25 % full
 
-  roof, as the box learned it        90 % of the model
-  production forecast, CRPS          192 W (81 % of 32 lit)
-  load forecast, CRPS                18 W (85 % covered)
+  roof, as the box learned it     90 % of the model
+  roof, is it still the roof it was  yes, 91 % of 89 %
+  production forecast, CRPS  173 W (83 % of 30 lit)
+  load forecast, CRPS           18 W (85 % covered)
 
-  electricity bill                          21.03 €
-  battery life spent                         0.62 €
-  comfort given up                           0.19 €
-  borrowed from the stores                   0.14 €
-  cost of the day                           21.97 €
-  without optimisation                      24.12 €
-  saved                                      2.14 €
-  …of it on the bill                         3.44 €
+  electricity bill                          19.97 €
+  …if the quarter hour were netted  +0.01 € on the bill saving, which a two-register meter does not forgive
+  battery life spent                         0.63 €
+  comfort given up                           0.22 €
+  borrowed from the stores                   0.08 €
+  cost of the day                           20.90 €
+  without optimisation                      21.96 €
+  saved                                      1.07 €
+  …of it on the bill                         0.63 €
 
   § 14a limit in force                       90 min
   …against a minimum of                     10.5 kW
   …covered by the store                     1.4 kWh
-  control events recorded            1 (93 samples)
+  control events recorded            1 (92 samples)
   self-restraint records                          1
   slowest reaction                   0 s, commanded
   minutes without a plan                          0
-  commands the hardware clipped      0 ticks (0.00 kWh)
+  commands the hardware clipped  0 ticks (0.00 kWh)
   quarter hours § 51 EEG zeroed                   0
-  carbon behind the imports          18.2 kg (327 g/kWh)
-  the opening plan expected          20.05 €, off by +0.98
-  without an Energy Guard                     3 min
+  carbon behind the imports     17.3 kg (327 g/kWh)
+  the opening plan expected   19.06 €, off by +0.91
+  without an Energy Guard                     2 min
   § 14a limit respected                         yes
   § 9 EEG ceiling respected                     yes
 
   described in S2                       6 resources
-  dearest asset vs cheapest                      2×
+  dearest asset vs cheapest                      1×
   relief from § 14a was worth            0.00 €/kWh
   Modul 2 pays above                     2417 kWh/a
-  …on this day it would have         -3.97 € on the energy
+  …on this day it would have  -3.77 € on the energy
+
 ```
 
 Five lines there are not in anybody else's table, and the
 [planner page](https://hupe1980.github.io/hems/docs/optimizer/) argues each:
 
-- **without optimisation** — the same day delivering the **same service** with no
-  battery, a wallbox that starts on plug-in and ordinary thermostats, against the
-  **same weather** and under the **same grid rules**. A saving computed any other
-  way flatters itself.
-- **saved / …of it on the bill** — €2,18 against €2,99. The saving counts the
+- **without optimisation** — the same day delivering the **same service** with the
+  **same equipment**: the same battery on the greedy self-consumption rule every
+  hybrid inverter ships with, a wallbox that starts on plug-in, ordinary
+  thermostats, the same weather and the same grid rules. The battery matters most:
+  a store earns the import/export spread on everything it cycles whether or not
+  anybody is optimising, so a saving measured against an *idle* one is the value
+  of owning a battery rather than of managing one (D195).
+- **saved / …of it on the bill** — €1,08 against €0,74. The saving counts the
   battery life, the comfort and the service the plan spent; the bill is the
-  flattering number every other system quotes.
+  flattering number every other system quotes. Here the bill saving is the
+  *smaller* of the two, because the factory controller cycles the pack harder and
+  lets the house drift further than the plan does.
 - **…if the quarter hour were netted** — how the bill is *accumulated* moves the
   saving, and nobody publishes their convention. A two-register meter does not
   net: a quarter hour with seven minutes of import and seven of export registers
   both, and is billed for both at two different prices. hems accumulates tick by
-  tick with the directions priced apart, on both sides of the comparison. The
-  line says what the shortcut would be worth — here **−€0,93 of a €2,99 bill
-  saving**, running *against* this product, because the unmanaged household is
-  the one whose heat pump cycles under a roof that is still producing.
+  tick with the directions priced apart, on both sides of the comparison. On this
+  day it is worth under a cent — and that is itself a finding, because against a
+  batteryless baseline it was worth €0,93. A store absorbs the sub-quarter-hour
+  reversals that netting forgives, so a published comparison of netting
+  conventions is measuring the baseline's storage as much as the convention.
 - **…covered by the store** — `[A1 2.3]` in one number: kilowatt-hours the
   battery lent the controllable devices during the reduction, which never crossed
   the connection point.
@@ -253,13 +262,17 @@ Five lines there are not in anybody else's table, and the
   anybody is checking.
 
 The three forecast lines are the evidence for the money lines: the planner is
-given only what six weeks of the box's own metering could have taught it, and
-`--perfect-foresight` shows what a saving quoted without that measures — **€4,78
-against €2,18** on this day.
+given only what six weeks of the box's own metering could have taught it.
+`--perfect-foresight` runs **the same day** with the planner shown the weather it
+will actually get — the unmanaged household comes out identical to the cent,
+which is what makes the difference attributable to foresight — and on this
+January day that is worth **€0,28 of a €0,57 bill saving**. A saving published
+from a perfect-foresight run therefore overstates itself by percent rather than
+by half (D197).
 
 ## 💡 What makes it different
 
-Seven claims, each argued on the site rather than here.
+Eight claims, each argued on the site rather than here.
 
 1. **The grid limit is a proven property, not a code path.** `[A1 4.6 S. 3]`
    requires a network operator's reduction to beat market control, so it lives in
@@ -293,17 +306,24 @@ Seven claims, each argued on the site rather than here.
    allocation, Modul 3 windows and the two years of § 14a evidence — in exact
    decimals, with the Festlegung's own numbering.
    ([grid rules](https://hupe1980.github.io/hems/docs/grid-rules/))
+8. **The household it is compared against owns the same equipment.** The same
+   battery, on the greedy self-consumption rule every hybrid inverter ships with;
+   the same tank at the same set point; the same community membership; the same
+   grid rules. Both households pay their own battery wear, and both can be charged
+   for ending the day emptier than they began — a term a comparison against an
+   idle store cannot even express (D195).
+   ([planner](https://hupe1980.github.io/hems/docs/optimizer/))
 
 ## 📐 What the rules are taken from
 
 Every regulatory number carries the document and clause it comes from —
 `[BK6-22-300 A1 4.5.2]`, `[LPC-031]` — and `cargo xtask check-citations` resolves
-all 458 of them against an index of primary sources, **failing the build** if one
+all 461 of them against an index of primary sources, **failing the build** if one
 names a document the index does not carry. `cargo xtask check-wire` does the same
 for the 130 quantities and instants, each of which has to say how it travels;
 `cargo xtask check-vital` for a daemon's background loops, since one spawned
 outside `Health::vital` has a liveness probe that cannot fail, which is worse
-than none; `cargo xtask check-deps-used` for the 259 declared dependencies,
+than none; `cargo xtask check-deps-used` for the 255 declared dependencies,
 because every crate here is published and an edge nobody uses is a resolution and
 a compile a downstream consumer pays for — and an edge from the simulator to the
 forecaster would be a path by which the day that happens could read the day that
@@ -427,7 +447,7 @@ obeys that as an instruction not to use it.
 | **The hot-water tank over EEBUS MDT** — the one number that kept the optimiser's hot-water store out of every real plan | a circuit reports 52,5 °C over SPINE and the planner gets a store; a flagged sensor reaches it as an absent tank rather than a number to heat against |
 | **The heat pump over EEBUS** — the lever an energy manager never had | OHPCF starts and stops the compressor's process, which is the one use case that can ask an appliance to consume *more*; MRT reports the air temperature of each room it watches and MOT the weather at this building, which are two of the three signals a thermal model is identified from. Three use cases on one session, because SHIP grants one per peer |
 | **The hot-water loading over EEBUS CDSF** | the button in the bathroom, pressed over the wire: the shortest path there is from "the roof is exporting" to "the tank is absorbing it", and given back when a cloud arrives. Not a setpoint — a setpoint hands the decision back to the circuit's own controller, which is what an MPC exists to replace |
-| **A vendor's own register map over Modbus TCP** | for everything that answers Modbus and publishes no SunSpec model list, which is most of the installed heat-pump base. Space, width, word order, scale and field are declared and none is guessed; it reads and never writes, because a map that could write is one where a typo starts a compressor |
+| **A vendor's own register map over Modbus TCP** | for everything that answers Modbus and publishes no SunSpec model list, which is most of the installed heat-pump base. Space, width, word order, scale and field are declared and none is guessed. It writes only registers a household **declared**, only the values that declaration enumerates, one sixteen-bit register each — so no scale can be got wrong, and a map with no `writes` is read-only |
 | **The car over EEBUS EVCC and EVSOC** — an arrival, which has no message: an `EV` entity appearing under the `EVSE` *is* the message | a cable goes in and the plan gets a charging deadline; a car that cannot say how full it is is still a car, and is not charged against an invented battery |
 | **Pairing a Steuerbox without a restart** | it dials a box that does not know it, is held pending, is approved mid-handshake, and gets through |
 | **The SHIP session** — TLS 1.2 with mutual authentication, the WebSocket upgrade, the handshake, a trust store and a SKI that survive a reboot, and a `_ship._tcp` announcement so a Steuerbox can find the box at all | a Steuerbox reduces a running household to 4,2 kW over a real socket, and an unapproved one completes TLS and gets no further |
@@ -452,15 +472,15 @@ obeys that as an instruction not to use it.
 | Not yet | |
 |---|---|
 | EEBUS certification | the **device-level** half is done — all seven `ATC_*` procedures driven against the box's own store, driver and SPINE session, judged by `eebus`'s harness, six answered and the seventh skipped with its reason on the report. What is left is the protocol-level suite over a real network, interop against another implementation, and the laboratory's own stopwatch on a physical box. mDNS/DNS-SD and a pairing flow a person can drive are done |
-| **Contact with an implementation that is not ours** | both protocol surfaces are tested against the library they are built on. For EEBUS that is a known blind spot with a known fix — `eebus-go`'s controlbox in a CI job. For S2 it is the same shape and was less obvious: the CEM on the far end of `managed_by_a_cem.rs` is `s2energy`, and so is the surface it dials, so the wire types are the standard's (generated from its JSON Schema) and the **session** is hand-written on both ends. `s2-analyzer` validates a live connection against those schemas and `s2-python` is a second stack; both are a CI job away. Until then "it can be driven by somebody else's energy manager" is a claim about one library's reading of EN 50491-12-2 |
+| **Contact with an implementation that is not ours** | both protocol surfaces are tested against the library they are built on. For EEBUS that is a known blind spot with a known fix — `eebus-go`'s controlbox in a CI job. For S2 it is the same shape: the CEM on the far end of `managed_by_a_cem.rs` is `s2-kit`'s own session engine, and so is the surface it dials. Narrower than it was — that engine runs a **rule-numbered semantic validator** over every message this box sends, and a violation names the clause it broke — but a catalogue and a session written by the same hand can be wrong together. `s2-analyzer` validates a live connection against the standard's own schemas and `s2-python` is a second stack; both are a CI job away. Until then "it can be driven by somebody else's energy manager" is a claim about one library's reading of EN 50491-12-2 |
 | The rest of the fleet tier | a household portal, a Postgres-plus-Iceberg store for `histd`, GDPR erasure, A/B images and OTA campaigns |
 | The market side | OpenADR 3.1 and § 41e, and the MiSpeL and § 42c *exports* — the arithmetic already ships |
 | Controlling devices rather than only being controlled | the EEBUS CEM role, V2H/V2G, Matter DEM. The S2 side is the other direction and is built |
 | A wallbox a manager can schedule rather than only cap | over S2 it is offered as an envelope, because describing it as a *store* means answering how many kilowatt-hours the car is holding — and the pack size reaches the box as the planner's input rather than as a fact about the site |
 
-1 127 tests. `just ci` runs formatting, Clippy with warnings as errors on every
+1 157 tests. `just ci` runs formatting, Clippy with warnings as errors on every
 feature combination, a purity check that fails if a domain crate reaches for a
-clock, the whole suite, the workspace guards (458 citations across five document
+clock, the whole suite, the workspace guards (461 citations across five document
 families, each resolving to a document the index carries; 130 quantities,
 instants and dates each naming how they travel), `cargo-deny` and the docs.
 
@@ -484,16 +504,25 @@ property is a statement about code that runs.
 
 ## 🤝 Related crates
 
-hems consumes rather than reimplements: [`s2energy`](https://crates.io/crates/s2energy)
-(the S2 / EN 50491-12-2 types, generated from the official schema by the
-standard's own authors), [`metering`](https://github.com/hupe1980/metering)
+hems consumes rather than reimplements: [`s2-kit`](https://github.com/hupe1980/s2-kit)
+(the S2 / EN 50491-12-2 data model, a rule-numbered semantic validator and
+sans-I/O Resource Manager and Customer Energy Manager session engines),
+[`metering`](https://github.com/hupe1980/metering)
 (Europe/Berlin calendar, OBIS, § 14a minimum power and netzwirksamer
 Leistungsbezug, Modul 3 calendars and their conformance rules, the VDE-AR-N 4100
 Unsymmetrieleistung, the allocation identity § 42b/c settle on),
 [`eebus`](https://github.com/hupe1980/eebus) (SHIP and SPINE sans-I/O, the LPC/LPP
 limitation machine, and a conformance suite over all four certifiable use cases),
-[`ocpp-kit`](https://github.com/hupe1980/ocpp-kit), [`iso15118`](https://github.com/hupe1980/iso15118)
-and [`mako`](https://github.com/hupe1980/mako) (the market side).
+[`chronix`](https://github.com/hupe1980/chronix) (the box's own measurement
+series), [`ocpp-kit`](https://github.com/hupe1980/ocpp-kit) (OCPP 1.6J/2.0.1/2.1
+for the charge-point side) and [`mako`](https://github.com/hupe1980/mako) (the
+market side).
+
+[`iso15118`](https://github.com/hupe1980/iso15118) is deliberately **not** among
+them. ISO 15118 is spoken on the charging cable, between a wallbox and a car;
+hems sits upstream of the wallbox and plans with what the wallbox reports. The
+one ISO 15118 artefact that reaches a manager is OCPP's `Get15118EVCertificate`,
+and its payload is a base64 blob a CSMS forwards rather than reads.
 
 **Two tiers, two stores, and the split is the answer to *what runs where*.** The
 edge is **one** process, `hemsd`, because the § 14a failsafe is a sixty-second

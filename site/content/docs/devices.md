@@ -400,12 +400,47 @@ A point declares five things and guesses none of them:
 | **scale** | a temperature is published in tenths of a kelvin as often as in kelvin, and a *negative* scale is how a vendor reporting generation as positive becomes this workspace's load convention |
 | **field** | which of `power`, `temperature_c` or `soc` it becomes — a short list on purpose, so a map can only say things the rest of the box already knows how to use |
 
-It **reads and never writes**, and that is the design rather than a stage it has
-not reached. A register map that could write is one where a typo in a
-configuration file starts a compressor: the consequence is not a bad reading, it
-is a heat pump doing something nobody asked for. Commanding belongs to a protocol
-that says what a value *means*, and the registry lets both drivers speak for one
-asset precisely so this one never has to.
+### What it writes
+
+A map with no `writes` is read-only, and that is the default. A register map
+that can write anything is one where a typo in a configuration file starts a
+compressor — the consequence is not a bad reading but a heat pump doing
+something nobody asked for — so commanding belongs to a protocol that says what
+a value *means*.
+
+One command has no such protocol: a **direction**. EEBUS's twelve HVAC use cases
+are temperature and system-function measurement and control, and none of them
+reverses a refrigerant circuit, so for a reversible heat pump the choice is a
+vendor register or a plan that cannot be carried out. A box that decides to
+pre-cool and cannot say so is worse than either: the unit runs whichever way its
+own thermostat last chose, the meter agrees with the commanded power, and the day
+report claims a saving nobody made.
+
+So a household may declare writes, under three rules:
+
+| Rule | What it prevents |
+|---|---|
+| A separate list, not a flag on a read point | no typo in a point can turn it into a write |
+| A write names its command and **enumerates** the values it may take (`heat = 1, cool = 2`) | the driver never computes a number to write, so there is no scale to get wrong |
+| One holding register, sixteen bits | the word-order trap, which is the commonest way a map is wrong while still looking plausible |
+
+Continuous setpoints — a consumption ceiling in watts — are deliberately not
+writable here. That is where a scale error is dangerous, and where EEBUS LPC and
+SunSpec 704/705 already work.
+
+Two answers are reported rather than assumed. A device that **refuses** a write
+answers with an exception on a transaction no outstanding read matches, so the
+driver tracks its own writes and turns the refusal into a `Command` event. And a
+reconnect **forgets** them: a transaction identifier means nothing across a new
+socket, and matching a stale one against a fresh reply reports a write that never
+happened.
+
+`run --check` closes the household side: a reversible heat pump whose drivers
+cannot set a thermal mode is **refused at start-up**. Everything else about that
+installation works — the plan decides cooling, the arbiter commands a power, the
+driver writes it, the meter agrees — and the compressor runs whichever way it was
+already running. In January that is invisible because both agree; in July it
+heats the house.
 
 One point per request, too, rather than one read spanning a block. Coalescing is
 the obvious optimisation and it is wrong here: a vendor map is sparse, a device

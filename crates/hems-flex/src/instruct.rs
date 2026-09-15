@@ -9,8 +9,8 @@
 use hems_core::asset::{Battery, DhwTank};
 use hems_core::prelude::*;
 use hems_device::SgReadyState;
-use s2energy::common::Id;
-use s2energy::{frbc, ombc, pebc, ppbc};
+use s2_kit::types::Id;
+use s2_kit::types::{frbc, ombc, pebc, ppbc};
 use time::OffsetDateTime;
 
 use crate::describe::{
@@ -107,9 +107,9 @@ pub fn actuator_factor(
     }
     let f = factor(instruction.operation_mode_factor)?;
     if instruction.operation_mode == *charge {
-        Ok((instruction.id.clone(), Direction::In, f))
+        Ok((instruction.id, Direction::In, f))
     } else if discharge.is_some_and(|d| instruction.operation_mode == *d) {
-        Ok((instruction.id.clone(), Direction::Out, f))
+        Ok((instruction.id, Direction::Out, f))
     } else {
         Err(InstructError::UnknownOperationMode)
     }
@@ -154,13 +154,8 @@ pub fn programme_start(
     {
         return Err(InstructError::UnknownOperationMode);
     }
-    OffsetDateTime::from_unix_timestamp_nanos(i128::from(
-        instruction
-            .execution_time
-            .timestamp_nanos_opt()
-            .unwrap_or(0),
-    ))
-    .map_err(|_| InstructError::UnknownOperationMode)
+    OffsetDateTime::try_from(instruction.execution_time)
+        .map_err(|_| InstructError::UnknownOperationMode)
 }
 
 /// The SG Ready state an OMBC instruction selects.
@@ -189,7 +184,7 @@ pub fn heat_pump_state(
 /// [`InstructError::NoMatchingEnvelope`] or [`InstructError::EmptyEnvelope`].
 pub fn envelope_now(
     instruction: &pebc::Instruction,
-    quantity: s2energy::common::CommodityQuantity,
+    quantity: s2_kit::types::common::CommodityQuantity,
 ) -> Result<(Power, Power), InstructError> {
     let envelope = instruction
         .power_envelopes
@@ -233,8 +228,8 @@ pub fn envelope_interval(
     mode: PhaseMode,
 ) -> Result<Envelope, InstructError> {
     let quantity = match asset.meta().phases.clamp_mode(mode) {
-        PhaseMode::Single => s2energy::common::CommodityQuantity::ElectricPowerL1,
-        PhaseMode::Three => s2energy::common::CommodityQuantity::ElectricPower3PhaseSymmetric,
+        PhaseMode::Single => s2_kit::types::common::CommodityQuantity::ElectricPowerL1,
+        PhaseMode::Three => s2_kit::types::common::CommodityQuantity::ElectricPower3PhaseSymmetric,
     };
     let (lower, upper) = envelope_now(instruction, quantity)?;
     Ok(Envelope::new(lower, upper))
@@ -270,7 +265,7 @@ mod tests {
         describe_pv,
     };
     use hems_core::asset::{AssetMeta, DhwTank, Evse, HeatPump, PvArray};
-    use s2energy::common::{Duration, Id};
+    use s2_kit::types::{Duration, Id};
     use time::OffsetDateTime;
     use time::macros::datetime;
 
@@ -307,9 +302,7 @@ mod tests {
             .actuator_id(actuator)
             .operation_mode(mode)
             .operation_mode_factor(f)
-            .execution_time(chrono::DateTime::from_timestamp_nanos(
-                i64::try_from(T0.unix_timestamp_nanos()).unwrap(),
-            ))
+            .execution_time(T0.into())
             .abnormal_condition(false)
             .build()
     }
@@ -319,10 +312,10 @@ mod tests {
         let b = battery();
         let d = describe_battery(&b, T0);
 
-        let charge = frbc_instruction(d.actuator.clone(), d.charge.clone(), 1.0);
+        let charge = frbc_instruction(d.actuator, d.charge, 1.0);
         assert_eq!(battery_power(&d, &charge, &b).unwrap(), Power::from_kw(5.0));
 
-        let discharge = frbc_instruction(d.actuator.clone(), d.discharge.clone(), 1.0);
+        let discharge = frbc_instruction(d.actuator, d.discharge, 1.0);
         assert_eq!(
             battery_power(&d, &discharge, &b).unwrap(),
             Power::from_kw(-5.0)
@@ -353,13 +346,13 @@ mod tests {
         let t = tank();
         let d = describe_dhw(&t, T0);
 
-        let full = frbc_instruction(d.actuator.clone(), d.heat.clone(), 1.0);
+        let full = frbc_instruction(d.actuator, d.heat, 1.0);
         assert_eq!(dhw_power(&d, &full, &t).unwrap(), Power::from_kw(3.0));
 
-        let half = frbc_instruction(d.actuator.clone(), d.heat.clone(), 0.5);
+        let half = frbc_instruction(d.actuator, d.heat, 0.5);
         assert_eq!(dhw_power(&d, &half, &t).unwrap(), Power::from_kw(1.5));
 
-        let idle = frbc_instruction(d.actuator.clone(), d.heat.clone(), 0.0);
+        let idle = frbc_instruction(d.actuator, d.heat, 0.0);
         assert_eq!(dhw_power(&d, &idle, &t).unwrap(), Power::ZERO);
 
         // A mode from somebody else's description. There is no discharge to
@@ -367,7 +360,7 @@ mod tests {
         // refused rather than read as "heat".
         let b = battery();
         let bd = describe_battery(&b, T0);
-        let wrong = frbc_instruction(d.actuator.clone(), bd.discharge.clone(), 1.0);
+        let wrong = frbc_instruction(d.actuator, bd.discharge, 1.0);
         assert!(matches!(
             dhw_power(&d, &wrong, &t),
             Err(InstructError::UnknownOperationMode)
@@ -381,8 +374,8 @@ mod tests {
         // mind.
         let b = battery();
         let d = describe_battery(&b, T0);
-        for mode in [d.charge.clone(), d.discharge.clone()] {
-            let idle = frbc_instruction(d.actuator.clone(), mode, 0.0);
+        for mode in [d.charge, d.discharge] {
+            let idle = frbc_instruction(d.actuator, mode, 0.0);
             assert_eq!(battery_power(&d, &idle, &b).unwrap(), Power::ZERO);
         }
     }
@@ -392,19 +385,11 @@ mod tests {
         let b = battery();
         let d = describe_battery(&b, T0);
         assert_eq!(
-            battery_power(
-                &d,
-                &frbc_instruction(d.actuator.clone(), Id::generate(), 1.0),
-                &b
-            ),
+            battery_power(&d, &frbc_instruction(d.actuator, Id::generate(), 1.0), &b),
             Err(InstructError::UnknownOperationMode)
         );
         assert_eq!(
-            battery_power(
-                &d,
-                &frbc_instruction(Id::generate(), d.charge.clone(), 1.0),
-                &b
-            ),
+            battery_power(&d, &frbc_instruction(Id::generate(), d.charge, 1.0), &b),
             Err(InstructError::UnknownActuator)
         );
     }
@@ -415,11 +400,7 @@ mod tests {
         let d = describe_battery(&b, T0);
         for bad in [1.5, -0.1, f64::NAN] {
             assert!(matches!(
-                battery_power(
-                    &d,
-                    &frbc_instruction(d.actuator.clone(), d.charge.clone(), bad),
-                    &b
-                ),
+                battery_power(&d, &frbc_instruction(d.actuator, d.charge, bad), &b),
                 Err(InstructError::FactorOutOfRange(_))
             ));
         }
@@ -451,7 +432,7 @@ mod tests {
 
         // An instruction issued against the first description is still
         // executable against the second.
-        let instruction = frbc_instruction(first.actuator.clone(), first.charge.clone(), 1.0);
+        let instruction = frbc_instruction(first.actuator, first.charge, 1.0);
         assert_eq!(
             battery_power(&second, &instruction, &b).unwrap(),
             Power::from_kw(5.0)
@@ -523,23 +504,21 @@ mod tests {
     }
 
     fn pebc_instruction(
-        quantity: s2energy::common::CommodityQuantity,
+        quantity: s2_kit::types::common::CommodityQuantity,
         lower: f64,
         upper: f64,
     ) -> pebc::Instruction {
         pebc::Instruction::builder()
             .message_id(Id::generate())
             .id(Id::generate())
-            .execution_time(chrono::DateTime::from_timestamp_nanos(
-                i64::try_from(T0.unix_timestamp_nanos()).unwrap(),
-            ))
+            .execution_time(T0.into())
             .abnormal_condition(false)
             .power_constraints_id(Id::generate())
             .power_envelopes(vec![pebc::PowerEnvelope {
                 id: Id::generate(),
                 commodity_quantity: quantity,
                 power_envelope_elements: vec![pebc::PowerEnvelopeElement {
-                    duration: Duration(900_000),
+                    duration: Duration::from_millis(900_000),
                     lower_limit: lower,
                     upper_limit: upper,
                 }],
@@ -549,7 +528,7 @@ mod tests {
 
     #[test]
     fn an_envelope_bounds_a_consumer_from_above_and_a_producer_from_below() {
-        let q = s2energy::common::CommodityQuantity::ElectricPower3PhaseSymmetric;
+        let q = s2_kit::types::common::CommodityQuantity::ElectricPower3PhaseSymmetric;
         let instruction = pebc_instruction(q, -4000.0, 4200.0);
 
         let wallbox = Asset::Evse(evse());
@@ -570,7 +549,7 @@ mod tests {
     #[test]
     fn an_envelope_for_another_commodity_is_not_silently_applied() {
         let instruction = pebc_instruction(
-            s2energy::common::CommodityQuantity::HeatThermalPower,
+            s2_kit::types::common::CommodityQuantity::HeatThermalPower,
             0.0,
             4200.0,
         );
@@ -593,7 +572,7 @@ mod tests {
             PhaseConnection::Switchable { phase: Phase::L1 },
         );
         let one_phase = pebc_instruction(
-            s2energy::common::CommodityQuantity::ElectricPowerL1,
+            s2_kit::types::common::CommodityQuantity::ElectricPowerL1,
             0.0,
             3000.0,
         );
@@ -613,7 +592,7 @@ mod tests {
         let mut single = evse();
         single.meta = meta("wallbox", 3.7, PhaseConnection::Single { phase: Phase::L1 });
         let instruction = pebc_instruction(
-            s2energy::common::CommodityQuantity::ElectricPowerL1,
+            s2_kit::types::common::CommodityQuantity::ElectricPowerL1,
             0.0,
             3000.0,
         );
@@ -628,6 +607,7 @@ mod tests {
             meta: meta("wp", 9.0, PhaseConnection::Three),
             electrical_nominal: Power::from_kw(4.0),
             heating_rod: None,
+            cooling_electrical: None,
             control: HeatPumpControl::SgReady,
             modulating: true,
             comfort_min_c: 20.0,
@@ -644,10 +624,8 @@ mod tests {
             let instruction = ombc::Instruction::builder()
                 .message_id(Id::generate())
                 .id(Id::generate())
-                .execution_time(chrono::DateTime::from_timestamp_nanos(
-                    i64::try_from(T0.unix_timestamp_nanos()).unwrap(),
-                ))
-                .operation_mode_id(id.clone())
+                .execution_time(T0.into())
+                .operation_mode_id(*id)
                 .operation_mode_factor(1.0)
                 .abnormal_condition(false)
                 .build();
@@ -661,9 +639,7 @@ mod tests {
         let instruction = ombc::Instruction::builder()
             .message_id(Id::generate())
             .id(Id::generate())
-            .execution_time(chrono::DateTime::from_timestamp_nanos(
-                i64::try_from(T0.unix_timestamp_nanos()).unwrap(),
-            ))
+            .execution_time(T0.into())
             .operation_mode_id(Id::generate())
             .operation_mode_factor(1.0)
             .abnormal_condition(false)

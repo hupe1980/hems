@@ -25,8 +25,9 @@
 use std::collections::BTreeMap;
 
 use hems_core::prelude::*;
-use s2energy::common::{Message, ResourceManagerDetails};
-use s2energy::pebc;
+use s2_kit::message::Message;
+use s2_kit::types::common::ResourceManagerDetails;
+use s2_kit::types::pebc;
 use time::OffsetDateTime;
 
 use crate::describe::{
@@ -328,23 +329,21 @@ fn heat_pump_envelope(
     valid_from: OffsetDateTime,
 ) -> pebc::PowerConstraints {
     let quantity = match hp.meta.phases.clamp_mode(mode) {
-        PhaseMode::Single => s2energy::common::CommodityQuantity::ElectricPowerL1,
-        PhaseMode::Three => s2energy::common::CommodityQuantity::ElectricPower3PhaseSymmetric,
+        PhaseMode::Single => s2_kit::types::common::CommodityQuantity::ElectricPowerL1,
+        PhaseMode::Three => s2_kit::types::common::CommodityQuantity::ElectricPower3PhaseSymmetric,
     };
     pebc::PowerConstraints::builder()
-        .message_id(s2energy::common::Id::generate())
+        .message_id(s2_kit::types::Id::generate())
         .id(crate::describe::stable_id(
             &hp.meta.id,
             "heat-pump/envelope",
         ))
-        .valid_from(chrono::DateTime::from_timestamp_nanos(
-            i64::try_from(valid_from.unix_timestamp_nanos()).unwrap_or(i64::MAX),
-        ))
+        .valid_from(valid_from.into())
         .consequence_type(pebc::PowerEnvelopeConsequenceType::Defer)
         .allowed_limit_ranges(vec![pebc::AllowedLimitRange {
             commodity_quantity: quantity,
             limit_type: pebc::PowerEnvelopeLimitType::UpperLimit,
-            range_boundary: s2energy::common::NumberRange {
+            range_boundary: s2_kit::types::common::NumberRange {
                 start_of_range: 0.0,
                 // The heating rod counts: it is the part of a heat pump a § 14a
                 // reduction actually reaches, and a manager told the compressor
@@ -424,6 +423,7 @@ mod tests {
                     meta: meta("waermepumpe", 8.0),
                     electrical_nominal: Power::from_kw(5.0),
                     heating_rod: Some(Power::from_kw(3.0)),
+                    cooling_electrical: None,
                     control: HeatPumpControl::PowerCeiling,
                     modulating: true,
                     comfort_min_c: 20.0,
@@ -512,7 +512,7 @@ mod tests {
     /// Every description survives the standard's own wire format **exactly**.
     ///
     /// A description that cannot be serialised is a description that cannot be
-    /// sent; `s2energy` is generated from the official schema, so parsing one
+    /// sent; `s2_kit` is generated from the official schema, so parsing one
     /// back is the whole crate checked against the standard for the price of one
     /// assertion.
     ///

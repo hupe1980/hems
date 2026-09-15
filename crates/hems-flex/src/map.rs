@@ -11,11 +11,11 @@
 //! use-case-organised protocols cannot.
 
 use hems_core::prelude::*;
-use s2energy::common::{ControlType as S2ControlType, RoleType};
+use s2_kit::types::common::{ControlType as S2ControlType, RoleType};
 
 /// The S2 control types, as hems uses them.
 ///
-/// A thin mirror of [`s2energy::common::ControlType`] so that the mapping can be
+/// A thin mirror of [`s2_kit::types::common::ControlType`] so that the mapping can be
 /// matched on and tested without constructing wire messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ControlType {
@@ -41,7 +41,7 @@ impl From<ControlType> for S2ControlType {
             ControlType::Ombc => S2ControlType::OperationModeBasedControl,
             ControlType::Ppbc => S2ControlType::PowerProfileBasedControl,
             ControlType::Ddbc => S2ControlType::DemandDrivenBasedControl,
-            ControlType::NotControllable => S2ControlType::NotControlable,
+            ControlType::NotControllable => S2ControlType::NotControllable,
         }
     }
 }
@@ -192,6 +192,7 @@ mod tests {
                 meta: meta("wp", 9.0),
                 electrical_nominal: Power::from_kw(5.0),
                 heating_rod: None,
+                cooling_electrical: None,
                 control,
                 modulating: true,
                 comfort_min_c: 20.0,

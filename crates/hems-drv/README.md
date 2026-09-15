@@ -118,9 +118,14 @@ Modbus and publishes no model list, which is most of the installed heat-pump
 base, where the numbers are in a PDF and every unit's differ. A point declares
 its register **space**, width and **word order**, scale and field, and guesses
 none of them: holding and input registers are separately addressed, and 1,8 kW
-read with the words the other way round is 117 964 800 W. It reads and never
-writes — a map that could write is one where a typo in a configuration file
-starts a compressor.
+read with the words the other way round is 117 964 800 W.
+
+It writes only what a household **declares**, in a list of its own, and only the
+values that declaration enumerates — one sixteen-bit holding register each, so
+nothing is computed from a scale. A map with no `writes` is read-only, because a
+map that could write anything is one where a typo in a configuration file starts
+a compressor. The command that needs it is a reversible heat pump's
+**direction**, which no EEBUS use case carries.
 
 ## One crate, not one per protocol
 

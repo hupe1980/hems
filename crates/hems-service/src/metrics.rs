@@ -77,11 +77,19 @@ fn http_metrics() -> (&'static CounterVec, &'static HistogramVec) {
 /// Idempotent: registering twice in one process is ignored rather than fatal, so
 /// a test that builds two daemons does not die on the second.
 #[cfg(feature = "postgres")]
-pub fn publish_pool(pool: &crate::db::Db, daemon: &'static str) {
-    // The daemon's name is in the metric name rather than in a label, because
-    // `PullingGauge::new` takes a name and a help string and no label set — and a
-    // deployment scrapes one daemon per target anyway, so the label a dashboard
-    // groups by is the *job*, which the scraper adds.
+pub fn publish_pool(pool: &crate::db::Db) {
+    // The daemon's name is **not** in the metric name and not in a label, and
+    // that is the correct answer rather than a missing feature: a deployment
+    // scrapes one daemon per target, so the series a dashboard groups by is the
+    // *job*, which the scraper attaches. Putting the daemon in the name would
+    // give every service a metric of its own and make `sum by (job)` impossible
+    // to write.
+    //
+    // This function used to take the name and drop it on the floor, under a
+    // comment claiming it was in the metric name — a parameter three daemons
+    // passed and nothing read, describing behaviour the code did not have
+    // (D196). The name is gone rather than used, because the metric was already
+    // right.
     let gauge = |suffix: &str, help: &str, read: Box<dyn Fn() -> f64 + Send + Sync>| {
         if let Ok(g) = prometheus::PullingGauge::new(format!("hems_db_pool_{suffix}"), help, read) {
             // Ignored rather than fatal: a process that builds two daemons —
@@ -90,7 +98,6 @@ pub fn publish_pool(pool: &crate::db::Db, daemon: &'static str) {
             let _ = prometheus::register(Box::new(g));
         }
     };
-    let _ = daemon;
 
     let status = pool.clone();
     gauge(

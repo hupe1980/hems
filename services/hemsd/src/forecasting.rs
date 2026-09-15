@@ -68,22 +68,54 @@ pub struct WeatherSpec {
     /// Soiling, shading, mismatch and module tolerance together. The forecast
     /// model does not know it; [`ResidualModel`] learns it.
     pub soiling: f64,
+    /// Whether the planner is shown the weather the day will actually have.
+    ///
+    /// The **only** field that changes what the box knows rather than what the
+    /// day is, and the reason it exists is that the other six cannot do this
+    /// job. See [`WeatherSpec::with_perfect_forecast`].
+    pub oracle_forecast: bool,
 }
 
 impl WeatherSpec {
-    /// A day that goes exactly as forecast.
+    /// **This** day, with the planner shown the weather it will actually have.
     ///
-    /// Nameable rather than implicit, because the difference between this and a
-    /// real day is the most interesting single number the simulator produces.
-    pub const PERFECT: Self = Self {
-        seed: 0,
-        cloud_amplitude: 0.0,
-        load_amplitude: 0.0,
-        temperature_swing_k: 0.0,
-        temperature_error_k: 0.0,
-        draw_amplitude: 0.0,
-        soiling: 1.0,
-    };
+    /// Changes nothing about the day — not the cloud, not the soiling, not the
+    /// diurnal swing, not the household — and changes only what
+    /// [`Weather::modelled_production`], [`Weather::forecast_outdoor_at`] and
+    /// [`Weather::forecast_window_at`] answer. The unmanaged household is
+    /// therefore **bit for bit the same** on both runs, which is the property
+    /// that makes the difference attributable to foresight at all.
+    ///
+    /// # It used to change the day instead
+    ///
+    /// This was a `const` that set every amplitude to zero and the soiling to
+    /// one, so `--perfect-foresight` ran a **different day** — a roof 8,7 %
+    /// cleaner, a January night five kelvin milder, no cloud variability, an
+    /// average household — and reported the difference as the price of
+    /// imperfect knowledge (D197). Two of those are not forecast error under
+    /// any reading: `temperature_swing_k` is in the forecast as well as in the
+    /// realisation, so zeroing it removed no error and merely flattened the
+    /// diurnal cycle; and `soiling` is a property of the roof that
+    /// [`ResidualModel`] is built to learn, so after the warm-up it is not a
+    /// forecast error on either side. The giveaway was the baseline: a
+    /// household with no planner in it moved by €1,71 between the two runs, and
+    /// nothing a *forecast* does can move a household that does not make one.
+    ///
+    /// # What it does not cover
+    ///
+    /// The **load** forecast, the hot-water draw and the charging session still
+    /// come from what the box learned, so this is the price of not knowing the
+    /// *weather* rather than of not knowing the future. That is the larger half
+    /// and it is the half the name has always meant, but the report says
+    /// "weather" now rather than "the future" because the two are not the same
+    /// claim.
+    #[must_use]
+    pub const fn with_perfect_forecast(self) -> Self {
+        Self {
+            oracle_forecast: true,
+            ..self
+        }
+    }
 
     /// A settled day: high pressure, a thin haze that comes and goes, an
     /// ordinary household.
@@ -97,6 +129,7 @@ impl WeatherSpec {
             temperature_error_k: 1.5,
             draw_amplitude: 0.35,
             soiling: 0.92,
+            oracle_forecast: false,
         }
     }
 
@@ -111,17 +144,14 @@ impl WeatherSpec {
             temperature_error_k: 2.5,
             draw_amplitude: 0.4,
             soiling: 0.92,
+            oracle_forecast: false,
         }
     }
 
-    /// Whether this day is the degenerate one in which nothing can be wrong.
+    /// Whether the planner is being shown the answer.
     #[must_use]
     pub fn is_perfect(&self) -> bool {
-        self.cloud_amplitude == 0.0
-            && self.load_amplitude == 0.0
-            && self.temperature_error_k == 0.0
-            && self.draw_amplitude == 0.0
-            && (self.soiling - 1.0).abs() < f64::EPSILON
+        self.oracle_forecast
     }
 }
 
@@ -178,9 +208,13 @@ impl Weather {
         )
     }
 
-    /// The outdoor temperature the *forecast* says — the diurnal shape alone.
+    /// The outdoor temperature the *forecast* says — the diurnal shape alone,
+    /// or the day's own temperature where the planner is being shown the answer.
     #[must_use]
     pub fn forecast_outdoor_at(&self, at: OffsetDateTime) -> f64 {
+        if self.spec.oracle_forecast {
+            return self.outdoor_at(at);
+        }
         Realisation::forecast_outdoor_c(at, self.mean_outdoor_c, self.spec.temperature_swing_k)
     }
 
@@ -230,6 +264,9 @@ impl Weather {
         slot: Slot,
         facade_azimuth_deg: f64,
     ) -> f64 {
+        if self.spec.oracle_forecast {
+            return self.window_at(location, slot_middle(slot), facade_azimuth_deg);
+        }
         let sun = hems_forecast::solar::sun_position(location, slot);
         let ghi = hems_forecast::clear_sky_ghi(sun) * (1.0 - self.mean_cloud).max(0.0);
         hems_forecast::solar::window_irradiance(sun, ghi, facade_azimuth_deg)
@@ -257,9 +294,23 @@ impl Weather {
     /// magnitude — the input the residual corrector corrects.
     #[must_use]
     pub fn modelled_production(&self, array: &ArrayModel, location: GeoPoint, slot: Slot) -> Power {
+        if self.spec.oracle_forecast {
+            // The soiling included: an oracle is not merely told the cloud, it
+            // is told what the roof will make — which is what leaves
+            // `ResidualModel` with a correction of exactly one and nothing to
+            // learn, and is the whole point of the comparison.
+            return self.production_at(array, location, slot_middle(slot));
+        }
         let ambient = self.forecast_outdoor_at(slot.start());
         array.clear_sky_power(location, slot, ambient).outflow() * (1.0 - self.mean_cloud)
     }
+}
+
+/// The middle of a slot — where a quarter hour is sampled when one instant has
+/// to stand for it, the same convention [`hems_forecast::solar::sun_position`]
+/// uses and for the same reason.
+fn slot_middle(slot: Slot) -> OffsetDateTime {
+    slot.start() + hems_core::slot::SLOT / 2_i32
 }
 
 /// What the box has learned from the days before this one.
@@ -271,6 +322,16 @@ pub struct Learned {
     pub roof: ResidualModel,
     /// When the car usually comes home, and how empty.
     pub sessions: SessionHistory,
+    /// Whether the roof is still the roof it was.
+    ///
+    /// Beside [`Learned::roof`] rather than inside it, because the two ask
+    /// opposite questions of the same numbers: the corrector has to **follow**
+    /// the array so the plan stays good, and this has to **notice it moving** so
+    /// the household finds out (D199). It is here rather than only on the
+    /// running box because a module the reference days never reach is a module
+    /// whose KPI cannot move, which is R20 exactly — and D199's own monitor was
+    /// built, wired into `hemsd run`, and never given a simulated day.
+    pub health: hems_forecast::PlantHealth,
     /// How many days of history it rests on.
     pub days: usize,
 }
@@ -320,6 +381,7 @@ pub fn warm_up(
         load: LoadProfile::default(),
         roof: ResidualModel::default(),
         sessions: SessionHistory::new(),
+        health: hems_forecast::PlantHealth::new(),
         days,
     };
 
@@ -334,6 +396,12 @@ pub fn warm_up(
             let modelled = past.modelled_production(array, location, slot);
             let actual = past.production_at(array, location, slot.start() + Duration::minutes(7));
             learned.roof.observe(slot, modelled.get(), actual.get());
+            // The same two numbers to the monitor watching for the array to
+            // move, as watts over a quarter hour turned into kilowatt-hours.
+            learned.health.observe_slot(
+                modelled.get() * hems_core::prelude::SLOT_HOURS / 1000.0,
+                actual.get() * hems_core::prelude::SLOT_HOURS / 1000.0,
+            );
             // The household: what it drew.
             learned
                 .load
@@ -352,6 +420,16 @@ pub fn warm_up(
                 energy: energy * (1.0 + jitter),
             });
         }
+        // The roof's day, closed. A performance ratio is a daily figure and the
+        // monitor is fed one at a time, so this is where a warm-up day becomes
+        // an observation rather than ninety-six of them.
+        //
+        // The days are **exchangeable** rather than chronological —
+        // `Weather::earlier` reseeds the realisation rather than stepping back
+        // through a season — so the order they arrive in decides nothing, and a
+        // trend is something no warm-up can contain. That is the honest limit of
+        // what a simulated baseline says about a real roof (R23).
+        let _ = learned.health.close_day();
     }
     learned
 }

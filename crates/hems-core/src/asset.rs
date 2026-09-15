@@ -37,16 +37,24 @@ impl Capabilities {
     pub const SET_MODE: Self = Self(1 << 4);
     /// Accepts a schedule for later execution.
     pub const SCHEDULE: Self = Self(1 << 5);
-    /// Can export as well as import (bidirectional).
-    pub const BIDIRECTIONAL: Self = Self(1 << 7);
-    /// Can be identified physically (blink, beep) during commissioning.
-    pub const IDENTIFY: Self = Self(1 << 8);
 
     // Note there is no `SWITCH_PHASES`. Whether a device can change its
     // conductor count is [`PhaseConnection::Switchable`], and one fact with two
     // representations is one fact that can contradict itself — a capability
     // declared on a fixed three-phase connection is a charge point asked to
     // switch that cannot.
+    //
+    // There is no `BIDIRECTIONAL` or `IDENTIFY` either, and there were until
+    // D196. Both were declared, neither was ever set by a driver and neither was
+    // ever read by a control path: the only code that mentioned them was one
+    // test composing them out of nothing to check that `contains` works. A
+    // capability granted and never checked is the defect this workspace keeps
+    // finding (D188), and a capability granted by nobody is one layer worse —
+    // the reader believes the arbiter knows whether a device can export, and it
+    // does not. Whether an asset is bidirectional is already answered where it
+    // is used, by [`Asset::ratings`] having a negative floor; whether one can be
+    // made to blink is a commissioning concern with no commissioning tool behind
+    // it yet. Both can come back the day something reads them (D184's rule).
 
     /// No capabilities.
     pub const NONE: Self = Self(0);
@@ -537,6 +545,26 @@ pub struct HeatPump {
     /// belongs to this asset rather than being a load of its own.
     #[cfg_attr(feature = "serde", serde(default))]
     pub heating_rod: Option<Power>,
+    /// Electrical power in **cooling** mode, where the unit is reversible.
+    ///
+    /// `None` is a heating-only unit, which is what most of the installed German
+    /// base still is. It is increasingly not what a *new* one is: the GEG has
+    /// made a heat pump the default heating system since January 2026, an
+    /// air-source unit is reversible for the cost of a four-way valve, and the
+    /// KfW subsidy covers the cooling function automatically when the unit is the
+    /// main heating system — so an installer has no reason to leave it out.
+    ///
+    /// Separate from `electrical_nominal` because it is a different number: a
+    /// reversible unit's cooling capacity is typically a little under its heating
+    /// capacity, and the efficiency curve runs the other way (see
+    /// [`crate::thermal::CopCurve::air_source_cooling`]).
+    ///
+    /// It is **not** a second Fallgruppe. `[A1 2.4.1]` lists Raumkühlung beside
+    /// Wärmepumpenheizung and `para14a` takes the *larger* of the two group
+    /// bases rather than their sum, precisely because one device cannot heat and
+    /// cool at once — so a reversible unit stays in the heat-pump group and
+    /// contributes the larger of its two powers ([`HeatPump::group_power`]).
+    pub cooling_electrical: Option<Power>,
     /// How it takes commands.
     pub control: HeatPumpControl,
     /// Whether the pump modulates or only starts and stops.
@@ -653,7 +681,19 @@ impl HeatPump {
     /// Compressor plus auxiliary heater — the Fallgruppe's summed power.
     #[must_use]
     pub fn group_power(&self) -> Power {
-        self.electrical_nominal + self.heating_rod.unwrap_or(Power::ZERO)
+        let heating = self.electrical_nominal + self.heating_rod.unwrap_or(Power::ZERO);
+        // The **larger**, never the sum. A reversible unit heats or cools; it
+        // does not do both, and `[A1 2.4.1]` takes the larger of the heat-pump
+        // and Raumkühlung bases for exactly that reason. Summing them would ask
+        // a network operator to reserve headroom for a machine that cannot
+        // exist, and it is the household that pays for the difference.
+        heating.max(self.cooling_electrical.unwrap_or(Power::ZERO))
+    }
+
+    /// Whether this unit can cool as well as heat.
+    #[must_use]
+    pub fn is_reversible(&self) -> bool {
+        self.cooling_electrical.is_some_and(|p| p > Power::ZERO)
     }
 }
 
@@ -1075,6 +1115,7 @@ mod tests {
             meta: meta("wp", 5.0),
             electrical_nominal: Power::from_kw(5.0),
             heating_rod: Some(Power::from_kw(6.0)),
+            cooling_electrical: None,
             control: HeatPumpControl::PowerCeiling,
             modulating: true,
             comfort_min_c: 20.0,
@@ -1151,10 +1192,10 @@ mod tests {
 
     #[test]
     fn capabilities_compose_and_answer_questions() {
-        let caps = Capabilities::MEASURE | Capabilities::LIMIT_CONSUMPTION | Capabilities::IDENTIFY;
+        let caps = Capabilities::MEASURE | Capabilities::LIMIT_CONSUMPTION | Capabilities::SCHEDULE;
         assert!(caps.contains(Capabilities::LIMIT_CONSUMPTION));
-        assert!(!caps.contains(Capabilities::BIDIRECTIONAL));
-        assert!(caps.contains(Capabilities::MEASURE | Capabilities::IDENTIFY));
+        assert!(!caps.contains(Capabilities::SET_POWER));
+        assert!(caps.contains(Capabilities::MEASURE | Capabilities::SCHEDULE));
     }
 
     #[test]

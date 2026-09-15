@@ -59,6 +59,47 @@
 //! to run them every quarter hour with no lookup table and no turbidity
 //! climatology. D172 has the alternatives and what the change is worth on the
 //! reference days.
+//!
+//! # The inverter is a step, not a share of the system losses
+//!
+//! `system_loss` is PVWatts' 0,14, and it was being asked to cover a loss it
+//! does not contain. PVWatts' ten default categories — soiling, shading, snow,
+//! mismatch, wiring, connections, light-induced degradation, nameplate
+//! tolerance, age, availability — are every one of them on the **direct-current**
+//! side; NREL models the inverter separately, and `pvlib` splits the same seam
+//! into `pvwatts_dc` and `pvwatts_ac`. This module had the first and not the
+//! second: it computed a direct current, clipped it at the inverter's
+//! alternating-current limit, and called the result AC. The doc comment on
+//! `system_loss` even said "everything … that is **not** the inverter", so the
+//! gap was written down beside the code that had it.
+//!
+//! That is worth about 4 % at full sun and far more than 4 % where a German
+//! roof actually lives: the published curve is
+//! `η = (η_nom/η_ref)(−0,0162·ζ − 0,0059/ζ + 0,9858)`, and the reciprocal term
+//! is an inverter's fixed housekeeping draw. At a twentieth of rated power it
+//! is 86 %, at a fiftieth 69 %, and below about 0,6 % of rated the inverter
+//! yields nothing at all — a start-up threshold that falls out of the
+//! correlation rather than being a constant somebody chose.
+//!
+//! **No reference day could have found it**, and that is the part worth
+//! recording. The simulated roof's *truth* is
+//! `hemsd`'s `Weather::production_at`, which calls
+//! [`ArrayModel::clear_sky_power`] — the same function the forecast is built
+//! from. Simulator and model therefore shared the missing step exactly, it
+//! cancelled in every comparison, and seven days that check a plan against a
+//! realisation drawn from the plan's own physics are blind to any error in that
+//! physics by construction. The only defence against that is an **external**
+//! bound — a published correlation, transcribed and pinned (`inverter_tests`),
+//! which is what R23 has been saying about every figure this workspace
+//! generates.
+//!
+//! On a real roof the error does not cancel, and
+//! [`crate::residual::ResidualModel`] is the only thing that would have stood in
+//! for it. That is D172's defect one layer down and it fails the same two ways:
+//! a box on its **first day** has no correction and is optimistic by the whole
+//! amount (D187's cold start), and the residual is a function of **how bright it
+//! is** while the corrector is bucketed by hour of day, so a fortnight's fit
+//! splits the difference and is wrong in both directions. D194.
 
 use hems_core::prelude::{GeoPoint, Power, Slot};
 
@@ -287,7 +328,14 @@ pub fn plane_of_array(sun: SunPosition, ghi: f64, tilt_deg: f64, azimuth_deg: f6
     // light that is not there — and the cap is a physical bound rather than a
     // tuning constant.
     let dni = (bhi / cos_zenith).min(sun.dni_extra_w_per_m2);
-    // Re-derived so the three components still sum to `ghi` after the cap.
+    // Re-derived from the capped beam, so that what is transposed is the light
+    // the cap left rather than the light the decomposition asked for. Where the
+    // cap binds — a low sun under a clearness index the correlation reads as
+    // mostly beam — the components then sum to *less* than `ghi`, and
+    // deliberately: the alternative is to hand the difference to the diffuse
+    // term, which would transpose invented light onto the plane through the sky
+    // view factor. Under-reading a roof is the safe direction and the cap is
+    // rare; over-reading it is D172.
     let bhi = dni * cos_zenith;
 
     // ── Transposition (HDKR) ────────────────────────────────────────────────
@@ -343,6 +391,44 @@ pub fn window_irradiance(sun: SunPosition, ghi: f64, azimuth_deg: f64) -> f64 {
 /// either.
 const GROUND_ALBEDO: f64 = 0.2;
 
+/// The reference inverter efficiency the PVWatts part-load curve is normalised
+/// against.
+///
+/// NREL fitted the curve to the California Energy Commission's weighted
+/// efficiencies for inverters built since 2010, and 0,9637 is the efficiency of
+/// the unit it came out describing. It is a property of the **correlation**
+/// rather than of any array here, which is why it is a constant and
+/// [`ArrayModel::inverter_nominal_efficiency`] is a field: the ratio
+/// `η_nom / η_ref` is what re-scales the published shape onto a particular
+/// inverter's own datasheet figure.
+const INVERTER_REFERENCE_EFFICIENCY: f64 = 0.9637;
+
+/// The PVWatts inverter curve: efficiency as a function of how hard the
+/// inverter is being driven.
+///
+/// ```text
+/// η = (η_nom / η_ref) · (−0,0162·ζ − 0,0059/ζ + 0,9858),   ζ = P_dc / P_dc0
+/// ```
+///
+/// The term that matters is `−0,0059/ζ`, and it is a **reciprocal**: an inverter
+/// draws roughly the same housekeeping power whatever it is converting, so that
+/// draw is a constant share of nothing at full load and a large share of very
+/// little at dawn. A curve without it — a flat 96 % — is right exactly once a
+/// day and wrong all winter, which is the regime a German roof spends most of
+/// its year in.
+///
+/// Returns zero below the load ratio where the curve crosses the axis (about
+/// 0,6 % of rated direct current), which is the inverter's own start-up
+/// threshold falling out of the arithmetic rather than being a second constant.
+#[must_use]
+pub fn inverter_efficiency(load_ratio: f64, nominal_efficiency: f64) -> f64 {
+    if !load_ratio.is_finite() || load_ratio <= 0.0 {
+        return 0.0;
+    }
+    let shape = 0.9858 - 0.0162 * load_ratio - 0.0059 / load_ratio;
+    ((nominal_efficiency / INVERTER_REFERENCE_EFFICIENCY) * shape).clamp(0.0, 1.0)
+}
+
 /// A photovoltaic array's geometry and electrical limits.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -357,10 +443,25 @@ pub struct ArrayModel {
     pub azimuth_deg: f64,
     /// Everything between the modules and the meter that is not the inverter:
     /// soiling, mismatch, wiring, and the modules' own tolerance.
+    ///
+    /// PVWatts' own default, and taken with PVWatts' own **scope**: the ten
+    /// categories it multiplies together — soiling, shading, snow, mismatch,
+    /// wiring, connections, light-induced degradation, nameplate tolerance, age
+    /// and availability — are all on the direct-current side, and the inverter
+    /// is not among them. It is modelled separately, by
+    /// [`ArrayModel::inverter_nominal_efficiency`] and
+    /// [`inverter_efficiency`], because its loss is the one that depends on how
+    /// hard it is being driven rather than on the installation.
     pub system_loss: f64,
     /// Relative power change per kelvin of cell temperature above 25 °C.
     /// Negative; −0,004 is typical for silicon.
     pub temperature_coefficient: f64,
+    /// The inverter's efficiency at its own rated power, from its datasheet.
+    ///
+    /// It sets the *height* of [`inverter_efficiency`]'s curve; the curve's
+    /// shape is the published one. 0,96 is PVWatts' default and a fair figure
+    /// for a modern residential string inverter.
+    pub inverter_nominal_efficiency: f64,
 }
 
 impl ArrayModel {
@@ -374,6 +475,23 @@ impl ArrayModel {
             azimuth_deg,
             system_loss: 0.14,
             temperature_coefficient: -0.004,
+            inverter_nominal_efficiency: 0.96,
+        }
+    }
+
+    /// The direct-current power at which the inverter reaches its alternating-
+    /// current limit — PVWatts' `P_dc0`, and the denominator of the load ratio.
+    ///
+    /// Derived from the AC limit and the nominal efficiency rather than from the
+    /// array's peak, because it is a fact about the **inverter**: an array
+    /// deliberately oversized against its inverter (which most German roofs now
+    /// are) still drives that inverter to exactly this much before it clips.
+    #[must_use]
+    pub fn inverter_dc_limit(&self) -> f64 {
+        if self.inverter_nominal_efficiency > 0.0 {
+            self.ac_nominal.get() / self.inverter_nominal_efficiency
+        } else {
+            self.ac_nominal.get()
         }
     }
 
@@ -396,6 +514,12 @@ impl ArrayModel {
 
     /// Alternating-current power for a given plane irradiance and air
     /// temperature, as a **negative** value in the load convention.
+    ///
+    /// The chain is PVWatts' own, in PVWatts' order: plane irradiance → cell
+    /// temperature → direct current after the system losses → **the inverter** →
+    /// the alternating-current clip. The inverter step is the one this model
+    /// went four versions without, and leaving it out is not a rounding error —
+    /// see the module note.
     #[must_use]
     pub fn ac_power(&self, poa: f64, ambient_c: f64) -> Power {
         if poa <= 0.0 {
@@ -405,9 +529,15 @@ impl ArrayModel {
         // above ambient at full sun.
         let cell_c = ambient_c + poa / 800.0 * 25.0;
         let temperature_factor = 1.0 + self.temperature_coefficient * (cell_c - 25.0);
-        let dc = self.kwp_dc.get() * (poa / 1000.0) * temperature_factor * (1.0 - self.system_loss);
+        let dc =
+            (self.kwp_dc.get() * (poa / 1000.0) * temperature_factor * (1.0 - self.system_loss))
+                .max(0.0);
+        let efficiency = inverter_efficiency(
+            dc / self.inverter_dc_limit(),
+            self.inverter_nominal_efficiency,
+        );
         // The inverter clips, which is why an oversized array is not wasted.
-        -Power::new(dc.max(0.0).min(self.ac_nominal.get()))
+        -Power::new((dc * efficiency).min(self.ac_nominal.get()))
     }
 
     /// Expected production in `slot` under a clear sky, load convention.
@@ -675,5 +805,100 @@ mod decomposition_tests {
                 sun.elevation_deg
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod inverter_tests {
+    use super::*;
+    use hems_core::prelude::Power;
+
+    fn array() -> ArrayModel {
+        ArrayModel::new(Power::from_kw(10.0), Power::from_kw(10.0), 35.0, 180.0)
+    }
+
+    /// The curve, against the values `pvlib.inverter.pvwatts` produces for the
+    /// same defaults.
+    ///
+    /// Pinned rather than merely exercised: this is somebody else's correlation,
+    /// and a transcription error in it is invisible in every aggregate figure
+    /// this workspace reports — it would simply make the roof a few percent
+    /// wrong for ever, which is the error the residual corrector was already
+    /// hiding once (D194).
+    #[test]
+    fn the_part_load_curve_is_the_published_one() {
+        // At rated power the curve returns the datasheet figure by construction:
+        // `(η_nom/η_ref)·(−0,0162 − 0,0059 + 0,9858)` and the bracket *is* η_ref.
+        assert!(
+            (inverter_efficiency(1.0, 0.96) - 0.96).abs() < 1e-6,
+            "at rated load the curve must return the nominal efficiency, got {}",
+            inverter_efficiency(1.0, 0.96)
+        );
+        for (zeta, expected) in [
+            (0.50, 0.9622),
+            (0.20, 0.9494),
+            (0.10, 0.9216),
+            (0.05, 0.8636),
+            (0.02, 0.6878),
+        ] {
+            let got = inverter_efficiency(zeta, 0.96);
+            assert!(
+                (got - expected).abs() < 5e-4,
+                "ζ = {zeta}: expected {expected}, got {got}"
+            );
+        }
+    }
+
+    /// Below its own start-up threshold an inverter yields nothing, and the
+    /// threshold is where the published curve crosses zero rather than a second
+    /// constant somebody chose.
+    #[test]
+    fn a_trickle_of_direct_current_does_not_become_alternating_current() {
+        assert_eq!(inverter_efficiency(0.004, 0.96), 0.0);
+        assert_eq!(inverter_efficiency(0.0, 0.96), 0.0);
+        assert_eq!(inverter_efficiency(-1.0, 0.96), 0.0);
+        assert_eq!(inverter_efficiency(f64::NAN, 0.96), 0.0);
+        // …and the array agrees: a few watts of plane irradiance on a ten
+        // kilowatt roof is below the threshold.
+        assert_eq!(array().ac_power(0.4, 10.0), Power::ZERO);
+    }
+
+    /// The whole point of the change: an alternating current is strictly less
+    /// than the direct current behind it, and the gap widens as the light fails.
+    #[test]
+    fn the_inverter_costs_more_at_dawn_than_at_noon() {
+        let a = array();
+        let efficiency_at = |poa: f64| {
+            let cell_c = 15.0 + poa / 800.0 * 25.0;
+            let dc = a.kwp_dc.get()
+                * (poa / 1000.0)
+                * (1.0 + a.temperature_coefficient * (cell_c - 25.0))
+                * (1.0 - a.system_loss);
+            a.ac_power(poa, 15.0).outflow().get() / dc
+        };
+        let noon = efficiency_at(950.0);
+        let dawn = efficiency_at(40.0);
+        assert!(
+            (0.95..=0.97).contains(&noon),
+            "a well-lit inverter runs near its datasheet figure, got {noon}"
+        );
+        assert!(
+            dawn < noon - 0.03,
+            "the part-load droop must be visible: dawn {dawn}, noon {noon}"
+        );
+        assert!(dawn > 0.5, "…but a dim roof is not a dead one, got {dawn}");
+    }
+
+    /// An oversized array still clips at the inverter's own limit, and the
+    /// clipping is on the **alternating-current** side of the efficiency.
+    #[test]
+    fn an_oversized_array_clips_at_the_inverter_and_not_above_it() {
+        let a = ArrayModel::new(Power::from_kw(15.0), Power::from_kw(10.0), 35.0, 180.0);
+        let clipped = a.ac_power(1000.0, 25.0).outflow().get();
+        assert!(
+            clipped <= a.ac_nominal.get() + 1e-9,
+            "an inverter cannot put out more than it is rated for: {clipped} W"
+        );
+        assert!(clipped > 9_000.0, "…and it should be right at the rail");
     }
 }

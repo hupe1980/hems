@@ -9,6 +9,7 @@ authors.workspace      = true
 edition.workspace      = true
 license.workspace      = true
 repository.workspace   = true
+homepage.workspace     = true
 rust-version.workspace = true
 
 # **Not `hems-forecast`, and not by accident.** This crate is the day that

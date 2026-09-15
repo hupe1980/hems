@@ -12,7 +12,23 @@ use hems_optimizer::model::{
     BatteryModel, DhwModel, EvSession, HeatPumpModel, PlanningLimits, Problem, SteuVeDevices,
     ThermalModel, TimedLimit,
 };
-use hems_optimizer::solve::{AssetNames, solve};
+use hems_optimizer::solve::{AssetNames, SolveError, Solved};
+
+/// Solve the way a **regression suite** has to, which is not the way a box does.
+///
+/// `Problem::solve_budget_s` is a wall-clock budget, so an assertion comparing
+/// two solves compares two *incumbents* and passes or fails by machine load.
+/// Zero here, which is what that field's own documentation asks of anything
+/// reproducible, and this wrapper is the only way in (D210).
+fn solve(
+    problem: &hems_optimizer::model::Problem<'_>,
+    names: &AssetNames,
+    now: time::OffsetDateTime,
+) -> Result<Solved, SolveError> {
+    let mut reproducible = problem.clone();
+    reproducible.solve_budget_s = 0.0;
+    hems_optimizer::solve::solve(&reproducible, names, now)
+}
 use hems_tariff::levies::Levies;
 use hems_tariff::stack::PriceStack;
 use hems_tariff::tariff::{EnergyPrice, FeedIn, NetworkCharge, Tariff};
@@ -2603,5 +2619,192 @@ fn no_tariff_or_forecast_can_make_the_plan_report_an_impossible_schedule() {
                 );
             }
         }
+    }
+}
+
+// ── Cooling ─────────────────────────────────────────────────────────────────
+
+/// A reversible unit: the same compressor, able to run backwards.
+fn reversible(indoor_c: f64) -> ThermalModel {
+    let hp = HeatPumpModel::modulating(Power::from_kw(5.0)).reversible(Power::from_kw(4.0));
+    ThermalModel {
+        comfort_min_c: 20.0,
+        comfort_max_c: 23.0,
+        ..ThermalModel::house(indoor_c, hp)
+    }
+}
+
+/// A house above its comfort band on a hot day is cooled rather than endured.
+///
+/// The case the summer reference day could not answer: with a heating-only unit
+/// the planner watched the house climb past 23 °C, paid the discomfort and had
+/// nothing to do about it. A reversible unit is what most new German
+/// installations now are — the GEG made a heat pump the default heating system
+/// in January 2026 and the KfW subsidy covers the cooling function when it is —
+/// so "nothing can be done" was a modelling gap rather than a fact (D202).
+#[test]
+fn a_reversible_unit_cools_a_house_that_is_too_warm() {
+    let h = horizon(32);
+    let p = prices(h, &[25]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    // A hot, still day: warmer outside than the band's ceiling all through.
+    let outdoor = vec![31.0; 32];
+
+    let hot = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(reversible(24.0), &outdoor, NO_SUN),
+        &names(),
+        T0,
+    )
+    .expect("a plan");
+    let cooled: f64 = hot.flows.iter().map(|f| f.cooling.get()).sum();
+    assert!(
+        cooled > 0.0,
+        "a house at 24 °C under a 23 °C ceiling has a reversible unit and did not use it"
+    );
+    assert!(
+        hot.flows.iter().all(|f| f.heat_pump == Power::ZERO),
+        "and it did not heat the house on a 31 °C day"
+    );
+
+    // The same day on a heating-only unit: nothing to be done, and the plan says
+    // so by spending nothing. That is the contrast the feature exists for.
+    let endured = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(thermal(24.0, true), &outdoor, NO_SUN),
+        &names(),
+        T0,
+    )
+    .expect("a plan");
+    assert!(
+        endured.flows.iter().all(|f| f.cooling == Power::ZERO),
+        "a heating-only unit cannot cool"
+    );
+    let discomfort = |s: &hems_optimizer::Solved| {
+        s.plan
+            .expected_cost
+            .as_ref()
+            .map_or(0.0, |c| c.discomfort_eur)
+    };
+    assert!(
+        discomfort(&hot) < discomfort(&endured),
+        "cooling has to buy comfort: {:.2} € against {:.2} €",
+        discomfort(&hot),
+        discomfort(&endured)
+    );
+}
+
+/// It never runs the compressor both ways in one quarter hour.
+///
+/// There is no binary keeping them apart — the argument is that both cost money
+/// and indoor is a single temperature, so paying twice to stand still is
+/// strictly dominated. That is a claim about the solver rather than about the
+/// model, which is exactly the kind that is worth a test.
+#[test]
+fn a_reversible_unit_never_heats_and_cools_at_once() {
+    let h = horizon(64);
+    let p = prices(h, &[25]);
+    let pv = flat(h, 0.0);
+    let load = flat(h, 500.0);
+    // A day that crosses the band: cold at first, hot later, so the plan has
+    // genuine reason to use both directions — on different slots. Sixteen hours
+    // rather than eight, because a house with real thermal mass takes most of a
+    // morning to climb through its own comfort band and a shorter horizon would
+    // be testing the masonry rather than the compressor.
+    let outdoor: Vec<f64> = (0..64).map(|k| if k < 20 { -4.0 } else { 34.0 }).collect();
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load).with_thermal(reversible(21.0), &outdoor, NO_SUN),
+        &names(),
+        T0,
+    )
+    .expect("a plan");
+    for (k, f) in solved.flows.iter().enumerate() {
+        assert!(
+            f.heat_pump == Power::ZERO || f.cooling == Power::ZERO,
+            "slot {k} both heats ({}) and cools ({})",
+            f.heat_pump,
+            f.cooling
+        );
+    }
+    assert!(
+        solved.flows.iter().any(|f| f.heat_pump > Power::ZERO),
+        "the cold half of the day wants heat"
+    );
+    assert!(
+        solved.flows.iter().any(|f| f.cooling > Power::ZERO),
+        "and the hot half wants cooling"
+    );
+}
+
+/// One compressor cannot run in both directions at once.
+///
+/// Heating and cooling at the cancelling ratio change no temperature and consume
+/// real kilowatts, so under a binding feed-in ceiling — where the surplus they
+/// burn would otherwise be curtailed, and curtailment is priced — the pair is
+/// strictly profitable. A physically impossible operating point no driver could
+/// carry out (D208).
+#[test]
+fn a_reversible_unit_is_never_asked_to_heat_and_cool_at_once() {
+    let h = horizon(8);
+    let p = prices(h, &[20]);
+    // Far more sun than the ceiling admits, and a comfortable house that wants
+    // neither heat nor cooling, so any compressor power at all is a dump load.
+    let pv = flat(h, 9000.0);
+    let load = flat(h, 300.0);
+    let outdoor = vec![21.5; 8];
+    let limits = PlanningLimits::default().with_feed_in(TimedLimit::always(Power::from_kw(1.0)));
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load)
+            .with_thermal(reversible(21.5), &outdoor, NO_SUN)
+            .with_limits(limits),
+        &names(),
+        T0,
+    )
+    .expect("a plan");
+
+    for (k, f) in solved.flows.iter().enumerate() {
+        assert!(
+            f.heat_pump == Power::ZERO || f.cooling == Power::ZERO,
+            "slot {k}: the plan runs one compressor in both directions — \
+             heating {:.0} W and cooling {:.0} W at once",
+            f.heat_pump.get(),
+            f.cooling.get()
+        );
+    }
+}
+
+/// One battery cannot charge and discharge at the same time either.
+///
+/// The same shape on the other pair that cancels: charging X and discharging X
+/// leaves the state of charge where it was and destroys the round-trip loss,
+/// which empties a pack for nothing — and a pack with room absorbs surplus that
+/// would otherwise be curtailed (D214).
+#[test]
+fn a_battery_is_never_asked_to_charge_and_discharge_at_once() {
+    let h = horizon(8);
+    let p = prices(h, &[20]);
+    let pv = flat(h, 9000.0);
+    let load = flat(h, 300.0);
+    let limits = PlanningLimits::default().with_feed_in(TimedLimit::always(Power::from_kw(1.0)));
+
+    let solved = solve(
+        &Problem::new(h, &p, &pv, &load)
+            // No wear, and nearly full, so there is very little room to absorb
+            // the surplus honestly — which is exactly when a dump load pays.
+            .with_battery(battery(10.0, 0.95, 0.0))
+            .with_limits(limits),
+        &names(),
+        T0,
+    )
+    .expect("a plan");
+
+    for (k, f) in solved.flows.iter().enumerate() {
+        assert!(
+            f.battery_charge == Power::ZERO || f.battery_discharge == Power::ZERO,
+            "slot {k}: one pack, charging {:.0} W and discharging {:.0} W at once",
+            f.battery_charge.get(),
+            f.battery_discharge.get()
+        );
     }
 }

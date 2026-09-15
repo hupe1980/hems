@@ -17,10 +17,11 @@ cases, which is why it needs a new one for each new thing a device might do.
 hems plans in S2's terms internally and speaks EEBUS where the German grid
 requires it. This crate is the first half.
 
-The wire types come from [`s2energy`](https://crates.io/crates/s2energy),
-generated from the official schema by the standard's own authors (TNO /
-Flexiblepower). Writing our own would be a second opinion about a wire format,
-which is the one thing a standard exists to prevent.
+The data model comes from [`s2-kit`](https://github.com/hupe1980/s2-kit), which
+proves it against the standard's own JSON schemas in its own CI and adds a
+rule-numbered semantic validator for what those schemas cannot express. Writing
+our own would be a second opinion about a wire format, which is the one thing a
+standard exists to prevent.
 
 ## Which control type an asset belongs to
 
@@ -93,6 +94,19 @@ for message in described.messages() { connection.send(message).await?; }
 
 `SiteDescription` groups what it built by control type and — this is the part
 that matters — keeps a separate list of what it **could not** build.
+
+## The session is where both ends are hand-written
+
+`describe_*` says what a resource *can* do; `session` has the conversation — the
+handshake, the control type, the statuses a manager is owed, and the instructions
+it sends back. Three rules there are invisible in any single message, so no
+schema and no validator checks them:
+
+- an instruction's `execution_time` is *when to start*, so one for later waits in
+  a bounded, revocable queue and is answered `Started` when it begins;
+- `RevokeObject` withdraws one that has not run;
+- `NO_SELECTION` is a manager letting go, and the hold is released at once —
+  a manager's instruction ranks above the box's own plan.
 
 ## Written, and *reached*
 

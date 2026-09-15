@@ -49,7 +49,7 @@ Determinism was never the thing that had to go; being *told the answer* was.
 
 <pre class="mermaid">
 flowchart LR
-  G["solar geometry<br/>position · clear-sky · Erbs + HDKR<br/><i>exact, free, no service</i>"] --> M
+  G["solar geometry<br/>position · clear-sky · Erbs + HDKR · inverter<br/><i>exact, free, no service</i>"] --> M
   W["cloud cover<br/>ICON-D2 via forecastd"] --> M["clear sky × (1 − cloud)"]
   M --> C["<b>residual corrector</b><br/>multiplicative · by local hour<br/>~a fortnight, exponentially weighted"]
   H["this roof's own meter"] --> C
@@ -63,6 +63,49 @@ geometry is exact, deterministic and free** — where the sun stands over a give
 roof at a given minute needs no weather service and is the same next January as
 it was last. The weather is neither. And the **roof itself** delivers less than
 its datasheet for reasons nobody wrote down.
+
+## The inverter is a step, not a share of the losses
+
+A photovoltaic model that stops at direct current and clips it at the inverter's
+rating has not modelled the inverter — it has modelled a perfect one.
+`system_loss` is PVWatts' default 0,14 and covers "everything between the
+modules and the meter that is **not** the inverter", so the inverter needs a
+step of its own.
+
+That scope is NREL's, not ours. PVWatts' ten default loss categories — soiling,
+shading, snow, mismatch, wiring, connections, light-induced degradation,
+nameplate tolerance, age, availability — are every one of them on the
+direct-current side, and `pvlib` splits the same seam into `pvwatts_dc` and
+`pvwatts_ac`. So the model had taken half of somebody else's chain, and the half
+it dropped is the one that varies:
+
+```text
+η = (η_nom / η_ref) · (−0,0162·ζ − 0,0059/ζ + 0,9858),   ζ = P_dc / P_dc0
+```
+
+The term that matters is the **reciprocal** one. An inverter draws roughly the
+same housekeeping power whatever it is converting, so that draw is nothing at
+full sun and most of the output at dawn:
+
+| Share of rated DC | Inverter efficiency |
+|---|---|
+| 100 % | 96,0 % |
+| 10 % | 92,2 % |
+| 5 % | 86,4 % |
+| 2 % | 68,8 % |
+| below ~0,6 % | nothing — the start-up threshold, falling out of the curve rather than chosen |
+
+A German roof spends most of its year in the bottom half of that table, which is
+why a flat 96 % would have been the wrong fix. The only parameter is the
+datasheet efficiency; the shape is the published one.
+
+**No reference day could have caught this**, and that is worth saying plainly.
+The simulated roof's *truth* is computed by the same function the forecast is
+built from, so simulator and model shared the missing step and it cancelled in
+every comparison. Seven days that check a plan against a realisation drawn from
+the plan's own physics are blind to any error in that physics by construction.
+The defence is an external bound — a published correlation, transcribed and
+pinned to published values — rather than another day.
 
 ## The soiling nobody mentions
 
@@ -85,6 +128,76 @@ has just been cleaned is not held to last summer.
 The width of the band is the dispersion the corrector has actually measured — not
 a constant somebody chose — with a floor under it, because a roof that has
 behaved identically for ten days has not made the weather deterministic.
+
+## The corrector makes the forecast good and the fault invisible
+
+The residual corrector above is doing its job when it learns that this roof
+delivers 90 % of its model. It is *still* doing its job when one string of three
+stops and it learns 60 % — the forecast stays accurate, the planner keeps
+planning well, and nobody is ever told the roof got worse. The yield is gone and
+the only artefact is a number that drifted.
+
+That is not a defect in the corrector; it is a second question the same
+measurements answer, and it needs the opposite time constant. So the box keeps a
+monitor beside it:
+
+| | corrector | monitor |
+|---|---|---|
+| job | **follow** the roof | **notice it moving** |
+| memory | a fortnight | a season |
+| output | a better forecast | a verdict a household can act on |
+
+The figure is the **performance ratio** in the sense of IEC 61724-1 — delivered
+energy over what the plane-of-array irradiance and the nameplate say was
+available. A residential array between 0,75 and 0,85 is ordinary. hems gets it
+for nothing, because the corrector already forms `actual / modelled` every time a
+slot is scored and the denominator is physics rather than a fit, so it does not
+drift with the roof.
+
+**"In the sense of" is doing work there.** IEC 61724-1 puts *measured* in-plane
+irradiance in the denominator, from a pyranometer in the array's own plane. This
+box has none, and divides by the plane-of-array figure the **forecast** used — so
+the ratio carries the weather model's error as well as the roof's condition, and
+one meter cannot separate them. Day-to-day noise is absorbed, because it is most
+of what the spread measures; a *persistent* bias is not, and a fortnight of a
+model promising more sun than arrives reads like an array that has stopped
+delivering. A false alarm rather than a missed fault, which is the safe way round
+for something whose only action is to send somebody to look — but it is why this
+figure must not be set beside a commercial monitoring product's PR as though they
+were the same measurement. Separating the two needs a **neighbour**: a
+degradation every roof within twenty kilometres reports on the same day is the
+weather. That is the first thing a fleet could answer that a box cannot.
+
+The monitor supplies the **reference** the ratio needs: 0,90 could be an ordinary German roof in
+its third year or one string of three stopped, and the box could not tell a
+household which. The monitor keeps a season-long baseline and this roof's own
+day-to-day spread, and says `Degraded` when a day sits more than three spreads
+below the baseline on three consecutive days — the ordinary control-chart rule,
+on a threshold the roof earns rather than one a constant asserts.
+
+It reports **underperformance, not a diagnosis.** Snow, fog, leaves, soiling, a
+new shadow and a failed string are indistinguishable from one array's own meter;
+saying otherwise would invent a confidence the measurement does not carry. What
+the household is told is how far down and for how long, which is what sends
+somebody to look — and the counter resets the day it recovers, so a spell of
+weather closes itself.
+
+The threshold **means the same thing in month two as in month twelve**. An
+exponentially weighted spread started at zero estimates `μ·(1 − (1−α)ⁿ)` rather
+than `μ`, and at a season's time constant that factor is 0,28 on the first day
+the monitor may speak — so an uncorrected "three spreads below" is 0,83 spreads
+in month two and three in month twelve. It is debiased by the weight actually
+accumulated, and a test runs one roof for a month and for a year and insists both
+are judged alike. A false alarm in month two teaches a household to ignore the
+true one in month eleven.
+
+The verdict is a line on the day report, beside the corrector's own figure —
+which is the other question the same numbers answer:
+
+```console
+  roof, as the box learned it        90 % of the model
+  roof, is it still the roof it was  yes, 91 % of 89 %
+```
 
 ## Scoring the forecast, beside the money
 
@@ -124,14 +237,26 @@ either way.
 $ cargo run -p hemsd -- simulate --day winter --perfect-foresight
 ```
 
-| Day | Saved | Saved, knowing the future | The premium |
+| Day | Saved | Saved, knowing the weather | The premium |
 |---|---|---|---|
-| January, § 14a reduction, 20 kWh of charging to place | **€2,18** | €4,78 | 54 % |
-| January evening, car arrives *as* the reduction starts | **€2,81** | €5,12 | 45 % |
-| June, more sun than the house can use | **€8,98** | €9,21 | 2 % |
-| May, § 9 EEG cap, no car | **€1,04** | €0,85 | **−22 %** |
+| January, § 14a reduction, 20 kWh of charging to place | **€1,08** | €1,22 | +€0,14 |
+| January evening, car arrives *as* the reduction starts | **€0,93** | €1,46 | +€0,53 |
+| June, more sun than the house can use | **€4,36** | €4,59 | +€0,23 |
+| May, § 9 EEG cap, no car | **€0,57** | €0,43 | −€0,14 |
 
-The shape of that table is a result rather than noise. Where the surplus lasts
+It is the **same day** on both sides, and the unmanaged household is what proves
+it: it makes no forecast, so it cannot move between the two runs, and it comes
+out identical to the cent. A flag that zeroed the *weather* rather than the
+*forecast* would run a sunnier, milder day and report the difference as the price
+of knowledge.
+
+The shape of that table is a result rather than noise. The premium is **tens of
+cents at most**:
+these days are driven by prices the planner knows exactly and by deadlines that
+are constraints rather than forecasts, and January imports 52,6 kWh against 7,4
+produced — there is not much sky to be wrong about. It is sometimes negative,
+which is ordinary receding-horizon non-monotonicity: a hedge that happened to pay
+on this realisation is one an oracle no longer buys. Where the surplus lasts
 all day the plan has slack and being wrong costs nothing. Where a large charging
 session has to be placed into the cheap hours **around** a network operator's
 reduction, more than half the headline saving was knowledge nobody has.
@@ -156,7 +281,7 @@ of them.
 
 | Module | Predicts | From |
 |---|---|---|
-| `solar` | what any plane on the house receives, and what the roof makes of it | geometry, a global horizontal irradiance — the clear-sky model or `forecastd`'s — split into beam and diffuse by **Erbs** and transposed by **HDKR**, this roof's own tilt and azimuth from the configuration, and the inverter's limit |
+| `solar` | what any plane on the house receives, and what the roof makes of it | geometry, a global horizontal irradiance — the clear-sky model or `forecastd`'s — split into beam and diffuse by **Erbs** and transposed by **HDKR**, this roof's own tilt and azimuth from the configuration, and the inverter — its **part-load efficiency curve**, then its rating |
 | `residual` | what it *will* produce | the same roof's own history against that model |
 | `load` | the household's uncontrolled draw | its own quarter hours, by day type |
 | `session` | when the car comes home and how empty | its own charging sessions, by weekday |

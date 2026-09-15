@@ -498,6 +498,26 @@ impl CopCurve {
         }
     }
 
+    /// The same unit running **backwards**, as an energy efficiency ratio.
+    ///
+    /// The slope is **negative**, which is the whole difference and is the thing
+    /// a heating curve reused unchanged would get exactly wrong: a heat pump
+    /// heats better when it is warm outside and cools *worse*, because in both
+    /// cases what it is fighting is the gap between indoors and out.
+    ///
+    /// Anchored at the two points a datasheet quotes: about 4,5 at 25 °C and
+    /// about 3,0 at 35 °C, which is an ordinary reversible air-to-water unit at a
+    /// cooling flow temperature underfloor heating can carry. The clamp
+    /// [`CopCurve::at`] already applies keeps it inside 1–6, so the extrapolation
+    /// below about 15 °C — where nobody cools anyway — cannot invent free cold.
+    #[must_use]
+    pub const fn air_source_cooling() -> Self {
+        Self {
+            at_zero: 8.25,
+            slope_per_k: -0.15,
+        }
+    }
+
     /// The coefficient at an outdoor temperature, clamped to a physically
     /// possible range so a nonsense forecast cannot invent free heat.
     #[must_use]

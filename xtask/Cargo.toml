@@ -1,8 +1,10 @@
 [package]
 name    = "xtask"
-version = "0.1.0"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+# Inherits the workspace version like everything else, so one checkout is one
+# version. No `homepage`: it is `publish = false` and has no page to point at.
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

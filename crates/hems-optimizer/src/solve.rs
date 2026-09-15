@@ -77,7 +77,9 @@ use good_lp::constraint::ConstraintReference;
 use good_lp::{
     Expression, ProblemVariables, Solution, SolverModel, Variable, constraint, variable,
 };
-use hems_core::prelude::{AssetId, AssetTarget, Envelope, Plan, PlanId, Power, SlotPlan};
+use hems_core::prelude::{
+    AssetId, AssetTarget, Envelope, Plan, PlanId, Power, SlotPlan, ThermalMode,
+};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -227,6 +229,13 @@ pub struct Flows {
     pub shared_import: Power,
     /// Electrical power drawn by the heat pump.
     pub heat_pump: Power,
+    /// What the same unit draws **cooling**, where it is reversible.
+    ///
+    /// A field of its own rather than a sign on `heat_pump`, because a meter
+    /// cannot tell them apart and a *driver* must: a reversible unit handed
+    /// "draw two kilowatts" in July with no mode beside it will heat the house.
+    /// The two are never both positive — see `building_variables`.
+    pub cooling: Power,
     /// Electrical power drawn by the hot-water heater.
     pub dhw: Power,
     /// Electrical power drawn by the shiftable appliances together.
@@ -473,6 +482,9 @@ fn shadow_prices(
         hp_on: (0..n)
             .map(|k| solution.value(solved.hp_on[k]).round())
             .collect(),
+        cool_on: (0..n)
+            .map(|k| solution.value(solved.cool_on[k]).round())
+            .collect(),
         sh_start: solved
             .sh_start
             .iter()
@@ -608,8 +620,11 @@ struct Vars<'a> {
     curtail: &'a [Variable],
     /// Heat-pump electrical power.
     hp: &'a [Variable],
+    cool: &'a [Variable],
     /// `1` while the heat pump runs. Only meaningful for a non-modulating unit.
     hp_on: &'a [Variable],
+    /// `1` while the compressor runs backwards. Zero for a heating-only unit.
+    cool_on: &'a [Variable],
     /// Indoor air temperature at the end of the slot, °C.
     t_in: &'a [Variable],
     /// Fabric temperature at the end of the slot, °C.
@@ -641,6 +656,8 @@ struct Vars<'a> {
     /// the household has forbidden charging it from the grid. See
     /// [`storage`].
     may_charge: &'a [Option<Variable>],
+    /// `1` where the pack is charging. `None` where it cannot both ways.
+    charging: &'a [Option<Variable>],
 }
 
 /// Every decision variable of the model, owned.
@@ -660,7 +677,9 @@ struct Variables {
     ev_short: Vec<Variable>,
     curtail: Vec<Variable>,
     hp: Vec<Variable>,
+    cool: Vec<Variable>,
     hp_on: Vec<Variable>,
+    cool_on: Vec<Variable>,
     t_in: Vec<Variable>,
     t_mass: Vec<Variable>,
     cold: Vec<Variable>,
@@ -673,6 +692,7 @@ struct Variables {
     shared: Vec<Variable>,
     exporting: Vec<Option<Variable>>,
     may_charge: Vec<Option<Variable>>,
+    charging: Vec<Option<Variable>>,
 }
 
 impl Variables {
@@ -690,7 +710,9 @@ impl Variables {
             ev_short: &self.ev_short,
             curtail: &self.curtail,
             hp: &self.hp,
+            cool: &self.cool,
             hp_on: &self.hp_on,
+            cool_on: &self.cool_on,
             t_in: &self.t_in,
             t_mass: &self.t_mass,
             cold: &self.cold,
@@ -703,6 +725,7 @@ impl Variables {
             shared: &self.shared,
             exporting: &self.exporting,
             may_charge: &self.may_charge,
+            charging: &self.charging,
         }
     }
 }
@@ -718,6 +741,10 @@ impl Variables {
 struct Pins {
     ev_on: Vec<f64>,
     hp_on: Vec<f64>,
+    /// Which way the compressor ran. Shared rather than per future, because the
+    /// direction is a commitment: one reversing valve serves whichever weather
+    /// arrives.
+    cool_on: Vec<f64>,
     /// Where each appliance's programme was placed, `[i][k]`.
     sh_start: Vec<Vec<f64>>,
     /// Which way the connection point ran, `[future][k]`. Per future rather
@@ -788,6 +815,13 @@ fn build_variables(
 struct SharedBinaries {
     ev_on: Vec<Variable>,
     hp_on: Vec<Variable>,
+    /// `1` where the compressor runs **backwards**, for a reversible unit.
+    ///
+    /// One refrigerant circuit and one reversing valve: a unit heats or cools
+    /// and cannot do both, and this is the only thing in the model that says so.
+    /// Pinned to zero for a heating-only unit, so a household that cannot cool
+    /// hands the backend exactly the model it had before cooling existed.
+    cool_on: Vec<Variable>,
     sh_start: Vec<Vec<Variable>>,
     sh_short: Vec<Variable>,
 }
@@ -811,6 +845,7 @@ fn shared_binaries(
     let mut shared = SharedBinaries {
         ev_on: Vec::with_capacity(n),
         hp_on: Vec::with_capacity(n),
+        cool_on: Vec::with_capacity(n),
         sh_start: Vec::with_capacity(problem.shiftable.len()),
         sh_short: Vec::with_capacity(problem.shiftable.len()),
     };
@@ -832,6 +867,16 @@ fn shared_binaries(
             heat_pump_binary(problem, vars, k, pins)
         } else {
             shared.hp_on[representative]
+        });
+        // The direction takes the **same** block structure as the compressor's
+        // own binary: decided slot by slot while the plan is a commitment, and
+        // one variable for a block of the coarse tail. A reversing valve takes
+        // minutes, so a unit that changed direction inside a quarter hour was
+        // never a physical possibility to give away.
+        shared.cool_on.push(if representative == k {
+            cooling_binary(problem, vars, k, pins)
+        } else {
+            shared.cool_on[representative]
         });
     }
     shiftable_variables(problem, vars, &mut shared, pins);
@@ -860,7 +905,9 @@ fn recourse_variables(
         ev_short: Vec::with_capacity(n),
         curtail: Vec::with_capacity(n),
         hp: Vec::with_capacity(n),
+        cool: Vec::with_capacity(n),
         hp_on: Vec::with_capacity(n),
+        cool_on: Vec::with_capacity(n),
         t_in: Vec::with_capacity(n),
         t_mass: Vec::with_capacity(n),
         cold: Vec::with_capacity(n),
@@ -873,6 +920,7 @@ fn recourse_variables(
         shared: Vec::with_capacity(n),
         exporting: Vec::with_capacity(n),
         may_charge: Vec::with_capacity(n),
+        charging: Vec::with_capacity(n),
     };
 
     let import_ceiling = problem
@@ -922,6 +970,8 @@ fn recourse_variables(
         ));
         v.may_charge
             .push(charge_source_binary(problem, vars, k, future, pins));
+        v.charging
+            .push(battery_direction_binary(problem, vars, pins));
         v.curtail.push(vars.add(variable().min(0.0).max(pv)));
 
         let (charge_max, discharge_max, floor, ceiling) =
@@ -943,6 +993,7 @@ fn recourse_variables(
 
         hot_water_variables(problem, vars, &mut v, k);
         v.hp_on.push(shared.hp_on[k]);
+        v.cool_on.push(shared.cool_on[k]);
         building_variables(problem, vars, &mut v);
     }
 
@@ -982,6 +1033,13 @@ fn building_variables(problem: &Problem<'_>, vars: &mut ProblemVariables, v: &mu
     match problem.thermal {
         Some(t) => {
             v.hp.push(vars.add(variable().min(0.0).max(t.heat_pump.max_electrical.get())));
+            // A **second** variable rather than a negative heating one, because
+            // the two have different efficiencies and different ratings. What
+            // keeps them apart is `cool_on` and the two rows in `building`;
+            // without those the pair is a dump load wherever electricity has
+            // non-positive marginal cost (D208).
+            v.cool
+                .push(vars.add(variable().min(0.0).max(t.heat_pump.max_cooling.get())));
             // Wide bounds on the temperatures: the comfort band is a *soft*
             // constraint, and pinning the state variable to it would make a cold
             // snap infeasible instead of merely uncomfortable.
@@ -993,6 +1051,7 @@ fn building_variables(problem: &Problem<'_>, vars: &mut ProblemVariables, v: &mu
         None => {
             for target in [
                 &mut v.hp,
+                &mut v.cool,
                 &mut v.t_in,
                 &mut v.t_mass,
                 &mut v.cold,
@@ -1089,6 +1148,45 @@ fn charge_source_binary(
     })
 }
 
+/// Which way the pack is running in slot `k`, per future.
+///
+/// `1` charging, `0` discharging. **One pack cannot do both**: charging X and
+/// discharging X leaves the state of charge where it was and destroys the
+/// round-trip loss, which is a way to empty a pack for free — and a pack with
+/// room in it absorbs surplus that would otherwise be curtailed, which is priced
+/// (D214).
+///
+/// Per **future** rather than shared, for the reason `exporting` is: this is
+/// physics rather than a commitment, and a bright afternoon fills a pack where a
+/// dull one empties it.
+///
+/// `None` where the question cannot arise — no battery, or a pack that can only
+/// go one way — so a household without one hands the backend the model it had.
+fn battery_direction_binary(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    pins: Option<&Pins>,
+) -> Option<Variable> {
+    let b = problem.battery?;
+    if b.max_charge <= Power::ZERO || b.max_discharge <= Power::ZERO {
+        return None;
+    }
+    // **Absent in the dual pass**, rather than pinned like every other binary
+    // here. Pinning this one would add a row that binds and did not exist
+    // before — `b_dis ≤ 0` in a slot the pack spent charging — and a dual is the
+    // price of relaxing whatever binds, so the shadow prices would be of a
+    // tighter program than the one the plan was made in.
+    //
+    // Omitting it is sound: the point being priced is the one the mixed-integer
+    // solve chose, that point satisfies exclusivity by construction, and a slack
+    // constraint changes no dual. What the dual pass still cannot see is relief
+    // whose value lies in changing a discrete decision (R39).
+    if pins.is_some() {
+        return None;
+    }
+    Some(vars.add(variable().binary()))
+}
+
 /// The most the connection point could draw in one slot, watts.
 ///
 /// Everything the household could switch on at once plus the load it cannot
@@ -1169,6 +1267,46 @@ fn charge_point_binary(
 /// [`CompressorState`].
 ///
 /// [`CompressorState`]: crate::model::CompressorState
+/// Which way the compressor runs in slot `k`.
+///
+/// `1` is cooling, `0` is heating, and the pair of big-M rows in [`building`]
+/// is what makes it mean anything.
+///
+/// **Pinned to zero unless the unit is reversible**, which is the majority of
+/// the installed German base. A pinned variable is a column branch and bound
+/// never opens, so a heating-only household pays nothing at all for this — the
+/// same discipline `heat_pump_binary` applies to a modulating unit.
+///
+/// There is no cheaper exact formulation and it is worth saying why, because the
+/// rest of this model works hard to avoid binaries. "At most one of two
+/// non-negative variables is positive" is a disjunction, and no linear
+/// inequality over `hp` and `cool` expresses one: every bound that admits
+/// `(P, 0)` and `(0, P)` admits the convex combinations between them, and the
+/// convex combinations are exactly the operating points a compressor does not
+/// have.
+fn cooling_binary(
+    problem: &Problem<'_>,
+    vars: &mut ProblemVariables,
+    k: usize,
+    pins: Option<&Pins>,
+) -> Variable {
+    let reversible = problem.thermal.is_some_and(|t| t.heat_pump.is_reversible());
+    if !reversible {
+        return vars.add(variable().min(0.0).max(0.0));
+    }
+    match pins {
+        // The dual pass is a linear program — Clarabel holds no integers — so
+        // every binary becomes the constant the mixed-integer solve chose. D42's
+        // rule, and forgetting it here is a panic rather than a wrong number,
+        // which is the right way round.
+        Some(p) => {
+            let cooling = p.cool_on.get(k).copied().unwrap_or(0.0);
+            vars.add(variable().min(cooling).max(cooling))
+        }
+        None => vars.add(variable().binary()),
+    }
+}
+
 fn heat_pump_binary(
     problem: &Problem<'_>,
     vars: &mut ProblemVariables,
@@ -1344,7 +1482,7 @@ fn build_objective(
     let futures = problem.realisations();
     let mut mean = Expression::from(0.0);
     for (s, realisation) in futures.iter().enumerate() {
-        mean += scenario_cost(problem, &per[s].borrow(), *realisation) * realisation.probability;
+        mean += scenario_cost(problem, &per[s].borrow()) * realisation.probability;
     }
     let Some(risk) = risk else {
         return mean;
@@ -1392,11 +1530,7 @@ fn connection_prices(problem: &Problem<'_>, k: usize) -> (f64, f64) {
 }
 
 /// What one future costs, in euros over the horizon.
-fn scenario_cost(
-    problem: &Problem<'_>,
-    vars: &Vars<'_>,
-    realisation: crate::model::Realisation,
-) -> Expression {
+fn scenario_cost(problem: &Problem<'_>, vars: &Vars<'_>) -> Expression {
     let mut objective = Expression::from(0.0);
     for k in 0..problem.horizon.len {
         let price = problem.prices.slots.get(k);
@@ -1460,7 +1594,6 @@ fn scenario_cost(
     // value, and the reason a plan does not let the house coast cold into its
     // own last slot. Valuing it at the replacement cost keeps it neutral: the
     // plan pre-heats when that is genuinely cheaper, and not otherwise.
-    let _ = realisation;
     if let Some(t) = problem.thermal {
         let mean_outdoor = if problem.outdoor_c.is_empty() {
             10.0
@@ -1626,8 +1759,8 @@ fn conditional_value_at_risk<M: SolverModel>(
     let Some(risk) = risk else {
         return model;
     };
-    for (s, realisation) in problem.realisations().iter().enumerate() {
-        let cost = scenario_cost(problem, &per[s].borrow(), *realisation);
+    for (s, variables) in per.iter().enumerate() {
+        let cost = scenario_cost(problem, &variables.borrow());
         // `tail_s + ζ − cost_s ≥ 0`, built as one expression rather than through
         // the comparison macro: `cost_s` is the whole of a future's objective —
         // several hundred terms — and a macro that has to decide which side of a
@@ -1663,6 +1796,7 @@ fn balance<M: SolverModel>(
         vars.g_in[k] - vars.g_out[k] - vars.b_ch[k] + vars.b_dis[k]
             - vars.ev[k]
             - vars.hp[k]
+            - vars.cool[k]
             - vars.dhw[k]
             - shiftable_total(problem, vars, k)
             - vars.curtail[k]
@@ -1742,6 +1876,13 @@ fn storage<M: SolverModel>(
             == previous + vars.b_ch[k] * (b.efficiency_charge * DT_HOURS)
                 - vars.b_dis[k] * (DT_HOURS / b.efficiency_discharge)
     )));
+    if let Some(charging) = vars.charging[k] {
+        // One pack, one direction (D214).
+        model = model.with(constraint!(vars.b_ch[k] <= charging * b.max_charge.get()));
+        model = model.with(constraint!(
+            vars.b_dis[k] <= (1.0 - charging) * b.max_discharge.get()
+        ));
+    }
     if let Some(may) = vars.may_charge[k] {
         // Nothing goes into this battery while the meter is running. See
         // [`charge_source_binary`] for why this is a disjunction rather than
@@ -1962,7 +2103,12 @@ fn grid_rules<M: SolverModel>(
             left += vars.ev[k];
         }
         if steuve.heat_pump {
-            left += vars.hp[k];
+            // Cooling counts against the same ceiling. `[A1 2.4.1]` lists
+            // Raumkühlung beside the heat-pump group and the budget takes the
+            // *larger* of the two bases rather than their sum, because one unit
+            // cannot do both — so the *power* is bounded here exactly as the
+            // heating power is.
+            left += vars.hp[k] + vars.cool[k];
         }
         model.add_constraint(constraint!(left <= ceiling.get()))
     } else {
@@ -1997,7 +2143,7 @@ fn grid_rules<M: SolverModel>(
         // ceiling, and a spender carries the same `+1` on this row as a
         // controllable device does. The two readings are the same inequality.
         model.add_constraint(constraint!(
-            vars.b_ch[k] + vars.ev[k] + vars.hp[k] - vars.b_dis[k]
+            vars.b_ch[k] + vars.ev[k] + vars.hp[k] + vars.cool[k] - vars.b_dis[k]
                 + vars.curtail[k]
                 + vars.dhw[k]
                 + shiftable_total(problem, vars, k)
@@ -2069,6 +2215,10 @@ fn building<M: SolverModel>(
     };
     let outdoor = problem.outdoor_at(k);
     let cop = t.heat_pump.cop(outdoor);
+    // The *other* curve, and the sign is the point: a kilowatt spent cooling
+    // takes `eer` kilowatts of heat **out** of the air node, where a kilowatt
+    // spent heating puts `cop` in.
+    let eer = t.heat_pump.eer(outdoor);
     let d = problem.thermal_step();
 
     let (prev_in, prev_mass): (Expression, Expression) = if k == 0 {
@@ -2090,6 +2240,7 @@ fn building<M: SolverModel>(
             == prev_in.clone() * d.a[0][0]
                 + prev_mass.clone() * d.a[0][1]
                 + vars.hp[k] * (d.b_heat[0] * cop / 1000.0)
+                - vars.cool[k] * (d.b_heat[0] * eer / 1000.0)
                 + d.b_heat[0] * free
                 + d.b_outdoor[0] * outdoor
     )));
@@ -2098,6 +2249,7 @@ fn building<M: SolverModel>(
             == prev_in * d.a[1][0]
                 + prev_mass * d.a[1][1]
                 + vars.hp[k] * (d.b_heat[1] * cop / 1000.0)
+                - vars.cool[k] * (d.b_heat[1] * eer / 1000.0)
                 + d.b_heat[1] * free
                 + d.b_outdoor[1] * outdoor
     )));
@@ -2106,6 +2258,20 @@ fn building<M: SolverModel>(
     // and expensive, not the problem infeasible.
     model = model.with(constraint!(vars.t_in[k] + vars.cold[k] >= t.comfort_min_c));
     model = model.with(constraint!(vars.t_in[k] - vars.warm[k] <= t.comfort_max_c));
+
+    // **One compressor, one direction.** The pair cancels thermally and adds
+    // electrically, so without these rows it is a dump load — strictly
+    // profitable wherever electricity has non-positive marginal cost, which is a
+    // binding § 9 EEG ceiling or a negative-price quarter hour (D208).
+    //
+    // Stated per future because `hp` and `cool` are recourse variables, over a
+    // shared binary — the same shape as the compressor's own on/off rows below.
+    if t.heat_pump.is_reversible() {
+        let heating = t.heat_pump.max_electrical.get();
+        let cooling = t.heat_pump.max_cooling.get();
+        model = model.with(constraint!(vars.hp[k] <= (1.0 - vars.cool_on[k]) * heating));
+        model = model.with(constraint!(vars.cool[k] <= vars.cool_on[k] * cooling));
+    }
 
     if t.heat_pump.modulating {
         return model;
@@ -2153,6 +2319,8 @@ fn building<M: SolverModel>(
 fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
     let mut cost = hems_core::prelude::CostBreakdown::default();
     let mut house = Unmanaged::new(problem);
+    // Watt-hours through the unmanaged battery, for the wear it pays at the end.
+    let mut throughput = 0.0_f64;
 
     for k in 0..problem.horizon.len {
         let (pv, load) = problem.forecasts_at(k);
@@ -2171,11 +2339,19 @@ fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
         let dhw = house.hot_water(problem, k, &mut cost);
         let appliances: f64 = house.appliances(problem, k);
 
+        // The battery, on the controller it came with. It sees the house's net
+        // position *before* the grid does, which is what self-consumption means:
+        // a surplus fills the store before it is exported, and a deficit empties
+        // it before anything is imported.
+        let demand = load + ev + hp + dhw + appliances - pv;
+        let battery = house.battery(problem, demand);
+        throughput += battery.abs() * DT_HOURS;
+
         // § 9 EEG and an LPP session bound what leaves the connection point, and
         // they do not ask whether there is an energy manager behind it. What the
         // baseline cannot export it throws away, at the same price the plan pays
         // for doing so.
-        let mut net = load + ev + hp + dhw + appliances - pv;
+        let mut net = demand + battery;
         if net < 0.0
             && let Some(ceiling) = slot_k.and_then(|s| problem.limits.feed_in_at(s))
         {
@@ -2220,6 +2396,10 @@ fn baseline_cost(problem: &Problem<'_>) -> hems_core::prelude::CostBreakdown {
             cost.discomfort_eur += outside * t.discomfort_eur_per_kelvin_hour * DT_HOURS;
         }
     }
+    // The life the factory controller spent, at the rate the plan pays for its
+    // own. Both households own the same pack.
+    cost.wear_eur += Unmanaged::wear_eur(problem, throughput);
+
     // A departure outside the horizon is not a missed deadline, so the baseline
     // is held to exactly what the plan is held to out there: the pro-rata floor
     // of `charging_target`. Charging it the whole outstanding balance instead
@@ -2253,6 +2433,8 @@ struct Unmanaged {
     car_remaining: f64,
     thermostat_on: bool,
     dhw_stored: f64,
+    /// What the battery is holding, Wh — see [`Unmanaged::battery`].
+    battery_stored: f64,
     thermal_state: hems_core::prelude::ThermalState,
     thermal_step: hems_core::prelude::Rc2Discrete,
     /// Where each programme runs with nobody deciding: the first slot the
@@ -2268,6 +2450,7 @@ impl Unmanaged {
             }),
             thermostat_on: false,
             dhw_stored: problem.dhw.map_or(0.0, |d| d.stored_now.get()),
+            battery_stored: problem.battery.map_or(0.0, |b| b.energy_now().get()),
             thermal_state: problem
                 .thermal
                 .map_or(hems_core::prelude::ThermalState::default(), |t| t.state),
@@ -2335,6 +2518,23 @@ impl Unmanaged {
         let Some(t) = problem.thermal else {
             return 0.0;
         };
+        let outdoor = problem.outdoor_at(k);
+
+        // The same reversible unit, on its own thermostat. A household that owns
+        // the cooling function uses it when the room is already too warm; a plan
+        // uses it when the roof is paying for it. That difference is what is
+        // being measured, and leaving the baseline unable to cool would credit
+        // the planner with the *hardware* — D195, in the other direction.
+        if t.heat_pump.is_reversible() && self.thermal_state.indoor_c > t.comfort_max_c {
+            let p = t.heat_pump.max_cooling.get().min(device_ceiling);
+            self.thermal_state = self.thermal_step.step(
+                self.thermal_state,
+                problem.free_heat_at(k) - p * t.heat_pump.eer(outdoor) / 1000.0,
+                outdoor,
+            );
+            return p;
+        }
+
         if self.thermal_state.indoor_c < t.comfort_min_c {
             self.thermostat_on = true;
         } else if self.thermal_state.indoor_c > t.comfort_min_c + 0.5 {
@@ -2345,7 +2545,6 @@ impl Unmanaged {
         } else {
             0.0
         };
-        let outdoor = problem.outdoor_at(k);
         // The same free heat the plan is given. A baseline heated by a different
         // physics from the plan's is not a comparison (D37).
         self.thermal_state = self.thermal_step.step(
@@ -2386,6 +2585,79 @@ impl Unmanaged {
         };
         self.dhw_stored = (self.dhw_stored + p * d.cop * DT_HOURS).min(d.capacity.get());
         p
+    }
+}
+
+impl Unmanaged {
+    /// The battery, run the way it runs itself: **maximise self-consumption**.
+    ///
+    /// Takes the household's net position for the slot in watts — positive for a
+    /// draw — and returns what the battery does about it, positive for charging,
+    /// negative for discharging. Surplus goes into the store until it is full or
+    /// the charger is at its rail; a deficit comes back out until the store is at
+    /// its floor or the inverter is at its rail. It never charges from the grid
+    /// and never discharges into it, which is exactly the greedy rule every
+    /// hybrid inverter in this market ships with as its default mode.
+    ///
+    /// # Why the baseline has a battery at all
+    ///
+    /// It did not, for five versions, and that made every saving this project
+    /// quoted the value of *owning a battery* rather than the value of managing
+    /// one. A household choosing whether to run hems already has the battery —
+    /// nobody removes one to go back to an unmanaged house — so the counterfactual
+    /// that answers their question is the same hardware on its factory
+    /// controller. Measuring against an idle store credits the planner with
+    /// roughly the import/export spread on everything the battery would have
+    /// cycled anyway, which is most of what a German home battery is worth.
+    ///
+    /// It is also the baseline the literature uses: rule-based self-consumption
+    /// is the reference every MPC comparison reports against, and a saving over
+    /// *no storage* is not comparable with any published figure.
+    ///
+    /// D195. It is the same discipline as D183's thermostat set point and D174's
+    /// community membership — the baseline gets the household's own equipment,
+    /// used the way it is used without a manager.
+    fn battery(&mut self, problem: &Problem<'_>, net_w: f64) -> f64 {
+        let Some(b) = problem.battery else {
+            return 0.0;
+        };
+        let floor = b.floor_energy().get();
+        let ceiling = b.ceiling_energy().get();
+        if net_w < 0.0 {
+            // A surplus. Charge with what the roof is giving, no faster than the
+            // charger and no further than full.
+            let room =
+                ((ceiling - self.battery_stored) / (b.efficiency_charge * DT_HOURS)).max(0.0);
+            let charge = (-net_w).min(b.max_charge.get()).min(room);
+            self.battery_stored += charge * b.efficiency_charge * DT_HOURS;
+            charge
+        } else {
+            // A deficit. Cover it from the store, down to the floor.
+            //
+            // **No § 14a ceiling here.** A reduction bounds the netzwirksamer
+            // Leistungsbezug — what crosses the connection point — and a
+            // discharging battery is what makes that smaller. The charging side
+            // needs none either: this controller only ever charges from surplus,
+            // so it never draws through the connection point at all.
+            let available =
+                ((self.battery_stored - floor) * b.efficiency_discharge / DT_HOURS).max(0.0);
+            let discharge = net_w.min(b.max_discharge.get()).min(available);
+            self.battery_stored -= discharge * DT_HOURS / b.efficiency_discharge;
+            -discharge
+        }
+    }
+
+    /// What the unmanaged battery spent of its own life over the horizon, €.
+    ///
+    /// Charged on throughput at the same rate the plan pays, because a household
+    /// that cycles its battery on a factory controller wears it out just as
+    /// surely — and a comparison that charged wear to only one side would hand
+    /// the planner a saving for the cycling it avoided *and* for the cycling it
+    /// did.
+    fn wear_eur(problem: &Problem<'_>, throughput_wh: f64) -> f64 {
+        problem.battery.map_or(0.0, |b| {
+            throughput_wh * b.degradation_eur_per_kwh / 2.0 / 1000.0
+        })
     }
 }
 
@@ -2474,6 +2746,7 @@ fn slot_targets(
             (b.max_charge, b.max_discharge)
         });
         targets.push(AssetTarget {
+            mode: ThermalMode::Heat,
             marginal_eur_per_kwh: value_of(id),
             asset: id.clone(),
             power: net,
@@ -2493,6 +2766,7 @@ fn slot_targets(
     if let Some(id) = &names.evse {
         let max = problem.ev.map_or(f.ev_charge, |e| e.max_charge);
         targets.push(AssetTarget {
+            mode: ThermalMode::Heat,
             marginal_eur_per_kwh: value_of(id),
             asset: id.clone(),
             power: f.ev_charge,
@@ -2505,14 +2779,43 @@ fn slot_targets(
         targets.push(AssetTarget {
             marginal_eur_per_kwh: value_of(id),
             asset: id.clone(),
-            power: f.heat_pump,
-            envelope: Envelope::new(Power::ZERO, t.heat_pump.max_electrical),
+            // The **electrical draw**, whichever direction the unit is running
+            // in: that is what the meter sees, what the guard bounds and what
+            // the § 14a ceiling counts. Only one of the two is ever positive,
+            // and `mode` is what says which — without it a July setpoint of four
+            // kilowatts heats the house.
+            mode: if f.cooling > Power::ZERO {
+                ThermalMode::Cool
+            } else {
+                ThermalMode::Heat
+            },
+            power: f.heat_pump + f.cooling,
+            // **Cooling gives the arbiter no headroom upward.**
+            //
+            // For heating, a wide envelope is what lets the arbiter spend a
+            // surplus the plan did not know about: more power is more heat, the
+            // unit's own thermostat stops it, and the household is warm either
+            // way. In cooling the sign flips and that reasoning inverts — more
+            // power is a *colder* house, and an arbiter absorbing surplus into a
+            // reversible unit drove the reference May day to 12,8 °C before this
+            // line existed.
+            //
+            // So the ceiling is what the plan asked for. The floor stays at zero
+            // because a § 14a reduction must still be able to take it away: the
+            // arbiter may always do *less* than the plan, and in this direction
+            // that is the only safe way to be wrong (D202).
+            envelope: if f.cooling > Power::ZERO {
+                Envelope::new(Power::ZERO, f.cooling)
+            } else {
+                Envelope::new(Power::ZERO, t.heat_pump.max_electrical)
+            },
         });
     }
     if let Some(id) = &names.dhw
         && let Some(d) = problem.dhw
     {
         targets.push(AssetTarget {
+            mode: ThermalMode::Heat,
             marginal_eur_per_kwh: value_of(id),
             asset: id.clone(),
             power: f.dhw,
@@ -2525,6 +2828,7 @@ fn slot_targets(
     // hour it is running in.
     for (id, power) in names.shiftable.iter().zip(appliances) {
         targets.push(AssetTarget {
+            mode: ThermalMode::Heat,
             marginal_eur_per_kwh: value_of(id),
             asset: id.clone(),
             power: *power,
@@ -2537,6 +2841,7 @@ fn slot_targets(
         let (pv, _) = problem.forecasts_at(k);
         let allowed = Power::new(pv) - f.curtailed;
         targets.push(AssetTarget {
+            mode: ThermalMode::Heat,
             marginal_eur_per_kwh: value_of(id),
             asset: id.clone(),
             power: -allowed,
@@ -2578,6 +2883,7 @@ fn read_flows(solution: &impl Solution, vars: &Vars<'_>, appliances: &[Power], k
         battery_discharge: value(vars.b_dis[k]),
         battery_energy: hems_core::prelude::Energy::new(solution.value(vars.b_e[k]).max(0.0)),
         ev_charge: value(vars.ev[k]),
+        cooling: value(vars.cool[k]),
         curtailed: value(vars.curtail[k]),
         shared_import: vars.shared.get(k).map_or(Power::ZERO, |v| value(*v)),
         heat_pump: value(vars.hp[k]),
@@ -2665,7 +2971,6 @@ fn read_back(
     let n = problem.horizon.len;
     let futures = problem.realisations();
     let vars = &per[central].borrow();
-    let central_realisation = futures[central];
     // Where each appliance's programme was placed, as a slot index. Read once:
     // it is a single decision per appliance and re-deriving it inside the slot
     // loop would make a quadratic scan out of a lookup.
@@ -2682,7 +2987,6 @@ fn read_back(
         let appliances = shiftable_at(problem, &placements, k);
         let f = read_flows(solution, vars, &appliances, k);
         charge_the_report(problem, &f, k, &mut cost);
-        let _ = central_realisation;
 
         // The marginal value of a kilowatt-hour in this slot. Where the dual
         // pass ran it is the **shadow price** of the energy balance — what the

@@ -141,6 +141,13 @@ demo day="winter":
     cargo run -p hemsd -- simulate --day {{ day }}
 
 # 🏠 Every day, and the six comparisons worth seeing
+# `the_landing_page_prints_the_day_it_says_it_does` holds both transcripts to this
+# report, so this is what regenerates them when a figure moves.
+
+# Print the winter day the landing page and the README pin
+day-report:
+    cargo run -q -p hemsd --example print_winter_day
+
 demo-all:
     @just demo winter
     @just demo summer
@@ -149,8 +156,8 @@ demo-all:
     @just demo offline
     @just demo autumn
     @just demo capped
-    @echo "  ── the same winter day with the future known in advance ──"
-    @echo "  ── (what a saving figure quoted without a forecast measures) ──"
+    @echo "  ── the same winter day with the weather known in advance ──"
+    @echo "  ── (the same day; only what the planner was told changes) ──"
     cargo run -q -p hemsd -- simulate --day winter --perfect-foresight
     @echo "  ── the same winter day with battery wear priced at zero ──"
     cargo run -q -p hemsd -- simulate --day winter --wear-eur-per-kwh 0

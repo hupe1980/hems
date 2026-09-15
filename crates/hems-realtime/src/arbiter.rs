@@ -279,6 +279,16 @@ pub struct Decision {
     /// What every asset was told, including the unchanged ones — the state the
     /// next tick compares against.
     pub commanded: BTreeMap<AssetId, Power>,
+    /// Which way each reversible thermal device was told to run.
+    ///
+    /// Beside `commanded` rather than folded into it, and filled every tick
+    /// rather than only when a [`Command::ThermalMode`] is emitted: a direction
+    /// is a *state* the device is left in, where a setpoint is an edge. A
+    /// consumer that read the plan for this instead — which the simulator did —
+    /// has a second source of truth that disagrees with the box exactly when it
+    /// matters, because the arbiter drops a plan older than
+    /// [`ArbiterConfig::max_plan_age`] and the plan does not know that.
+    pub thermal: BTreeMap<AssetId, hems_core::prelude::ThermalMode>,
     /// The guard's bounds and reasons for this tick.
     pub verdict: GuardVerdict,
     /// The phase policy for the next tick. Feed it back through
@@ -357,6 +367,7 @@ impl Arbiter {
         // ── 4. Smooth, and 5. explain ──────────────────────────────────────
         let mut setpoints = Vec::new();
         let mut commanded = BTreeMap::new();
+        let mut thermal = BTreeMap::new();
         let mut clipped = BTreeMap::new();
 
         for (id, (want, _)) in &desires.wants {
@@ -417,9 +428,24 @@ impl Arbiter {
             // almost no device speaks them. `hems-device` turns the decision
             // into amperes for a charge point, a contact state for an SG Ready
             // heat pump, a ceiling for an inverter.
+            // The plan's direction for this asset, or heating where there is no
+            // plan. A reversible unit with no plan is on its own thermostat and
+            // heating is what `ThermalMode` defaults to; the guard can still
+            // take the power away underneath either.
+            // The plan's direction for this asset, or heating where there is no
+            // plan — which is what `ThermalMode` defaults to and what a
+            // reversible unit falls back to on its own thermostat. Recorded for
+            // every asset the arbiter decided, so that nothing downstream has to
+            // go back to the plan to find out.
+            let direction = desires
+                .slot_plan
+                .and_then(|s| s.target(id))
+                .map_or(hems_core::prelude::ThermalMode::Heat, |t| t.mode);
+            thermal.insert(id.clone(), direction);
             let decision = hems_device::Decision::new(smoothed)
                 .guard_limited(guard_rule.is_some())
-                .in_phase_mode(mode);
+                .in_phase_mode(mode)
+                .in_thermal_mode(direction);
             for command in hems_device::commands_for(asset, decision) {
                 if let Ok(setpoint) = Setpoint::new(id.clone(), command, reason, tick.now) {
                     setpoints.push(setpoint);
@@ -430,6 +456,7 @@ impl Arbiter {
         Decision {
             setpoints,
             commanded,
+            thermal,
             balance_residual: Self::balance_residual(&tick, max_age),
             verdict,
             phases,
@@ -1295,6 +1322,7 @@ mod tests {
                 flexibility_eur_per_kwh: None,
                 slot,
                 targets: vec![AssetTarget {
+                    mode: ThermalMode::Heat,
                     marginal_eur_per_kwh: None,
                     asset: AssetId::new("battery").unwrap(),
                     power: Power::from_kw(4.0),
@@ -1325,6 +1353,7 @@ mod tests {
                 flexibility_eur_per_kwh: None,
                 slot,
                 targets: vec![AssetTarget {
+                    mode: ThermalMode::Heat,
                     marginal_eur_per_kwh: None,
                     asset: AssetId::new("battery").unwrap(),
                     power: Power::from_kw(4.0),
@@ -1817,6 +1846,7 @@ mod tests {
                 flexibility_eur_per_kwh: None,
                 slot,
                 targets: vec![AssetTarget {
+                    mode: ThermalMode::Heat,
                     marginal_eur_per_kwh: None,
                     asset: AssetId::new("wallbox").unwrap(),
                     power: Power::from_kw(11.0),

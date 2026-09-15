@@ -680,6 +680,18 @@ pub struct SiteSettings {
     pub heat_pump_kw: f64,
     /// Whether the heat pump modulates rather than switching on and off.
     pub heat_pump_modulating: bool,
+    /// Electrical power the heat pump draws **cooling**, kW. Zero is a
+    /// heating-only unit.
+    ///
+    /// Declared rather than inferred, and rather than defaulted to a fraction of
+    /// the heating rating: whether a unit is reversible is a fact an installer
+    /// reads off the nameplate, and a box that assumed one would either leave a
+    /// household sweltering with the hardware to fix it or plan cooling a unit
+    /// cannot deliver. Zero by default, which is the safe direction — the box
+    /// endures what it could have fixed rather than commanding what is not there
+    /// (D202).
+    #[serde(default)]
+    pub heat_pump_cooling_kw: f64,
     /// How the heat pump takes instructions.
     #[serde(default)]
     pub heat_pump_control: HeatPumpInterface,
@@ -730,6 +742,14 @@ pub struct SiteSettings {
     /// exported: three-phase charging cannot start below 4,14 kW, single-phase
     /// below 1,38 kW. Almost every wallbox sold in Germany since 2022 can.
     pub evse_switchable: bool,
+    /// Whether the charge point can discharge the car into the house.
+    ///
+    /// A fact about the hardware on the wall. What the wallbox and the car
+    /// negotiate between themselves is ISO 15118 and this box never sees it;
+    /// what this decides is whether the planner may ask for a discharge at all,
+    /// and whether a Customer Energy Manager is told the wallbox can produce.
+    #[serde(default)]
+    pub evse_bidirectional: bool,
     /// The state of charge the household asks its car to stop at, 0…1.
     pub ev_charge_limit: Option<f64>,
     /// The programme a shiftable appliance is loaded with, as the average power
@@ -788,6 +808,7 @@ impl Default for SiteSettings {
             longitude: reference.location.longitude,
             altitude_m: reference.location.altitude_m,
             heat_pump_kw: heat_pump.power.kw(),
+            heat_pump_cooling_kw: heat_pump.cooling_electrical.map_or(0.0, Power::kw),
             heat_pump_modulating: heat_pump.modulating,
             heat_pump_control: heat_pump.control.into(),
             comfort_min_c: heat_pump.comfort_min_c,
@@ -801,6 +822,7 @@ impl Default for SiteSettings {
             dhw_t_max_c: dhw.t_max_c,
             evse_max_a: evse.max_current.get(),
             evse_switchable: evse.switchable,
+            evse_bidirectional: evse.bidirectional,
             ev_charge_limit: evse.charge_limit.map(Soc::fraction),
             dishwasher_kw_steps: reference
                 .dishwasher
@@ -1241,6 +1263,7 @@ impl SiteSettings {
                     Ok::<_, SettingsError>(crate::site::EvseConfig {
                         max_current: Current::new(self.evse_max_a),
                         switchable: self.evse_switchable,
+                        bidirectional: self.evse_bidirectional,
                         charge_limit: self
                             .ev_charge_limit
                             .map(|v| fraction("ev_charge_limit", v))
@@ -1253,6 +1276,8 @@ impl SiteSettings {
                 modulating: self.heat_pump_modulating,
                 comfort_min_c: self.comfort_min_c,
                 comfort_max_c: self.comfort_max_c,
+                cooling_electrical: (self.heat_pump_cooling_kw > 0.0)
+                    .then(|| Power::from_kw(self.heat_pump_cooling_kw)),
                 control: self.heat_pump_control.into(),
             }),
             dhw: (self.dhw_litres > 0.0 && self.dhw_heater_kw > 0.0).then(|| {
@@ -1375,6 +1400,15 @@ pub struct RegisterSettings {
     /// The map itself. At least one point, or the driver would poll nothing and
     /// report a device that is perfectly reachable and says nothing.
     pub points: Vec<hems_drv::modbus::registers::Point>,
+    /// The registers a command may write, if any.
+    ///
+    /// Empty by default, and a map with none is read-only — which is what every
+    /// register map in this workspace was until a reversible heat pump needed a
+    /// direction that no EEBUS use case carries. A write names the command it
+    /// serves and enumerates the raw values it may take, so nothing here is ever
+    /// computed from a scale.
+    #[serde(default)]
+    pub writes: Vec<hems_drv::modbus::registers::Write>,
 }
 
 /// A heat-pump compressor on the household's own network, over EEBUS.
@@ -1710,6 +1744,60 @@ mod tests {
             .expect("a roof");
         assert!((roof.tilt_deg - 12.0).abs() < 1e-9);
         assert!((roof.azimuth_deg - 95.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_bidirectional_wallbox_is_offered_as_a_producer() {
+        // Three separate places read `Evse::bidirectional` — the envelope's
+        // floor in `hems_core::asset`, the roles in `hems_flex::map`, the
+        // discharge operation mode in `hems_flex::describe` — and each had a
+        // unit test for both branches. What nothing had was a way to *reach* the
+        // true one: the daemon wrote `bidirectional: false` into every wallbox
+        // in the country and no setting said otherwise, so a V2H household was
+        // unconfigurable and the three true branches were dead on a real box.
+        //
+        // This asserts the chain rather than the flag: a setting, through the
+        // site, to the thing a Customer Energy Manager is actually told.
+        let evse = |bidirectional: bool| {
+            let settings = SiteSettings {
+                evse_bidirectional: bidirectional,
+                ..SiteSettings::default()
+            };
+            let household =
+                crate::site::Household::build(&settings.household().expect("a household"))
+                    .expect("a site");
+            household
+                .site
+                .assets
+                .iter()
+                .find_map(|a| match a {
+                    hems_core::prelude::Asset::Evse(e) => Some(e.clone()),
+                    _ => None,
+                })
+                .expect("a wallbox")
+        };
+
+        let v2h = evse(true);
+        let ordinary = evse(false);
+
+        // The roles. A manager told only `EnergyConsumer` has not been told the
+        // wallbox can give anything back.
+        assert!(
+            hems_flex::map::roles_for(&hems_core::prelude::Asset::Evse(v2h.clone()))
+                .contains(&s2_kit::types::common::RoleType::EnergyProducer)
+        );
+        assert!(
+            !hems_flex::map::roles_for(&hems_core::prelude::Asset::Evse(ordinary.clone()))
+                .contains(&s2_kit::types::common::RoleType::EnergyProducer)
+        );
+
+        // The envelope. The floor is what the arbiter is allowed to command, and
+        // an ordinary wallbox's is zero however willing the plan is.
+        let floor = |e: &hems_core::prelude::Evse| {
+            hems_core::prelude::Asset::Evse(e.clone()).ratings().floor
+        };
+        assert!(floor(&v2h) < hems_core::prelude::Power::ZERO);
+        assert_eq!(floor(&ordinary), hems_core::prelude::Power::ZERO);
     }
 
     #[test]
@@ -2070,6 +2158,7 @@ asset = "netzanschluss"
             battery_kwh: 0.0,
             evse_max_a: 0.0,
             heat_pump_kw: 0.0,
+            heat_pump_cooling_kw: 0.0,
             dhw_litres: 0.0,
             ..SiteSettings::default()
         };

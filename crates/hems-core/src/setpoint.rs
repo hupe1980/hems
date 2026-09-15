@@ -41,6 +41,18 @@ pub enum Command {
     /// Enter this discrete operating mode. The `u8` is the SG Ready state 1–4
     /// or the index of an S2 `OMBC` operation mode.
     OperationMode(u8),
+    /// Run a reversible thermal device this way round.
+    ///
+    /// Separate from [`Command::OperationMode`] because it is not one of a
+    /// vendor's named states: it is the direction of the refrigerant circuit,
+    /// and it is the one thing a power cannot say. A reversible unit handed
+    /// "draw four kilowatts" in July with no direction beside it heats the
+    /// house, and no meter can tell afterwards which it did.
+    ///
+    /// Emitted **before** the power in the same batch, for the reason a charge
+    /// point's phase count is: a unit that is told how much to draw before it is
+    /// told which way to run spends a tick running the wrong way.
+    ThermalMode(crate::plan::ThermalMode),
     /// Switch the asset on or off.
     OnOff(bool),
 }
@@ -54,7 +66,10 @@ impl Command {
             | Command::ConsumptionCeiling(p)
             | Command::ProductionCeiling(p) => p.is_finite(),
             Command::ChargingCurrent(c) => c.is_finite(),
-            Command::PhaseCount(_) | Command::OperationMode(_) | Command::OnOff(_) => true,
+            Command::PhaseCount(_)
+            | Command::OperationMode(_)
+            | Command::ThermalMode(_)
+            | Command::OnOff(_) => true,
         }
     }
 }
@@ -68,6 +83,8 @@ impl fmt::Display for Command {
             Command::ChargingCurrent(c) => write!(f, "charging current {c}"),
             Command::PhaseCount(n) => write!(f, "{n}-phase"),
             Command::OperationMode(m) => write!(f, "operation mode {m}"),
+            Command::ThermalMode(crate::plan::ThermalMode::Heat) => f.write_str("heating"),
+            Command::ThermalMode(crate::plan::ThermalMode::Cool) => f.write_str("cooling"),
             Command::OnOff(true) => f.write_str("on"),
             Command::OnOff(false) => f.write_str("off"),
         }

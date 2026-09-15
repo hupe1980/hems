@@ -165,11 +165,18 @@ impl EvSession {
     ///
     /// It is the cheap answer to "is this household at risk today", and the
     /// reason it exists is a measurement. Planning against three futures instead
-    /// of one median is worth €0,16 a day on the evening a car arrives *as* a
-    /// § 14a reduction starts — and it removes the charge the median plan leaves
-    /// undelivered — while costing €1,03 a day and five to seven times the solve on an
-    /// ordinary winter evening where nothing is at stake. Something has to
-    /// decide which day it is.
+    /// of one median is worth €0,13 a day on the evening a car arrives *as* a
+    /// § 14a reduction starts, removes the charge the median plan leaves
+    /// undelivered, and takes that evening's **worst** weather from −€0,58 to
+    /// €0,54 — the median plan does not merely save less on a bad day, it costs
+    /// the household money. The same machinery turns a €0,46 saving into a
+    /// €0,46 loss on an ordinary winter day where nothing is at stake, at five
+    /// to nine times the solve. Something has to decide which day it is.
+    ///
+    /// Those figures are against a baseline that owns the same battery. Against
+    /// the batteryless one they read the other way round on the worst day, which
+    /// is how a handicapped counterfactual hid a controller's downside for five
+    /// versions (D200).
     ///
     /// The obvious candidate — ask the plan whether it expects a shortfall —
     /// **does not work**, and the way it fails is worth stating: a plan that has
@@ -351,6 +358,20 @@ pub struct HeatPumpModel {
     /// How the coefficient of performance moves with the weather.
     #[cfg_attr(feature = "serde", serde(default))]
     pub cop: CopCurve,
+    /// Electrical power the unit can draw **cooling**, where it is reversible.
+    ///
+    /// [`Power::ZERO`] is a heating-only unit and costs the model nothing: the
+    /// cooling variable is then bounded at zero and the solver drops it.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub max_cooling: Power,
+    /// How the *cooling* efficiency moves with the weather — the other way.
+    ///
+    /// See [`CopCurve::air_source_cooling`]. Kept as a second curve rather than a
+    /// sign convention on the first because the two genuinely differ: a heat
+    /// pump heats better when it is warm and cools worse, and one curve serving
+    /// both would be right at one end and wrong at the other.
+    #[cfg_attr(feature = "serde", serde(default = "CopCurve::air_source_cooling"))]
+    pub eer: CopCurve,
     /// The fewest consecutive slots the unit must stay on once started.
     /// Ignored when `modulating`.
     pub min_on_slots: usize,
@@ -374,6 +395,11 @@ impl HeatPumpModel {
             min_electrical: max_electrical * 0.3,
             modulating: true,
             cop: CopCurve::air_source(),
+            // Heating only unless a household says otherwise. Most of the
+            // *installed* German base is, even though most of what is being
+            // fitted now is not.
+            max_cooling: Power::ZERO,
+            eer: CopCurve::air_source_cooling(),
             min_on_slots: 2,
             min_off_slots: 2,
             compressor: CompressorState::default(),
@@ -414,6 +440,25 @@ impl HeatPumpModel {
     #[must_use]
     pub fn cop(&self, outdoor_c: f64) -> f64 {
         self.cop.at(outdoor_c)
+    }
+
+    /// The **cooling** efficiency ratio at an outdoor temperature.
+    #[must_use]
+    pub fn eer(&self, outdoor_c: f64) -> f64 {
+        self.eer.at(outdoor_c)
+    }
+
+    /// Whether this unit can cool.
+    #[must_use]
+    pub fn is_reversible(&self) -> bool {
+        self.max_cooling > Power::ZERO
+    }
+
+    /// The same unit, able to cool at `power`.
+    #[must_use]
+    pub const fn reversible(mut self, power: Power) -> Self {
+        self.max_cooling = power;
+        self
     }
 
     /// How many slots at the start of the horizon the compressor's own history
@@ -1024,8 +1069,9 @@ pub struct Problem<'a> {
     ///
     /// [`Risk::deterministic`] by default — one future, the median of both
     /// forecasts. Not because it is the best plan: `hemsd risk` measures three
-    /// futures as worth about €0,16 a day where a service is at risk and as
-    /// costing about €1,03 a day where none is, and five to seven times the
+    /// futures as worth about €0,13 a day where a service is at risk — and a
+    /// whole euro on that day's worst weather — and as costing about €0,92 a
+    /// day where none is, and five to nine times the
     /// solve. That is a trade a household's box should make
     /// deliberately rather than inherit. See [`Risk`].
     pub risk: Risk,

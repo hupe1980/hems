@@ -27,15 +27,35 @@
 //!   often as in kelvin, and a sign flip is how a vendor that reports generation
 //!   as positive is turned into this workspace's load convention.
 //!
-//! # What it does not do
+//! # What it writes
 //!
-//! It does not command. A register map that could write is a register map that
-//! can turn a compressor on from a number in a configuration file, and the
-//! consequence of a typo there is not a bad reading — it is a heat pump doing
-//! something nobody asked for. Commanding a heat pump is
-//! [`eebus_heat_pump`](crate::eebus_heat_pump)'s, over a protocol that says what a value
-//! means; the registry lets both drivers speak for one asset precisely so that
-//! this one never has to.
+//! Nothing, unless a household declares it. A register map that can write
+//! anything is one that can start a compressor from a number somebody typed into
+//! a configuration file, and the consequence of a typo is not a bad reading but
+//! a heat pump doing something nobody asked for — so commanding belongs to a
+//! protocol that says what a value *means*, which is
+//! [`eebus_heat_pump`](crate::eebus_heat_pump)'s job.
+//!
+//! One command has no such protocol: a **direction**. `eebus` 0.9's twelve HVAC
+//! use cases are temperature and system-function measurement and control, and
+//! none of them reverses a refrigerant circuit, so a reversible unit needs a
+//! vendor register or its plan cannot be carried out — the compressor runs
+//! whichever way its own thermostat last chose, the meter agrees with the
+//! commanded power, and the day report claims a saving nobody made.
+//!
+//! So a household may declare writes, under three rules:
+//!
+//! * **A separate declaration.** [`Write`] is its own list, not a flag on
+//!   [`Point`], so no typo in a read point can turn it into a write.
+//! * **Only declared values.** A write names its command and enumerates the raw
+//!   values it may take — `heat = 1, cool = 2`. Nothing is computed, so there is
+//!   no scale to get wrong.
+//! * **One register, sixteen bits.** A mode register is never 32-bit, and
+//!   refusing width removes the word-order trap.
+//!
+//! Continuous setpoints — a consumption ceiling in watts — are deliberately not
+//! writable: that is where a scale error is dangerous, and where EEBUS LPC and
+//! SunSpec 704/705 already work.
 
 use hems_core::prelude::{AssetId, Measurement, Power, Soc};
 use hems_core::setpoint::Command;
@@ -43,6 +63,7 @@ use time::OffsetDateTime;
 
 use super::Cadence;
 use super::frame::{self, Request, RequestBody, Response, ResponseBody, Space};
+use crate::event::CommandOutcome;
 use crate::{Driver, DriverCapabilities, DriverError, DriverEvent, LinkState};
 
 /// How wide a value is, and in which order its registers arrive.
@@ -148,6 +169,74 @@ fn one() -> f64 {
     1.0
 }
 
+/// A register a declared command may write, and the only values it may take.
+///
+/// Always one holding register, sixteen bits wide, and always one of an
+/// enumerated set — see the module note for why both restrictions are what make
+/// writing from a hand-typed file safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Write {
+    /// The holding register to write.
+    pub register: u16,
+    /// Which command it serves, and the raw values it may take.
+    #[cfg_attr(feature = "serde", serde(flatten))]
+    pub kind: WriteKind,
+}
+
+/// What a writable register means, and its whole value set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case", tag = "command"))]
+pub enum WriteKind {
+    /// Which way a reversible thermal device runs.
+    ///
+    /// The one command no protocol in this workspace can carry, and the reason
+    /// this driver writes at all.
+    ThermalMode {
+        /// Written for [`hems_core::prelude::ThermalMode::Heat`].
+        heat: u16,
+        /// Written for [`hems_core::prelude::ThermalMode::Cool`].
+        cool: u16,
+    },
+    /// On or off.
+    OnOff {
+        /// Written to switch the device on.
+        on: u16,
+        /// Written to switch it off.
+        off: u16,
+    },
+    /// A vendor's named modes, in the order the rest of the box numbers them.
+    ///
+    /// `modes[n - 1]` is written for `Command::OperationMode(n)`, so an SG Ready
+    /// unit declares the four values its own documentation gives for states 1
+    /// to 4. A command outside the declared set is refused rather than clamped:
+    /// a mode nobody declared is a mode nobody knows the meaning of.
+    OperationMode {
+        /// The raw value per state, state 1 first.
+        modes: Vec<u16>,
+    },
+}
+
+impl WriteKind {
+    /// The raw value `command` asks this register to take, where it asks at all.
+    fn value_for(&self, command: &Command) -> Option<u16> {
+        match (self, command) {
+            (Self::ThermalMode { heat, cool }, Command::ThermalMode(mode)) => Some(match mode {
+                hems_core::prelude::ThermalMode::Heat => *heat,
+                hems_core::prelude::ThermalMode::Cool => *cool,
+            }),
+            (Self::OnOff { on, off }, Command::OnOff(wanted)) => {
+                Some(if *wanted { *on } else { *off })
+            }
+            (Self::OperationMode { modes }, Command::OperationMode(state)) => {
+                modes.get(usize::from(state.saturating_sub(1))).copied()
+            }
+            _ => None,
+        }
+    }
+}
+
 /// A device read through a declared register map.
 #[derive(Debug)]
 pub struct Registers {
@@ -155,11 +244,19 @@ pub struct Registers {
     unit: u8,
     cadence: Cadence,
     points: Vec<Point>,
+    writes: Vec<Write>,
     link: LinkState,
     inbox: Vec<u8>,
     outbox: Vec<Request>,
     /// Which point each outstanding transaction is for.
     pending: Option<(u16, usize, OffsetDateTime)>,
+    /// Transactions of writes still waiting for their answer.
+    ///
+    /// Kept so that a device **refusing** a write is reported rather than
+    /// swallowed: a response whose transaction matches no outstanding read would
+    /// otherwise be dropped on the floor, and everything above would go on
+    /// believing a compressor had been turned round.
+    written: Vec<u16>,
     /// The next point to read this round.
     next: usize,
     next_transaction: u16,
@@ -194,6 +291,8 @@ impl Registers {
             unit,
             cadence,
             points,
+            writes: Vec::new(),
+            written: Vec::new(),
             link: LinkState::Down,
             inbox: Vec::new(),
             outbox: Vec::new(),
@@ -204,6 +303,15 @@ impl Registers {
             events: Vec::new(),
             due: None,
         })
+    }
+
+    /// The same device, with the registers a command may write.
+    ///
+    /// Declared separately from the read points on purpose: see the module note.
+    #[must_use]
+    pub fn writing(mut self, writes: Vec<Write>) -> Self {
+        self.writes = writes;
+        self
     }
 
     fn transaction(&mut self) -> u16 {
@@ -246,6 +354,28 @@ impl Registers {
 
     /// Fold one answer in and ask for the next point, or publish the round.
     fn absorb(&mut self, response: &Response, now: OffsetDateTime) {
+        // A write's answer first, because it is the one that arrives with no
+        // read outstanding and would otherwise fall through every branch below.
+        if let Some(i) = self.written.iter().position(|t| *t == response.transaction) {
+            self.written.remove(i);
+            let (accepted, detail) = match &response.body {
+                ResponseBody::WriteAccepted { .. } => (true, None),
+                ResponseBody::Exception { function, code } => (
+                    false,
+                    Some(format!(
+                        "the device answered function {function:#04x} with exception {code:#04x}"
+                    )),
+                ),
+                ResponseBody::Registers(_) => (false, Some("a read answered a write".to_owned())),
+            };
+            self.events.push(DriverEvent::Command(CommandOutcome {
+                accepted,
+                confirmed: None,
+                at: now,
+                detail,
+            }));
+            return;
+        }
         let Some((transaction, index, _)) = self.pending else {
             return;
         };
@@ -285,9 +415,15 @@ impl Driver for Registers {
     }
 
     fn capabilities(&self) -> DriverCapabilities {
-        // It reads and never writes. See the module note: a register map that
-        // could command is one where a typo starts a compressor.
-        DriverCapabilities::meter()
+        // Derived from what was declared rather than asserted, so the
+        // registry's start-up refusal has something true to check against.
+        let mut caps = DriverCapabilities::meter();
+        caps.accepts_commands = !self.writes.is_empty();
+        caps.sets_thermal_mode = self
+            .writes
+            .iter()
+            .any(|w| matches!(w.kind, WriteKind::ThermalMode { .. }));
+        caps
     }
 
     fn on_bytes(&mut self, bytes: &[u8], now: OffsetDateTime) -> Result<(), DriverError> {
@@ -316,6 +452,11 @@ impl Driver for Registers {
     fn on_link(&mut self, state: LinkState, now: OffsetDateTime) {
         self.inbox.clear();
         self.outbox.clear();
+        // A write whose answer was on the socket that dropped was never
+        // confirmed, and a transaction identifier means nothing across a new
+        // one — matching a stale one against a fresh reply is how a driver
+        // reports a write that never happened.
+        self.written.clear();
         self.pending = None;
         self.partial = None;
         if self.link != state {
@@ -352,10 +493,31 @@ impl Driver for Registers {
     }
 
     fn command(&mut self, command: &Command, _: OffsetDateTime) -> Result<(), DriverError> {
-        Err(DriverError::Unsupported(format!(
-            "`{}` is read through a register map, which never writes: {command:?}",
-            self.asset
-        )))
+        let Some((register, value)) = self
+            .writes
+            .iter()
+            .find_map(|w| w.kind.value_for(command).map(|v| (w.register, v)))
+        else {
+            // Refused rather than dropped. A driver that silently ignores a
+            // command it cannot carry out is the failure this workspace keeps
+            // finding in itself: everything above goes on believing the device
+            // was told.
+            return Err(DriverError::Unsupported(format!(
+                "`{}`'s register map declares no register for {command}",
+                self.asset
+            )));
+        };
+        let transaction = self.transaction();
+        self.written.push(transaction);
+        self.outbox.push(Request {
+            transaction,
+            unit: self.unit,
+            body: RequestBody::Write {
+                address: register,
+                values: vec![value],
+            },
+        });
+        Ok(())
     }
 
     fn poll_event(&mut self) -> Option<DriverEvent> {
@@ -385,6 +547,7 @@ impl Driver for Registers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hems_core::prelude::ThermalMode;
     use time::macros::datetime;
 
     const START: OffsetDateTime = datetime!(2026-01-15 08:00:00 UTC);
@@ -548,10 +711,12 @@ mod tests {
     }
 
     #[test]
-    fn a_register_map_refuses_every_command() {
-        // A map that could write is one where a typo in a configuration file
-        // starts a compressor. Commanding a heat pump belongs to a protocol that
-        // says what a value *means*.
+    fn a_register_map_writes_only_what_it_was_told_to_write() {
+        // The original rule, kept where it still holds: a map that could write
+        // anything is one where a typo in a configuration file starts a
+        // compressor. What changed is that *declaring* a register is now how a
+        // household says otherwise, one command at a time — so the default is
+        // still a driver that refuses everything.
         let mut d = driver();
         let refused = d.command(&Command::OnOff(true), at(0));
         assert!(refused.is_err());
@@ -580,6 +745,133 @@ mod tests {
             LinkState::Stale,
             "and a device that stopped answering mid-round is one the guard has \
              to stop believing"
+        );
+    }
+
+    /// The same map, able to turn a reversible unit round.
+    fn reversible() -> Registers {
+        driver().writing(vec![Write {
+            register: 1_501,
+            kind: WriteKind::ThermalMode { heat: 1, cool: 2 },
+        }])
+    }
+
+    #[test]
+    fn a_map_with_no_writes_still_refuses_every_command() {
+        let mut d = driver();
+        assert!(!d.capabilities().accepts_commands);
+        assert!(!d.capabilities().sets_thermal_mode);
+        assert!(
+            d.command(&Command::ThermalMode(ThermalMode::Cool), at(0))
+                .is_err(),
+            "a read-only map must stay read-only"
+        );
+    }
+
+    #[test]
+    fn a_declared_mode_register_is_written_with_the_declared_value() {
+        let mut d = reversible();
+        assert!(d.capabilities().accepts_commands);
+        assert!(d.capabilities().sets_thermal_mode);
+        d.on_link(LinkState::Up, at(0));
+        // Drain the poll the link brought with it.
+        let _ = d.poll_transmit();
+
+        d.command(&Command::ThermalMode(ThermalMode::Cool), at(1))
+            .expect("the map declares a mode register");
+        let bytes = d.poll_transmit().expect("a write went out");
+        // function, address, count, byte count, value
+        assert_eq!(bytes[7], frame::function::WRITE_MULTIPLE);
+        assert_eq!(u16::from_be_bytes([bytes[8], bytes[9]]), 1_501);
+        assert_eq!(u16::from_be_bytes([bytes[10], bytes[11]]), 1);
+        assert_eq!(u16::from_be_bytes([bytes[13], bytes[14]]), 2, "cool = 2");
+
+        d.command(&Command::ThermalMode(ThermalMode::Heat), at(2))
+            .expect("and the other way");
+        let bytes = d.poll_transmit().expect("a second write");
+        assert_eq!(u16::from_be_bytes([bytes[13], bytes[14]]), 1, "heat = 1");
+    }
+
+    /// The whole of the safety argument: only what was declared is ever sent.
+    #[test]
+    fn a_command_the_map_does_not_declare_is_refused_rather_than_guessed() {
+        let mut d = reversible();
+        for command in [
+            Command::OnOff(true),
+            Command::OperationMode(2),
+            Command::ConsumptionCeiling(Power::from_kw(3.0)),
+        ] {
+            assert!(
+                d.command(&command, at(0)).is_err(),
+                "{command} is not in this map and must not be invented"
+            );
+        }
+        assert!(
+            d.poll_transmit().is_none(),
+            "and nothing at all went on to the wire"
+        );
+    }
+
+    /// A refused write that nobody hears is a compressor running the wrong way.
+    #[test]
+    fn a_device_that_refuses_a_write_is_reported_rather_than_assumed() {
+        let mut d = reversible();
+        d.on_link(LinkState::Up, at(0));
+        let _ = d.poll_transmit();
+        d.command(&Command::ThermalMode(ThermalMode::Cool), at(1))
+            .expect("declared");
+        let request = d.poll_transmit().expect("a write");
+        let transaction = u16::from_be_bytes([request[0], request[1]]);
+
+        // Exception 0x02: the device has no such register.
+        let mut out = Vec::new();
+        out.extend_from_slice(&transaction.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&3u16.to_be_bytes());
+        out.push(1);
+        out.extend_from_slice(&[frame::function::WRITE_MULTIPLE | 0x80, 0x02]);
+        d.on_bytes(&out, at(2))
+            .expect("a refusal is not a broken frame");
+
+        let outcome = std::iter::from_fn(|| d.poll_event())
+            .find_map(|e| match e {
+                DriverEvent::Command(c) => Some(c),
+                _ => None,
+            })
+            .expect("the refusal has to be an event");
+        assert!(!outcome.accepted);
+        assert!(outcome.detail.is_some_and(|d| d.contains("exception")));
+    }
+
+    /// A write whose answer was on the socket that dropped was never confirmed.
+    #[test]
+    fn a_reconnect_forgets_an_unanswered_write() {
+        let mut d = reversible();
+        d.on_link(LinkState::Up, at(0));
+        let _ = d.poll_transmit();
+        d.command(&Command::ThermalMode(ThermalMode::Cool), at(1))
+            .expect("declared");
+        let request = d.poll_transmit().expect("a write");
+        let transaction = u16::from_be_bytes([request[0], request[1]]);
+
+        d.on_link(LinkState::Down, at(2));
+        d.on_link(LinkState::Up, at(3));
+        while d.poll_event().is_some() {}
+
+        // The old transaction, answered on the new socket. It must decide
+        // nothing: the identifier is meaningless across a reconnect.
+        let mut out = Vec::new();
+        out.extend_from_slice(&transaction.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&6u16.to_be_bytes());
+        out.push(1);
+        out.extend_from_slice(&[frame::function::WRITE_MULTIPLE]);
+        out.extend_from_slice(&1_501u16.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes());
+        d.on_bytes(&out, at(4)).expect("a well-formed frame");
+        assert!(
+            !std::iter::from_fn(|| d.poll_event()).any(|e| matches!(e, DriverEvent::Command(_))),
+            "a stale transaction must not confirm a write that never happened"
         );
     }
 }

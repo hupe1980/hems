@@ -80,6 +80,15 @@ pub struct EvseConfig {
     /// decides whether 2 kW of surplus charges a car or is exported: three-phase
     /// charging cannot start below 4,14 kW, single-phase below 1,38 kW.
     pub switchable: bool,
+    /// Whether the charge point can discharge the car into the house.
+    ///
+    /// It is a fact about the **hardware on the wall**, not about the cable:
+    /// what the wallbox and the car negotiate between themselves is ISO 15118,
+    /// which this box never sees. What it changes here is what a manager may be
+    /// told the wallbox can do — a `EnergyProducer` role, a discharge operation
+    /// mode in the S2 description, and an envelope whose floor is negative — and
+    /// therefore what the planner is allowed to ask for.
+    pub bidirectional: bool,
     /// The state of charge the household asked its car to reach.
     ///
     /// `None` means "fill it". It is only ever read by the real-time fallback —
@@ -101,6 +110,14 @@ pub struct HeatPumpConfig {
     pub comfort_min_c: f64,
     /// The top of the comfort band, °C.
     pub comfort_max_c: f64,
+    /// Electrical power in **cooling** mode, where the unit is reversible.
+    ///
+    /// `None` is a heating-only unit. A reversible one is what most new German
+    /// installations are since the GEG made a heat pump the default heating
+    /// system in January 2026 — the hardware is a four-way valve and the KfW
+    /// subsidy covers the function automatically — so this is a fact an installer
+    /// reads off the unit rather than a preference (D202).
+    pub cooling_electrical: Option<Power>,
     /// How the unit takes instructions.
     ///
     /// A ceiling by default, because every § 14a heat pump can be told to use
@@ -325,6 +342,12 @@ impl Default for HouseholdConfig {
             evse: Some(EvseConfig {
                 max_current: Current::new(16.0),
                 switchable: true,
+                // Not bidirectional, which is the honest reference: a wallbox
+                // that can discharge a car was still a special order in Germany
+                // in 2026. `a_bidirectional_wallbox_is_offered_as_a_producer`
+                // is where the other branch is measured, on its own household,
+                // so the reference days keep measuring what they were tuned for.
+                bidirectional: false,
                 // Three quarters, the figure most owners of a car they drive
                 // daily set: it is where lithium ageing turns and where a
                 // charging session stops being worth waiting for.
@@ -335,6 +358,12 @@ impl Default for HouseholdConfig {
                 modulating: true,
                 comfort_min_c: 20.0,
                 comfort_max_c: 23.0,
+                // Reversible, at four fifths of its heating rating — the ordinary
+                // shape of an air-to-water unit, and the ordinary shape of a new
+                // German installation. It is what makes the June day a question
+                // about *control* rather than a fortnight of unavoidable
+                // discomfort the planner watches and pays for (D202).
+                cooling_electrical: Some(Power::from_kw(4.0)),
                 control: HeatPumpControl::PowerCeiling,
             }),
             // Three hundred litres on a hot-water heat pump — the standard
@@ -519,6 +548,7 @@ fn heat_pump(hp: &HeatPumpConfig, declared: Declared) -> HeatPump {
         ),
         electrical_nominal: hp.power,
         heating_rod: Some(HEATING_ROD),
+        cooling_electrical: None,
         control: hp.control,
         modulating: hp.modulating,
         comfort_min_c: hp.comfort_min_c,
@@ -627,7 +657,7 @@ fn assets_of(
             },
             min_current: Current::new(6.0),
             max_current: evse.max_current,
-            bidirectional: false,
+            bidirectional: evse.bidirectional,
             public: false,
             // The household's Ladelimit, as a fraction of the vehicle's own
             // capacity. The planner works from an energy target and a departure

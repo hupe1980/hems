@@ -171,6 +171,11 @@ pub struct Status {
     pub plan_expected_eur: Option<f64>,
     /// What the same horizon would cost with no energy manager, euros.
     pub plan_baseline_eur: Option<f64>,
+    /// What the roof has been doing against its own baseline.
+    ///
+    /// Updated on the local-day boundary, because a performance ratio is a daily
+    /// figure. `None` until the box has closed its first day.
+    pub roof_health: Option<hems_forecast::Health>,
 }
 
 /// The household this loop is deciding for, and the two facts about it that are
@@ -381,6 +386,7 @@ pub async fn run(
 /// two get out of step with the boundary that resets the rest.
 fn carried_from(started: OffsetDateTime) -> Carried {
     Carried {
+        roof_health: None,
         exposure: None,
         exposure_at: None,
         previous: BTreeMap::new(),
@@ -438,7 +444,7 @@ async fn close_the_quarter_hour(
     register(managed, carried, prices, store).await;
     // After the register, because the day being closed is built from the rows
     // this loop has written — including the one that was just written.
-    close_the_day(managed, carried, store, now).await;
+    close_the_day(managed, learned, carried, store, now).await;
     carried.delivered.clear();
     carried.samples = 0;
     carried.pv_wh = 0.0;
@@ -733,6 +739,7 @@ fn meter(managed: &Managed, carried: &mut Carried, observed: &Observed, seconds:
 /// priorities exactly backwards.
 async fn close_the_day(
     managed: &Managed,
+    learned: &Arc<Mutex<crate::runtime::planner::Learned>>,
     carried: &mut Carried,
     store: Option<&Arc<Mutex<crate::store::Store>>>,
     now: OffsetDateTime,
@@ -743,6 +750,28 @@ async fn close_the_day(
     }
     let finished = carried.local_day;
     carried.local_day = today;
+
+    // The roof's own day, closed here because this is the one place that knows a
+    // **local** day is over. It is deliberately outside the `store` guard below:
+    // a household whose array has stopped should be told whether or not the
+    // evidence store is writable, and the two failures are unrelated (D199).
+    let roof = learned.lock().await.close_roof_day();
+    carried.roof_health = Some(roof);
+    if let hems_forecast::Health::Degraded {
+        recent,
+        baseline,
+        days,
+    } = roof
+    {
+        tracing::warn!(
+            %finished,
+            performance_ratio = recent,
+            baseline,
+            days,
+            "the roof has been below its own baseline for several days — snow, \
+             soiling, a new shadow or a failed string"
+        );
+    }
     let unplanned = carried.unplanned;
     let clipping = carried.clipping;
     let feed_in = carried.feed_in;
@@ -1103,6 +1132,9 @@ async fn teach_the_house(
 
 /// What one tick hands to the next.
 struct Carried {
+    /// The roof's verdict, settled on the local-day boundary and carried until
+    /// the next one.
+    roof_health: Option<hems_forecast::Health>,
     /// How exposed this household is to § 14a control, refreshed slowly.
     ///
     /// A summary of up to two years of record, and a tick is a second, so it is
@@ -1471,6 +1503,9 @@ async fn tick(
     (
         Status {
             at: Some(now),
+            // Carried, not recomputed: the roof's verdict is settled once a day
+            // on the local-day boundary, and a tick is a second.
+            roof_health: carried.roof_health,
             // Carried rather than recomputed: the exposure is a summary of two
             // years of record and a tick is a second. `Carried::exposure` is
             // refreshed on its own slow cadence.

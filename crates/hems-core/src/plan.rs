@@ -25,12 +25,40 @@ use crate::ids::{AssetId, PlanId};
 use crate::slot::{Horizon, SLOT, Slot};
 use crate::units::{Energy, Power};
 
+/// Which way a reversible thermal device runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum ThermalMode {
+    /// Putting heat into the house. The default, and the only thing a
+    /// heating-only unit can do.
+    #[default]
+    Heat,
+    /// Taking heat out of it.
+    Cool,
+}
+
 /// What one asset should do in one slot.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AssetTarget {
     /// The asset.
     pub asset: AssetId,
+    /// Which way a reversible thermal device is to run.
+    ///
+    /// [`ThermalMode::Heat`] for everything else, and for every heat pump that
+    /// cannot cool — so the field costs a non-reversible household nothing and
+    /// says the right thing by default.
+    ///
+    /// It exists because a **power is not an instruction** for a device with two
+    /// directions: a reversible unit handed "draw four kilowatts" in July with
+    /// no mode beside it will heat the house, and the meter cannot tell the two
+    /// apart afterwards. The planner is the only layer that knows which it meant
+    /// — it decided the direction from the comfort band and the weather — so the
+    /// mode travels with the setpoint rather than being inferred downstream
+    /// (D202).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub mode: ThermalMode,
     /// The average power the plan intends, load convention.
     ///
     /// Through [`AssetTarget::energy`] this is the slot's energy commitment,
@@ -73,6 +101,7 @@ impl AssetTarget {
     pub fn fixed(asset: AssetId, power: Power) -> Self {
         Self {
             asset,
+            mode: ThermalMode::Heat,
             power,
             envelope: Envelope::exactly(power),
             marginal_eur_per_kwh: None,

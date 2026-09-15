@@ -523,6 +523,10 @@ pub struct BuildingSim {
     pub nominal_electrical: Power,
     /// How the coefficient of performance moves with the weather.
     pub cop: CopCurve,
+    /// Electrical power the unit can draw cooling. Zero is heating-only.
+    pub cooling_electrical: Power,
+    /// How the *cooling* efficiency moves with the weather — the other way.
+    pub eer: CopCurve,
     /// The indoor temperature the unit's own thermostat aims for, °C.
     pub thermostat_set_c: f64,
     /// The lowest average a single-speed compressor can hold across a slot.
@@ -668,6 +672,9 @@ impl BuildingSim {
             nominal_electrical: Power::from_kw(5.0),
             min_electrical: Power::from_kw(5.0) * 0.3,
             cop: CopCurve::air_source(),
+            // Heating only by default, the way the asset model defaults.
+            cooling_electrical: Power::ZERO,
+            eer: CopCurve::air_source_cooling(),
             thermostat_set_c: 20.5,
             thermostat_max_c: 23.0,
             calling: false,
@@ -732,6 +739,27 @@ impl BuildingSim {
         window_w_per_m2: f64,
         dt: Duration,
     ) -> Power {
+        // **The unit's own cooling thermostat**, which runs whether or not
+        // anybody is managing the house.
+        //
+        // A reversible unit is not a heater that happens to have a second mode;
+        // it is the household's air conditioning, and it answers a hot room on
+        // its own. Leaving this out made the degraded mode — the box with its
+        // planner switched off — sit through 9,6 K·h of overheating that the
+        // same hardware unmanaged would have fixed, which is a simulator
+        // modelling a machine nobody sells (D202).
+        //
+        // The commanded value is still a *ceiling*: a § 14a reduction takes the
+        // cooling away exactly as it takes the heating away.
+        if self.cooling_electrical > Power::ZERO && self.state.indoor_c > self.thermostat_max_c {
+            let ceiling = if electrical >= self.nominal_electrical {
+                self.cooling_electrical
+            } else {
+                electrical
+            };
+            return self.step_cooling(ceiling, outdoor_c, window_w_per_m2, dt);
+        }
+
         let unlimited = electrical >= self.nominal_electrical;
         // The unit's own hysteresis, kept across ticks so it does not chatter.
         if self.state.indoor_c < self.thermostat_set_c {
@@ -778,6 +806,41 @@ impl BuildingSim {
 
         let heat_kw =
             drawn.kw() * self.cop(outdoor_c) + self.building.free_heat_kw(window_w_per_m2);
+        self.state = self.building.step(self.state, heat_kw, outdoor_c, dt);
+        drawn
+    }
+
+    /// Run the same unit **backwards** for a step, and report what it drew.
+    ///
+    /// Separate from [`BuildingSim::step`] rather than a sign on its argument,
+    /// because the two share nothing but the building: a different rating, a
+    /// different efficiency curve, and none of the heating thermostat's
+    /// hysteresis — a unit told to cool is being *commanded*, where one told to
+    /// heat may be under a ceiling and left to its own thermostat.
+    ///
+    /// The free heat still arrives. That is the point of cooling in July: the
+    /// sun through the glazing is what the compressor is fighting, and a
+    /// simulator that left it out would make cooling look far cheaper than it is
+    /// (D202).
+    pub fn step_cooling(
+        &mut self,
+        electrical: Power,
+        outdoor_c: f64,
+        window_w_per_m2: f64,
+        dt: Duration,
+    ) -> Power {
+        // A real unit has a cooling set point and stops at it. Without this the
+        // simulator models a compressor that will chill a living room to twelve
+        // degrees if something keeps asking, which no thermostat on the market
+        // does and no household would tolerate.
+        let floor = self.thermostat_set_c - 0.5;
+        let drawn = if self.state.indoor_c <= floor {
+            Power::ZERO
+        } else {
+            electrical.clamp(Power::ZERO, self.cooling_electrical)
+        };
+        let heat_kw =
+            self.building.free_heat_kw(window_w_per_m2) - drawn.kw() * self.eer.at(outdoor_c);
         self.state = self.building.step(self.state, heat_kw, outdoor_c, dt);
         drawn
     }

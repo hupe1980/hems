@@ -515,7 +515,8 @@ fn register_map(
     .map_err(|e| StartError::Driver {
         asset: settings.asset.clone(),
         detail: e.to_string(),
-    })?;
+    })?
+    .writing(settings.writes.clone());
     Ok(Box::new(driver))
 }
 

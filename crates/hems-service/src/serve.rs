@@ -43,7 +43,6 @@ pub enum ServerError {
 
 /// A daemon's HTTP surface.
 pub struct Server {
-    identity: Identity,
     settings: Settings,
     health: Health,
     router: Router,
@@ -64,7 +63,6 @@ impl Server {
     #[must_use]
     pub fn new(identity: Identity, settings: Settings, health: Health, router: Router) -> Self {
         Self {
-            identity,
             settings,
             health: health.clone(),
             router: router
@@ -105,12 +103,10 @@ impl Server {
     /// As [`Server::run`].
     pub async fn run_until(self, signal: Shutdown) -> Result<(), ServerError> {
         let Self {
-            identity,
             settings,
             health: _,
             router: app,
         } = self;
-        let _ = identity;
 
         let listener = tokio::net::TcpListener::bind(settings.listen)
             .await

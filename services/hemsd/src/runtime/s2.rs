@@ -69,7 +69,7 @@ use axum::extract::{Path, State};
 use axum::response::{IntoResponse as _, Response};
 use hems_core::prelude::{Asset, AssetId, Envelope, Site};
 use hems_realtime::CemRequest;
-use s2energy::common::Message;
+use s2_kit::message::Message;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 
@@ -136,7 +136,7 @@ pub struct Cem {
 struct Outstanding {
     /// The instruction's own identifier, which is what an `InstructionStatusUpdate`
     /// is about.
-    id: s2energy::common::Id,
+    id: s2_kit::types::Id,
     /// Whether the manager has already been told this one was overridden.
     ///
     /// Once, not once a second: a § 14a reduction lasts minutes and a status
@@ -220,7 +220,7 @@ impl Cem {
         }
     }
 
-    async fn instruct(&self, asset: AssetId, request: CemRequest, id: s2energy::common::Id) {
+    async fn instruct(&self, asset: AssetId, request: CemRequest, id: s2_kit::types::Id) {
         let mut held = self.held.write().await;
         held.requests.insert(asset.clone(), request);
         held.outstanding
@@ -239,7 +239,7 @@ impl Cem {
     /// The instruction this asset owes the manager an abort for, if it owes one.
     ///
     /// Takes it: the answer is given once per instruction, not once per tick.
-    async fn owed_abort(&self, asset: &AssetId) -> Option<(s2energy::common::Id, String)> {
+    async fn owed_abort(&self, asset: &AssetId) -> Option<(s2_kit::types::Id, String)> {
         let mut held = self.held.write().await;
         let rule = held.overridden.get(asset)?.clone();
         let outstanding = held.outstanding.get_mut(asset)?;
@@ -247,7 +247,7 @@ impl Cem {
             return None;
         }
         outstanding.told = true;
-        Some((outstanding.id.clone(), rule))
+        Some((outstanding.id, rule))
     }
 
     async fn opened(&self, asset: &AssetId) {
@@ -435,7 +435,7 @@ async fn serve(surface: Surface, asset: AssetId, mut socket: WebSocket) {
                     );
                     session.instruction_became(
                         instruction,
-                        s2energy::common::InstructionStatus::Aborted,
+                        s2_kit::types::common::InstructionStatus::Aborted,
                         now,
                     );
                 }
@@ -533,15 +533,11 @@ async fn apply(
                     tracing::debug!(%asset, %power, "the manager asked for a power");
                     surface
                         .cem
-                        .instruct(
-                            asset.clone(),
-                            CemRequest::power(power, until),
-                            instruction.clone(),
-                        )
+                        .instruct(asset.clone(), CemRequest::power(power, until), instruction)
                         .await;
                 }
                 Instructed::Envelope(envelope_instruction) => {
-                    let instruction_id = instruction.clone();
+                    let instruction_id = instruction;
                     match envelope_of(&surface.site, asset, &envelope_instruction) {
                         Some(envelope) => {
                             tracing::debug!(%asset, ?envelope, "the manager sent an envelope");
@@ -550,7 +546,7 @@ async fn apply(
                                 .instruct(
                                     asset.clone(),
                                     CemRequest::envelope(envelope, until),
-                                    instruction_id.clone(),
+                                    instruction_id,
                                 )
                                 .await;
                         }
@@ -572,6 +568,15 @@ async fn apply(
                 tracing::warn!(%asset, %reason, "an instruction from the manager was refused");
                 surface.cem.refused().await;
             }
+            SessionEvent::Released => {
+                // The same clearing a closed connection gets, and for the same
+                // reason: a manager has said something, and what it has said is
+                // that it is no longer managing this resource. The *connection*
+                // stays up — it may want the measurements, and it may select
+                // again — so this is deliberately not `closed = true`.
+                tracing::info!(%asset, "the manager handed the resource back");
+                surface.cem.closed(asset).await;
+            }
             SessionEvent::Closed(reason) => {
                 tracing::warn!(%asset, %reason, "the S2 session ended on a protocol fault");
                 closed = true;
@@ -585,7 +590,7 @@ async fn apply(
 fn envelope_of(
     site: &Site,
     asset: &AssetId,
-    instruction: &s2energy::pebc::Instruction,
+    instruction: &s2_kit::types::pebc::Instruction,
 ) -> Option<Envelope> {
     let asset = site.asset(asset)?;
     let mode = asset.meta().phases.default_mode();

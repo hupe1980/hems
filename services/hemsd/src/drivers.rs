@@ -90,6 +90,11 @@ pub enum RegistryError {
          would spend the day talking to a device it can never move"
     )]
     CannotCommand(String),
+    /// A reversible heat pump whose driver cannot choose the direction.
+    #[error(
+        "`{0}` is a reversible heat pump and no driver for it can set a thermal mode,          so the plan's cooling would reach a unit that decides its own direction —          give the driver a mode register, or set `heat_pump_cooling_kw = 0` if the          unit does not actually cool"
+    )]
+    CannotSetThermalMode(String),
     /// The site takes part in § 14a and nothing can hear a reduction.
     #[error(
         "this site takes part in the netzorientierte Steuerung and no driver reports \
@@ -364,6 +369,22 @@ impl Registry {
             let spoken_for = self.entries.iter().any(|e| e.asset == id);
             if spoken_for && self.role(&id, "command").is_none() {
                 return Err(RegistryError::CannotCommand(id.to_string()));
+            }
+            // A reversible unit whose driver cannot turn it round is the quiet
+            // one. Everything works: the plan decides cooling, the arbiter
+            // commands a power, the driver writes it, the meter agrees — and the
+            // compressor runs whichever way its own thermostat last chose. In
+            // January that is invisible because both agree; in July it heats the
+            // house and the day report claims the saving. Loud at start-up is
+            // the only place this can be caught.
+            if matches!(asset, hems_core::asset::Asset::HeatPump(hp) if hp.is_reversible())
+                && spoken_for
+                && !self
+                    .entries
+                    .iter()
+                    .any(|e| e.asset == id && e.driver.capabilities().sets_thermal_mode)
+            {
+                return Err(RegistryError::CannotSetThermalMode(id.to_string()));
             }
         }
         let participates = !hems_grid::classify_at(&site.assets, now).is_empty();

@@ -18,7 +18,7 @@
 //! parameter — the same contract [`hems_drv`] holds a protocol driver to, for
 //! the same reason: a handshake, a rejected instruction and a CEM that selects a
 //! control type nobody offered are all unit tests rather than a WebSocket and a
-//! sleep. `s2energy::connection` is the async transport for anyone who wants
+//! sleep. `s2_kit::connection` is the async transport for anyone who wants
 //! one; `hemsd` owns the socket and hands the bytes here.
 //!
 //! [`hems_drv`]: https://docs.rs/hems-drv
@@ -59,12 +59,14 @@ use std::collections::VecDeque;
 
 use hems_core::prelude::{AssetId, Power};
 use hems_device::sg_ready::SgReadyState;
-use s2energy::common::{
-    ControlType, EnergyManagementRole, Handshake, Id, InstructionStatus, InstructionStatusUpdate,
-    Message, PowerMeasurement, PowerValue, ReceptionStatus, ReceptionStatusValues,
-    ResourceManagerDetails,
+use s2_kit::message::Message;
+use s2_kit::types::Id;
+use s2_kit::types::common::{
+    ControlType, EnergyManagementRole, Handshake, InstructionStatus, InstructionStatusUpdate,
+    PowerMeasurement, PowerValue, ReceptionStatus, ReceptionStatusValues, ResourceManagerDetails,
+    RevokableObjects, RevokeObject,
 };
-use s2energy::{frbc, ombc, pebc, ppbc};
+use s2_kit::types::{frbc, ombc, pebc, ppbc};
 use thiserror::Error;
 use time::OffsetDateTime;
 
@@ -73,11 +75,27 @@ use crate::describe::{
 };
 use crate::instruct::{self, InstructError};
 
-/// S2's generated types carry `chrono` timestamps; the rest of hems uses `time`.
-fn utc(at: OffsetDateTime) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp_nanos(
-        i64::try_from(at.unix_timestamp_nanos()).unwrap_or(i64::MAX),
-    )
+/// An instant, in the shape S2 wants it.
+///
+/// One line, and it used to be six. `s2_kit` put `chrono::DateTime` in its
+/// public API, so this crate carried `chrono` purely to name the type on a wire
+/// field. `s2-kit` has its own `Timestamp` and a `From<time::OffsetDateTime>`
+/// behind the `time` feature, so the conversion is the library's and `time` is
+/// once again the only calendar in the product (D201).
+fn utc(at: OffsetDateTime) -> s2_kit::types::Timestamp {
+    at.into()
+}
+
+/// The protocol version this Resource Manager negotiates.
+///
+/// `0.0.2-beta`, which is what `s2_kit` sent and what `s2-kit`'s own note calls
+/// "what every deployed implementation still negotiates" — so the wire bytes did
+/// not move when the library did. S2 JSON v1.0.0 is the published tag and is a
+/// deliberate *later* decision: changing it is an interoperability change rather
+/// than a dependency upgrade, and it belongs with the ElaadNL event where there
+/// is something on the other end to disagree with (R32).
+fn ours() -> s2_kit::types::ProtocolVersion {
+    s2_kit::types::ProtocolVersion::V0_0_2_BETA
 }
 
 /// What this Resource Manager is offering on this connection.
@@ -227,6 +245,18 @@ pub enum SessionEvent {
         /// Why.
         reason: InstructError,
     },
+    /// The CEM handed the resource back.
+    ///
+    /// `SelectControlType { NO_SELECTION }` — a **state** rather than a
+    /// capability, *"to be used if no control type is or has been selected"* —
+    /// which is how a manager stops driving without dropping the connection: an
+    /// aggregator finishing a dispatch window, a building manager handing a flat
+    /// back to its tenant.
+    ///
+    /// Reported rather than swallowed, because a CEM's instruction ranks **above
+    /// the box's own plan**: a resource that stays selected after its manager let
+    /// go is a household obeying somebody who has stopped asking (D213).
+    Released,
     /// The session ended.
     Closed(CloseReason),
 }
@@ -283,7 +313,31 @@ pub struct Session {
     /// The operation mode reported last, so a status can name the one before it
     /// — which S2 requires of every status but the first.
     active_mode: Option<Id>,
+    /// Instructions accepted and not yet due, earliest first.
+    ///
+    /// S2's data model says of `execution_time`: *"When to start. In the past
+    /// means as soon as possible."* So an instruction is a **schedule**, and a
+    /// Resource Manager that acts on receipt fires a manager's whole day at once
+    /// (D212).
+    pending: Vec<Scheduled>,
 }
+
+/// An accepted instruction waiting for its moment.
+#[derive(Debug, Clone, PartialEq)]
+struct Scheduled {
+    at: OffsetDateTime,
+    wanted: Instructed,
+    instruction: Id,
+}
+
+/// How many instructions may wait at once.
+///
+/// A manager scheduling a day of quarter hours needs ninety-six; one that has
+/// lost track of what it has sent must not be able to exhaust a gateway box's
+/// memory through a socket. Two days' worth, and the two-hundredth is refused
+/// rather than silently dropped, because a queue that discards is a manager
+/// planning against a household that is quietly not listening.
+const MAX_PENDING: usize = 192;
 
 impl Session {
     /// A session for one resource, not yet opened.
@@ -303,7 +357,53 @@ impl Session {
             outbox: VecDeque::new(),
             events: Vec::new(),
             active_mode: None,
+            pending: Vec::new(),
         }
+    }
+
+    /// Release every instruction whose moment has come.
+    ///
+    /// Called from every entry point that carries a clock — `on_message` and
+    /// `report` — so a caller cannot forget it, and exposed as well because a
+    /// household that goes quiet still has a schedule to keep: a manager that
+    /// sends nothing between 16:00 and 18:00 has still asked for something at
+    /// 17:00.
+    ///
+    /// Emitting is what makes an instruction *happen*: the event reaches the
+    /// arbiter, and `Started` is the status S2 defines for exactly this moment —
+    /// `Accepted` said the household intends to carry it out, this says it has
+    /// begun.
+    pub fn advance(&mut self, now: OffsetDateTime) {
+        if !matches!(self.state, SessionState::Active(_)) {
+            return;
+        }
+        let due: Vec<Scheduled> = {
+            let (due, later) = std::mem::take(&mut self.pending)
+                .into_iter()
+                .partition(|s| s.at <= now);
+            self.pending = later;
+            due
+        };
+        for s in due {
+            self.start(s, now);
+        }
+    }
+
+    /// Put an instruction into effect and tell the manager it has begun.
+    fn start(&mut self, s: Scheduled, now: OffsetDateTime) {
+        self.events.push(SessionEvent::Instructed {
+            asset: self.asset.clone(),
+            wanted: s.wanted,
+            instruction: s.instruction,
+        });
+        self.outbox.push_back(
+            InstructionStatusUpdate::builder()
+                .instruction_id(s.instruction)
+                .status_type(InstructionStatus::Started)
+                .timestamp(utc(now))
+                .build()
+                .into(),
+        );
     }
 
     /// Which asset this session is about.
@@ -337,7 +437,7 @@ impl Session {
         self.outbox.push_back(
             Handshake::builder()
                 .role(EnergyManagementRole::Rm)
-                .supported_protocol_versions(vec![s2energy::s2_schema_version().to_string()])
+                .supported_protocol_versions(vec![ours()])
                 .build()
                 .into(),
         );
@@ -361,9 +461,32 @@ impl Session {
         if matches!(message, Message::ReceptionStatus(_)) {
             return;
         }
+        // Where the acknowledgement goes in the queue, taken **before** the
+        // handler runs and inserted there afterwards.
+        //
+        // `handle` may queue the consequences of the message — a
+        // `SelectControlType` puts the system description on the outbox — and
+        // pushing the `ReceptionStatus` after them sends those consequences
+        // *ahead of* the acknowledgement that accepted the message they answer.
+        // A CEM that tracks session state reads that as a control-type message
+        // arriving before its selection was accepted and refuses it
+        // (`S2-STATE-001`, citing S2 Connect's normative state table), which is
+        // the correct reading: until the RM says `OK`, the manager has not been
+        // told its selection took.
+        //
+        // This was the order for five versions and nothing caught it, because
+        // the interop test's CEM was a hand-written frame reader with no session
+        // state of its own. Driving a real `CemSession` found it on the first
+        // run (D201).
+        // Anything already due goes out *before* this message is handled, so an
+        // instruction for 17:00 and a message arriving at 17:05 leave in the
+        // order they happened rather than the order they were spoken.
+        self.advance(now);
+        let at = self.outbox.len();
         let status = self.handle(message, now);
         if let Some(id) = message.id() {
-            self.outbox.push_back(
+            self.outbox.insert(
+                at,
                 ReceptionStatus {
                     subject_message_id: id,
                     status: status.0,
@@ -379,6 +502,7 @@ impl Session {
     /// A no-op until the CEM has chosen a control type: a status before the
     /// selection is a message about a description the manager has not been sent.
     pub fn report(&mut self, report: &Report, now: OffsetDateTime) {
+        self.advance(now);
         let SessionState::Active(control) = self.state else {
             return;
         };
@@ -417,12 +541,12 @@ impl Session {
         let Some((mode, factor)) = self.activity(power) else {
             return;
         };
-        let previous = self.active_mode.clone().filter(|m| *m != mode);
-        self.active_mode = Some(mode.clone());
+        let previous = self.active_mode.filter(|m| *m != mode);
+        self.active_mode = Some(mode);
         let transition = previous.as_ref().map(|_| utc(now));
         let message: Message = match &self.offer {
             Offer::Battery(d) => frbc::ActuatorStatus {
-                actuator_id: d.actuator.clone(),
+                actuator_id: d.actuator,
                 active_operation_mode_id: mode,
                 previous_operation_mode_id: previous,
                 operation_mode_factor: factor,
@@ -431,7 +555,7 @@ impl Session {
             }
             .into(),
             Offer::Ev(d) => frbc::ActuatorStatus {
-                actuator_id: d.actuator.clone(),
+                actuator_id: d.actuator,
                 active_operation_mode_id: mode,
                 previous_operation_mode_id: previous,
                 operation_mode_factor: factor,
@@ -440,7 +564,7 @@ impl Session {
             }
             .into(),
             Offer::Dhw(d) => frbc::ActuatorStatus {
-                actuator_id: d.actuator.clone(),
+                actuator_id: d.actuator,
                 active_operation_mode_id: mode,
                 previous_operation_mode_id: previous,
                 operation_mode_factor: factor,
@@ -475,9 +599,9 @@ impl Session {
         };
         match &self.offer {
             Offer::Battery(d) => Some(if power < Power::ZERO {
-                (d.discharge.clone(), fraction(self.ratings.discharge))
+                (d.discharge, fraction(self.ratings.discharge))
             } else {
-                (d.charge.clone(), fraction(self.ratings.charge))
+                (d.charge, fraction(self.ratings.charge))
             }),
             Offer::Ev(d) => {
                 if power < Power::ZERO {
@@ -486,12 +610,12 @@ impl Session {
                     // status a CEM cannot reconcile with the measurement beside
                     // it. It should not happen; if it does, saying nothing is
                     // the honest answer.
-                    Some((d.discharge.clone()?, fraction(self.ratings.discharge)))
+                    Some((d.discharge?, fraction(self.ratings.discharge)))
                 } else {
-                    Some((d.charge.clone(), fraction(self.ratings.charge)))
+                    Some((d.charge, fraction(self.ratings.charge)))
                 }
             }
-            Offer::Dhw(d) => Some((d.heat.clone(), fraction(self.ratings.charge))),
+            Offer::Dhw(d) => Some((d.heat, fraction(self.ratings.charge))),
             // An SG Ready unit's state is a contact position rather than
             // something a meter can be inverted into: two states draw the same
             // power and mean different things. The box reports the state it
@@ -514,18 +638,18 @@ impl Session {
         let Some((mode, _)) = d.modes.iter().find(|(_, s)| *s == state) else {
             return;
         };
-        let mode = mode.clone();
+        let mode = *mode;
         if self.active_mode.as_ref() == Some(&mode) {
             return;
         }
-        let previous = self.active_mode.replace(mode.clone());
+        let previous = self.active_mode.replace(mode);
         if !self.state.is_active() {
             return;
         }
         self.outbox.push_back(
             ombc::Status {
                 active_operation_mode_id: mode,
-                previous_operation_mode_id: previous.clone(),
+                previous_operation_mode_id: previous,
                 operation_mode_factor: 1.0,
                 message_id: Id::generate(),
                 transition_timestamp: previous.map(|_| utc(now)),
@@ -547,7 +671,7 @@ impl Session {
     pub fn programme_is(
         &mut self,
         status: ppbc::PowerSequenceStatus,
-        progress: Option<s2energy::common::Duration>,
+        progress: Option<s2_kit::types::Duration>,
     ) {
         let Offer::Programme(d) = &self.offer else {
             return;
@@ -586,12 +710,12 @@ impl Session {
     }
 
     /// The commodity this resource's power is measured in.
-    fn quantity(&self) -> s2energy::common::CommodityQuantity {
+    fn quantity(&self) -> s2_kit::types::common::CommodityQuantity {
         self.details
             .provides_power_measurement_types
             .first()
             .copied()
-            .unwrap_or(s2energy::common::CommodityQuantity::ElectricPower3PhaseSymmetric)
+            .unwrap_or(s2_kit::types::common::CommodityQuantity::ElectricPower3PhaseSymmetric)
     }
 
     /// Handle one message, returning the `ReceptionStatus` it earns.
@@ -606,37 +730,24 @@ impl Session {
                 (ReceptionStatusValues::Ok, None)
             }
             (SessionState::AwaitingVersion, Message::HandshakeResponse(response)) => {
-                let ours = s2energy::s2_schema_version().to_string();
-                if response.selected_protocol_version == ours {
+                if response.selected_protocol_version == ours() {
                     self.outbox.push_back(self.details.clone().into());
                     self.state = SessionState::AwaitingControlType;
                     (ReceptionStatusValues::Ok, None)
                 } else {
                     let reason = CloseReason::UnsupportedVersion {
-                        selected: response.selected_protocol_version.clone(),
+                        selected: response.selected_protocol_version.as_str().to_owned(),
                     };
                     let label = reason.to_string();
                     self.close(reason);
                     (ReceptionStatusValues::InvalidContent, Some(label))
                 }
             }
-            (SessionState::AwaitingControlType, Message::SelectControlType(select)) => {
-                let offered = self.offer.control_type();
-                if select.control_type == offered {
-                    self.outbox.push_back(self.offer.system_description());
-                    self.state = SessionState::Active(offered);
-                    self.events.push(SessionEvent::Ready(offered));
-                    (ReceptionStatusValues::Ok, None)
-                } else {
-                    let reason = CloseReason::UnofferedControlType {
-                        selected: select.control_type,
-                        offered,
-                    };
-                    let label = reason.to_string();
-                    self.close(reason);
-                    (ReceptionStatusValues::InvalidContent, Some(label))
-                }
-            }
+            (
+                SessionState::AwaitingControlType | SessionState::Active(_),
+                Message::SelectControlType(select),
+            ) => self.select(select.control_type),
+            (SessionState::Active(_), Message::RevokeObject(revoke)) => self.revoke(revoke, now),
             (SessionState::Active(_), _) => self.instructed(message, now),
             (state, message) => {
                 // Out of order. The session ends rather than guessing: S2's
@@ -652,6 +763,83 @@ impl Session {
                 (ReceptionStatusValues::InvalidContent, Some(label))
             }
         }
+    }
+
+    /// The CEM chose a control type — or chose to stop driving.
+    ///
+    /// Handled in **both** the selecting and the active state, because S2 lets a
+    /// manager change its mind and the two interesting cases are the same
+    /// message: re-selecting what is already running is idempotent, and
+    /// `NO_SELECTION` is a manager letting go.
+    fn select(&mut self, selected: ControlType) -> (ReceptionStatusValues, Option<String>) {
+        let offered = self.offer.control_type();
+        if selected == ControlType::NoSelection {
+            // Not an error in either state, and not a close. The connection
+            // stays up — a manager that is not driving may still want the
+            // measurements and forecasts S2 keeps flowing — and the resource
+            // goes back to the household's own plan.
+            let was_active = matches!(self.state, SessionState::Active(_));
+            self.pending.clear();
+            self.state = SessionState::AwaitingControlType;
+            self.active_mode = None;
+            if was_active {
+                self.events.push(SessionEvent::Released);
+            }
+            return (ReceptionStatusValues::Ok, None);
+        }
+        if selected == offered {
+            self.outbox.push_back(self.offer.system_description());
+            self.state = SessionState::Active(offered);
+            self.events.push(SessionEvent::Ready(offered));
+            return (ReceptionStatusValues::Ok, None);
+        }
+        let reason = CloseReason::UnofferedControlType { selected, offered };
+        let label = reason.to_string();
+        self.close(reason);
+        (ReceptionStatusValues::InvalidContent, Some(label))
+    }
+
+    /// The CEM withdrew something it had sent.
+    ///
+    /// Only instructions matter here, and only ones still **waiting**: one
+    /// already carried out is not revocable — it is a thing that happened, and
+    /// the honest answer is the `Aborted` the arbiter's own override path
+    /// already sends. A revocation for an identifier this session is not holding
+    /// is answered `OK` rather than refused, because a manager withdrawing
+    /// something it is unsure about is being careful rather than wrong.
+    ///
+    fn revoke(
+        &mut self,
+        revoke: &RevokeObject,
+        now: OffsetDateTime,
+    ) -> (ReceptionStatusValues, Option<String>) {
+        let instruction = matches!(
+            revoke.object_type,
+            RevokableObjects::FrbcInstruction
+                | RevokableObjects::OmbcInstruction
+                | RevokableObjects::PebcInstruction
+                | RevokableObjects::DdbcInstruction
+                | RevokableObjects::PpbcScheduleInstruction
+        );
+        if !instruction {
+            return (ReceptionStatusValues::Ok, None);
+        }
+        if let Some(i) = self
+            .pending
+            .iter()
+            .position(|s| s.instruction == revoke.object_id)
+        {
+            self.pending.remove(i);
+            self.outbox.push_back(
+                InstructionStatusUpdate::builder()
+                    .instruction_id(revoke.object_id)
+                    .status_type(InstructionStatus::Revoked)
+                    .timestamp(utc(now))
+                    .build()
+                    .into(),
+            );
+        }
+        (ReceptionStatusValues::Ok, None)
     }
 
     /// An instruction on an active session.
@@ -681,13 +869,13 @@ impl Session {
                     .map(|(id, dir, f)| (id, Instructed::Power(power(dir, f))))
             }
             (Offer::HeatPump(d), Message::OmbcInstruction(i)) => {
-                instruct::heat_pump_state(d, i).map(|s| (i.id.clone(), Instructed::SgReady(s)))
+                instruct::heat_pump_state(d, i).map(|s| (i.id, Instructed::SgReady(s)))
             }
             (Offer::Programme(d), Message::PpbcScheduleInstruction(i)) => {
-                instruct::programme_start(d, i).map(|at| (i.id.clone(), Instructed::Start(at)))
+                instruct::programme_start(d, i).map(|at| (i.id, Instructed::Start(at)))
             }
             (Offer::Envelope(_), Message::PebcInstruction(i)) => {
-                Ok((i.id.clone(), Instructed::Envelope(Box::new(i.clone()))))
+                Ok((i.id, Instructed::Envelope(i.clone())))
             }
             // Everything else on an active session is either a message a CEM may
             // legitimately send and this RM has nothing to do with, or one it
@@ -697,14 +885,10 @@ impl Session {
             _ => return (ReceptionStatusValues::Ok, None),
         };
 
-        let _ = now;
         match decoded {
             Ok((instruction, wanted)) => {
-                self.events.push(SessionEvent::Instructed {
-                    asset: self.asset.clone(),
-                    wanted,
-                    instruction: instruction.clone(),
-                });
+                // Accepted first, always: the instruction is well formed and
+                // names something this resource described, whenever it is for.
                 self.outbox.push_back(
                     InstructionStatusUpdate::builder()
                         .instruction_id(instruction)
@@ -713,6 +897,35 @@ impl Session {
                         .build()
                         .into(),
                 );
+                let at = execution_time(message).unwrap_or(now);
+                let s = Scheduled {
+                    at,
+                    wanted,
+                    instruction,
+                };
+                if at <= now {
+                    // "In the past means as soon as possible."
+                    self.start(s, now);
+                } else if self.pending.len() >= MAX_PENDING {
+                    let label = format!(
+                        "this resource is already holding {MAX_PENDING} scheduled instructions"
+                    );
+                    self.outbox.push_back(
+                        InstructionStatusUpdate::builder()
+                            .instruction_id(instruction)
+                            .status_type(InstructionStatus::Rejected)
+                            .timestamp(utc(now))
+                            .build()
+                            .into(),
+                    );
+                    return (ReceptionStatusValues::TemporaryError, Some(label));
+                } else {
+                    // Kept in time order, so `advance` can stop at the first one
+                    // that is not due and a schedule is carried out in the
+                    // order it describes rather than the order it arrived.
+                    let i = self.pending.partition_point(|p| p.at <= at);
+                    self.pending.insert(i, s);
+                }
                 (ReceptionStatusValues::Ok, None)
             }
             Err(reason) => {
@@ -737,8 +950,19 @@ impl Session {
     }
 
     fn close(&mut self, reason: CloseReason) {
+        // A schedule belongs to the manager that made it. One that has gone —
+        // or has been refused — must not go on moving a household's battery
+        // from a queue nobody can revoke, which is the § 14a failsafe's own
+        // failure mode with the ownership reversed.
+        self.pending.clear();
         self.events.push(SessionEvent::Closed(reason.clone()));
         self.state = SessionState::Closed(reason);
+    }
+
+    /// How many accepted instructions are waiting for their moment.
+    #[must_use]
+    pub fn scheduled(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -778,13 +1002,32 @@ impl Ratings {
 /// The instruction identifier a message carries, where it is one.
 fn instruction_id(message: &Message) -> Option<Id> {
     match message {
-        Message::FrbcInstruction(i) => Some(i.id.clone()),
-        Message::OmbcInstruction(i) => Some(i.id.clone()),
-        Message::PebcInstruction(i) => Some(i.id.clone()),
-        Message::PpbcScheduleInstruction(i) => Some(i.id.clone()),
-        Message::DdbcInstruction(i) => Some(i.id.clone()),
+        Message::FrbcInstruction(i) => Some(i.id),
+        Message::OmbcInstruction(i) => Some(i.id),
+        Message::PebcInstruction(i) => Some(i.id),
+        Message::PpbcScheduleInstruction(i) => Some(i.id),
+        Message::DdbcInstruction(i) => Some(i.id),
         _ => None,
     }
+}
+
+/// When an instruction says it should start.
+///
+/// Every control type spells the field the same way and means the same thing by
+/// it — *"in the past means as soon as possible"* — so this is the one place
+/// that reads it. A `PPBC.ScheduleInstruction` is deliberately **not** here: its
+/// execution time is the whole of what it decides and it travels in the event as
+/// [`Instructed::Start`], for the planner to place rather than the session to
+/// wait out. A dishwasher is scheduled, not switched.
+fn execution_time(message: &Message) -> Option<OffsetDateTime> {
+    let at = match message {
+        Message::FrbcInstruction(i) => i.execution_time,
+        Message::OmbcInstruction(i) => i.execution_time,
+        Message::PebcInstruction(i) => i.execution_time,
+        Message::DdbcInstruction(i) => i.execution_time,
+        _ => return None,
+    };
+    OffsetDateTime::try_from(at).ok()
 }
 
 /// A message's name, for a diagnostic a human will read.
@@ -825,7 +1068,7 @@ const fn name_of(state: &SessionState) -> &'static str {
 pub fn profile_status(
     description: &ProgrammeDescription,
     status: ppbc::PowerSequenceStatus,
-    into: Option<s2energy::common::Duration>,
+    into: Option<s2_kit::types::Duration>,
 ) -> ppbc::PowerProfileStatus {
     let chosen = matches!(
         status,
@@ -833,12 +1076,12 @@ pub fn profile_status(
             | ppbc::PowerSequenceStatus::Executing
             | ppbc::PowerSequenceStatus::Finished
     )
-    .then(|| description.sequence.clone());
+    .then(|| description.sequence);
     ppbc::PowerProfileStatus {
         message_id: Id::generate(),
         sequence_container_status: vec![ppbc::PowerSequenceContainerStatus {
-            power_profile_id: description.definition.id.clone(),
-            sequence_container_id: description.container.clone(),
+            power_profile_id: description.definition.id,
+            sequence_container_id: description.container,
             selected_sequence_id: chosen,
             status,
             progress: into,
@@ -853,7 +1096,7 @@ mod tests {
     use crate::resource_manager_details;
     use hems_core::asset::{Asset, AssetMeta, Battery, Capabilities, HeatPump, HeatPumpControl};
     use hems_core::prelude::{CircuitId, Energy, PhaseConnection, PhaseMode, Soc};
-    use s2energy::common::{HandshakeResponse, SelectControlType};
+    use s2_kit::types::common::{HandshakeResponse, SelectControlType};
     use time::macros::datetime;
 
     const T0: OffsetDateTime = datetime!(2026-01-15 12:00 UTC);
@@ -901,8 +1144,8 @@ mod tests {
         out
     }
 
-    fn version() -> String {
-        s2energy::s2_schema_version().to_string()
+    fn version() -> s2_kit::types::ProtocolVersion {
+        ours()
     }
 
     /// The CEM's own handshake. S2 makes its version list *optional* — the RM is
@@ -910,7 +1153,10 @@ mod tests {
     fn cem_handshake() -> Message {
         Handshake::builder()
             .role(EnergyManagementRole::Cem)
-            .supported_protocol_versions(vec![])
+            // **Absent**, not empty. S2 makes the list optional because the RM
+            // is the constrained side, and `s2-kit` types it as
+            // `Option<Vec<_>>` — so the distinction the schema draws is one this
+            // test can now express rather than approximate with an empty vector.
             .build()
             .into()
     }
@@ -920,7 +1166,13 @@ mod tests {
         session.open();
         let opening = sent(session);
         session.on_message(&cem_handshake(), T0);
-        session.on_message(&HandshakeResponse::new(version()).into(), T0);
+        session.on_message(
+            &HandshakeResponse::builder()
+                .selected_protocol_version(version())
+                .build()
+                .into(),
+            T0,
+        );
         session.on_message(
             &SelectControlType {
                 control_type: control,
@@ -947,7 +1199,8 @@ mod tests {
         let opening = sent(&mut session);
         assert!(
             matches!(opening.as_slice(), [Message::Handshake(h)]
-                if h.role == EnergyManagementRole::Rm && !h.supported_protocol_versions.is_empty()),
+                if h.role == EnergyManagementRole::Rm
+                    && h.supported_protocol_versions.as_ref().is_some_and(|v| !v.is_empty())),
             "the RM speaks first, and its handshake is the one that must list versions: {opening:?}"
         );
         assert_eq!(*session.state(), SessionState::AwaitingHandshake);
@@ -955,7 +1208,13 @@ mod tests {
         session.on_message(&cem_handshake(), T0);
         assert_eq!(*session.state(), SessionState::AwaitingVersion);
 
-        session.on_message(&HandshakeResponse::new(version()).into(), T0);
+        session.on_message(
+            &HandshakeResponse::builder()
+                .selected_protocol_version(version())
+                .build()
+                .into(),
+            T0,
+        );
         assert_eq!(*session.state(), SessionState::AwaitingControlType);
         let after_version = sent(&mut session);
         assert!(
@@ -1032,7 +1291,13 @@ mod tests {
         session.open();
         let _ = sent(&mut session);
         session.on_message(&cem_handshake(), T0);
-        session.on_message(&HandshakeResponse::new(version()).into(), T0);
+        session.on_message(
+            &HandshakeResponse::builder()
+                .selected_protocol_version(version())
+                .build()
+                .into(),
+            T0,
+        );
         let _ = sent(&mut session);
 
         session.on_message(
@@ -1067,7 +1332,13 @@ mod tests {
         session.open();
         let _ = sent(&mut session);
         session.on_message(&cem_handshake(), T0);
-        session.on_message(&HandshakeResponse::new("9.9.9".to_owned()).into(), T0);
+        session.on_message(
+            &HandshakeResponse::builder()
+                .selected_protocol_version(s2_kit::types::ProtocolVersion::new("9.9.9"))
+                .build()
+                .into(),
+            T0,
+        );
         assert!(matches!(
             session.state(),
             SessionState::Closed(CloseReason::UnsupportedVersion { .. })
@@ -1085,10 +1356,10 @@ mod tests {
         let id = Id::generate();
         session.on_message(
             &frbc::Instruction {
-                id: id.clone(),
+                id,
                 message_id: Id::generate(),
-                actuator_id: description.actuator.clone(),
-                operation_mode: description.discharge.clone(),
+                actuator_id: description.actuator,
+                operation_mode: description.discharge,
                 operation_mode_factor: 0.5,
                 execution_time: utc(T0),
                 abnormal_condition: false,
@@ -1104,7 +1375,7 @@ mod tests {
                 asset: AssetId::new("battery").unwrap(),
                 // Half of a 5 kW discharge, load convention.
                 wanted: Instructed::Power(Power::from_kw(-2.5)),
-                instruction: id.clone(),
+                instruction: id,
             }]
         );
 
@@ -1118,6 +1389,265 @@ mod tests {
                 .any(|m| matches!(m, Message::InstructionStatusUpdate(u)
                 if u.instruction_id == id && u.status_type == InstructionStatus::Accepted)),
             "and so is the household: {out:?}"
+        );
+    }
+
+    /// An instruction for later is carried out **later**.
+    ///
+    /// `execution_time` is "when to start; in the past means as soon as
+    /// possible", so a time in the future is a schedule rather than a
+    /// suggestion. A test that sets it to the session's own `now` cannot tell
+    /// the two behaviours apart (D212).
+    #[test]
+    fn an_instruction_for_later_is_not_carried_out_now() {
+        let (mut session, description) = battery_session();
+        let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
+        let _ = session.drain();
+
+        let id = Id::generate();
+        let later = T0 + time::Duration::hours(2);
+        session.on_message(
+            &frbc::Instruction {
+                id,
+                message_id: Id::generate(),
+                actuator_id: description.actuator,
+                operation_mode: description.discharge,
+                operation_mode_factor: 0.5,
+                execution_time: utc(later),
+                abnormal_condition: false,
+            }
+            .into(),
+            T0,
+        );
+
+        assert_eq!(
+            session.drain(),
+            vec![],
+            "an instruction two hours out must not move the battery now"
+        );
+        let out = sent(&mut session);
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, Message::InstructionStatusUpdate(u)
+                if u.instruction_id == id && u.status_type == InstructionStatus::Accepted)),
+            "…and it is still accepted, because it is a perfectly good instruction: {out:?}"
+        );
+    }
+
+    /// …and it *is* carried out when its moment comes.
+    ///
+    /// The other half, without which the fix above is indistinguishable from
+    /// dropping the instruction on the floor.
+    #[test]
+    fn an_instruction_for_later_is_carried_out_then() {
+        let (mut session, description) = battery_session();
+        let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
+        let _ = session.drain();
+
+        let id = Id::generate();
+        let later = T0 + time::Duration::hours(2);
+        session.on_message(
+            &frbc::Instruction {
+                id,
+                message_id: Id::generate(),
+                actuator_id: description.actuator,
+                operation_mode: description.discharge,
+                operation_mode_factor: 0.5,
+                execution_time: utc(later),
+                abnormal_condition: false,
+            }
+            .into(),
+            T0,
+        );
+        assert_eq!(session.scheduled(), 1);
+        let _ = session.drain();
+        let _ = sent(&mut session);
+
+        // A minute early is still early.
+        session.advance(later - time::Duration::minutes(1));
+        assert_eq!(session.drain(), vec![]);
+
+        session.advance(later);
+        assert_eq!(
+            session.drain(),
+            vec![SessionEvent::Instructed {
+                asset: AssetId::new("battery").unwrap(),
+                wanted: Instructed::Power(Power::from_kw(-2.5)),
+                instruction: id,
+            }]
+        );
+        assert_eq!(session.scheduled(), 0, "and it is not carried out twice");
+        let out = sent(&mut session);
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, Message::InstructionStatusUpdate(u)
+                if u.instruction_id == id && u.status_type == InstructionStatus::Started)),
+            "`Started` is the status S2 has for exactly this moment: {out:?}"
+        );
+    }
+
+    /// A manager that hands the resource back is heard.
+    ///
+    /// `NO_SELECTION` is a **state**, not a capability: "to be used if no
+    /// control type is or has been selected". Before this it was read as an
+    /// unoffered control type and tore the session down at selection time, and
+    /// was answered `OK` and ignored on an active one — so a household went on
+    /// obeying a manager that had stopped asking, at a rank *above its own
+    /// plan*.
+    #[test]
+    fn a_manager_that_selects_no_control_type_hands_the_resource_back() {
+        let (mut session, description) = battery_session();
+        let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
+        let later = T0 + time::Duration::hours(2);
+        session.on_message(
+            &frbc::Instruction {
+                id: Id::generate(),
+                message_id: Id::generate(),
+                actuator_id: description.actuator,
+                operation_mode: description.discharge,
+                operation_mode_factor: 1.0,
+                execution_time: utc(later),
+                abnormal_condition: false,
+            }
+            .into(),
+            T0,
+        );
+        assert_eq!(session.scheduled(), 1);
+        let _ = session.drain();
+        let _ = sent(&mut session);
+
+        session.on_message(
+            &SelectControlType::builder()
+                .control_type(ControlType::NoSelection)
+                .build()
+                .into(),
+            T0,
+        );
+
+        assert!(
+            session.drain().contains(&SessionEvent::Released),
+            "the arbiter has to be told, or the hold outlives the manager"
+        );
+        assert_eq!(session.scheduled(), 0, "and the schedule goes with it");
+        assert!(
+            !matches!(session.state(), SessionState::Closed(_)),
+            "the connection stays up: a manager that is not driving may still \
+             want the measurements S2 keeps flowing"
+        );
+        session.advance(later);
+        assert_eq!(
+            session.drain(),
+            vec![],
+            "nothing it was holding moves the household afterwards"
+        );
+
+        // …and it can pick the resource up again without reconnecting.
+        session.on_message(
+            &SelectControlType::builder()
+                .control_type(ControlType::FillRateBasedControl)
+                .build()
+                .into(),
+            T0,
+        );
+        assert!(
+            session
+                .drain()
+                .contains(&SessionEvent::Ready(ControlType::FillRateBasedControl)),
+            "selecting again is how a manager comes back"
+        );
+    }
+
+    /// A manager may withdraw an instruction it has not had carried out yet.
+    ///
+    /// Only load-bearing since instructions started waiting for their execution
+    /// time: before that there was never anything to revoke, so `RevokeObject`
+    /// fell through the catch-all and a manager that scheduled a discharge for
+    /// the evening and thought better of it was ignored.
+    #[test]
+    fn a_scheduled_instruction_can_be_withdrawn() {
+        let (mut session, description) = battery_session();
+        let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
+        let id = Id::generate();
+        let later = T0 + time::Duration::hours(2);
+        session.on_message(
+            &frbc::Instruction {
+                id,
+                message_id: Id::generate(),
+                actuator_id: description.actuator,
+                operation_mode: description.discharge,
+                operation_mode_factor: 1.0,
+                execution_time: utc(later),
+                abnormal_condition: false,
+            }
+            .into(),
+            T0,
+        );
+        assert_eq!(session.scheduled(), 1);
+        let _ = session.drain();
+        let _ = sent(&mut session);
+
+        session.on_message(
+            &RevokeObject::builder()
+                .object_type(RevokableObjects::FrbcInstruction)
+                .object_id(id)
+                .build()
+                .into(),
+            T0,
+        );
+        assert_eq!(session.scheduled(), 0);
+        let out = sent(&mut session);
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, Message::InstructionStatusUpdate(u)
+                if u.instruction_id == id && u.status_type == InstructionStatus::Revoked)),
+            "`Revoked` is the status S2 has for this: {out:?}"
+        );
+
+        session.advance(later);
+        assert_eq!(
+            session.drain(),
+            vec![],
+            "and a withdrawn instruction does not move the household afterwards"
+        );
+    }
+
+    /// A manager that has lost track of what it sent must not exhaust the box.
+    #[test]
+    fn a_schedule_is_bounded_and_the_refusal_is_told_to_the_manager() {
+        let (mut session, description) = battery_session();
+        let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
+        let instruct = |session: &mut Session, n: i64| -> Id {
+            let id = Id::generate();
+            session.on_message(
+                &frbc::Instruction {
+                    id,
+                    message_id: Id::generate(),
+                    actuator_id: description.actuator,
+                    operation_mode: description.charge,
+                    operation_mode_factor: 1.0,
+                    execution_time: utc(T0 + time::Duration::minutes(15 * n)),
+                    abnormal_condition: false,
+                }
+                .into(),
+                T0,
+            );
+            id
+        };
+        for n in 1..=i64::try_from(MAX_PENDING).unwrap() {
+            let _ = instruct(&mut session, n);
+        }
+        assert_eq!(session.scheduled(), MAX_PENDING);
+        let _ = sent(&mut session);
+
+        let refused = instruct(&mut session, 9_999);
+        assert_eq!(session.scheduled(), MAX_PENDING, "the queue held");
+        let out = sent(&mut session);
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, Message::InstructionStatusUpdate(u)
+                if u.instruction_id == refused && u.status_type == InstructionStatus::Rejected)),
+            "a dropped instruction the manager was not told about is a manager \
+             planning against a household that is quietly not listening: {out:?}"
         );
     }
 
@@ -1140,7 +1670,7 @@ mod tests {
         // peer never sent is a protocol error at the far end.
         let fresh = {
             let (mut s, _) = battery_session();
-            s.instruction_became(id.clone(), InstructionStatus::Started, T0);
+            s.instruction_became(id, InstructionStatus::Started, T0);
             sent(&mut s)
         };
         assert!(
@@ -1151,8 +1681,8 @@ mod tests {
         let _ = negotiate(&mut session, ControlType::FillRateBasedControl);
         let _ = sent(&mut session);
 
-        session.instruction_became(id.clone(), InstructionStatus::Started, T0);
-        session.instruction_became(id.clone(), InstructionStatus::Aborted, T0);
+        session.instruction_became(id, InstructionStatus::Started, T0);
+        session.instruction_became(id, InstructionStatus::Aborted, T0);
         let out = sent(&mut session);
         let updates: Vec<_> = out
             .iter()
@@ -1185,10 +1715,10 @@ mod tests {
         let id = Id::generate();
         session.on_message(
             &frbc::Instruction {
-                id: id.clone(),
+                id,
                 message_id: Id::generate(),
                 actuator_id: Id::generate(),
-                operation_mode: description.charge.clone(),
+                operation_mode: description.charge,
                 operation_mode_factor: 1.0,
                 execution_time: utc(T0),
                 abnormal_condition: false,
@@ -1287,6 +1817,7 @@ mod tests {
             .with_capabilities(Capabilities::MEASURE | Capabilities::SET_MODE),
             electrical_nominal: Power::from_kw(3.0),
             heating_rod: None,
+            cooling_electrical: None,
             control: HeatPumpControl::SgReady,
             modulating: false,
             comfort_min_c: 20.0,
@@ -1460,8 +1991,8 @@ mod tests {
             &frbc::Instruction {
                 id: Id::generate(),
                 message_id: Id::generate(),
-                actuator_id: description.actuator.clone(),
-                operation_mode: description.charge.clone(),
+                actuator_id: description.actuator,
+                operation_mode: description.charge,
                 operation_mode_factor: 0.4,
                 execution_time: utc(T0),
                 abnormal_condition: false,

@@ -127,6 +127,15 @@ pub struct StatusBody {
     /// The first thing to look at when a device is not doing what this page says
     /// it was told to: the setpoint was decided and had nowhere to go.
     pub undriven: Vec<String>,
+    /// Whether the roof is still delivering what it used to.
+    ///
+    /// The performance ratio of IEC 61724-1 against this array's own seasonal
+    /// baseline, and a verdict. It is on the status page rather than in a log
+    /// because it is the one fault a household can *act* on — the others here
+    /// are for an installer — and because the box is otherwise the last thing
+    /// that would notice: its own forecast corrector is built to learn a lower
+    /// roof and carry on planning well (D199).
+    pub roof_health: Option<hems_forecast::Health>,
     /// The § 14a ceiling in force, kW.
     pub steuve_ceiling_kw: Option<f64>,
     /// What the controllable devices may draw in total, surplus included, kW.
@@ -464,6 +473,7 @@ async fn status(State(local): State<Local>) -> Json<StatusBody> {
             .map(|(id, why)| (id.to_string(), why.clone()))
             .collect(),
         undriven: held.undriven.iter().map(ToString::to_string).collect(),
+        roof_health: held.roof_health,
         steuve_ceiling_kw: held.steuve_ceiling.map(hems_core::prelude::Power::kw),
         steuve_budget_kw: held.steuve_budget.map(hems_core::prelude::Power::kw),
         netzwirksam_kw: held.netzwirksam.map(hems_core::prelude::Power::kw),

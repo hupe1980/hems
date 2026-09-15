@@ -594,6 +594,26 @@ mod modelled_production_tests {
         }
     }
 
+    /// A day's alternating-current production through the path a box runs, kWh.
+    fn produced(array: &crate::ArrayModel, series: &WeatherSeries) -> f64 {
+        series
+            .modelled_production(array, BERLIN)
+            .iter()
+            .map(|(_, w)| w * hems_core::prelude::SLOT_HOURS)
+            .sum::<f64>()
+            / 1000.0
+    }
+
+    /// The same array with its modules horizontal — the reference a tilt gain is
+    /// measured against, and identical in every other respect so that nothing
+    /// but the pitch can move the ratio.
+    fn laid_flat(array: &crate::ArrayModel) -> crate::ArrayModel {
+        crate::ArrayModel {
+            tilt_deg: 0.0,
+            ..*array
+        }
+    }
+
     /// **The path a box on a wall runs, scored rather than merely exercised.**
     ///
     /// This is the seam that hid a 2,7× error for months (D172).
@@ -610,41 +630,34 @@ mod modelled_production_tests {
     /// plane, and its plane cannot receive more than the beam-transposed global
     /// value plus the sky and the ground — which, for the *overcast* case where
     /// there is no beam to transpose, is very close to the global value itself.
+    ///
+    /// The reference is **this same array laid flat** rather than a
+    /// direct-current quantity, so what the ratio measures is the transposition
+    /// and only that. A flat plane sees exactly the global horizontal value —
+    /// HDKR collapses to it at a tilt of zero — so the comparison is the roof's
+    /// pitch against no pitch, with the same cell temperature, the same system
+    /// losses and the same inverter on both sides. Reading it off a
+    /// direct-current reference made it a test of the transposition *and* the
+    /// inverter at once, which is how adding an inverter (D194) broke a test
+    /// about the sky.
     #[test]
     fn an_overcast_winter_day_does_not_out_produce_the_light_that_fell_on_it() {
         let array = array();
         // A tenth of the clear sky: a solid December overcast.
         let series = series(time::macros::date!(2026 - 12 - 21), 0.10);
-        let modelled: f64 = series
-            .modelled_production(&array, BERLIN)
-            .iter()
-            .map(|(_, w)| w * hems_core::prelude::SLOT_HOURS)
-            .sum::<f64>()
-            / 1000.0;
-        // What the array would make if every square metre of module saw exactly
-        // the *horizontal* irradiance. Under an overcast sky a tilted plane sees
-        // slightly less than that, never three times it.
-        let horizontal: f64 = series
-            .slots
-            .iter()
-            .map(|(_, p)| {
-                array.kwp_dc.kw()
-                    * (p.ghi_w_per_m2 / 1000.0)
-                    * (1.0 - array.system_loss)
-                    * hems_core::prelude::SLOT_HOURS
-            })
-            .sum();
+        let modelled = produced(&array, &series);
+        let horizontal = produced(&laid_flat(&array), &series);
         // Under a solid overcast there is almost no beam to project, so the
         // plane is worth about what the horizontal is worth: the sky-view
         // fraction of the diffuse (0,91 at 35°), plus a little off the ground,
         // plus the percent or two of beam Erbs still allows at `kt = 0,1`
-        // magnified by a low winter sun. It lands within a tenth either way.
-        // The constant this replaced put it at **2,7 times**.
+        // magnified by a low winter sun. The constant this replaced put it at
+        // **2,7 times**.
         let ratio = modelled / horizontal;
         assert!(
-            (0.85..1.10).contains(&ratio),
-            "the box modelled {modelled:.3} kWh from a sky that put {horizontal:.3} kWh \
-             on a horizontal metre — {ratio:.2}×, and an overcast sky has no beam to project"
+            (0.80..1.15).contains(&ratio),
+            "the box modelled {modelled:.3} kWh where the same roof laid flat makes \
+             {horizontal:.3} kWh — {ratio:.2}×, and an overcast sky has no beam to project"
         );
     }
 
@@ -657,22 +670,8 @@ mod modelled_production_tests {
     fn a_clear_winter_day_beats_the_horizontal_by_the_tilt_and_not_by_three() {
         let array = array();
         let series = series(time::macros::date!(2026 - 12 - 21), 1.0);
-        let modelled: f64 = series
-            .modelled_production(&array, BERLIN)
-            .iter()
-            .map(|(_, w)| w * hems_core::prelude::SLOT_HOURS)
-            .sum::<f64>()
-            / 1000.0;
-        let horizontal: f64 = series
-            .slots
-            .iter()
-            .map(|(_, p)| {
-                array.kwp_dc.kw()
-                    * (p.ghi_w_per_m2 / 1000.0)
-                    * (1.0 - array.system_loss)
-                    * hems_core::prelude::SLOT_HOURS
-            })
-            .sum();
+        let modelled = produced(&array, &series);
+        let horizontal = produced(&laid_flat(&array), &series);
         // Two to three times, which is the well-known midwinter tilt gain for a
         // 30–40° south plane at 52° north, and is higher than the *noon* ratio
         // (about 2,2) because the low-sun slots either side of it have the

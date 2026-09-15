@@ -13,32 +13,40 @@
 //! chain — the route, the JSON binding, the session, the decode, the shared map
 //! — fails here rather than on somebody's bench.
 //!
-//! # What this does **not** prove (R32)
+//! # What this proves, and what it still does not (R32)
 //!
-//! The CEM is `s2energy`'s own connector and so is the surface it dials, so both
-//! ends of this socket are the same crate. What the test holds is that hems's
-//! *use* of S2 is coherent end to end; what it cannot see is `s2energy` reading
-//! the standard wrongly, because both sides would read it wrongly together. The
-//! serialisation is generated from the official JSON Schema rather than hand-
-//! written, which narrows the gap and does not close it — a schema can be
-//! generated faithfully and still be wired up by a hand-written session that is
-//! not.
+//! The CEM is `s2-kit`'s own [`CemSession`] and so is the surface it dials, so
+//! both ends of this socket are the same crate. That much is unchanged.
 //!
-//! Closing it needs an implementation that is not ours on one end:
-//! `flexiblepower/s2-analyzer` validates a live connection against the
-//! standard's own schemas, and `s2-python` is a second stack. Until one of them
-//! is in CI this file is the EEBUS blind spot of D119 with a different protocol
-//! on it, and saying so here is cheaper than discovering it at a test event.
+//! What **did** change when the crate did is that the manager on the other end is
+//! now a session engine with a **rule-numbered semantic validator** in front of
+//! it, on by default. Every message this box sends is checked against the rule
+//! catalogue before the CEM accepts it, and a violation arrives as
+//! `CemEvent::Refused { report }` or `CemEvent::Warnings { report }` with the
+//! rule that was broken named. `assert_clean` below fails the test on either.
+//!
+//! That is a third artefact rather than a second opinion: the catalogue is
+//! written from the standard's text and is independent of the session logic on
+//! *either* side, so "hems sends a description `s2-python` would refuse" is a
+//! test failure here rather than a discovery at a test event. A peer that merely
+//! decoded would only ever prove the far end did not crash.
+//!
+//! What is still open is the same shape as D119's EEBUS blind spot: a validator
+//! and a session written by the same hand can be wrong together, and no
+//! implementation that is not ours has yet read a byte of this.
+//! `flexiblepower/s2-analyzer` and `s2-python` are the answers, and the ElaadNL
+//! event (28–29 October 2026) is the multi-vendor version.
 
 use std::sync::Arc;
 
 use hems_core::prelude::{AssetId, Power};
 use hemsd::drivers::Registry;
 use hemsd::runtime::s2::{Cem, S2Settings, Surface};
-use s2energy::common::{
-    ControlType, EnergyManagementRole, Handshake, HandshakeResponse, Message, SelectControlType,
-};
-use s2energy::transport::websockets_json::connect_as_client;
+use s2_kit::io::{Dialled, Driver, WebSocket};
+use s2_kit::message::Message;
+use s2_kit::session::{CemConfig, CemEvent, CemSession};
+use s2_kit::types::Timestamp;
+use s2_kit::types::common::ControlType;
 use tokio::sync::Mutex;
 
 /// The token this box answers to.
@@ -103,41 +111,167 @@ async fn a_box_with_its_access() -> (
     (address, cem, site, access)
 }
 
-/// A CEM's connection request, carrying the household's own credential.
-///
-/// S2's binding is JSON over WebSockets and says nothing about authentication,
-/// so the credential rides in the ordinary `Authorization` header — the same one
-/// every other surface in this workspace uses, rather than a scheme invented for
-/// this socket.
-fn as_the_household(address: &str, asset: &AssetId) -> http::Request<()> {
-    request_to(address, asset, Some(TOKEN))
-}
-
-/// The same, with whatever credential — or none.
-fn request_to(address: &str, asset: &AssetId, token: Option<&str>) -> http::Request<()> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-    let mut request = format!("ws://{address}/s2/{asset}")
-        .into_client_request()
-        .expect("a valid websocket handshake");
-    if let Some(token) = token {
-        request.headers_mut().insert(
-            http::header::AUTHORIZATION,
-            http::HeaderValue::from_str(&format!("Bearer {token}")).expect("a valid header"),
-        );
+/// A short name for an event, for a failure message.
+fn event_name(e: &CemEvent) -> String {
+    match e {
+        CemEvent::Refused { kind, report, .. } => format!("REFUSED {kind:?}: {report:?}"),
+        CemEvent::Warnings { kind, report } => format!("WARN {kind:?}: {report:?}"),
+        other => format!("{other:?}")
+            .split_whitespace()
+            .next()
+            .unwrap_or("?")
+            .to_owned(),
     }
-    request
 }
 
-/// Now, in the calendar `s2energy`'s generated types use.
+/// A real Customer Energy Manager, on a real socket.
 ///
-/// S2's schema puts instants in `chrono`; hems is a `time` workspace throughout
-/// (`hems-flex` converts at its own edge). Rather than adding a second date
-/// library to this daemon for one field, the instant is built from the Unix
-/// second both agree about.
-fn now_utc() -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::from_timestamp_nanos(
-        i64::try_from(time::OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(0),
-    )
+/// `s2-kit`'s own [`CemSession`] driven by its own [`Driver`], rather than a
+/// hand-written sequence of frames. That is the point rather than a convenience:
+/// the engine performs the handshake in the order S2 specifies, acknowledges what
+/// the standard says must be acknowledged, and — the part this file is for —
+/// **validates every message the box sends against the rule catalogue** before
+/// accepting it. A test that wrote its own frames would be testing the box
+/// against a peer that exists nowhere.
+///
+/// S2's binding says nothing about authentication, so the credential rides in the
+/// ordinary `Authorization` header — S2 Connect's own rule, and the same scheme
+/// every other surface in this workspace uses. `WebSocket::connect` puts it
+/// there, so nothing here builds a handshake request by hand.
+struct Manager {
+    session: CemSession,
+    driver: Driver<Dialled>,
+    seen: Vec<CemEvent>,
+}
+
+impl Manager {
+    /// Dial the box with the household's own credential.
+    async fn as_the_household(address: &str, asset: &AssetId) -> Manager {
+        Self::connect(address, asset, Some(TOKEN))
+            .await
+            .expect("the box to accept a manager")
+    }
+
+    /// Dial with whatever credential — or none.
+    async fn connect(
+        address: &str,
+        asset: &AssetId,
+        token: Option<&str>,
+    ) -> Result<Manager, String> {
+        let socket = WebSocket::connect(&format!("ws://{address}/s2/{asset}"), token)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut session = CemSession::new(CemConfig::default());
+        session.open(Timestamp::now());
+        Ok(Manager {
+            session,
+            driver: Driver::new(socket),
+            seen: Vec::new(),
+        })
+    }
+
+    /// Connect, let the handshake finish, and select a control type.
+    ///
+    /// The preamble every test but the credential ones share. It is a method
+    /// rather than four copies because the handshake is the **engine's** now: a
+    /// test that spelled it out would be asserting the library's behaviour in
+    /// seven places instead of hems's in one.
+    async fn ready(address: &str, asset: &AssetId, control: ControlType) -> Manager {
+        let mut manager = Self::as_the_household(address, asset).await;
+        manager
+            .until("describe itself", |e| {
+                matches!(e, CemEvent::ResourceDescribed(_)).then_some(())
+            })
+            .await;
+        manager
+            .session
+            .select_control_type(control, Timestamp::now())
+            .expect("the selection to go out");
+        // …and **wait for it to be active**. The engine validates outbound
+        // messages, so an instruction sent before the box has acknowledged the
+        // selection is refused at this end with `NotAllowed` — which is the
+        // right answer and means a test that raced ahead would be testing the
+        // CEM's own guard rather than the box.
+        manager
+            .until("activate the control type", |e| {
+                matches!(e, CemEvent::Ready { .. }).then_some(())
+            })
+            .await;
+        manager
+    }
+
+    /// Step the session until `want` matches, or fail rather than hang.
+    async fn until<T>(&mut self, what: &str, mut want: impl FnMut(&CemEvent) -> Option<T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                while let Some(event) = self.session.poll_event() {
+                    let found = want(&event);
+                    self.seen.push(event);
+                    if let Some(found) = found {
+                        return found;
+                    }
+                }
+                self.driver
+                    .step(&mut self.session)
+                    .await
+                    .expect("the box to stay on the wire");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the box did not {what} within five seconds; saw: {:?}",
+                self.seen.iter().map(event_name).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    /// Let the conversation run on for a moment without waiting for anything.
+    ///
+    /// What it is for is [`Manager::assert_clean`]: a message the validator
+    /// objects to may arrive *after* the thing a test was waiting for, and a test
+    /// that stopped reading the moment it had its answer would never see it.
+    async fn settle(&mut self) {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                while let Some(event) = self.session.poll_event() {
+                    self.seen.push(event);
+                }
+                if self.driver.step(&mut self.session).await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+    }
+
+    /// Fail if the validator had anything to say about what the **box** sent.
+    ///
+    /// The whole value of driving a real CEM. A rule-numbered refusal or warning
+    /// against one of this box's own messages is a defect in this product, and it
+    /// is one that "the far end did not crash" would never have found (R32).
+    ///
+    /// There is no allowlist. Every rule in the catalogue is a failure here with
+    /// no way to opt out, which is what makes the check mean anything: the one
+    /// disagreement this workspace ever had — `S2-RMD-003`, whether a battery may
+    /// be storage, load *and* generator for electricity — was settled by the
+    /// standard's own `maxItems: 3` on `roles`, and the rule was narrowed to the
+    /// `(role, commodity)` pair rather than tolerated here (D201).
+    fn assert_clean(&self) {
+        for event in &self.seen {
+            let (what, report) = match event {
+                CemEvent::Refused { kind, report, .. } => (format!("refused {kind:?}"), report),
+                CemEvent::Warnings { kind, report } => (format!("objects to {kind:?}"), report),
+                _ => continue,
+            };
+            if let Some(violation) = report.violations().first() {
+                panic!(
+                    "the manager {what}: [{}] {} at {} — {:?}",
+                    violation.rule.0, violation.message, violation.path, violation.severity
+                );
+            }
+        }
+    }
 }
 
 /// The identifier of the reference household's battery.
@@ -149,27 +283,6 @@ fn battery(site: &hems_core::prelude::Site) -> AssetId {
             _ => None,
         })
         .expect("the reference household has a battery")
-}
-
-/// Wait for the box to say something, acknowledging it, and fail rather than
-/// hang.
-///
-/// `receive_and_confirm` is the manager's side of the rule the box keeps too:
-/// every S2 message but a `ReceptionStatus` is answered with one. A test CEM
-/// that read without acknowledging would be testing the box against a peer that
-/// does not exist.
-async fn next_message<T>(connection: &mut s2energy::connection::S2Connection<T>) -> Message
-where
-    T: s2energy::transport::S2Transport,
-{
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        connection
-            .receive_and_confirm()
-            .await
-            .expect("the box to stay on the wire")
-    })
-    .await
-    .expect("the box to answer within five seconds")
 }
 
 /// The whole conversation, and then the thing it was for.
@@ -186,46 +299,19 @@ async fn a_manager_connects_selects_a_control_type_and_instructs_the_battery() {
 
     // The path is what names the resource: no S2 message carries a resource
     // identifier, so one connection cannot carry a whole house.
-    let mut connection = connect_as_client(as_the_household(&address, &battery))
-        .await
-        .expect("the box to accept a manager");
+    let mut manager = Manager::as_the_household(&address, &battery).await;
 
-    // 1. The box speaks first.
-    let Message::Handshake(handshake) = next_message(&mut connection).await else {
-        panic!("a Resource Manager opens an S2 conversation with its own handshake");
-    };
-    assert_eq!(handshake.role, EnergyManagementRole::Rm);
-    assert!(
-        !handshake.supported_protocol_versions.is_empty(),
-        "S2 makes the version list mandatory for the RM: it is the constrained side"
-    );
-
-    // 2. The manager answers, choosing a version the box offered.
-    connection
-        .send_message(
-            Handshake::builder()
-                .role(EnergyManagementRole::Cem)
-                .supported_protocol_versions(vec![s2energy::s2_schema_version().to_string()])
-                .build(),
-        )
-        .await
-        .expect("the manager's handshake to go out");
-    connection
-        .send_message(HandshakeResponse::new(
-            s2energy::s2_schema_version().to_string(),
-        ))
-        .await
-        .expect("the manager's version selection to go out");
-
-    // 3. The box says what it is. The reception statuses for the two messages
-    //    above arrive first — S2 acknowledges everything but an acknowledgement.
-    let details = loop {
-        match next_message(&mut connection).await {
-            Message::ResourceManagerDetails(details) => break details,
-            Message::ReceptionStatus(_) => {}
-            other => panic!("unexpected before the details: {other:?}"),
-        }
-    };
+    // 1–3. The handshake is the **engine's**, in the order S2 specifies: the
+    //      Resource Manager speaks first because it is the constrained side, the
+    //      manager picks a version, and everything but an acknowledgement is
+    //      acknowledged. A regression in hems's ordering is therefore caught by a
+    //      peer that knows the rule, not by a script that happened to expect it.
+    let details = manager
+        .until("describe itself", |e| match e {
+            CemEvent::ResourceDescribed(d) => Some(d.clone()),
+            _ => None,
+        })
+        .await;
     assert!(
         details
             .available_control_types
@@ -236,18 +322,20 @@ async fn a_manager_connects_selects_a_control_type_and_instructs_the_battery() {
 
     // 4. The manager selects it, and the box sends the system description that
     //    tells it what the actuator and the two operation modes are called.
-    connection
-        .send_message(SelectControlType::new(ControlType::FillRateBasedControl))
-        .await
+    manager
+        .session
+        .select_control_type(ControlType::FillRateBasedControl, Timestamp::now())
         .expect("the selection to go out");
 
-    let description = loop {
-        match next_message(&mut connection).await {
-            Message::FrbcSystemDescription(description) => break description,
-            Message::ReceptionStatus(_) | Message::PowerMeasurement(_) => {}
-            other => panic!("unexpected before the system description: {other:?}"),
-        }
-    };
+    let description = manager
+        .until("send its system description", |e| match e {
+            CemEvent::Description {
+                message: Message::FrbcSystemDescription(d),
+                ..
+            } => Some(d.clone()),
+            _ => None,
+        })
+        .await;
     let actuator = description
         .actuators
         .first()
@@ -267,20 +355,24 @@ async fn a_manager_connects_selects_a_control_type_and_instructs_the_battery() {
         "a session that has selected a control type has not yet instructed anything"
     );
 
-    // 5. …and the thing all of that was for.
-    connection
-        .send_message(
-            s2energy::frbc::Instruction::builder()
-                .id(s2energy::common::Id::generate())
-                .actuator_id(actuator.id.clone())
-                .operation_mode(charge.id.clone())
+    // 5. …and the thing all of that was for. `instruct` validates it against the
+    //    rule catalogue on the way out, so an instruction hems could not
+    //    legitimately be sent is a failure here rather than a refusal on the wire.
+    manager
+        .session
+        .instruct(
+            s2_kit::types::frbc::Instruction::builder()
+                .id(s2_kit::types::Id::generate())
+                .actuator_id(actuator.id)
+                .operation_mode(charge.id)
                 .operation_mode_factor(0.5)
-                .execution_time(now_utc())
+                .execution_time(Timestamp::now())
                 .abnormal_condition(false)
                 .build(),
+            Timestamp::now(),
         )
-        .await
         .expect("the instruction to go out");
+    manager.settle().await;
 
     // The box accepts it on the wire *and* acts on it, which are two different
     // answers to two different questions — "I read it" is about the socket and
@@ -316,6 +408,12 @@ async fn a_manager_connects_selects_a_control_type_and_instructs_the_battery() {
     assert_eq!(status.connected, vec![battery.to_string()]);
     assert_eq!(status.instructing, vec![battery.to_string()]);
     assert_eq!(status.refused, 0, "nothing here was refused");
+
+    // And the manager's own validator had nothing to say about any of it. This is
+    // the assertion the previous library could not carry: every handshake,
+    // description, status and measurement this box sent was checked against the
+    // rule catalogue, and a violation would name the rule it broke.
+    manager.assert_clean();
 }
 
 /// A manager addressing an actuator this household does not have is told so, and
@@ -329,52 +427,23 @@ async fn a_manager_connects_selects_a_control_type_and_instructs_the_battery() {
 async fn an_instruction_for_an_actuator_nobody_described_is_refused_and_counted() {
     let (address, cem, site) = a_box_that_can_be_managed().await;
     let battery = battery(&site);
-    let mut connection = connect_as_client(as_the_household(&address, &battery))
-        .await
-        .expect("the box to accept a manager");
+    let mut manager = Manager::ready(&address, &battery, ControlType::FillRateBasedControl).await;
 
-    let _ = next_message(&mut connection).await;
-    connection
-        .send_message(
-            Handshake::builder()
-                .role(EnergyManagementRole::Cem)
-                .supported_protocol_versions(vec![s2energy::s2_schema_version().to_string()])
-                .build(),
-        )
-        .await
-        .expect("the handshake to go out");
-    connection
-        .send_message(HandshakeResponse::new(
-            s2energy::s2_schema_version().to_string(),
-        ))
-        .await
-        .expect("the version to go out");
-    loop {
-        if matches!(
-            next_message(&mut connection).await,
-            Message::ResourceManagerDetails(_)
-        ) {
-            break;
-        }
-    }
-    connection
-        .send_message(SelectControlType::new(ControlType::FillRateBasedControl))
-        .await
-        .expect("the selection to go out");
-
-    connection
-        .send_message(
-            s2energy::frbc::Instruction::builder()
-                .id(s2energy::common::Id::generate())
-                .actuator_id(s2energy::common::Id::generate())
-                .operation_mode(s2energy::common::Id::generate())
+    manager
+        .session
+        .instruct(
+            s2_kit::types::frbc::Instruction::builder()
+                .id(s2_kit::types::Id::generate())
+                .actuator_id(s2_kit::types::Id::generate())
+                .operation_mode(s2_kit::types::Id::generate())
                 .operation_mode_factor(0.5)
-                .execution_time(now_utc())
+                .execution_time(Timestamp::now())
                 .abnormal_condition(false)
                 .build(),
+            Timestamp::now(),
         )
-        .await
         .expect("the instruction to go out");
+    manager.settle().await;
 
     let refused = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -405,10 +474,11 @@ async fn an_instruction_for_an_actuator_nobody_described_is_refused_and_counted(
 async fn there_is_nothing_to_manage_on_an_asset_this_household_does_not_have() {
     let (address, _cem, _site) = a_box_that_can_be_managed().await;
     assert!(
-        connect_as_client(as_the_household(
+        Manager::connect(
             &address,
-            &AssetId::new("a-device-nobody-owns").expect("a valid identifier")
-        ))
+            &AssetId::new("a-device-nobody-owns").expect("a valid identifier"),
+            Some(TOKEN)
+        )
         .await
         .is_err(),
         "an unknown asset is a 404 rather than an S2 session about nothing"
@@ -431,44 +501,17 @@ async fn there_is_nothing_to_manage_on_an_asset_this_household_does_not_have() {
 async fn a_manager_is_told_when_the_grid_overrides_its_instruction() {
     let (address, cem, site) = a_box_that_can_be_managed().await;
     let battery = battery(&site);
-    let mut connection = connect_as_client(as_the_household(&address, &battery))
-        .await
-        .expect("the box to accept a manager");
+    let mut manager = Manager::ready(&address, &battery, ControlType::FillRateBasedControl).await;
 
-    let _ = next_message(&mut connection).await;
-    connection
-        .send_message(
-            Handshake::builder()
-                .role(EnergyManagementRole::Cem)
-                .supported_protocol_versions(vec![s2energy::s2_schema_version().to_string()])
-                .build(),
-        )
-        .await
-        .expect("the handshake to go out");
-    connection
-        .send_message(HandshakeResponse::new(
-            s2energy::s2_schema_version().to_string(),
-        ))
-        .await
-        .expect("the version to go out");
-    loop {
-        if matches!(
-            next_message(&mut connection).await,
-            Message::ResourceManagerDetails(_)
-        ) {
-            break;
-        }
-    }
-    connection
-        .send_message(SelectControlType::new(ControlType::FillRateBasedControl))
-        .await
-        .expect("the selection to go out");
-
-    let description = loop {
-        if let Message::FrbcSystemDescription(description) = next_message(&mut connection).await {
-            break description;
-        }
-    };
+    let description = manager
+        .until("send its system description", |e| match e {
+            CemEvent::Description {
+                message: Message::FrbcSystemDescription(d),
+                ..
+            } => Some(d.clone()),
+            _ => None,
+        })
+        .await;
     let actuator = description.actuators.first().expect("one actuator");
     let charge = actuator
         .operation_modes
@@ -476,19 +519,22 @@ async fn a_manager_is_told_when_the_grid_overrides_its_instruction() {
         .find(|m| m.elements.iter().any(|e| e.fill_rate.end_of_range > 0.0))
         .expect("a mode that fills it");
 
-    connection
-        .send_message(
-            s2energy::frbc::Instruction::builder()
-                .id(s2energy::common::Id::generate())
-                .actuator_id(actuator.id.clone())
-                .operation_mode(charge.id.clone())
+    let instruction = s2_kit::types::Id::generate();
+    manager
+        .session
+        .instruct(
+            s2_kit::types::frbc::Instruction::builder()
+                .id(instruction)
+                .actuator_id(actuator.id)
+                .operation_mode(charge.id)
                 .operation_mode_factor(1.0)
-                .execution_time(now_utc())
+                .execution_time(Timestamp::now())
                 .abnormal_condition(false)
                 .build(),
+            Timestamp::now(),
         )
-        .await
         .expect("the instruction to go out");
+    manager.settle().await;
 
     // Wait until the box has taken it, then let the guard take it back — which
     // is what the control loop does on the tick a § 14a ceiling arrives.
@@ -513,22 +559,25 @@ async fn a_manager_is_told_when_the_grid_overrides_its_instruction() {
 
     // And it arrives on the wire as an `InstructionStatusUpdate`, not as silence.
     let update = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            if let Message::InstructionStatusUpdate(update) = next_message(&mut connection).await
-                && update.status_type == s2energy::common::InstructionStatus::Aborted
-            {
-                return update;
-            }
-        }
+        manager
+            .until("report the abort", |e| match e {
+                CemEvent::InstructionStatus(update)
+                    if update.status_type == s2_kit::types::common::InstructionStatus::Aborted =>
+                {
+                    Some(update.clone())
+                }
+                _ => None,
+            })
+            .await
     })
     .await
     .expect("the manager to be told its instruction was overridden");
 
     assert_eq!(
-        update.status_type,
-        s2energy::common::InstructionStatus::Aborted,
+        update.instruction_id, instruction,
         "S2's `ABORTED` is *started and could not be completed*, which is exactly \
-         what a network operator's reduction does to an accepted instruction"
+         what a network operator's reduction does to an accepted instruction — and \
+         the update names the instruction it aborted, not merely a status"
     );
 
     // Once, not once a second: a reduction lasts minutes and a status update on
@@ -612,13 +661,11 @@ async fn the_box_answers_nothing_about_a_household_without_its_credential() {
 
     // …and the S2 socket, which is the one that lets somebody else drive.
     assert!(
-        connect_as_client(request_to(&address, &battery, None))
-            .await
-            .is_err(),
+        Manager::connect(&address, &battery, None).await.is_err(),
         "a Customer Energy Manager with no credential opened a session"
     );
     assert!(
-        connect_as_client(request_to(&address, &battery, Some("a-guess")))
+        Manager::connect(&address, &battery, Some("a-guess"))
             .await
             .is_err(),
         "a Customer Energy Manager with the wrong credential opened a session"
@@ -792,4 +839,146 @@ async fn a_manager_may_drive_the_house_and_not_read_its_life() {
             .status()
             .is_success()
     );
+}
+
+/// An instruction scheduled for later does not move the household now.
+///
+/// `execution_time` means "when to start; in the past means as soon as
+/// possible", so a time in the future is a schedule. A Resource Manager that
+/// acts on receipt fires an aggregator's whole day at once, on every household
+/// at once (D212). Not checkable from a message: it is a **session** behaviour,
+/// and a test that sets the execution time to `now` cannot tell the two
+/// behaviours apart.
+#[tokio::test]
+async fn an_instruction_for_later_does_not_move_the_household_now() {
+    let (address, cem, site) = a_box_that_can_be_managed().await;
+    let battery = battery(&site);
+    let mut manager = Manager::ready(&address, &battery, ControlType::FillRateBasedControl).await;
+    let (actuator, charge) = charge_mode(&mut manager).await;
+
+    manager
+        .session
+        .instruct(
+            s2_kit::types::frbc::Instruction::builder()
+                .id(s2_kit::types::Id::generate())
+                .actuator_id(actuator)
+                .operation_mode(charge)
+                .operation_mode_factor(1.0)
+                .execution_time(Timestamp::from(
+                    time::OffsetDateTime::now_utc() + time::Duration::hours(2),
+                ))
+                .abnormal_condition(false)
+                .build(),
+            Timestamp::now(),
+        )
+        .expect("a scheduled instruction is a perfectly good one");
+
+    // It is accepted — it is well formed and names a described actuator — and it
+    // is *not* carried out. `until` rather than `settle` first, because `settle`
+    // drains events without matching and would swallow the status this is about.
+    let accepted = manager
+        .until("accept the instruction", |e| match e {
+            CemEvent::InstructionStatus(update) => Some(update.status_type),
+            _ => None,
+        })
+        .await;
+    assert_eq!(
+        accepted,
+        s2_kit::types::common::InstructionStatus::Accepted,
+        "a schedule is accepted, not refused"
+    );
+    manager.settle().await;
+    assert!(
+        !cem.active(time::OffsetDateTime::now_utc())
+            .await
+            .contains_key(&battery),
+        "an instruction two hours out must not be in the map the arbiter reads"
+    );
+    manager.assert_clean();
+}
+
+/// A manager that selects `NO_SELECTION` hands the resource back.
+///
+/// A **state** rather than a capability — "to be used if no control type is or
+/// has been selected" — and how an aggregator finishes a dispatch window without
+/// dropping the connection it still wants the measurements on. The hold has to
+/// go at once, because a manager's instruction ranks above the box's own plan
+/// (D213).
+#[tokio::test]
+async fn a_manager_that_stops_driving_stops_being_obeyed() {
+    let (address, cem, site) = a_box_that_can_be_managed().await;
+    let battery = battery(&site);
+    let mut manager = Manager::ready(&address, &battery, ControlType::FillRateBasedControl).await;
+    let (actuator, charge) = charge_mode(&mut manager).await;
+
+    manager
+        .session
+        .instruct(
+            s2_kit::types::frbc::Instruction::builder()
+                .id(s2_kit::types::Id::generate())
+                .actuator_id(actuator)
+                .operation_mode(charge)
+                .operation_mode_factor(1.0)
+                .execution_time(Timestamp::now())
+                .abnormal_condition(false)
+                .build(),
+            Timestamp::now(),
+        )
+        .expect("the instruction to go out");
+    manager.settle().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !cem
+            .active(time::OffsetDateTime::now_utc())
+            .await
+            .contains_key(&battery)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the household to be under instruction first");
+
+    manager
+        .session
+        .select_control_type(ControlType::NoSelection, Timestamp::now())
+        .expect("handing a resource back is a thing a manager may do");
+    manager.settle().await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let status = cem.status(time::OffsetDateTime::now_utc()).await;
+            if status.connected.is_empty() && status.instructing.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hold to be released the moment the manager let go");
+
+    manager.assert_clean();
+}
+
+/// The actuator and its charge mode, read off the description rather than
+/// assumed — which is the whole point of a standard that names things by ID.
+async fn charge_mode(manager: &mut Manager) -> (s2_kit::types::Id, s2_kit::types::Id) {
+    let description = manager
+        .until("send its system description", |e| match e {
+            CemEvent::Description {
+                message: Message::FrbcSystemDescription(d),
+                ..
+            } => Some(d.clone()),
+            _ => None,
+        })
+        .await;
+    let actuator = description
+        .actuators
+        .first()
+        .expect("a battery has one actuator");
+    let charge = actuator
+        .operation_modes
+        .iter()
+        .find(|m| m.elements.iter().any(|e| e.fill_rate.end_of_range > 0.0))
+        .expect("a battery has a mode that fills it");
+    (actuator.id, charge.id)
 }

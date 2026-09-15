@@ -341,27 +341,36 @@ under each policy:
 ```console
 $ just risk deadline 20
   policy                mean     worst      best    unserved     solve
-  one median           2.81€     1.78€     3.55€       0.07€      103s
-  three futures        2.96€     1.76€     3.92€       0.01€      517s
-  …and the tail        2.89€     1.67€     3.82€       0.01€      481s
-  only when at risk     2.92€     1.67€     3.93€       0.01€      467s
+  one median           1.09€    -0.58€     1.75€       0.10€       81s
+  three futures        1.22€     0.54€     1.60€       0.00€      651s
+  …and the tail        1.20€     0.62€     1.69€       0.00€      567s
+  only when at risk     1.18€     0.61€     1.69€       0.00€      480s
 
   band               covered      CRPS    episodes
-  production             80%      178W          20
+  production             80%      165W          20
   household load         81%       21W          20
 
   a 10–90 band should cover 80 %. It does, over enough days to say so.
 ```
 
 Over twenty seeded weathers on each of two days, scenarios **pay where a service
-is at risk** — three futures beat the median on the mean, €3,01 against €2,85,
-and take the undelivered charge from €0,07 to €0,01. They **cost €1,03 a day
-where nothing is at risk**. And **no** policy improves the worst day: on the
-ordinary day the hedge takes it from €1,21 to €0,37. So the default is one
-median.
+is at risk** — three futures beat the median on the mean, €1,22 against €1,09,
+and take the undelivered charge from €0,10 to nothing. They **cost about ninety
+cents a day where nothing is at risk**, turning a €0,46 saving into a €0,46 loss
+on an ordinary winter day. And the hedge **does** buy a better bad day: on the
+tight evening it takes the worst weather from **−€0,58 to €0,62** — the median
+plan does not merely save less on its worst day, it costs the household money.
 
-Every one of those figures moved when the sweep grew from four weathers to
-twenty, which is the argument for owning the sweep rather than a footnote to it.
+That last finding depends entirely on what the comparison household owns. Against
+one with **no battery**, the median plan's downside is invisible: a handicapped
+baseline is one you beat on a bad day as well as a good one. It is the sharpest
+reason here to own the sweep rather than footnote it.
+
+The default is still one median, for a narrower reason than before: `adaptive` —
+three futures only where the charging session is tight — is the best of the four
+on this evidence, within €0,04 of always hedging on the day that needs it and
+€0,08 of the median on the day that does not, but it fires on a charging session
+a real box does not yet carry in its plan.
 
 A calibrated band is a *precondition* for planning against scenarios, not an
 improvement to it. Scored only where there is something to forecast — a band of
@@ -687,9 +696,64 @@ The ledger is closed on the stores as well. A period that ends with an emptier
 battery than it began with has spent something it started with, and that is
 charged at what it would cost to put back — the same number the terminal value
 already puts in the objective, on the other side of the ledger. The mirror case
-is deliberately *not* credited: the baseline has no battery to store anything in
-and could never earn it, so a saving figure may understate itself and may not
-flatter itself.
+is deliberately *not* credited, so a saving figure may understate itself and may
+not flatter itself. Both households can be charged it: the unmanaged one has the
+same battery and the same tank, so this stopped being a term only one side could
+owe.
+
+### The heat pump runs both ways
+
+A German heat pump fitted since January 2026 is usually reversible: the GEG made
+one the default heating system, the hardware is a four-way valve, and the KfW
+subsidy covers the cooling function when the unit is the main heating. So the
+planner decides a direction as well as a power.
+
+The physics was already there — the two-mass model is linear in the heat input,
+and a negative input is a house losing heat. What cooling needed was its own
+*variable*, because the efficiency curve runs the other way: a heat pump heats
+better when it is warm outside and cools worse, since in both cases what it is
+fighting is the gap between indoors and out. One curve serving both would be
+right at one end and wrong at the other.
+
+The direction travels with the setpoint, and that is not decoration: a power is
+not an instruction for a device with two modes. A reversible unit handed "draw
+four kilowatts" in July with no mode beside it will heat the house, and the meter
+cannot tell the two apart afterwards. It travels all the way — plan, arbiter,
+`Command::ThermalMode`, driver — and a household whose drivers cannot carry it is
+refused at start-up rather than run the wrong way for a summer.
+
+Cooling is also the one load that wants to run exactly when a roof is producing
+most, so it absorbs curtailment a battery has no room left for. Without it a June
+day's largest cost is discomfort no controller can touch.
+
+#### One device, one direction
+
+A compressor runs one way and a pack charges or discharges, so each gets a binary
+per slot — declared only where the question can arise, so a heating-only
+household and a household with no store hand the backend the model they had
+before either was written.
+
+Two variables and no binary is the tempting shape, on the argument that both
+directions cost energy and a plan that plays a device against itself pays twice
+to stand still. That holds only while electricity costs something. Under a
+binding § 9 EEG feed-in ceiling the surplus a load absorbs is surplus that would
+otherwise be curtailed, and curtailment is priced; in a negative-price quarter
+hour the household is paid to consume. Then the cancelling pair is a **dump
+load** — it changes no state and consumes real kilowatts — and it is strictly
+profitable. Without the binaries the planner commands 4,64 kW of heat and 3,06 kW
+of cooling through one 5 kW machine, and 5 kW into and 5 kW out of one pack,
+which is worth €0,47 a day on the June reference day and three points of its
+self-sufficiency.
+
+There is no cheaper exact formulation, and the reason is worth stating because
+the rest of this model works hard to avoid binaries: "at most one of two
+non-negative variables is positive" is a **disjunction**, and no linear
+inequality over the pair expresses one. Every bound admitting `(P, 0)` and
+`(0, P)` admits the convex combinations between them, and those are exactly the
+operating points the hardware does not have.
+
+The general question, for any new pair that can cancel: *what would this model do
+if energy were free?*
 
 The **car** is the exception and has an entry of its own, because both households
 own the same one. Charge pushed into it *past* what the household asked for is a
@@ -701,11 +765,20 @@ a car at nothing.
 
 That baseline has to deliver the **same service** or it is not a comparison: the
 car still reaches its target, the house is still warm and the shower is still
-hot. What it lacks is the *decisions* — no battery, a charge point that starts
-the moment the car is plugged in, and a heat pump and a hot-water tank on
-ordinary thermostats, stepped through the same two-mass building model the plan
-is solved against. A baseline that priced a household with no car and no heating
-at all would credit the optimiser for energy it never had to buy.
+hot. It also has the **same equipment**: the same battery, running the greedy
+self-consumption rule every hybrid inverter ships with — surplus into the store,
+deficit out of it, never buying to charge and never selling to discharge. What it
+lacks is the *decisions* — a charge point that starts the moment the car is
+plugged in, and a heat pump and a hot-water tank on ordinary thermostats, stepped
+through the same two-mass building model the plan is solved against.
+
+The battery is the one that matters most. A store earns the import/export spread
+on everything it cycles whether or not anybody optimises, so a saving measured
+against an idle one is the value of *owning* a battery — and is comparable with
+nothing in the MPC literature, which reports against rule-based self-consumption.
+A baseline that priced a household with no car and no heating at all would credit
+the optimiser for energy it never had to buy; one with no battery credits it for
+a spread it never had to earn.
 
 It also lives under the **same law**: a house with no energy management system
 cannot be addressed as one `[A1 4.4.b]`, so during a reduction its Steuerbox

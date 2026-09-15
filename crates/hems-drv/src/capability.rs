@@ -9,8 +9,9 @@
 /// because a property is a statement about code that runs.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "a capability set is four independent yes/no facts about one driver; \
-              folding them into a state machine would relate things that are not related"
+    reason = "a capability set is a handful of independent yes/no facts about one \
+              driver; folding them into a state machine would relate things that \
+              are not related"
 )]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -32,6 +33,22 @@ pub struct DriverCapabilities {
     pub measures: bool,
     /// It can be told a power setpoint or ceiling.
     pub accepts_commands: bool,
+    /// It can be told which way a reversible thermal device should run.
+    ///
+    /// A power is not an instruction for a machine with two directions. A
+    /// reversible heat pump handed "draw four kilowatts" in July with no
+    /// direction beside it runs whichever way its own thermostat last chose, and
+    /// no meter can tell afterwards which that was — so a planner that decided
+    /// to pre-cool a house into a cheap afternoon gets pre-*heating* and reports
+    /// a saving it never made.
+    ///
+    /// Declared rather than assumed for the reason the rest of this struct is:
+    /// a household whose unit is reversible and whose driver cannot turn it
+    /// round is refused at start-up (`RegistryError::CannotSetThermalMode`)
+    /// instead of running the wrong way for a summer. EEBUS has no cooling
+    /// process to match `OHPCF`, so today this is a vendor register map or
+    /// nothing, and saying which is the driver's job.
+    pub sets_thermal_mode: bool,
     /// It carries limits from the network operator.
     ///
     /// The distinguishing mark of a **grid** driver. A site that declares § 14a
@@ -94,6 +111,18 @@ pub struct DriverCapabilities {
 }
 
 impl DriverCapabilities {
+    /// The same, and able to turn a reversible thermal device round.
+    ///
+    /// A builder rather than a sixth constructor: the direction is orthogonal to
+    /// every other question here — a unit can be measured or not, polled or
+    /// notified, and still reversible — and a constructor per combination is the
+    /// matrix this struct exists to avoid.
+    #[must_use]
+    pub const fn setting_thermal_mode(mut self) -> Self {
+        self.sets_thermal_mode = true;
+        self
+    }
+
     /// A driver that reports a device and takes commands.
     #[must_use]
     pub const fn device() -> Self {
@@ -103,6 +132,7 @@ impl DriverCapabilities {
             reports_grid_limits: false,
             reports_on_change: false,
             reports_available_power: false,
+            sets_thermal_mode: false,
         }
     }
 
@@ -115,6 +145,7 @@ impl DriverCapabilities {
             reports_grid_limits: false,
             reports_on_change: false,
             reports_available_power: false,
+            sets_thermal_mode: false,
         }
     }
 
@@ -132,6 +163,7 @@ impl DriverCapabilities {
             reports_grid_limits: false,
             reports_on_change: false,
             reports_available_power: false,
+            sets_thermal_mode: false,
         }
     }
 
@@ -154,6 +186,7 @@ impl DriverCapabilities {
             reports_grid_limits: false,
             reports_on_change: false,
             reports_available_power: false,
+            sets_thermal_mode: false,
         }
     }
 
@@ -169,6 +202,7 @@ impl DriverCapabilities {
             reports_grid_limits: true,
             reports_on_change: false,
             reports_available_power: false,
+            sets_thermal_mode: false,
         }
     }
 
