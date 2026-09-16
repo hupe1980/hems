@@ -2114,7 +2114,6 @@ dependencies = [
  "axum",
  "deadpool-postgres",
  "ed25519-dalek",
- "hems-service",
  "hex",
  "http",
  "prometheus",

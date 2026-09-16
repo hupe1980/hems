@@ -323,7 +323,7 @@ names a document the index does not carry. `cargo xtask check-wire` does the sam
 for the 130 quantities and instants, each of which has to say how it travels;
 `cargo xtask check-vital` for a daemon's background loops, since one spawned
 outside `Health::vital` has a liveness probe that cannot fail, which is worse
-than none; `cargo xtask check-deps-used` for the 255 declared dependencies,
+than none; `cargo xtask check-deps-used` for the 254 declared dependencies,
 because every crate here is published and an edge nobody uses is a resolution and
 a compile a downstream consumer pays for — and an edge from the simulator to the
 forecaster would be a path by which the day that happens could read the day that

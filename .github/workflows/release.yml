@@ -146,16 +146,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo install --locked cargo-cyclonedx
-      # For `hemsd` alone rather than `--all`: the daemon is the artefact that
-      # ships, its tree transitively contains every domain crate, and one file is
-      # a bill of materials where twelve are a directory listing.
-      - run: cargo cyclonedx -p hemsd --format json --all-features
+      # `cargo-cyclonedx` takes **no `-p`**. It walks the workspace and writes one
+      # SBOM per member beside that member's manifest, and `--manifest-path` picks
+      # which manifest it starts from rather than which crate it emits. So the
+      # daemon's file is named directly below: `hemsd` is the artefact that ships
+      # and its tree transitively contains every domain crate, which is why one
+      # file is the bill of materials and twenty are a directory listing.
+      - run: cargo cyclonedx --manifest-path services/hemsd/Cargo.toml --format json --all-features
       - name: Collect
         run: |
           set -euo pipefail
           mkdir -p sbom
-          find . -name '*.cdx.json' -not -path './target/*' \
-            -exec cp {} "sbom/hemsd-${{ needs.verify.outputs.version }}.cdx.json" \;
+          # Named, not found. A `find` over `*.cdx.json` matches all twenty and
+          # copying each onto one destination leaves whichever the filesystem
+          # happened to return last — an SBOM for an arbitrary crate, under the
+          # daemon's name.
+          cp services/hemsd/hemsd.cdx.json \
+             "sbom/hemsd-${{ needs.verify.outputs.version }}.cdx.json"
+          # It has to describe the daemon and contain the whole workspace, or it
+          # is a bill of materials for something else.
+          python3 - "sbom/hemsd-${{ needs.verify.outputs.version }}.cdx.json" <<'PY'
+          import json, sys
+          bom = json.load(open(sys.argv[1]))
+          name = bom["metadata"]["component"]["name"]
+          ours = sum(1 for c in bom["components"] if c["name"].startswith("hems-"))
+          assert name == "hemsd", f"the SBOM describes {name}, not hemsd"
+          assert ours >= 12, f"only {ours} hems crates in it — not the daemon's whole tree"
+          print(f"{name}: {len(bom['components'])} components, {ours} of them ours")
+          PY
           ls -l sbom
       - uses: actions/upload-artifact@v4
         with:
@@ -205,14 +223,23 @@ jobs:
 
   # ── 5. crates.io, last, because it cannot be undone ─────────────────────────
   #
-  # `cargo publish --workspace` resolves the order of the ten publishable crates
-  # itself and skips the two that are `publish = false` (`hemsd`, `xtask`), which
-  # is why there is no hand-maintained list here to drift out of date.
+  # Twelve publishable crates. The daemons and `xtask` are `publish = false` and
+  # are not in the list below.
   #
   # Authentication is **trusted publishing**: GitHub's OIDC identity is exchanged
-  # for a token that lives for the length of this job. There is no long-lived
+  # for a token that lives thirty minutes. There is no long-lived
   # `CARGO_REGISTRY_TOKEN` in the repository secrets to leak, and the exchange
   # only succeeds for this workflow on this repository.
+  #
+  # It is configured **per crate**, and that is the operational catch: each of
+  # the twelve needs its own entry at `crates.io/crates/<name>/settings` naming
+  # owner `hupe1980`, repository `hems`, workflow `release.yml` and environment
+  # `crates-io`. A crate without one fails at its own step with a permissions
+  # error, and everything before it has already published — which the loop below
+  # is built for: add the missing entry and re-run the tag.
+  #
+  # No crate here needs a manual first publish. That rule applies to a crate
+  # *name* that has never been published, and all twelve have been since 0.1.0.
   crates-io:
     name: Publish to crates.io
     needs: [verify, binaries]
@@ -229,6 +256,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
-      - run: cargo publish --workspace --locked
+
+      # One `cargo publish` per crate, in dependency order, **tolerating a crate
+      # that is already there** — `mako`'s shape, for `mako`'s reason.
+      #
+      # `cargo publish --workspace` is neither atomic nor resumable: an upload
+      # that fails partway leaves the crates that landed on crates.io, cargo has
+      # no `--skip-published`, and a second run dies on the first one it finds
+      # (rust-lang/cargo#16181). A version cannot be un-published, so that is a
+      # release with no way forward but finishing it by hand.
+      #
+      # Tolerating "already uploaded" makes the whole job idempotent: re-run the
+      # tag and it publishes exactly what did not land. It is also what makes the
+      # hand-written order below safe to get wrong — a crate whose dependency is
+      # not on the registry yet fails loudly, and the re-run after fixing the
+      # order skips everything that already went.
+      - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          set -uo pipefail
+          for crate in hems-core hems-events hems-service hems-device \
+                       hems-forecast hems-grid hems-sim hems-drv hems-flex \
+                       hems-realtime hems-tariff hems-optimizer; do
+            echo "::group::$crate"
+            out=$(cargo publish -p "$crate" --locked 2>&1) && rc=0 || rc=$?
+            echo "$out"
+            echo "::endgroup::"
+            if [ $rc -ne 0 ] \
+               && ! echo "$out" | grep -qE "already uploaded|already exists on crates\.io"; then
+              exit $rc
+            fi
+          done

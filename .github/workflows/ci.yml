@@ -113,10 +113,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # Every regulatory citation resolves to an indexed document, every
-      # CloudEvents type is in the catalogue, and every crate can actually be
-      # packaged. All three failures are otherwise silent — the last one until
-      # the day somebody runs `cargo publish`.
+      # CloudEvents type is in the catalogue, and every crate's manifest names
+      # files that exist. All of those failures are otherwise silent.
       - run: cargo xtask check-all
+
+  # ── The one resolution nothing else performs ────────────────────────────────
+  #
+  # `cargo publish` resolves every dependency against **crates.io**, where every
+  # other job here resolves against the tree. A self-dependency, a path
+  # dependency with no version, or a version bump that outran a sibling's
+  # published one therefore fails in this job and in no other — and, before this
+  # job existed, at `git push --tags`, which is the most expensive place to find
+  # out.
+  #
+  # Four seconds: `--no-verify` makes the check the *resolution* rather than a
+  # second build of what `test` already built.
+  publishable:
+    name: Publishable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: extractions/setup-just@v3
+      # Through `just` so the flags have one definition: `--no-verify` is the
+      # whole difference between a four-second check and a forty-second one, and
+      # two copies of that decision would drift.
+      - run: just publishable
 
   demo:
     name: Simulated days

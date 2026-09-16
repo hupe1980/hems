@@ -18,7 +18,7 @@ default:
 # runs on a clone and a toolchain.
 #
 # ✅ Everything CI runs, in CI order
-ci: fmt-check lint purity test guards deny doc
+ci: fmt-check lint purity test guards publishable deny doc
     @echo "✅ all checks passed"
 
 # 🎨 Format the workspace
@@ -108,6 +108,19 @@ test-crate crate:
 # declares a dependency its source never reaches
 guards:
     cargo xtask check-all
+
+# `cargo publish` resolves each dependency against crates.io rather than against
+# the workspace, so a self-dependency, a path dependency with no version, or a
+# version bump that outran a sibling's published one fails here and in no other
+# check — `build`, `test` and `clippy` all resolve against the tree.
+#
+# `--no-verify` because the point is the *resolution*, not a second build of what
+# `test` already built: four seconds against forty, catching the same faults. The
+# real `cargo publish` verifies at release time.
+
+# Every publishable crate still packages against the registry
+publishable:
+    cargo publish --workspace --locked --dry-run --no-verify --allow-dirty
 
 # 📜 Licences and advisories
 deny:

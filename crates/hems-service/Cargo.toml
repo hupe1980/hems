@@ -61,4 +61,21 @@ tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "signal", "time", "net", "io-util"] }
-hems-service = { workspace = true, features = ["testkit"] }
+
+# `tests/migrations.rs` needs a real PostgreSQL, which is `testdb` behind the
+# `testkit` feature. An integration test links this crate from outside, so
+# `cfg(test)` does not reach the library and the feature has to be on — but a
+# **dev-dependency on itself** is the wrong way to say so. Cargo resolves a
+# versioned dev-dependency against the registry at publish time, so a
+# self-dependency asks crates.io for the version being published and
+# `cargo publish` fails: *"failed to select a version for the requirement
+# `hems-service = ^0.2`"*. It survives a patch release only because the previous
+# version is already on the index, which makes it a release blocker that hides
+# until the next minor bump.
+#
+# `required-features` is the mechanism the problem actually wants: it states what
+# the test needs, and a build without it **skips** the test instead of failing to
+# compile. `just test` runs `--all-features`, so the suite is unaffected.
+[[test]]
+name             = "migrations"
+required-features = ["testkit"]
